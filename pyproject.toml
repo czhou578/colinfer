@@ -1,0 +1,64 @@
+[project]
+name = "colin-inference-engine"
+version = "0.0.1"
+description = "Single-user inference engine for DGX Spark (GB10, sm_121)"
+readme = "PLAN.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Host-side toolchain: pinned exactly, these are sm_121-sensitive (see PLAN.md 1.x).
+    # torch cu130 matches the nvcc 13.0 on the box so torch.utils.cpp_extension builds cleanly.
+    "torch==2.14.1",
+    "triton==3.8.0",
+    # FlashInfer: python package + precompiled cubins + the GB10-specific (sm121a) JIT cache.
+    "flashinfer-python==0.7.0.post1",
+    "flashinfer-cubin==0.7.0.post1",
+    "flashinfer-jit-cache==0.7.0.post1",
+    "flashinfer-jit-cache-sm121a==0.7.0.post1",
+    # Model loading / tokenization.
+    "transformers==5.18.0",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.23.0",
+    "numpy>=2.3",
+    # Build helper for torch.utils.cpp_extension / CMake.
+    "ninja>=1.11",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+]
+
+[tool.uv]
+# The flashinfer-jit-cache shim hard-depends on precompiled providers for every
+# CUDA arch (~hundreds of MB each). Only sm121a (GB10) is useful here; drop the rest.
+override-dependencies = [
+    "flashinfer-jit-cache-sm100a; python_version < '0'",
+    "flashinfer-jit-cache-sm103a; python_version < '0'",
+    "flashinfer-jit-cache-sm110a; python_version < '0'",
+    "flashinfer-jit-cache-sm120f; python_version < '0'",
+    "flashinfer-jit-cache-sm80; python_version < '0'",
+    "flashinfer-jit-cache-sm89; python_version < '0'",
+    "flashinfer-jit-cache-sm90a; python_version < '0'",
+]
+
+# Reproducible: torch and flashinfer wheels come only from their own indexes.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
+flashinfer-cubin = { index = "flashinfer" }
