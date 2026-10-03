@@ -166,3 +166,124 @@ above uses 8 everywhere; the true optimum is shape-dependent. FlashInfer's SM120
   the 128-row tile's wasted MMA work, not in bandwidth. Make it measure against 217, not 233.
 - FlashInfer's NVFP4 GEMMs are 15-20% slower than CUTLASS at decode M and collapse on the
   down projection; confirms the plan's choice to use FlashInfer only as an attention stopgap.
+
+## 3. Checkpoint inventory: `nvidia/Qwen3.8-27B-NVFP4`
+
+Source: `tools/tensor_inventory.py nvidia/Qwen3.8-27B-NVFP4` (reads safetensors headers only).
+Full dump: `docs/nvfp4_inventory.txt`. Where the checkpoints live: `docs/checkpoints.md`.
+
+**The checkpoint is mixed precision, not NVFP4 throughout** (`hf_quant_config.json`:
+`quant_algo: MIXED_PRECISION`). What each module class is stored as:
+
+| Module class | Count | Storage | Scales | Bytes streamed per token |
+|---|---|---|---|---|
+| MLP gate / up / down (64 layers) | 192 | NVFP4: U8 packed e2m1, `[N, K/2]` | `weight_scale` e4m3 `[N, K/16]` (block 16, plain row-major, **not** the CUTLASS 128x4 swizzle), `weight_scale_2` f32 global, `input_scale` f32 static | 9.63 GB (8.56 weights + 1.07 scales) |
+| GDN `in_proj_qkv` `[10240,5120]`, `in_proj_z` `[6144,5120]`, `out_proj` `[5120,6144]` (48 layers) | 144 | **FP8 e4m3, per-tensor** | `weight_scale` f32 scalar, `input_scale` f32 scalar | 5.54 GB |
+| Full attention q `[12288,5120]`, k/v `[1024,5120]`, o `[5120,6144]` (16 layers) | 64 | **FP8 e4m3, per-tensor** | f32 scalars | 1.68 GB |
+| lm_head `[248320, 5120]` | 1 | NVFP4, block 16 | as MLP | 0.72 GB |
+| Norms, conv1d `[10240,1,4]`, `in_proj_a/b` `[48,5120]`, `A_log`, `dt_bias` | | BF16 | | 0.05 GB |
+| **Per-token total (backbone + lm_head)** | | | | **17.61 GB** |
+| Embeddings `[248320, 5120]` | 1 | BF16 (one row per token, not streamed) | | 2.54 GB resident |
+| MTP head (1 layer: full attention + MLP + fc `[5120,10240]`) | | **BF16, excluded from quantization** | | 0.85 GB per draft step |
+| Vision tower (27 blocks + merger) | | BF16, unused for text | | 0.92 GB, do not load |
+
+### What this changes
+
+- **The plan's roofline assumed 14.98 GB per token at NVFP4; this checkpoint streams 17.61 GB.**
+  With FP8 KV at 8k context (0.27 GB) and the GDN state read + written (0.30 GB), a decode step
+  moves 18.2 GB: **ceiling 12.8 tok/s at 233 GB/s, 11.5 tok/s at the plan's 90% efficiency
+  goal.** The public SGLang number for this checkpoint (12.32 tok/s) is therefore 96% of the
+  bandwidth wall, not 85%. There is no kernel-level headroom on the stock checkpoint.
+- **To get the plan's 15 tok/s base decode, the 7.2 GB of FP8 attention and GDN projections
+  must be re-quantized to NVFP4 by us** (7.22 GB -> 4.06 GB, per-token 14.45 GB, ceiling
+  15.5 tok/s). NVIDIA left them at FP8; the GDN in-projections are the likely accuracy
+  reason, so this needs the perplexity harness before it is trusted. Decision for Phase 2.
+- The NVFP4 scale tensors are plain `[N, K/16]` row-major; the loader must repack them into
+  the CUTLASS SM120 scale-factor layout (the plan's "repack cache").
+- Activation quantization is static per-tensor (`input_scale` scalar per linear): the
+  fused norm -> quant kernels need only a scalar multiply, no per-token amax reduction.
+- The MTP head is BF16 (0.85 GB). At 233 GB/s that is 3.6 ms per draft step, a quarter of a
+  full base step; quantize it to NVFP4 ourselves before relying on MTP speculative decoding.
+- Full-attention o_proj is `[5120, 6144]` and q_proj `[12288, 5120]`: 24 heads x 256 with a
+  gate (q is 2x), matching the plan's gated-attention description.
+
+### The other two checkpoints (for the roofline and the parity harness)
+
+| Checkpoint | Scheme | Per-token bytes (backbone + lm_head) | Notes |
+|---|---|---|---|
+| `Qwen/Qwen3.8-27B-FP8` | FP8 e4m3 weights with **128x128 block-wise `weight_scale_inv` (BF16)**, dynamic per-token activation scales, no static input scales | **26.9 GB** (plan assumed 25.8; lm_head is BF16 here, 2.5 GB) | All linears incl. MTP are FP8; needs a block-scaled FP8 GEMM (CUTLASS `sm120_mma_tma_blockwise_scaling`), not the per-tensor path benchmarked in section 2. Ceiling 8.5 tok/s at 8k. Full dump `docs/fp8_inventory.txt`. |
+| `Qwen/Qwen3.8-27B` | BF16, nothing quantized | **51.2 GB** (plan assumed 51.25) | Parity reference only. Ceiling 4.5 tok/s at 8k. Full dump `docs/bf16_inventory.txt`. |
+
+## 4. Public-stack baselines on the NVFP4 checkpoint (2026-10-03)
+
+Harness: `~/Projects/model-benchmarks` (`core_runner.py`), YAMLs `models/qwen3.8_27b_nvidia_nvfp4*.yml`,
+raw summaries in `docs/baselines_2026-10-03.md`, run dirs under its `results/`. Settings chosen to
+match the engine's use case: prefix / radix cache **off** (so prefill is raw), max 4 running requests,
+128k context, fp8 KV cache, FlashInfer attention, thinking disabled in the harness prompts.
+
+| Stack | Version / kernels | Notes |
+|---|---|---|
+| vLLM | 0.25.1 wheel (`~/Projects/model-benchmarks/.venv`, torch 2.11+cu130, flashinfer 0.6.13), `FlashInferCutlassNvFp4LinearKernel` for the NVFP4 MLPs, `FlashInferFP8ScaledMM` for attention/GDN, FlashInfer attention, CUDA graphs | The source build in `~/Projects/vllm` (July main) cannot serve this checkpoint natively: it gates the FlashInfer FP4 kernel to sm_100, excludes FlashInfer's `b12x` from auto-selection, and its Marlin fallback op is not compiled. First start JIT-compiles FlashInfer kernels for 12 min; cached after that (startup 140 s). |
+| SGLang | 0.5.21 (`~/Projects/sglang/.venv`, torch 2.13+cu130, flashinfer 0.6.18, sgl-kernel aarch64), `--fp4-gemm-backend flashinfer_cutlass`, GDN backend, fused SiLU*up->FP4 quant before down_proj | Installed natively today. First start 530 s (JIT), then ~2 min. The harness's streaming TTFT probe gets no first-token timing from SGLang, so its TTFT / latency-sweep cells are empty; prefill throughput below is from SGLang's own per-batch log. |
+
+### Decode (single stream, prose prompt, 512 to 2048 output tokens)
+
+| Stack | tok/s | % of 12.8 tok/s ceiling (17.6 GB/token at 233 GB/s) |
+|---|---|---|
+| vLLM | 12.3 (peak 12.8) | 96% |
+| SGLang | 12.3 | 96% |
+| vLLM + MTP (`num_speculative_tokens` 3), mean acceptance length 2.1 to 2.45 | 22 to 25 | 1.8 to 2.0x |
+| SGLang + NEXTN (3 steps, 4 draft tokens), accept length 2.6 to 4.0 | 22 to 25 on the prose prompt, 34 on the concurrency prompts | 1.8 to 2.8x |
+
+Both stacks sit on the bandwidth wall of the stock checkpoint. The plan's "85% of ceiling" for the
+public stacks was based on the 15.0 GB/token assumption; against the real 17.6 GB/token they are
+at 96%, so **a better decode kernel cannot beat them on this checkpoint**; only fewer bytes
+(re-quantized attention/GDN, section 3) or speculation can.
+
+### Prefill (prefix cache off)
+
+| Prompt tokens | vLLM TTFT median | vLLM prefill tok/s | SGLang prefill tok/s (own log) |
+|---|---|---|---|
+| 512 | 0.25 s | 2,150 | |
+| 2,048 | 0.81 s | 2,530 | ~1,530 (2k chunks) |
+| 8,192 | 3.9 s | 2,040 | ~1,660 (8k chunks) |
+| 16,384 | 8.1 s | 2,010 | |
+| 32,768 | 18.0 s | 1,800 | |
+| 65,536 | 43.3 s | 1,515 | |
+
+vLLM's 2,530 tok/s at 2k is 125 TFLOPS effective, about 35% of the measured NVFP4 GEMM ceiling
+(section 2); the fall-off beyond 8k is attention at head_dim 256, not GEMM. Public figure in
+the plan (1,800 tok/s) is reproduced at 32k.
+
+### Concurrency (256-token outputs, aggregate tok/s)
+
+| Streams | vLLM | SGLang | SGLang + NEXTN |
+|---|---|---|---|
+| 1 | 12.2 | 12.2 | 34.1 |
+| 2 | 23.3 | 23.3 | 44.1 |
+| 3 | 30.7 | 30.6 | 70.5 |
+| 4 | 45.0 | 44.6 | 76.3 |
+
+Decode batching is nearly free up to 4 streams (bandwidth-bound, weights read once per step),
+which is the whole premise of the plan's three-slot scheduler and of batched verification.
+
+## 5. Frozen Phase 2 to 4 targets (from the measurements above)
+
+Units: Qwen3.8-27B, batch 1 unless stated, 8k context, prefix cache off. "Ceiling" means the
+roofline from sections 1 to 3; "baseline" means the better of vLLM / SGLang above.
+
+| Metric | Ceiling | Baseline | Target | Why |
+|---|---|---|---|---|
+| Base decode, stock checkpoint (17.6 GB/token) | 12.8 tok/s | 12.3 | **>= 12.5 tok/s (97%)**, token-exact with HF BF16 | Only 4% of headroom exists; this is a correctness-and-parity milestone, not a speed one. |
+| Base decode, own NVFP4 re-quant of attention + GDN (14.45 GB/token) | 15.5 tok/s | none | **>= 14.0 tok/s (90%)** with perplexity within 1% of stock | The only route to the plan's 15 tok/s. Gate on the perplexity harness. |
+| Decode step kernel efficiency | 233 GB/s | CUTLASS GEMM at M=1: 217 GB/s (93%) | **>= 215 GB/s effective weight streaming per step** incl. attention, GDN state, norms | A hand-written GEMV has at most 7% over stock CUTLASS; the step must be fused end to end. |
+| Three concurrent streams | 3 x 12.8 | 30.7 aggregate | **>= 34 aggregate (>= 11.3 each)** | Batched weight reads; current stacks lose 16% at 3 streams. |
+| MTP speculative decode, prose | | 22 to 25 tok/s (acceptance 2.1 to 2.5) | **>= 35 tok/s** (acceptance >= 3.0 at k=4, verify step <= 1.15x base step) | Plan's 35 to 45 band; verification of 5 tokens costs about one base step (section 2, M=16 at 213 GB/s). |
+| MTP speculative decode, code | | 34 tok/s (SGLang, mixed prompts) | **>= 50 tok/s** | Plan's "better drafter" band; acceptance on code is higher. |
+| Prefill throughput, 2k to 8k prompts | ~6,000 tok/s at 300 TFLOPS | 2,530 / 2,040 | **>= 3,500 tok/s** (>= 175 TFLOPS effective, 50% of the NVFP4 GEMM ceiling) | GEMMs alone allow 6,000; attention, GDN chunk kernels, norms and quant get the other half. |
+| Prefill throughput, 32k | ~5,400 | 1,800 | **>= 2,700 tok/s** (TTFT <= 12 s) | Needs an attention kernel that holds >= 60% of tensor peak at head_dim 256. |
+| TTFT, 2k prompt | | 0.81 s | **<= 0.6 s** | Follows from 3,500 tok/s. |
+| Startup to first token after process start | | 140 s (vLLM, warm JIT) | **<= 30 s** | No JIT, prebuilt kernels, repacked weights cached on disk. |
+
+Re-freeze these after any driver, firmware or toolchain change (re-run sections 1 and 2 first).
+

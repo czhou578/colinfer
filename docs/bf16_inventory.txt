@@ -1,0 +1,134 @@
+checkpoint: /home/colin-spark/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+
+[config.json]
+  architectures: ["Qwen3_5ForConditionalGeneration"]
+  model_type: qwen3_5
+  transformers_version: 5.8.0.dev0
+  hidden_size: 5120
+  intermediate_size: 17408
+  num_hidden_layers: 64
+  num_attention_heads: 24
+  num_key_value_heads: 4
+  head_dim: 256
+  vocab_size: 248320
+  tie_word_embeddings: false
+  layer_types: 64 layers: linear_attentionx48, full_attentionx16
+  linear_num_key_heads: 16
+  linear_num_value_heads: 48
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_conv_kernel_dim: 4
+  full_attention_interval: 4
+  mtp_num_hidden_layers: 1
+
+18 safetensors files, 1199 tensors,   55.563 GB total
+
+parameter (layer index collapsed)                                           n dtype    shape                      bytes
+  lm_head.weight                                                            1 BF16     [248320, 5120]                2.543 GB
+  model.language_model.embed_tokens.weight                                  1 BF16     [248320, 5120]                2.543 GB
+  model.language_model.layers.{L}.input_layernorm.weight                   64 BF16     [5120]                          0.7 MB
+  model.language_model.layers.{L}.linear_attn.A_log                        48 BF16     [48]                            0.0 MB
+  model.language_model.layers.{L}.linear_attn.conv1d.weight                48 BF16     [10240, 1, 4]                   3.9 MB
+  model.language_model.layers.{L}.linear_attn.dt_bias                      48 BF16     [48]                            0.0 MB
+  model.language_model.layers.{L}.linear_attn.in_proj_a.weight             48 BF16     [48, 5120]                     23.6 MB
+  model.language_model.layers.{L}.linear_attn.in_proj_b.weight             48 BF16     [48, 5120]                     23.6 MB
+  model.language_model.layers.{L}.linear_attn.in_proj_qkv.weight           48 BF16     [10240, 5120]                 5.033 GB
+  model.language_model.layers.{L}.linear_attn.in_proj_z.weight             48 BF16     [6144, 5120]                  3.020 GB
+  model.language_model.layers.{L}.linear_attn.norm.weight                  48 BF16     [128]                           0.0 MB
+  model.language_model.layers.{L}.linear_attn.out_proj.weight              48 BF16     [5120, 6144]                  3.020 GB
+  model.language_model.layers.{L}.mlp.down_proj.weight                     64 BF16     [5120, 17408]                11.409 GB
+  model.language_model.layers.{L}.mlp.gate_proj.weight                     64 BF16     [17408, 5120]                11.409 GB
+  model.language_model.layers.{L}.mlp.up_proj.weight                       64 BF16     [17408, 5120]                11.409 GB
+  model.language_model.layers.{L}.post_attention_layernorm.weight          64 BF16     [5120]                          0.7 MB
+  model.language_model.layers.{L}.self_attn.k_norm.weight                  16 BF16     [256]                           0.0 MB
+  model.language_model.layers.{L}.self_attn.k_proj.weight                  16 BF16     [1024, 5120]                  0.168 GB
+  model.language_model.layers.{L}.self_attn.o_proj.weight                  16 BF16     [5120, 6144]                  1.007 GB
+  model.language_model.layers.{L}.self_attn.q_norm.weight                  16 BF16     [256]                           0.0 MB
+  model.language_model.layers.{L}.self_attn.q_proj.weight                  16 BF16     [12288, 5120]                 2.013 GB
+  model.language_model.layers.{L}.self_attn.v_proj.weight                  16 BF16     [1024, 5120]                  0.168 GB
+  model.language_model.norm.weight                                          1 BF16     [5120]                          0.0 MB
+  model.visual.blocks.{L}.attn.proj.bias                                   27 BF16     [1152]                          0.1 MB
+  model.visual.blocks.{L}.attn.proj.weight                                 27 BF16     [1152, 1152]                   71.7 MB
+  model.visual.blocks.{L}.attn.qkv.bias                                    27 BF16     [3456]                          0.2 MB
+  model.visual.blocks.{L}.attn.qkv.weight                                  27 BF16     [3456, 1152]                  0.215 GB
+  model.visual.blocks.{L}.mlp.linear_fc1.bias                              27 BF16     [4304]                          0.2 MB
+  model.visual.blocks.{L}.mlp.linear_fc1.weight                            27 BF16     [4304, 1152]                  0.268 GB
+  model.visual.blocks.{L}.mlp.linear_fc2.bias                              27 BF16     [1152]                          0.1 MB
+  model.visual.blocks.{L}.mlp.linear_fc2.weight                            27 BF16     [1152, 4304]                  0.268 GB
+  model.visual.blocks.{L}.norm1.bias                                       27 BF16     [1152]                          0.1 MB
+  model.visual.blocks.{L}.norm1.weight                                     27 BF16     [1152]                          0.1 MB
+  model.visual.blocks.{L}.norm2.bias                                       27 BF16     [1152]                          0.1 MB
+  model.visual.blocks.{L}.norm2.weight                                     27 BF16     [1152]                          0.1 MB
+  model.visual.merger.linear_fc1.bias                                       1 BF16     [4608]                          0.0 MB
+  model.visual.merger.linear_fc1.weight                                     1 BF16     [4608, 4608]                   42.5 MB
+  model.visual.merger.linear_fc2.bias                                       1 BF16     [5120]                          0.0 MB
+  model.visual.merger.linear_fc2.weight                                     1 BF16     [5120, 4608]                   47.2 MB
+  model.visual.merger.norm.bias                                             1 BF16     [1152]                          0.0 MB
+  model.visual.merger.norm.weight                                           1 BF16     [1152]                          0.0 MB
+  model.visual.patch_embed.proj.bias                                        1 BF16     [1152]                          0.0 MB
+  model.visual.patch_embed.proj.weight                                      1 BF16     [1152, 3, 2, 16, 16]            3.5 MB
+  model.visual.pos_embed.weight                                             1 BF16     [2304, 1152]                    5.3 MB
+  mtp.fc.weight                                                             1 BF16     [5120, 10240]                 0.105 GB
+  mtp.layers.{L}.input_layernorm.weight                                     1 BF16     [5120]                          0.0 MB
+  mtp.layers.{L}.mlp.down_proj.weight                                       1 BF16     [5120, 17408]                 0.178 GB
+  mtp.layers.{L}.mlp.gate_proj.weight                                       1 BF16     [17408, 5120]                 0.178 GB
+  mtp.layers.{L}.mlp.up_proj.weight                                         1 BF16     [17408, 5120]                 0.178 GB
+  mtp.layers.{L}.post_attention_layernorm.weight                            1 BF16     [5120]                          0.0 MB
+  mtp.layers.{L}.self_attn.k_norm.weight                                    1 BF16     [256]                           0.0 MB
+  mtp.layers.{L}.self_attn.k_proj.weight                                    1 BF16     [1024, 5120]                   10.5 MB
+  mtp.layers.{L}.self_attn.o_proj.weight                                    1 BF16     [5120, 6144]                   62.9 MB
+  mtp.layers.{L}.self_attn.q_norm.weight                                    1 BF16     [256]                           0.0 MB
+  mtp.layers.{L}.self_attn.q_proj.weight                                    1 BF16     [12288, 5120]                 0.126 GB
+  mtp.layers.{L}.self_attn.v_proj.weight                                    1 BF16     [1024, 5120]                   10.5 MB
+  mtp.norm.weight                                                           1 BF16     [5120]                          0.0 MB
+  mtp.pre_fc_norm_embedding.weight                                          1 BF16     [5120]                          0.0 MB
+  mtp.pre_fc_norm_hidden.weight                                             1 BF16     [5120]                          0.0 MB
+
+bytes by category
+  backbone     48.706 GB
+  lm_head       2.543 GB
+  embed         2.543 GB
+  mtp           0.849 GB
+  vision        0.921 GB
+  per-token    51.249 GB   (backbone + lm_head: what a decode step must stream)
+
+quantized weights and their scales (collapsed)
+  none (no U8 / F8 / I8 weight tensors)
+
+not quantized (weights kept in BF16):
+  lm_head.weight     2.543 GB
+  model.language_model.embed_tokens.weight     2.543 GB
+  model.language_model.layers.{L}.input_layernorm.weight       0.7 MB
+  model.language_model.layers.{L}.linear_attn.conv1d.weight       3.9 MB
+  model.language_model.layers.{L}.linear_attn.in_proj_a.weight      23.6 MB
+  model.language_model.layers.{L}.linear_attn.in_proj_b.weight      23.6 MB
+  model.language_model.layers.{L}.linear_attn.in_proj_qkv.weight     5.033 GB
+  model.language_model.layers.{L}.linear_attn.in_proj_z.weight     3.020 GB
+  model.language_model.layers.{L}.linear_attn.norm.weight       0.0 MB
+  model.language_model.layers.{L}.linear_attn.out_proj.weight     3.020 GB
+  model.language_model.layers.{L}.mlp.down_proj.weight    11.409 GB
+  model.language_model.layers.{L}.mlp.gate_proj.weight    11.409 GB
+  model.language_model.layers.{L}.mlp.up_proj.weight    11.409 GB
+  model.language_model.layers.{L}.post_attention_layernorm.weight       0.7 MB
+  model.language_model.layers.{L}.self_attn.k_norm.weight       0.0 MB
+  model.language_model.layers.{L}.self_attn.k_proj.weight     0.168 GB
+  model.language_model.layers.{L}.self_attn.o_proj.weight     1.007 GB
+  model.language_model.layers.{L}.self_attn.q_norm.weight       0.0 MB
+  model.language_model.layers.{L}.self_attn.q_proj.weight     2.013 GB
+  model.language_model.layers.{L}.self_attn.v_proj.weight     0.168 GB
+  model.language_model.norm.weight       0.0 MB
+  mtp.fc.weight     0.105 GB
+  mtp.layers.{L}.input_layernorm.weight       0.0 MB
+  mtp.layers.{L}.mlp.down_proj.weight     0.178 GB
+  mtp.layers.{L}.mlp.gate_proj.weight     0.178 GB
+  mtp.layers.{L}.mlp.up_proj.weight     0.178 GB
+  mtp.layers.{L}.post_attention_layernorm.weight       0.0 MB
+  mtp.layers.{L}.self_attn.k_norm.weight       0.0 MB
+  mtp.layers.{L}.self_attn.k_proj.weight      10.5 MB
+  mtp.layers.{L}.self_attn.o_proj.weight      62.9 MB
+  mtp.layers.{L}.self_attn.q_norm.weight       0.0 MB
+  mtp.layers.{L}.self_attn.q_proj.weight     0.126 GB
+  mtp.layers.{L}.self_attn.v_proj.weight      10.5 MB
+  mtp.norm.weight       0.0 MB
+  mtp.pre_fc_norm_embedding.weight       0.0 MB
+  mtp.pre_fc_norm_hidden.weight       0.0 MB
