@@ -1,0 +1,80 @@
+gemm_peak  2026-10-02 23:05:42  NVIDIA GB10 cc 12.1  torch 2.14.1+cu130  iters 20 (+3 warmup)  medians  cutlass swizzle=8 raster=h
+backends: 15  (11 CUTLASS configs)
+=== N x K = 17408 x 5120   TFLOPS (median)   '!' = verification failed, '-' = unsupported/error
+  backend                                  M=1    M=16   M=256  M=2048  M=4096
+  bf16 cuBLAS (torch.matmul)               0.2     3.6    47.8    90.0    96.1
+  fp8 cuBLASLt (torch._scaled_mm)          0.4     6.1    92.5   200.4   199.2
+  nvfp4 flashinfer b12x                    0.6     9.9   138.1   341.4   373.3
+  nvfp4 flashinfer cutlass                 0.6    10.5   144.5   310.0   341.0
+  fp8 cutlass 128x128x128 coop             0.4     6.7    96.4   184.9   183.0
+  fp8 cutlass 128x128x128 pp               0.4     6.7    94.6   183.1   185.4
+  fp8 cutlass 128x128x64 coop              0.4     6.0    85.1   182.1   186.3
+  fp8 cutlass 128x64x64 coop               0.3     5.1    90.0   173.1   149.0
+  fp8 cutlass 64x128x128 pp                0.4     6.7    96.5   154.5   159.6
+  nvfp4 cutlass 128x128x128 coop           0.7    11.3   152.1   336.8   319.6
+  nvfp4 cutlass 128x128x128 pp             0.7    10.9   153.0   330.4   318.5
+  nvfp4 cutlass 128x128x256 coop           0.8    12.1   164.2   332.0   307.3
+  nvfp4 cutlass 128x128x256 pp             0.8    11.9   159.6   325.9   314.5
+  nvfp4 cutlass 128x64x128 pp              0.5     8.3   154.3   304.7   291.1
+  nvfp4 cutlass 256x128x128 coop           0.5     7.8   147.4   354.8   347.0
+  -- weight-stream GB/s for small M (N*K weight bytes / time; decode-relevant, bandwidth measured at 233)
+  bf16 cuBLAS (torch.matmul)             231.0   227.0
+  fp8 cuBLASLt (torch._scaled_mm)        193.8   189.7
+  nvfp4 flashinfer b12x                  177.1   173.8
+  nvfp4 flashinfer cutlass               180.7   183.9
+  fp8 cutlass 128x128x128 coop           209.2   210.1
+  fp8 cutlass 128x128x128 pp             211.6   208.1
+  fp8 cutlass 128x128x64 coop            193.5   187.6
+  fp8 cutlass 128x64x64 coop             145.7   158.2
+  fp8 cutlass 64x128x128 pp              213.2   209.2
+  nvfp4 cutlass 128x128x128 coop         202.0   197.9
+  nvfp4 cutlass 128x128x128 pp           194.9   192.5
+  nvfp4 cutlass 128x128x256 coop         216.8   212.8
+  nvfp4 cutlass 128x128x256 pp           211.7   209.1
+  nvfp4 cutlass 128x64x128 pp            130.4   146.1
+  nvfp4 cutlass 256x128x128 coop         130.5   137.8
+=== N x K = 5120 x 17408   TFLOPS (median)   '!' = verification failed, '-' = unsupported/error
+  backend                                  M=1    M=16   M=256  M=2048  M=4096
+  bf16 cuBLAS (torch.matmul)               0.2     3.5    50.4    92.1    93.4
+  fp8 cuBLASLt (torch._scaled_mm)          0.4     6.8    90.4   193.3   195.4
+  nvfp4 flashinfer b12x                    0.6     9.5   132.2   231.4   116.9
+  nvfp4 flashinfer cutlass                 0.6    10.2   148.0   273.6   132.0
+  fp8 cutlass 128x128x128 coop             0.4     6.8    93.6   142.0   151.6
+  fp8 cutlass 128x128x128 pp               0.4     6.7    92.2   142.3   151.8
+  fp8 cutlass 128x128x64 coop              0.4     6.1    83.8   135.2   136.5
+  fp8 cutlass 128x64x64 coop               0.3     6.1    80.0   112.1   122.8
+  fp8 cutlass 64x128x128 pp                0.4     6.8    87.9   123.3   134.8
+  nvfp4 cutlass 128x128x128 coop           0.7    10.7   150.4   284.3   326.4
+  nvfp4 cutlass 128x128x128 pp             0.7    10.2   145.0   281.2   322.4
+  nvfp4 cutlass 128x128x256 coop           0.7    11.8   166.9   298.3   335.2
+  nvfp4 cutlass 128x128x256 pp             0.7    11.7   161.5   300.6   332.7
+  nvfp4 cutlass 128x64x128 pp              0.5     8.8   153.6   247.6   247.8
+  nvfp4 cutlass 256x128x128 coop           0.5     7.9   155.1   308.7   313.6
+  -- weight-stream GB/s for small M (N*K weight bytes / time; decode-relevant, bandwidth measured at 233)
+  bf16 cuBLAS (torch.matmul)             220.9   220.8
+  fp8 cuBLASLt (torch._scaled_mm)        214.6   213.0
+  nvfp4 flashinfer b12x                  166.4   166.9
+  nvfp4 flashinfer cutlass               179.1   179.5
+  fp8 cutlass 128x128x128 coop           213.7   212.6
+  fp8 cutlass 128x128x128 pp             210.7   209.3
+  fp8 cutlass 128x128x64 coop            188.9   189.6
+  fp8 cutlass 128x64x64 coop             148.0   190.9
+  fp8 cutlass 64x128x128 pp              210.6   211.2
+  nvfp4 cutlass 128x128x128 coop         186.9   188.1
+  nvfp4 cutlass 128x128x128 pp           185.4   179.6
+  nvfp4 cutlass 128x128x256 coop         210.8   207.3
+  nvfp4 cutlass 128x128x256 pp           204.5   206.4
+  nvfp4 cutlass 128x64x128 pp            143.5   154.4
+  nvfp4 cutlass 256x128x128 coop         130.5   138.4
+=== best per shape / M
+  17408x5120 M=1     nvfp4    0.8 TF (cutlass 128x128x256 coop)   fp8    0.4 TF (cutlass 64x128x128 pp)   bf16    0.2 TF (cuBLAS (torch.matmul))
+  17408x5120 M=16    nvfp4   12.1 TF (cutlass 128x128x256 coop)   fp8    6.7 TF (cutlass 128x128x128 coop)   bf16    3.6 TF (cuBLAS (torch.matmul))
+  17408x5120 M=256   nvfp4  164.2 TF (cutlass 128x128x256 coop)   fp8   96.5 TF (cutlass 64x128x128 pp)   bf16   47.8 TF (cuBLAS (torch.matmul))
+  17408x5120 M=2048  nvfp4  354.8 TF (cutlass 256x128x128 coop)   fp8  200.4 TF (cuBLASLt (torch._scaled_mm))   bf16   90.0 TF (cuBLAS (torch.matmul))
+  17408x5120 M=4096  nvfp4  373.3 TF (flashinfer b12x)   fp8  199.2 TF (cuBLASLt (torch._scaled_mm))   bf16   96.1 TF (cuBLAS (torch.matmul))
+  5120x17408 M=1     nvfp4    0.7 TF (cutlass 128x128x256 coop)   fp8    0.4 TF (cuBLASLt (torch._scaled_mm))   bf16    0.2 TF (cuBLAS (torch.matmul))
+  5120x17408 M=16    nvfp4   11.8 TF (cutlass 128x128x256 coop)   fp8    6.8 TF (cuBLASLt (torch._scaled_mm))   bf16    3.5 TF (cuBLAS (torch.matmul))
+  5120x17408 M=256   nvfp4  166.9 TF (cutlass 128x128x256 coop)   fp8   93.6 TF (cutlass 128x128x128 coop)   bf16   50.4 TF (cuBLAS (torch.matmul))
+  5120x17408 M=2048  nvfp4  308.7 TF (cutlass 256x128x128 coop)   fp8  193.3 TF (cuBLASLt (torch._scaled_mm))   bf16   92.1 TF (cuBLAS (torch.matmul))
+  5120x17408 M=4096  nvfp4  335.2 TF (cutlass 128x128x256 coop)   fp8  195.4 TF (cuBLASLt (torch._scaled_mm))   bf16   93.4 TF (cuBLAS (torch.matmul))
+wrote /tmp/claude-1000/-home-colin-spark-Projects-colin-inference-engine/d79d7660-bd0d-4a5b-9f0f-a89baceba217/scratchpad/gemm_run2.json

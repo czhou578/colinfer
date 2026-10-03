@@ -76,6 +76,93 @@ Qwen3.8-27B, batch 1, 8k context, no speculative decoding:
 | FP8 | 26.39 | 8.8 | 7.9 |
 | BF16 | 51.82 | 4.5 | 4.0 |
 
-## 2. GEMM peak (pending)
+## 2. GEMM ceiling
 
-`bench/gemm_peak.py` and CUTLASS Example 79 on the model shapes: not yet measured.
+Source: `bench/gemm_peak.py` (cuBLAS BF16, cuBLASLt FP8 via `torch._scaled_mm`, FlashInfer NVFP4
+as a cross-check) and `bench/gemm_sm120.cu` (CUTLASS 4.8 SM120 kernels, one binary per tile
+config, built by `make -C bench gemm -k`). Shapes are the Qwen3.8-27B MLP projections:
+N x K = 17408 x 5120 (gate/up) and 5120 x 17408 (down). D = A * B^T, bf16 out, fp32 accumulate.
+20 timed iterations after 3 warmup, medians. Every number below passed a numerical check
+(CUTLASS: 65,536 sampled outputs against an independent dequantize-and-dot kernel; torch:
+against an fp32 matmul; FlashInfer: relative error against fp32). Full output with all 11
+CUTLASS configs: `docs/gemm_peak_2026-10-02.txt`.
+
+### Peak TFLOPS by format (best verified kernel per cell, CUTLASS scheduler swizzle 8)
+
+| N x K | Format | M=1 | M=16 | M=256 | M=2048 | M=4096 |
+|---|---|---|---|---|---|---|
+| 17408 x 5120 | NVFP4 (CUTLASS / FlashInfer b12x) | 0.8 | 12.1 | 164 | 355 | 347 / 373 |
+| 17408 x 5120 | FP8 (cuBLASLt) | 0.4 | 6.7 | 96 | 200 | 199 |
+| 17408 x 5120 | BF16 (cuBLAS) | 0.2 | 3.6 | 48 | 90 | 96 |
+| 5120 x 17408 | NVFP4 (CUTLASS) | 0.7 | 11.8 | 167 | 309 | 335 |
+| 5120 x 17408 | FP8 (cuBLASLt) | 0.4 | 6.8 | 94 | 193 | 195 |
+| 5120 x 17408 | BF16 (cuBLAS) | 0.2 | 3.5 | 50 | 92 | 93 |
+
+The published 356 TFLOPS NVFP4 / 188 FP8 figures for this chip are reproduced (359-373 / 200).
+
+### CUTLASS NVFP4 tile configs (TFLOPS, swizzle 8)
+
+| Tile, schedule | 17408x5120 M=16 | M=256 | M=2048 | M=4096 | 5120x17408 M=16 | M=256 | M=2048 | M=4096 |
+|---|---|---|---|---|---|---|---|---|
+| 128x128x128 pingpong | 10.9 | 153 | 330 | 319 | 10.2 | 145 | 281 | 322 |
+| 128x128x128 cooperative | 11.3 | 152 | 337 | 320 | 10.7 | 150 | 284 | 326 |
+| **128x128x256 cooperative** | **12.1** | **164** | 332 | 307 | **11.8** | **167** | 298 | **335** |
+| 128x128x256 pingpong | 11.9 | 160 | 326 | 315 | 11.7 | 162 | 301 | 333 |
+| 256x128x128 cooperative | 7.8 | 147 | **355** | **347** | 7.9 | 155 | **309** | 314 |
+| 128x64x128 pingpong (undocumented, works) | 8.3 | 154 | 305 | 291 | 8.8 | 154 | 248 | 248 |
+| 64x128x128 pingpong (undocumented) | does not compile: TMA tile/smem static_assert | | | | | | | |
+
+### Weight-streaming efficiency at decode-sized M (GB/s of weight bytes, bandwidth ceiling 233)
+
+| Kernel | 17408x5120 M=1 | M=16 | 5120x17408 M=1 | M=16 |
+|---|---|---|---|---|
+| cuBLAS BF16 (has a real GEMV path) | 231 | 227 | 221 | 221 |
+| cuBLASLt FP8 | 194 | 190 | 215 | 213 |
+| CUTLASS FP8 128x128x128 coop | 209 | 210 | 214 | 213 |
+| **CUTLASS NVFP4 128x128x256 coop** | **217** | **213** | **211** | **207** |
+| FlashInfer NVFP4 (b12x / cutlass) | 177 / 181 | 174 / 184 | 166 / 179 | 167 / 180 |
+
+### Tile-scheduler raster swizzle (the L2 finding)
+
+With CUTLASS's default scheduler settings, the down projection at M=4096 collapsed to 131 TFLOPS
+(NVFP4) and the gate/up FP8 case to 128, while cuBLASLt held 195. Cause: at that size both
+operands are ~35-45 MB against a 24 MB L2, so a plain raster re-streams one operand from DRAM
+once per tile row (1.4 GB at 233 GB/s = 6 ms, versus 2 ms of math). Setting the persistent
+scheduler's `max_swizzle_size` (exposed as `--swizzle`) fixes it:
+
+| NVFP4 128x128x256 pp, 5120x17408, M=4096 | swizzle 0 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| TFLOPS | 131 | 169 | 267 | **336** | 216 |
+
+FP8 128x128x128 coop on 17408x5120 at M=4096 goes 128 -> 197 the same way. Swizzle 8 is
+neutral or slightly negative (within 5%) for the cases that were already healthy, so the sweep
+above uses 8 everywhere; the true optimum is shape-dependent. FlashInfer's SM120 NVFP4 backends
+(b12x and cutlass) do not swizzle and still collapse to 117-132 TFLOPS on this case.
+
+### What this fixes for the design
+
+- **NVFP4 prefill ceiling is 310-370 TFLOPS on the real shapes, FP8 is 195-200, BF16 is 90-96.**
+  NVFP4 is 1.75x FP8 and 3.7x BF16 for the same GEMM, so prefill is worth doing in NVFP4 and
+  the plan's FP8 fallback costs almost half the throughput.
+- **Prefill ceiling in tokens (`tools/roofline.py --bw 233 --tflops ...`, 48.7 GFLOP/token):**
+  NVFP4 at 300 TFLOPS sustained = 6,100 tok/s at 2k context, 5,960 at 8k, 5,440 at 32k; FP8 at
+  190 = 3,870 / 3,780 / 3,450; BF16 at 93 = 1,890 / 1,850 / 1,690. The plan's 2,500-3,500 tok/s
+  target needs only 125-175 TFLOPS sustained across a whole layer, i.e. 40-50% of the NVFP4 GEMM
+  ceiling, which leaves room for attention, GDN, norms and quantization overhead.
+- **Tile choice for NVFP4:** 128x128x256 cooperative for M <= 256 (prefill chunks and the
+  verify path), 256x128x128 cooperative for M >= 2048 on gate/up. K=256 beats K=128 by 5-8% at
+  small M. There is no K=64 NVFP4 tile in the SM120 builder; K=64 exists only for FP8 and was
+  never the best FP8 config. Shape-dependent, so keep the per-shape tile sweep in the plan.
+- **The scheduler swizzle is mandatory for the down projection at long prefill.** Any CUTLASS
+  GEMM we ship must set `max_swizzle_size` (8 here), and any third-party NVFP4 GEMM must be
+  checked at M=4096, N=5120, K=17408 before trusting it.
+- **FP8: use cuBLASLt, not CUTLASS.** cuBLASLt beats every CUTLASS SM120 FP8 config at
+  M >= 2048 by 5-30% and matches it at small M. CUTLASS FP8 only matters if an epilogue fusion
+  needs it.
+- **Decode: a stock CUTLASS NVFP4 GEMM at M=1 already streams weights at 217 GB/s, 93% of the
+  measured 233 GB/s**, and 213 GB/s (91%) at M=16. cuBLAS's BF16 GEMV reaches 99%. The plan's
+  hand-written NVFP4 GEMV therefore has at most ~7% of raw bandwidth to gain; its value is in
+  fused epilogues (silu * up, residual, quantization of the next activation) and in avoiding
+  the 128-row tile's wasted MMA work, not in bandwidth. Make it measure against 217, not 233.
+- FlashInfer's NVFP4 GEMMs are 15-20% slower than CUTLASS at decode M and collapse on the
+  down projection; confirms the plan's choice to use FlashInfer only as an attention stopgap.
