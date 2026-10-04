@@ -1,0 +1,23 @@
+bench/traces/decode_8k_2026-10-03.sqlite: 24 steps analysed
+median step: span 80.31 ms, GPU busy 79.95 ms, idle 0.36 ms (0.4%), 610 kernels
+span over steps: min 79.74 / median 80.31 / max 1162.68 ms
+
+kernel                                                            ms  count     %
+k_fp8                                                          31.60    128  39.5
+k_nvfp4_swiglu                                                 27.49     64  34.4
+k_nvfp4                                                        17.61     65  22.0
+k_bf16                                                          2.99     48   3.7
+k_split                                                         1.33     16   1.7
+k_delta                                                         1.23     48   1.5
+k_rmsnorm                                                       0.32    129   0.4
+k_conv                                                          0.11     48   0.1
+cunn_SoftMaxForward                                             0.08      1   0.1
+k_prologue                                                      0.06     16   0.1
+k_combine                                                       0.05     16   0.1
+vectorized_elementwise_kernel                                   0.03     23   0.0
+TopPSamplingFromProbKernel                                      0.02      1   0.0
+elementwise_kernel                                              0.01      2   0.0
+reduce_kernel                                                   0.01      2   0.0
+RadixTopKMaskLogitsKernel_MultiCTA                              0.01      1   0.0
+indexSelectSmallIndex                                           0.00      1   0.0
+unrolled_elementwise_kernel                                     0.00      1   0.0

@@ -214,6 +214,15 @@ class KernelRMSNorm(nn.Module):
         return out.view(x.shape)
 
 
+_SIDE = {}
+
+
+def _side_stream(device):
+    if device not in _SIDE:
+        _SIDE[device] = torch.cuda.Stream(device)
+    return _SIDE[device]
+
+
 class KernelGDN(GatedDeltaNet):
     """Single-token steps use the fused conv + delta-rule kernels (csrc/gdn_step.cu); multi-token
     prefill chunks fall back to the Phase 1 chunked PyTorch path."""
@@ -223,16 +232,23 @@ class KernelGDN(GatedDeltaNet):
         if T != 1 or state is None:
             out = super().forward(x, state, layer_idx)
             return out if residual is None else residual + out
+        if not hasattr(self, "w_ba"):  # in_proj_b and in_proj_a stacked: one tiny GEMV launch
+            self.w_ba = torch.cat([self.in_proj_b.weight, self.in_proj_a.weight]).contiguous()
+        # the tiny b/a GEMV runs on a side stream, overlapped with the big qkv/z weight stream
+        x2 = x.view(B, -1)
+        ba = torch.empty(B, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
+        main = torch.cuda.current_stream()
+        side = _side_stream(x.device)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            ops().bf16_gemv(x2, self.w_ba, ba)
         if hasattr(self, "qkvz"):
             mixed, z = self.qkvz(x)
             mixed, z = mixed.reshape(B, -1).contiguous(), z.reshape(B, -1).contiguous()
         else:
             mixed = self.in_proj_qkv(x).view(B, -1)
             z = self.in_proj_z(x).view(B, -1)
-        if not hasattr(self, "w_ba"):  # in_proj_b and in_proj_a stacked: one tiny GEMV launch
-            self.w_ba = torch.cat([self.in_proj_b.weight, self.in_proj_a.weight]).contiguous()
-        ba = torch.empty(B, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
-        ops().bf16_gemv(x.view(B, -1), self.w_ba, ba)
+        main.wait_stream(side)
         b, a = ba[:, : self.num_v_heads].contiguous(), ba[:, self.num_v_heads:].contiguous()
         qkv = torch.empty_like(mixed)
         ops().gdn_conv(mixed, state.conv[layer_idx], self.conv1d.weight, qkv)
@@ -264,13 +280,7 @@ class FastQwen35(Qwen35ForCausalLM):
         if state.pos + T > state.max_seq_len:
             raise ValueError(f"sequence length {state.pos + T} exceeds state max_seq_len {state.max_seq_len}")
         x = self.embed_tokens(input_ids)
-        if self._inv_freq is None or self._inv_freq.device != x.device:
-            d = self.cfg.rotary_dim
-            self._inv_freq = 1.0 / (self.cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=x.device) / d))
-        positions = (state.pos_t.long()[:, None] + state.arange[:T]).float()  # [B, T]
-        freqs = positions[..., None] * self._inv_freq
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos, sin = emb.cos().to(x.dtype), emb.sin().to(x.dtype)
+        cos = sin = None  # RoPE is applied inside the fused attention prologue
         for layer in self.layers:
             x = layer(x, cos, sin, state)
         x = self.norm(x)
@@ -308,15 +318,17 @@ def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False) -> FastQwen35:
 
 
 class DecodeGraph:
-    """One CUDA graph for a full decode step (T=1 per slot): embed -> 64 layers -> lm_head -> argmax.
+    """One CUDA graph for a full decode step (T=1 per slot): embed -> 64 layers -> lm_head -> sampler.
 
     Capture runs on a fresh state and resets it afterwards (warm-up executes the step for real).
     Per step the host writes the input tokens into a static buffer, replays, and reads back the
     argmax ids (and optionally the logits)."""
 
     def __init__(self, model: FastQwen35, state: FastState):
+        from engine.runtime.sampler import SamplerParams, sample
         self.model, self.state = model, state
         B = state.pos_t.shape[0]
+        self.params = SamplerParams(B, model.cfg.vocab_size, state.pos_t.device)
         self.tok = torch.zeros(B, 1, dtype=torch.long, device=state.pos_t.device)
         state.reset()
         state.pos = 1  # record the decode (has-previous-state) branches
@@ -324,17 +336,19 @@ class DecodeGraph:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s), torch.inference_mode():
             for _ in range(2):
-                model(self.tok, state, last_only=True)
+                sample(model(self.tok, state, last_only=True)[:, -1], self.params)
                 state.pos = 1
         torch.cuda.current_stream().wait_stream(s)
         self.graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(self.graph):
             self.logits = model(self.tok, state, last_only=True)[:, -1]
-            self.next = self.logits.argmax(-1)
+            self.next = sample(self.logits, self.params)
         state.reset()
+        self.params.offset.zero_()
 
     def step(self, tokens: torch.Tensor) -> torch.Tensor:
-        """tokens: [B] long on the device. Returns argmax ids [B] (device); logits in self.logits."""
+        """tokens: [B] long on the device. Returns sampled ids [B] (device; greedy for slots with
+        temperature 0, see self.params); logits in self.logits."""
         if self.state.pos + 1 > self.state.max_seq_len:
             raise ValueError("state full")
         self.tok.copy_(tokens.view(-1, 1))

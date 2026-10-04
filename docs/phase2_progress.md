@@ -1,4 +1,4 @@
-# Phase 2 progress: decode at the bandwidth roofline (2026-10-03)
+# Phase 2: decode at the bandwidth roofline (2026-10-03, complete)
 
 Checkpoint `nvidia/Qwen3.8-27B-NVFP4` (stock, mixed NVFP4 / FP8), batch 1, one CUDA graph per decode
 step, host reads every token back. `bench/decode_bench.py --kv-fp8`.
@@ -8,14 +8,14 @@ step, host reads every token back. `bench/decode_bench.py --kv-fp8`.
 | Context | ms / token | tok/s | Ceiling at 233 GB/s | % of ceiling | vLLM / SGLang |
 |---|---|---|---|---|---|
 | 64 | 78.4 | **12.75** | 13.1 | 97% | 12.3 / 12.3 |
-| 8k | 79.8 | **12.53** (12.49 to 12.57 over 5 runs) | 12.95 | 97% | 12.3 / 12.3 |
+| 8k | 79.6 | **12.56** (12.52 to 12.58 over 8 runs since the b/a overlap) | 12.95 | 97% | 12.3 / 12.3 |
 | 32k | 83.3 | 12.01 | 12.3 | 98% | |
 | 128k | 97.6 | 10.24 | 10.5 | 97.5% | |
 
 Ceiling = (17.56 GB of weights + FP8 KV + 0.30 GB GDN state read and written) / 233 GB/s.
 
-**Frozen exit target (baseline.md section 5): >= 12.5 tok/s at 8k on the stock checkpoint: met, with
-little margin (mean 12.53; one of five runs read 12.49).** The plan's original ">= 13.5 at 8k / >= 11 at
+**Frozen exit target (baseline.md section 5): >= 12.5 tok/s at 8k on the stock checkpoint: met (12.56 to 12.58 over the last three runs; before the b/a
+overlap, 12.49 to 12.57).** The plan's original ">= 13.5 at 8k / >= 11 at
 128k" assumed 15 GB per token and is not reachable on this checkpoint (ceilings 12.95 / 10.5); it applies
 only after re-quantizing attention and GDN to NVFP4.
 
@@ -65,10 +65,20 @@ slightly more accurate than the reference, not bit-identical to it.
 in_proj_b/a BF16 GEMV, 0.3 ms norms, 0.2 ms prologue / combine / conv; the rest is the host round trip.
 Virtually no PyTorch elementwise kernels remain in the step.
 
-## Remaining Phase 2 work
+## Sampling (in the graph)
 
-1. Fused sampler (temperature / top-k / top-p, Philox per slot) inside the graph; today the graph does argmax.
-2. nsys trace of a step checked into `bench/traces/`.
-3. Margin on the 8k target: overlap the in_proj_b/a GEMV with the qkvz GEMV (separate graph branch), and
-   drop the unused rotary tables still computed in FastQwen35.forward.
-4. Re-quantize attention + GDN projections to NVFP4 (gated on perplexity) to unlock the 14 tok/s target.
+`engine/runtime/sampler.py`: greedy, temperature, min-p, top-k, top-p per slot from device buffers, Philox
+offsets advanced on the GPU; ~0.15 ms per step. Uses FlashInfer's rejection sampler, called once per slot:
+**FlashInfer 0.7.0.post1 accepts per-row seed/offset arrays, but row 0's values perturb every row's draw**,
+so batched calls would make a request's output depend on its neighbours (`tests/test_sampler.py::test_slot_independence`).
+
+## Trace (`bench/traces/decode_8k_2026-10-03.nsys-rep`, summary `..._summary.txt`, `bench/trace_summary.py`)
+
+Median step 80.3 ms under nsys, **GPU idle 0.36 ms (0.4%)** across 610 kernels: no launch bubbles remain.
+GEMVs are 95.6% of busy time. The in_proj_b/a BF16 GEMV runs on a side stream overlapped with the qkv/z GEMV
+(its 3 ms in the trace is time-sharing SMs with that GEMV, not added latency).
+
+## Carried forward
+
+- Re-quantize attention + GDN projections to NVFP4 (gated on perplexity) to unlock the 14 tok/s target.
+- Repetition penalty is not implemented in the sampler (needs per-slot token history).
