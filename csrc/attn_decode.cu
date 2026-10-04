@@ -181,7 +181,7 @@ __global__ void k_combine(const float* __restrict__ part_acc, const float2* __re
 //   v:  written to v_cache[b, h, pos_t[b] + t]
 // qp: q_proj output [B, T, Hq, 2D] (q in the first D of each head); kp, vp: [B, T, Hkv, D].
 template <typename KV>
-__global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bfloat16* __restrict__ kp, const __nv_bfloat16* __restrict__ vp,
+__global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bfloat16* __restrict__ kp, const __nv_bfloat16* __restrict__ vp, int ldq, int ldk, int ldv,
                            const __nv_bfloat16* __restrict__ qn_w, const __nv_bfloat16* __restrict__ kn_w, const float* __restrict__ inv_freq,
                            const int* __restrict__ pos_t, typename KV::Elem* __restrict__ kc, typename KV::Elem* __restrict__ vc,
                            __nv_bfloat16* __restrict__ q_out, int Hq, int Hkv, int T, int Lmax, int R, float eps) {
@@ -190,11 +190,13 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
     __shared__ float xs[D], red[D / 32];
     float x;
     const __nv_bfloat16* w;
-    if (hh < Hq) { x = __bfloat162float(qp[(((size_t)b * T + t) * Hq + hh) * 2 * D + d]); w = qn_w; }
-    else if (hh < Hq + Hkv) { x = __bfloat162float(kp[(((size_t)b * T + t) * Hkv + (hh - Hq)) * D + d]); w = kn_w; }
+    // token row (b, t) of q / k / v starts at (b * T + t) * ld{q,k,v} (row strides of the projection outputs)
+    const size_t row = (size_t)b * T + t;
+    if (hh < Hq) { x = __bfloat162float(qp[row * ldq + (size_t)hh * 2 * D + d]); w = qn_w; }
+    else if (hh < Hq + Hkv) { x = __bfloat162float(kp[row * ldk + (size_t)(hh - Hq) * D + d]); w = kn_w; }
     else {
         const int h = hh - Hq - Hkv;
-        KV::store(vc + (((size_t)b * Hkv + h) * Lmax + pos) * D + d, __bfloat162float(vp[(((size_t)b * T + t) * Hkv + h) * D + d]));
+        KV::store(vc + (((size_t)b * Hkv + h) * Lmax + pos) * D + d, __bfloat162float(vp[row * ldv + (size_t)h * D + d]));
         return;
     }
     float ss = x * x;
@@ -243,16 +245,16 @@ cudaError_t launch_attn_decode(const void* q, const void* kc, const void* vc, co
     return cudaGetLastError();
 }
 
-cudaError_t launch_attn_prologue(const void* qp, const void* kp, const void* vp, const void* qn_w, const void* kn_w, const float* inv_freq,
+cudaError_t launch_attn_prologue(const void* qp, const void* kp, const void* vp, int ldq, int ldk, int ldv, const void* qn_w, const void* kn_w, const float* inv_freq,
                                  const int* pos_t, void* kc, void* vc, void* q_out, int B, int T, int Hq, int Hkv, int Lmax, int R, float eps,
                                  bool kv_fp8, cudaStream_t st) {
     dim3 grid(B * T, Hq + 2 * Hkv);
     if (kv_fp8)
-        attn::k_prologue<attn::KvFp8><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp,
+        attn::k_prologue<attn::KvFp8><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp, ldq, ldk, ldv,
                                                                 (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
                                                                 (uint8_t*)kc, (uint8_t*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps);
     else
-        attn::k_prologue<attn::KvBf16><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp,
+        attn::k_prologue<attn::KvBf16><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp, ldq, ldk, ldv,
                                                                  (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
                                                                  (__nv_bfloat16*)kc, (__nv_bfloat16*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps);
     return cudaGetLastError();

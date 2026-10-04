@@ -69,6 +69,8 @@ def test_split_prefill_matches_one_shot(model, ids, split):
 @torch.inference_mode()
 def test_matches_hf_tiny(model, ids):
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+    from tests.hf_fallback import force_hf_torch_fallbacks
+    force_hf_torch_fallbacks()
     c = model.cfg
     hcfg = Qwen3_5TextConfig(hidden_size=c.hidden_size, intermediate_size=c.intermediate_size,
                              num_hidden_layers=c.num_hidden_layers, layer_types=c.layer_types,

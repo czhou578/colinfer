@@ -25,11 +25,11 @@ MAX_M = 4
 
 
 class Nvfp4Linear(nn.Module):
-    def __init__(self, w: torch.Tensor, sf: torch.Tensor, gscale: float, out_fp32: bool = False):
+    def __init__(self, w: torch.Tensor, sf: torch.Tensor, gscale: float, out_fp32: bool = False, in_scale: float = 1.0):
         super().__init__()
         self.register_buffer("w", w, persistent=False)
         self.register_buffer("sf", sf, persistent=False)
-        self.gscale, self.out_fp32 = float(gscale), out_fp32
+        self.gscale, self.out_fp32, self.in_scale = float(gscale), out_fp32, float(in_scale)
         self.out_features, self.in_features = w.shape[0], w.shape[1] * 2
 
     def forward(self, x, residual=None):
@@ -43,10 +43,10 @@ class Nvfp4Linear(nn.Module):
 
 
 class Fp8Linear(nn.Module):
-    def __init__(self, w: torch.Tensor, scale: float):
+    def __init__(self, w: torch.Tensor, scale: float, in_scale: float = 1.0):
         super().__init__()
         self.register_buffer("w", w, persistent=False)
-        self.scale = float(scale)
+        self.scale, self.in_scale = float(scale), float(in_scale)
         self.out_features, self.in_features = w.shape
 
     def forward(self, x, residual=None):
@@ -70,6 +70,9 @@ class StackedFp8Linear(nn.Module):
                                               for p in parts]), persistent=False)
         self.sizes = [p.out_features for p in parts]
         self.in_features = parts[0].in_features
+        if len({p.in_scale for p in parts}) != 1:
+            raise ValueError("stacked FP8 parts must share the input scale")
+        self.in_scale = parts[0].in_scale
         off = 0
         for p in parts:  # the parts keep working (prefill path) as views into the stacked weight
             p.w = self.w[off:off + p.out_features]
@@ -122,9 +125,12 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
         base = name[: -len(".weight")]
         mod = local[: -len(".weight")] if local.endswith(".weight") else None
         if t.dtype == torch.uint8 and base + ".weight_scale" in raw:
-            quant[mod] = Nvfp4Linear(t, raw[base + ".weight_scale"], float(raw[base + ".weight_scale_2"].float()), out_fp32=(mod == "lm_head"))
+            insc = float(raw[base + ".input_scale"].float()) if base + ".input_scale" in raw else 1.0
+            quant[mod] = Nvfp4Linear(t, raw[base + ".weight_scale"], float(raw[base + ".weight_scale_2"].float()), out_fp32=(mod == "lm_head"),
+                                     in_scale=insc)
         elif t.dtype == torch.float8_e4m3fn and base + ".weight_scale" in raw:
-            quant[mod] = Fp8Linear(t, float(raw[base + ".weight_scale"].float()))
+            insc = float(raw[base + ".input_scale"].float()) if base + ".input_scale" in raw else 1.0
+            quant[mod] = Fp8Linear(t, float(raw[base + ".weight_scale"].float()), in_scale=insc)
         elif t.dtype == torch.float8_e4m3fn:
             raise NotImplementedError(f"{name}: block-scaled FP8 is not supported on the decode path yet")
         else:
@@ -191,12 +197,12 @@ class KernelAttention(Attention):
         else:
             qp, kp, vp = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         kc, vc = state.k[layer_idx], state.v[layer_idx]
-        qp = qp.reshape(B, T, -1).contiguous()
+        qp = qp.reshape(B, T, -1)
         q = torch.empty(B, self.num_heads, T, self.head_dim, device=x.device, dtype=torch.bfloat16)
-        ops().attn_prologue(qp, kp.contiguous(), vp.contiguous(), self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t,
+        ops().attn_prologue(qp, kp, vp, self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t,
                             kc, vc, q, self.q_norm.eps)
         attn = torch.empty(B, T, self.num_heads * self.head_dim, device=x.device, dtype=torch.bfloat16)
-        ops().attn_decode(q, kc, vc, state.pos_t + T, attn, ATTN_SPLITS, self.head_dim ** -0.5, qp)
+        ops().attn_decode(q, kc, vc, state.pos_t + T, attn, ATTN_SPLITS, self.head_dim ** -0.5, qp.contiguous())
         return self.o_proj(attn, residual)
 
 
@@ -325,7 +331,9 @@ class DecodeGraph:
     argmax ids (and optionally the logits)."""
 
     def __init__(self, model: FastQwen35, state: FastState):
+        from engine.model.prefill import prepare_prefill
         from engine.runtime.sampler import SamplerParams, sample
+        prepare_prefill(model)  # re-points weights (stacking); must happen before the graph records addresses
         self.model, self.state = model, state
         B = state.pos_t.shape[0]
         self.params = SamplerParams(B, model.cfg.vocab_size, state.pos_t.device)

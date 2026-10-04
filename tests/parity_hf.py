@@ -39,6 +39,8 @@ def build_inputs(tok, prompt: str) -> torch.Tensor:
 
 def run_ref(args):
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+    from tests.hf_fallback import force_hf_torch_fallbacks
+    force_hf_torch_fallbacks()  # Phase 1 reference = transformers' PyTorch paths, not FLA
     path = resolve(args.ckpt)
     tok = AutoTokenizer.from_pretrained(path)
     t0 = time.time()
