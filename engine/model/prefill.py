@@ -166,16 +166,18 @@ def _split(t, sizes):
 
 
 @torch.inference_mode()
-def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk: int = CHUNK, all_logits: bool = False) -> torch.Tensor:
+def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk: int = CHUNK, all_logits: bool = False,
+            return_hidden: bool = False):
     """input_ids [1, T]. Runs the prompt through the model in chunks, advancing `state`; returns the
     fp32 logits of the last token [1, vocab], or with all_logits the bf16 logits of every token
-    [T, vocab] (lm_head as a W4A4 GEMM; for perplexity)."""
+    [T, vocab] (lm_head as a W4A4 GEMM; for perplexity). return_hidden: also return the post-final-norm
+    hidden state of every prompt position [T, H] (the MTP drafter's input)."""
     assert input_ids.shape[0] == 1, "one slot at a time"
     prepare_prefill(model)
     T_all = input_ids.shape[1]
     if state.pos + T_all > state.max_seq_len:
         raise ValueError("prompt exceeds the slot's max_seq_len")
-    x_last, outs = None, []
+    x_last, outs, hid = None, [], []
     for c0 in range(0, T_all, chunk):
         ids = input_ids[0, c0:c0 + chunk]
         T = ids.numel()
@@ -188,6 +190,8 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
         state.pos += T
         state.pos_t += T
         x_last = x[-1:]
+        if return_hidden:
+            hid.append(model.norm(x))
         if all_logits:
             xq = torch.empty(T, x.shape[1] // 2, dtype=torch.uint8, device=x.device)
             xsf = torch.empty(ops().nvfp4_sf_size(T, x.shape[1]), dtype=torch.uint8, device=x.device)
@@ -195,4 +199,5 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
             outs.append(_gemm_nvfp4(xq, xsf, model.p_lm))
     if all_logits:
         return torch.cat(outs)
-    return model.lm_head(model.norm(x_last)).float()
+    logits = model.lm_head(model.norm(x_last)).float()
+    return (logits, torch.cat(hid)) if return_hidden else logits

@@ -247,6 +247,8 @@ class KernelGDN(GatedDeltaNet):
 
     def forward(self, x, state, layer_idx: int, residual=None):
         B, T, _ = x.shape
+        if T > 1 and getattr(state, "spec", False):
+            return self._verify(x, state, layer_idx, residual)
         if T != 1 or state is None:
             out = super().forward(x, state, layer_idx)
             return out if residual is None else residual + out
@@ -287,6 +289,36 @@ def fast_layer_forward(self, x, cos, sin, state):
     return self.mlp(self.post_attention_layernorm(x), residual=x)
 
 
+def _gdn_verify(self, x, state, layer_idx: int, residual=None):
+    """Speculative verify of T tokens per slot: outputs for every token, GDN state untouched; the inputs
+    are kept for the commit (engine/spec)."""
+    B, T, _ = x.shape
+    mixed, z = self.qkvz(x)
+    mixed, z = mixed.reshape(B, T, -1).contiguous(), z.reshape(B, T, -1).contiguous()
+    ba = torch.empty(B * T, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
+    x2 = x.reshape(B * T, -1)
+    for i in range(0, B * T, MAX_M):
+        ops().bf16_gemv(x2[i:i + MAX_M], self.w_ba, ba[i:i + MAX_M])
+    ba = ba.view(B, T, -1)
+    b, a = ba[..., : self.num_v_heads].contiguous(), ba[..., self.num_v_heads:].contiguous()
+    qkv = torch.empty_like(mixed)
+    ops().gdn_conv_multi(mixed, state.conv[layer_idx], self.conv1d.weight, qkv)
+    o = torch.empty_like(z)
+    ops().gdn_delta_multi(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], o, self.num_k_heads, self.norm.eps)
+    self._spec = (mixed, qkv, z, b, a, o)
+    return self.out_proj(o.view(B, T, -1), residual)
+
+
+def _gdn_commit(self, state, layer_idx: int, n: torch.Tensor):
+    mixed, qkv, z, b, a, o = self._spec
+    ops().gdn_conv_commit(mixed, state.conv[layer_idx], n)
+    ops().gdn_delta_multi(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], o, self.num_k_heads, self.norm.eps, n)
+
+
+KernelGDN._verify = _gdn_verify
+KernelGDN.commit = _gdn_commit
+
+
 class FastQwen35(Qwen35ForCausalLM):
     kv_fp8 = False
 
@@ -309,6 +341,34 @@ class FastQwen35(Qwen35ForCausalLM):
         state.pos_t += T * state.active
         state.pos += T
         return logits
+
+
+def _verify(self, input_ids: torch.Tensor, state: FastState, return_hidden: bool = False):
+    """Speculative verify: logits for all T rows per slot [B, T, V] (and the post-norm hidden [B, T, H]);
+    KV is written for all T, GDN state and positions are left for commit()."""
+    B, T = input_ids.shape
+    state.spec = True
+    try:
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = layer(x, None, None, state)
+        h = self.norm(x)
+        logits = self.lm_head(h).float()
+    finally:
+        state.spec = False
+    return (logits, h) if return_hidden else logits
+
+
+def _commit(self, state: FastState, n: torch.Tensor):
+    """Accept n[b] (int32, device) of the T verified tokens per slot: GDN state forward, positions += n."""
+    for i, layer in enumerate(self.layers):
+        if layer.block_type == "linear_attention":
+            layer.linear_attn.commit(state, i, n)
+    state.pos_t += n
+
+
+FastQwen35.verify = _verify
+FastQwen35.commit = _commit
 
 
 def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False) -> FastQwen35:

@@ -292,7 +292,51 @@ void gated_rmsnorm(torch::Tensor o, torch::Tensor z, torch::Tensor w, double eps
                                       (float)eps, at::cuda::getCurrentCUDAStream()));
 }
 
+cudaError_t launch_gdn_conv_multi(const void*, const void*, const void*, void*, int, int, int, cudaStream_t);
+cudaError_t launch_gdn_conv_commit(const void*, void*, const int*, int, int, int, cudaStream_t);
+cudaError_t launch_gdn_delta_multi(const void*, const void*, const void*, const void*, const void*, const void*, const void*, float*, void*, int, int,
+                                   int, float, int, const int*, cudaStream_t);
+
+// speculative verify: conv over T tokens per slot from the (unchanged) conv state. mixed, out: bf16 [B, T, C].
+void gdn_conv_multi(torch::Tensor mixed, torch::Tensor conv_state, torch::Tensor w, torch::Tensor out) {
+    for (auto* t : {&mixed, &conv_state, &w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
+    const int64_t B = conv_state.size(0), C = conv_state.size(1), T = mixed.numel() / (B * C);
+    TORCH_CHECK(mixed.numel() == B * T * C && out.numel() == mixed.numel() && w.numel() == C * 4, "bad shapes");
+    CHECK_LAUNCH(launch_gdn_conv_multi(mixed.data_ptr(), conv_state.data_ptr(), w.data_ptr(), out.data_ptr(), B, T, C, at::cuda::getCurrentCUDAStream()));
+}
+
+// speculative commit: conv state advanced by n[b] of the T verified tokens. n: int32 [B] on the device.
+void gdn_conv_commit(torch::Tensor mixed, torch::Tensor conv_state, torch::Tensor n) {
+    CHECK_CUDA_TENSOR(mixed, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(conv_state, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(n, torch::kInt32);
+    const int64_t B = conv_state.size(0), C = conv_state.size(1), T = mixed.numel() / (B * C);
+    TORCH_CHECK(n.numel() == B && mixed.numel() == B * T * C, "bad shapes");
+    CHECK_LAUNCH(launch_gdn_conv_commit(mixed.data_ptr(), conv_state.data_ptr(), n.data_ptr<int>(), B, T, C, at::cuda::getCurrentCUDAStream()));
+}
+
+// speculative verify (n = None: outputs for all T tokens, state untouched) or commit (n: int32 [B]: state
+// advanced by n[b] tokens and written, no outputs). qkv [B, T, C]; z [B, T, Hv*128]; b, a [B, T, Hv].
+void gdn_delta_multi(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tensor a, torch::Tensor A_log, torch::Tensor dt_bias,
+                     torch::Tensor norm_w, torch::Tensor state, torch::Tensor out, int64_t Hk, double eps, c10::optional<torch::Tensor> n) {
+    for (auto* t : {&qkv, &z, &b, &a, &A_log, &dt_bias, &norm_w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(state, torch::kFloat32);
+    const int64_t B = state.size(0), Hv = state.size(1), C = 2 * Hk * 128 + Hv * 128, T = qkv.numel() / (B * C);
+    TORCH_CHECK(qkv.numel() == B * T * C && z.numel() == B * T * Hv * 128 && b.numel() == B * T * Hv && a.numel() == b.numel() &&
+                out.numel() == z.numel(), "bad shapes");
+    const int* np = nullptr;
+    if (n) { CHECK_CUDA_TENSOR(*n, torch::kInt32); TORCH_CHECK(n->numel() == B); np = n->data_ptr<int>(); }
+    CHECK_LAUNCH(launch_gdn_delta_multi(qkv.data_ptr(), z.data_ptr(), b.data_ptr(), a.data_ptr(), A_log.data_ptr(), dt_bias.data_ptr(),
+                                        norm_w.data_ptr(), state.data_ptr<float>(), out.data_ptr(), B, Hk, Hv, (float)eps, T, np,
+                                        at::cuda::getCurrentCUDAStream()));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gdn_conv_multi", &gdn_conv_multi, "spec verify: GDN conv over T tokens, state read-only");
+    m.def("gdn_conv_commit", &gdn_conv_commit, "spec commit: advance the GDN conv state by n tokens");
+    m.def("gdn_delta_multi", &gdn_delta_multi, "spec verify / commit: GDN delta rule over T tokens", py::arg("qkv"), py::arg("z"), py::arg("b"),
+          py::arg("a"), py::arg("A_log"), py::arg("dt_bias"), py::arg("norm_w"), py::arg("state"), py::arg("out"), py::arg("Hk"), py::arg("eps"),
+          py::arg("n") = py::none());
     m.def("fp8_quant", &fp8_quant, "bf16 -> e4m3, static scale");
     m.def("silu_mul_quant", &silu_mul_quant, "fused silu(gate)*up -> NVFP4 (swizzled scales)");
     m.def("causal_conv_silu", &causal_conv_silu, "GDN causal depthwise conv (k=4) + SiLU, token-major, split q|k|v outputs");
