@@ -333,7 +333,7 @@ void gdn_delta_multi(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch:
 
 cudaError_t launch_philox_uniform(const int64_t*, const int64_t*, float*, int, int, cudaStream_t);
 
-// out fp32 [B, n] = per-slot seeded uniforms in [0, 1) at counters offset[b] + i (seed, offset: int64 [B], device).
+// out fp32 [B, n] = per-slot seeded uniforms in (0, 1] at counters offset[b] + i (seed, offset: int64 [B], device).
 void philox_uniform(torch::Tensor seed, torch::Tensor offset, torch::Tensor out) {
     CHECK_CUDA_TENSOR(seed, torch::kInt64);
     CHECK_CUDA_TENSOR(offset, torch::kInt64);

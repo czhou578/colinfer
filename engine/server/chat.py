@@ -249,9 +249,10 @@ class OutputParser:
         return [("tool_call", {"id": "call_" + uuid.uuid4().hex[:24], **call})]
 
     def finish(self) -> list:
-        if self.mode == "tool":  # unterminated tool call (length limit or a stop token right after </function>)
+        if self.mode == "tool":  # unterminated tool call (length limit, or a stop token before </tool_call>)
+            # keep the call with its completed parameters, as vLLM's parser does; finish_reason stays "length"
             body = self.fmt.tok.decode(self.tool_ids, skip_special_tokens=True)
-            call = parse_tool_call(body, self.tools) if "</function>" in body else None
+            call = parse_tool_call(body, self.tools) if _FUNC_RE.search(body) else None
             self.mode, self.detok = "content", Detokenizer(self.fmt.tok)
             if call is not None:
                 self.n_tool_calls += 1

@@ -6,6 +6,7 @@ the model to repeat it, greedy, thinking off. Exercises chunked prefill (FlashIn
 BF16 cache) and the decode attention kernel at depth.
 
   uv run python tests/passkey.py [--lens 16384 65536 131072] [--depths 0.1 0.5 0.9] [--kv-fp8]
+  uv run python tests/passkey.py --url http://127.0.0.1:8000 --lens 262000 --depths 0.5   # through the server
 """
 import argparse
 import os
@@ -43,12 +44,29 @@ def main():
     ap.add_argument("--lens", type=int, nargs="+", default=[16384, 65536, 131072])
     ap.add_argument("--depths", type=float, nargs="+", default=[0.1, 0.5, 0.9])
     ap.add_argument("--kv-fp8", action="store_true")
+    ap.add_argument("--url", default=None, help="test a running server (engine/server) over HTTP instead of a local scheduler")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
-    eng = Scheduler(to_fast(load_fast_model(path), kv_fp8=a.kv_fp8), n_slots=1, max_seq_len=max(a.lens) + 64, n_checkpoints=0)
     rng = random.Random(0)
     hits = 0
+    if a.url:
+        import requests
+        print(f"server {a.url}")
+        for L in a.lens:
+            for d in a.depths:
+                key = rng.randint(100000, 999999)
+                ids = build(tok, L, d, key)
+                r = requests.post(a.url + "/v1/completions", json={"prompt": ids, "max_tokens": 12, "temperature": 0, "cache_prompt": False},
+                                  timeout=3600).json()
+                ans = r["choices"][0]["text"].strip()
+                ok = str(key) in re.sub(r"[^0-9]", "", ans) or str(key) in ans
+                hits += ok
+                print(f"  len {len(ids):6d} depth {d:.1f}: key {key} -> {ans!r:24s} {'OK' if ok else 'MISS'}  "
+                      f"(TTFT {r['timings']['ttft_s']:6.1f} s)", flush=True)
+        print(f"PASSKEY {hits}/{len(a.lens) * len(a.depths)}")
+        return
+    eng = Scheduler(to_fast(load_fast_model(path), kv_fp8=a.kv_fp8), n_slots=1, max_seq_len=max(a.lens) + 64, n_checkpoints=0)
     print(f"KV {'fp8' if a.kv_fp8 else 'bf16'}")
     for L in a.lens:
         for d in a.depths:

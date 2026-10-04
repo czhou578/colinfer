@@ -35,7 +35,7 @@ Startup takes about 21 s with a warm page cache: 6 s to load weights, 10 s for t
   - `temperature: 0` gives greedy decoding.
 - **Length:** `max_tokens` / `max_completion_tokens` (default: the remaining context), `min_tokens`, `ignore_eos`.
 - **Stopping:** `stop` (strings; matched on the decoded text and excluded from the output) and `stop_token_ids`.
-- **Seeds:** `seed` makes sampling reproducible, including with speculation and with other requests running alongside. Without a seed, each request gets a random one.
+- **Seeds:** with a `seed`, the tokens depend only on the seed and the prompt. That holds with speculation on or off and whatever else runs alongside, because each position's draw is keyed by (seed, position). Without a seed, each request gets a random one.
 - **Logprobs:**
   - Chat: `logprobs` with `top_logprobs` (at most 20).
   - Completions: `logprobs: n`.
@@ -80,7 +80,7 @@ Other endpoints:
 
 ## Behavior worth knowing
 
-- **Speculation is always on unless the server runs with `--spec none`.** Greedy output is token-identical to plain decode, and sampled output has the plain-sampling distribution.
+- **Speculation is always on unless the server runs with `--spec none`.** Its output is token-identical to plain decode, greedy or sampled (with the same seed).
 - **Draft length depends on how many slots are decoding.**
   - A cycle verifies (k+1) rows per slot, and a weight-streaming pass handles 8 rows.
   - One or two decoding slots use k=3: 4 and 8 rows.

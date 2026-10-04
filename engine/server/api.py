@@ -347,10 +347,12 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             async def gen():
                 done = False
                 try:
-                    yield _sse(chunk({"role": "assistant", "content": ""}))
-                    n_calls, first, carry_ids, carry_lps = 0, True, [], []
+                    n_calls, first, role_sent, carry_ids, carry_lps = 0, True, False, [], []
                     while True:
                         item = await st.q.get()
+                        if not role_sent and item[0] != "error":  # the role chunk goes out with the first output, as vLLM does
+                            role_sent = True
+                            yield _sse(chunk({"role": "assistant", "content": ""}))
                         if item[0] == "error":
                             done = True
                             yield _sse({"error": {"message": item[1], "code": item[2]}})

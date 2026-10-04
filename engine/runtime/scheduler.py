@@ -123,7 +123,6 @@ class Scheduler:
             self.mst.pos_t.zero_()
         else:
             self.graphs = {(lo, hi): DecodeGraph(model, self.state.view(lo, hi), self.params.view(lo, hi)) for lo, hi in self._ranges()}
-        self.params.offset.zero_()
         self.state.reset()
         self.state.active.zero_()
         self.slots = [Slot(i) for i in range(n_slots)]
@@ -251,9 +250,10 @@ class Scheduler:
             s.salt = req.cache_salt
             s.req, s.phase, s.todo, s.y = req, "prefill", list(P[len(s.tokens):]), None
             s.splits = []
-            if self.boundary is not None:
-                bs = [i for i, t in enumerate(P) if t == self.boundary and i > 0]
-                s.splits = sorted({p for p in (bs[:1] + bs[-2:-1]) if len(s.tokens) + 256 <= p <= len(P) - 256}) if self.free_bufs or self.ckpts else []
+            if self.boundary is not None and (self.free_bufs or self.ckpts):
+                # message starts, without the last one (it opens the reply being generated: the prompt-end snapshot)
+                bs = [i for i, t in enumerate(P) if t == self.boundary and i > 0][:-1]
+                s.splits = sorted({p for p in bs[:1] + bs[-1:] if p >= len(s.tokens) + 256})
             self.params.set(b, req.temperature, req.top_k, req.top_p, req.min_p, req.seed)
             if self.mtp is not None:
                 ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
@@ -319,7 +319,7 @@ class Scheduler:
             self._snapshot(s)
         if done:
             req = s.req
-            tok = int(sample(logits, self.params.view(b, b + 1)))
+            tok = int(sample(logits, self.params.view(b, b + 1), view.pos_t))
             lp = self._logprobs(logits, [tok], req.logprobs) if req.logprobs is not None else None
             s.phase, s.y = "decode", tok
             self._emit(s, [tok], lp)

@@ -131,3 +131,9 @@ def test_parse_tool_call_untyped_and_json():
     c = parse_tool_call('{"name": "g", "arguments": {"a": 1}}', None)
     assert c["name"] == "g" and json.loads(c["arguments"]) == {"a": 1}
     assert parse_tool_call("garbage", None) is None
+
+
+def test_truncated_tool_call_keeps_complete_params(fmt):
+    body = "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=days>\n4"
+    out = run(OutputParser(fmt, False, TOOLS), enc(fmt, body))
+    assert len(out["tool_call"]) == 1 and json.loads(out["tool_call"][0]["arguments"]) == {"city": "Rome"}

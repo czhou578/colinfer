@@ -1,9 +1,12 @@
 """In-graph sampler (PLAN.md 4.3 item 7): greedy / temperature / min-p / top-k / top-p per slot.
 
-All parameters live in per-slot device buffers so the sampler is captured inside the decode CUDA
-graph; the host only rewrites the buffers when a slot's request changes. Randomness is Philox
-(FlashInfer's rejection sampler) keyed by a per-slot seed and an offset that the graph advances
-on the device every step.
+All parameters live in per-slot device buffers so the sampler is captured inside the decode CUDA graph; the host
+only rewrites the buffers when a slot's request changes.
+
+Randomness is keyed by position: the token at absolute position t of a request is drawn by inverse CDF from the
+processed distribution with one uniform u = Philox(seed, counter t) (csrc/sampling.cu). So a request's tokens
+depend only on (seed, prompt), never on what else runs in the batch, and speculative decoding reproduces plain
+sampling token for token (engine/spec/accept.py).
 
 Order (as in vLLM / HF): temperature -> min-p (relative to the top token) -> top-k -> top-p -> sample.
 temperature == 0 selects the argmax for that slot regardless of the other parameters.
@@ -14,8 +17,6 @@ import math
 
 import torch
 
-OFFSET_STRIDE = 1 << 20  # Philox offset consumed per step; far more than one rejection loop draws
-
 
 class SamplerParams:
     def __init__(self, batch: int, vocab: int, device):
@@ -25,13 +26,12 @@ class SamplerParams:
         self.top_p = torch.ones(batch, dtype=torch.float32, device=device)
         self.log_min_p = torch.full((batch,), -math.inf, dtype=torch.float32, device=device)
         self.seed = torch.zeros(batch, dtype=torch.int64, device=device)
-        self.offset = torch.zeros(batch, dtype=torch.int64, device=device)
 
     def view(self, lo: int, hi: int) -> "SamplerParams":
         """Parameters of slots [lo, hi), sharing this object's device buffers."""
         v = SamplerParams.__new__(SamplerParams)
         v.vocab = self.vocab
-        for name in ("temperature", "top_k", "top_p", "log_min_p", "seed", "offset"):
+        for name in ("temperature", "top_k", "top_p", "log_min_p", "seed"):
             setattr(v, name, getattr(self, name)[lo:hi])
         return v
 
@@ -42,20 +42,10 @@ class SamplerParams:
         self.top_p[slot] = float(top_p)
         self.log_min_p[slot] = math.log(min_p) if min_p > 0 else -math.inf
         self.seed[slot] = int(seed)
-        self.offset[slot] = 0
 
 
-def sample(logits: torch.Tensor, p: SamplerParams) -> torch.Tensor:
-    """logits [B, V] fp32 -> token ids [B] int64. Graph-capturable (no host syncs)."""
-    import flashinfer.sampling as fs
-    greedy = logits.argmax(-1)
-    scaled = logits / p.temperature.clamp_min(1e-6)[:, None]
-    thr = scaled.amax(-1, keepdim=True) + p.log_min_p[:, None]
-    scaled = scaled.masked_fill(scaled < thr, float("-inf"))
-    # One call per slot: FlashInfer 0.7.0.post1 accepts per-row seed/offset arrays but row 0's values
-    # perturb every row's draw, so a slot's output would depend on its neighbours. Slots are <= 4.
-    drawn = torch.cat([fs.top_k_top_p_sampling_from_logits(scaled[b:b + 1], p.top_k[b:b + 1], p.top_p[b:b + 1],
-                                                           seed=p.seed[b:b + 1], offset=p.offset[b:b + 1])
-                       for b in range(logits.shape[0])])
-    p.offset += OFFSET_STRIDE
-    return torch.where(p.temperature > 0, drawn.long(), greedy)
+def sample(logits: torch.Tensor, p: SamplerParams, pos: torch.Tensor) -> torch.Tensor:
+    """logits [B, V] fp32 -> token ids [B] int64. pos [B]: the position of the token being sampled (device).
+    Graph-capturable (no host syncs)."""
+    from engine.spec.accept import draw
+    return draw(logits[:, None], p, pos)[:, 0]

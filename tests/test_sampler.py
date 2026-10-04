@@ -1,5 +1,5 @@
 """In-graph sampler (engine/runtime/sampler.py): distribution checks against exact truncated
-softmax, per-slot parameters, determinism by seed, and capture inside a CUDA graph."""
+softmax, per-slot parameters, determinism by (seed, position), and capture inside a CUDA graph."""
 import os
 import sys
 
@@ -44,8 +44,8 @@ def test_distribution(t, k, p, min_p):
     params.seed.copy_(torch.arange(B, device="cuda") * 7919)
     counts = torch.zeros(V, device="cuda")
     logits = base.expand(B, V).contiguous()
-    for _ in range(rounds):
-        counts += torch.bincount(sample(logits, params), minlength=V).float()
+    for r in range(rounds):
+        counts += torch.bincount(sample(logits, params, torch.full((B,), r, device="cuda")), minlength=V).float()
     emp = counts / counts.sum()
     want = expected(base, t, k if k > 0 else V, p, min_p)
     assert emp[want == 0].sum() == 0, "sampled a token outside the allowed set"
@@ -62,7 +62,7 @@ def test_slot_independence():
         p = SamplerParams(2, V, "cuda")
         p.set(0, temperature=1.0, seed=other_seed)
         p.set(1, temperature=1.0, seed=9)
-        outs.append([int(sample(logits, p)[1]) for _ in range(10)])
+        outs.append([int(sample(logits, p, torch.full((2,), i, device="cuda"))[1]) for i in range(10)])
     assert outs[0] == outs[1]
 
 
@@ -73,16 +73,16 @@ def test_greedy_slots_and_seed_determinism():
     p.set(0, temperature=0.0)
     p.set(1, temperature=1.0, seed=7)
     p.set(2, temperature=1.0, seed=7)
-    out = sample(logits, p)
+    pos = lambda i: torch.full((3,), i, device="cuda")  # noqa: E731
+    out = sample(logits, p, pos(0))
     assert out[0] == logits[0].argmax()
-    p.set(1, temperature=1.0, seed=7)
-    a = [int(sample(logits, p)[1]) for _ in range(20)]
-    p.set(1, temperature=1.0, seed=7)
-    b = [int(sample(logits, p)[1]) for _ in range(20)]
+    a = [int(sample(logits, p, pos(i))[1]) for i in range(20)]
+    b = [int(sample(logits, p, pos(i))[1]) for i in range(20)]
     assert a == b and len(set(a)) > 1
+    assert [int(sample(logits[[1, 1, 1]], p, pos(i))[2]) for i in range(20)] == a  # a slot's draws depend on (seed, position)
 
 
-def test_captured_in_cuda_graph_advances_offset():
+def test_captured_in_cuda_graph_follows_position():
     torch.manual_seed(2)
     logits = torch.zeros(2, V, device="cuda")  # uniform: draws should differ step to step
     p = SamplerParams(2, V, "cuda")
@@ -90,12 +90,14 @@ def test_captured_in_cuda_graph_advances_offset():
     p.set(1, temperature=1.0, seed=4)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
+    pos = torch.zeros(2, dtype=torch.int32, device="cuda")
     with torch.cuda.stream(s):
-        sample(logits, p)
+        sample(logits, p, pos)
     torch.cuda.current_stream().wait_stream(s)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        out = sample(logits, p)
+        out = sample(logits, p, pos)
+        pos += 1
     draws = []
     for _ in range(30):
         g.replay()

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Speculative decoding check (PLAN.md Phase 4 exit: greedy outputs identical with and without spec).
+"""Speculative decoding check (PLAN.md Phase 4 exit: greedy outputs identical with and without spec; with the MTP
+drafter, seeded sampled outputs are identical too).
 
 Runs each prompt through plain greedy decode (CUDA graph, T=1) and through the speculative generator,
 asserts identical token sequences, and reports tok/s and acceptance.
@@ -73,11 +74,12 @@ def main():
         st0 = dict(spec.stats)
         t0 = time.perf_counter(); out = spec.generate(ids, a.max_new, eos_ids=EOS, **kw); t_spec = time.perf_counter() - t0
         d = {k: spec.stats[k] - st0[k] for k in spec.stats}
-        same = out == ref if a.temperature == 0 else True
+        exact = a.temperature == 0 or a.drafter == "mtp"  # MTP sampling is position-keyed: identical to plain sampling too
+        same = out == ref if exact else True
         all_same &= same
         tot_tok += len(out); tot_t += t_spec
         acc = d["accepted"] / max(1, d["drafted"])
-        tag = ("IDENTICAL" if same else "DIFFERENT") if a.temperature == 0 else "sampled  "
+        tag = ("IDENTICAL" if same else "DIFFERENT") if exact else "sampled  "
         print(f"{name:10s} {tag}  {len(out):4d} tok  plain {len(ref) / t_plain:5.1f} tok/s  "
               f"spec {len(out) / t_spec:5.1f} tok/s  ({d['spec_steps']}/{d['steps']} steps drafted, acceptance {acc:.2f}, "
               f"{len(out) / max(1, d['steps']):.2f} tok/step)", flush=True)

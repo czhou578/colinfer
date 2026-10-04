@@ -30,7 +30,7 @@ class FastGenerator:
         logits = None
         for i in range(0, input_ids.shape[1], PREFILL_CHUNK):
             logits = m(input_ids[:, i:i + PREFILL_CHUNK], st, last_only=True)[:, -1]
-        tok = sample(logits, self.graph.params) if self.graph is not None else logits.argmax(-1)
+        tok = sample(logits, self.graph.params, st.pos_t) if self.graph is not None else logits.argmax(-1)
         out, kept = [], []
         eos = set(int(e) for e in eos_ids)
         for step in range(max_new_tokens):

@@ -418,15 +418,14 @@ class DecodeGraph:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s), torch.inference_mode():
             for _ in range(2):
-                sample(model(self.tok, state, last_only=True)[:, -1], self.params)
+                sample(model(self.tok, state, last_only=True)[:, -1], self.params, state.pos_t)
                 state.pos = 1
         torch.cuda.current_stream().wait_stream(s)
         self.graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(self.graph):
             self.logits = model(self.tok, state, last_only=True)[:, -1]
-            self.next = sample(self.logits, self.params)
+            self.next = sample(self.logits, self.params, state.pos_t)  # pos_t now holds the predicted token's position
         state.reset()
-        self.params.offset.zero_()
 
     def step(self, tokens: torch.Tensor) -> torch.Tensor:
         """tokens: [B] long on the device. Returns sampled ids [B] (device; greedy for slots with

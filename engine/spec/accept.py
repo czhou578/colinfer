@@ -1,17 +1,18 @@
-"""Distribution-preserving acceptance for speculative sampling (PLAN.md 4.5, Phase 4 week 14).
+"""Sampling that speculative decoding reproduces exactly (PLAN.md 4.5, Phase 4 week 14 / Phase 5).
 
-The MTP drafter proposes deterministically (its argmax), i.e. a point-mass proposal q = delta(d).
-Speculative sampling (Leviathan et al. 2023; Chen et al. 2023) with such a proposal reduces to:
-    accept d_i with probability p_i(d_i); on the first rejection emit a token drawn from p_i with d_i
-    removed (renormalised), i.e. norm(max(0, p_i - q_i)); if every draft is accepted, emit a bonus token
-    drawn from p_k.
-p_i is the target's processed distribution at row i (temperature -> min-p -> top-k -> top-p, exactly
-what plain sampling draws from), so the emitted sequence has exactly the plain-sampling distribution.
+Every token is drawn by inverse CDF from the target's processed distribution p_t (temperature -> min-p -> top-k ->
+top-p, exactly what plain sampling uses) with a uniform keyed by (seed, position t). Verification samples the
+target at every verified row with the uniforms of those rows' positions and accepts the leading drafts that equal
+those samples; the first mismatch is replaced by the target's sample, and if every draft matches the last row's
+sample is the bonus token. The emitted sequence is therefore exactly the sequence plain sampling would produce
+(same seed, same logits), whatever the draft length, the batch width or the drafter.
+
+With a deterministic drafter (the MTP argmax), the chance of accepting draft d is P(x_t = d) = p_t(d), the same
+acceptance rate as speculative rejection sampling (Leviathan et al. 2023) with a point-mass proposal, whose
+correction distribution normalize(p_t with d removed) is exactly the law of x_t given x_t != d.
 Everything runs on the device (graph-capturable).
 """
 from __future__ import annotations
-
-import math
 
 import torch
 
@@ -29,20 +30,21 @@ def processed_probs(logits: torch.Tensor, temperature: torch.Tensor, top_k: torc
     return fs.top_p_renorm_probs(p, top_p.expand(R).contiguous())
 
 
-def accept_sample(P: torch.Tensor, drafts: torch.Tensor, u: torch.Tensor, seed: torch.Tensor, offset: torch.Tensor):
-    """P [k+1, V] target probabilities, drafts [k] (int64), u [k] uniforms in [0, 1).
-    Returns (n [1] int32 = accepted inputs incl. the first, i.e. 1 + accepted drafts; next token [1] int64)."""
-    import flashinfer.sampling as fs
-    k = drafts.numel()
-    rows = torch.arange(k, device=P.device)
-    pd = P[rows, drafts]                                   # p_i(d_i)
-    acc = (u < pd).int()
-    n = (1 + acc.cumprod(0).sum()).int().view(1)           # 1..k+1
-    resid = P[:k].clone()
-    resid.scatter_(1, drafts[:, None], 0.0)  # (no CPU scalar tensor: graph-capturable)
-    s = resid.sum(-1, keepdim=True)
-    resid = torch.where(s > 0, resid / s.clamp_min(1e-30), P[:k])  # p_i was a point mass on d_i: never rejected anyway
-    cand = torch.cat([resid, P[k:]], 0)                     # row i < k: correction after rejecting d_i; row k: bonus
-    c = fs.sampling_from_probs(cand, seed=seed, offset=offset)
-    nxt = c.long().gather(0, (n.long() - 1))
-    return n, nxt
+def inverse_cdf(P: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """P [R, V] probabilities, u [R] uniforms in (0, 1] -> [R] int64: the first index whose CDF reaches u
+    (never a zero-probability token)."""
+    c = P.cumsum(-1)
+    return (c < (u * c[:, -1])[:, None]).sum(-1).clamp_max(P.shape[-1] - 1)
+
+
+def draw(logits: torch.Tensor, p, pos: torch.Tensor) -> torch.Tensor:
+    """logits [B, R, V] fp32: row r of slot b predicts the token at position pos[b] + r.
+    p: SamplerParams for the B slots. Returns the sampled tokens [B, R] int64 (argmax for slots with temperature 0)."""
+    from engine.kernels import ops
+    B, R, _ = logits.shape
+    u = torch.empty(B, R, device=logits.device)
+    ops().philox_uniform(p.seed, pos.long().contiguous(), u)
+    greedy = logits.argmax(-1)
+    rows = [inverse_cdf(processed_probs(logits[b], p.temperature[b:b + 1], p.top_k[b:b + 1], p.top_p[b:b + 1], p.log_min_p[b:b + 1]), u[b])
+            for b in range(B)]
+    return torch.where(p.temperature[:, None] > 0, torch.stack(rows), greedy)

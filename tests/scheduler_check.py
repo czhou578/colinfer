@@ -7,7 +7,8 @@ greedy tokens:
   2. all four together (widths 3 -> 1 as they finish, a 4th request queued);
   3. together with a sampled request and a 5000-token chunked prefill (sampled cycle graphs, masked slots);
 plus
-  4. seeded sampling: same seed alone and alongside other requests -> identical tokens;
+  4. seeded sampling at T=0.8: the MTP scheduler emits exactly what plain decode samples, alone and next to one or two
+     other requests (position-keyed draws, engine/spec/accept.py);
   5. multi-turn: turn 2 restores the end-of-turn-1 checkpoint (stop-token cut keeps it a prefix);
   6. a second conversation with the same long system prompt, while the first is still decoding, restores the
      system-prompt checkpoint by copying its KV prefix into another slot; its greedy output matches a run
@@ -82,14 +83,16 @@ def main():
     ok &= all(same)
     print(f"[mixed] greedy requests identical {sum(same)}/2 next to a sampled request and a 5000-token prefill")
 
-    # 4. seeded sampling reproducibility
+    # 4. seeded sampling: speculative output = plain sampling, at any batch width
     kw = dict(temperature=0.8, top_p=0.95, top_k=20, seed=1234, max_new_tokens=120)
+    plain = ref.run([R(prompts[3], **kw)])[0].output
     a1 = spec.run([R(prompts[3], **kw)])[0].output
-    a2 = spec.run([R(prompts[3], **kw)])[0].output
-    a3 = spec.run([R(prompts[0]), R(prompts[3], **kw), R(prompts[1], temperature=0.5, seed=9)])[1].output
-    rep = a1 == a2 == a3
+    a2 = spec.run([R(prompts[1], temperature=0.5, seed=9), R(prompts[3], **kw)])[1].output
+    a3 = spec.run([R(prompts[0]), R(prompts[3], **kw), R(prompts[2], temperature=1.0, seed=5)])[1].output
+    rep = plain == a1 == a2 == a3
     ok &= rep
-    print(f"[seeded] same seed alone x2 and next to two others: {'IDENTICAL' if rep else 'DIFFERENT'} ({len(a1)} tok)")
+    print(f"[seeded] T=0.8 plain decode vs MTP alone / next to one / next to two (k=1 cycles): "
+          f"{'IDENTICAL' if rep else 'DIFFERENT'} ({len(a1)} tok; agree {[sum(x == y for x, y in zip(plain, o)) for o in (a1, a2, a3)]})")
 
     # 5. multi-turn: turn 2 restores the end of turn 1
     sys_msg = {"role": "system", "content": "You are a careful assistant. Background notes: " + " ".join(f"item {i}" for i in range(1500))}

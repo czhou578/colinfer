@@ -7,8 +7,9 @@ h_i) where h_i is the target's post-final-norm hidden state at position i, and p
     -> shared lm_head.  Chained steps feed the MTP's own normed output as the next hidden.
 
 MtpCycle captures one CUDA graph per decode cycle for B slots (k drafts each):
-  1. verify [y, d1..dk] of every slot on the target (hidden states kept); acceptance (greedy, or speculative
-     sampling for slots with temperature > 0); the accepted length is cut after the first accepted stop token
+  1. verify [y, d1..dk] of every slot on the target (hidden states kept); acceptance (drafts that equal the
+     target's argmax, or its position-keyed sample for slots with temperature > 0, so the output is exactly what
+     plain decoding would emit); the accepted length is cut after the first accepted stop token
      so the state never runs past the end of a reply; commit n[b] tokens per slot (0 for inactive slots);
   2. MTP catch-up: rows for the n newly committed positions with the true target hidden states (rows past
      n are padding, overwritten later); the last valid row yields the next d1;
@@ -219,8 +220,9 @@ class MtpCycle:
 
     tok [B, k+1] (the next cycle's input [y, d1..dk] per slot), stop_ids [B, S] (int64, -1 = unused) and
     params may be views into buffers shared by the graphs of every batch width, so a slot keeps its pending
-    input when the width changes. params: SamplerParams -> sampled cycle (speculative sampling for slots with
-    temperature > 0, greedy for the rest; engine/spec/accept.py); None -> greedy cycle.
+    input when the width changes. params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts
+    that equal the target's position-keyed sample, so the output is exactly plain sampling; greedy for the rest;
+    engine/spec/accept.py); None -> greedy cycle.
     After replay: out_tok [B, k+1] (first n[b] valid), n [B] int32, logits [B, k+1, V] fp32 (verify rows,
     raw), H [B, k+1, hidden] (target post-norm hidden of the verify rows)."""
 
@@ -245,33 +247,20 @@ class MtpCycle:
             self.out_tok, self.n, self.logits, self.H = self._body()
         state.reset()
         mst.pos_t.zero_()
-        if params is not None:
-            params.offset.zero_()
 
     def _body(self):
         k, m, mtp, st = self.k, self.model, self.mtp, self.state
         tok = self.tok
         B = tok.shape[0]
         logits, H = m.verify(tok, st, return_hidden=True)            # [B, k+1, V], [B, k+1, H]
-        pred = logits.argmax(-1)                                     # [B, k+1]
+        if self.params is None:
+            pred = logits.argmax(-1)                                 # [B, k+1]
+        else:  # the target's own sample at every row, keyed by position (engine/spec/accept.py): output = plain sampling
+            from engine.spec.accept import draw
+            pred = draw(logits, self.params, st.pos_t + 1)           # row i predicts position pos + i + 1
         match = (pred[:, :k] == tok[:, 1:]).int()
         n = (1 + match.cumprod(-1).sum(-1)).int()                    # [B] accepted inputs, 1..k+1
         bonus = pred.gather(1, (n.long() - 1)[:, None])[:, 0]        # [B]
-        if self.params is not None:                                  # distribution-preserving acceptance per sampled slot
-            from engine.spec.accept import accept_sample, processed_probs
-            pp = self.params
-            u = torch.empty(B, k, device=tok.device)
-            ops().philox_uniform(pp.seed, pp.offset, u)              # seeded per slot: reproducible, independent of other slots
-            ns, xs = [], []
-            for b in range(B):
-                P = processed_probs(logits[b], pp.temperature[b:b + 1], pp.top_k[b:b + 1], pp.top_p[b:b + 1], pp.log_min_p[b:b + 1])
-                nb, xb = accept_sample(P, tok[b, 1:], u[b], pp.seed[b:b + 1], pp.offset[b:b + 1])
-                ns.append(nb)
-                xs.append(xb)
-            pp.offset += 1 << 20
-            hot = pp.temperature > 0
-            n = torch.where(hot, torch.cat(ns), n)
-            bonus = torch.where(hot, torch.cat(xs), bonus)
         # cut after the first accepted stop token: drafts d1..dk are out positions 0..k-1, accepted while < n-1
         d = tok[:, 1:]
         hit = (d[:, :, None] == self.stop_ids[:, None, :]).any(-1) & (self.idx[None, :k] < (n - 1)[:, None])
@@ -322,13 +311,13 @@ class MtpGenerator:
         from engine.runtime.sampler import sample
         st, mst, k = self.state, self.mst, self.k
         self.params.set(0, temperature, top_k, top_p, min_p, seed)
-        self.plain.params.set(0, temperature, top_k, top_p, min_p, seed + 1)
+        self.plain.params.set(0, temperature, top_k, top_p, min_p, seed)
         cyc = self.cycle_s if temperature > 0 else self.cycle
         st.reset(); st.pos = 0
         mst.pos_t.zero_()
         self.mtp.set_prompt_vocab(list(input_ids))
         logits, H = prefill(self.model, torch.tensor([input_ids], device="cuda"), st, return_hidden=True)
-        y = int(sample(logits, self.params)) if temperature > 0 else int(logits.argmax(-1))
+        y = int(sample(logits, self.params, st.pos_t)) if temperature > 0 else int(logits.argmax(-1))
         out = [y]
         eos = set(eos_ids)
         if not use_spec:
