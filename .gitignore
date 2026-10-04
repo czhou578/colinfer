@@ -21,3 +21,6 @@ bench/traces/
 
 # GPUDirect Storage log written by fastsafetensors/vLLM runs
 cufile.log
+
+# parity harness outputs (large .pt files)
+tests/parity_out/

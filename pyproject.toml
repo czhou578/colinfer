@@ -25,6 +25,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "accelerate>=1.15.0",
+    "pyarrow>=25.0.1",
     "pytest>=9.0",
 ]
 
