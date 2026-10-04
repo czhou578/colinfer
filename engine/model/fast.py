@@ -79,18 +79,25 @@ class Nvfp4Linear(nn.Module):
 
 
 class Fp8Linear(nn.Module):
+    """FP8 weights (the prefill path's W8A8 GEMM reads w directly). dec: optional NVFP4 copy of the same linear
+    (attach_requant) that the decode path streams instead, ~half the bytes."""
+
     def __init__(self, w: torch.Tensor, scale: float, in_scale: float = 1.0):
         super().__init__()
         self.register_buffer("w", w, persistent=False)
         self.scale, self.in_scale = float(scale), float(in_scale)
         self.out_features, self.in_features = w.shape
+        self.dec = None
 
     def forward(self, x, residual=None):
         shp = x.shape
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
         r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
-        fp8_rows(x2, self.w, self.scale, r2, out)
+        if self.dec is not None:
+            nvfp4_rows(x2, self.dec.w, self.dec.sf, self.dec.gscale, r2, out)
+        else:
+            fp8_rows(x2, self.w, self.scale, r2, out)
         return out.view(*shp[:-1], self.out_features)
 
 
@@ -108,6 +115,7 @@ class StackedFp8Linear(nn.Module):
         if len({p.in_scale for p in parts}) != 1:
             raise ValueError("stacked FP8 parts must share the input scale")
         self.in_scale = parts[0].in_scale
+        self.dec = None  # optional stacked NVFP4 copy for decode (attach_requant)
         off = 0
         for p in parts:  # the parts keep working (prefill path) as views into the stacked weight
             p.w = self.w[off:off + p.out_features]
@@ -117,7 +125,10 @@ class StackedFp8Linear(nn.Module):
         shp = x.shape
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], sum(self.sizes), device=x.device, dtype=torch.bfloat16)
-        fp8_rows(x2, self.w, 1.0, None, out, self.rs)
+        if self.dec is not None:
+            nvfp4_rows(x2, self.dec.w, self.dec.sf, self.dec.gscale, None, out)
+        else:
+            fp8_rows(x2, self.w, 1.0, None, out, self.rs)
         return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
 
 
@@ -433,6 +444,40 @@ def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False) -> FastQwen35:
         layer.forward = fast_layer_forward.__get__(layer)
     model.norm = KernelRMSNorm(model.norm)
     return model
+
+
+def requant_path(path_or_repo: str) -> str:
+    """Where tools/requant_nvfp4.py writes the NVFP4 copies of a checkpoint's FP8 linears."""
+    return os.path.join(os.path.expanduser("~/.cache/colinfer/requant"), os.path.basename(resolve(path_or_repo)), "attn_gdn_nvfp4.safetensors")
+
+
+def attach_requant(model: FastQwen35, file: str) -> int:
+    """Decode streams NVFP4 re-quantizations (tools/requant_nvfp4.py, from the BF16 originals) of the FP8 attention /
+    GDN projections: 7.2 GB -> 4.1 GB per token, WikiText perplexity +0.13% (6.9789 vs 6.9698). Prefill keeps the
+    FP8 weights (W8A8 GEMM). Stacked projections share a global scale in the file, so they stay one launch.
+    Call after to_fast (the stacking) and before capturing graphs. Returns the number of linears attached."""
+    from engine.weights.loader import PREFIX
+    n = 0
+    with safe_open(file, framework="pt", device=str(model.embed_tokens.weight.device)) as f:
+        def nv(names):
+            ws = [f.get_tensor(PREFIX + m + ".weight") for m in names]
+            sfs = [f.get_tensor(PREFIX + m + ".weight_scale") for m in names]
+            gs = {float(f.get_tensor(PREFIX + m + ".weight_scale_2")) for m in names}
+            assert len(gs) == 1, names
+            return Nvfp4Linear(torch.cat(ws).contiguous(), torch.cat(sfs).contiguous(), gs.pop())
+        for i, layer in enumerate(model.layers):
+            p = f"layers.{i}."
+            if layer.block_type == "full_attention":
+                a = layer.self_attn
+                a.qkv.dec = nv([p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"])
+                a.o_proj.dec = nv([p + "self_attn.o_proj"])
+                n += 4
+            else:
+                g = layer.linear_attn
+                g.qkvz.dec = nv([p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"])
+                g.out_proj.dec = nv([p + "linear_attn.out_proj"])
+                n += 3
+    return n
 
 
 class DecodeGraph:

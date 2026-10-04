@@ -61,7 +61,7 @@ class Worker(threading.Thread):
     def _build(self):
         a, t0 = self.args, time.perf_counter()
         from engine.kernels import ops
-        from engine.model.fast import load_fast_model, set_linear_kernel, to_fast
+        from engine.model.fast import attach_requant, load_fast_model, requant_path, set_linear_kernel, to_fast
         # speculation verifies many rows per weight pass: tensor-core skinny GEMM; plain decode (1-3 rows): GEMV
         set_linear_kernel("skinny" if a.spec == "mtp" else "gemv")
         from engine.runtime.scheduler import Scheduler
@@ -70,6 +70,12 @@ class Worker(threading.Thread):
         t1 = time.perf_counter()
         path = resolve(a.model)
         model = to_fast(load_fast_model(path), kv_fp8=True)
+        rq = requant_path(path)
+        if a.decode_weights == "requant":
+            if os.path.exists(rq):
+                log(f"[engine] decode streams NVFP4 re-quantized attention / GDN projections: {attach_requant(model, rq)} linears ({rq})")
+            else:
+                log(f"[engine] no re-quantized weights at {rq} (run tools/requant_nvfp4.py): decoding the checkpoint's FP8 projections")
         mtp = None
         if a.spec == "mtp":
             from engine.spec.mtp import Mtp
@@ -555,6 +561,9 @@ def main(argv=None):
     ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
     ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP drafts among this many frequent tokens (+ prompt tokens); 0 = full")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
+    ap.add_argument("--decode-weights", choices=("requant", "checkpoint"), default="requant",
+                    help="requant: decode the attention / GDN projections from NVFP4 re-quantizations (tools/requant_nvfp4.py; "
+                         "+0.13%% perplexity, ~18%% faster decode) when the file exists; checkpoint: their FP8 originals")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto", help="default enable_thinking (auto: the template's default, on)")

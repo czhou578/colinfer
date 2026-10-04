@@ -46,6 +46,8 @@ def main():
     ap.add_argument("--engine", choices=["reference", "prefill"], default="reference",
                     help="reference: Phase 1 PyTorch model; prefill: Phase 3 W4A4 / W8A8 kernel prefill path")
     ap.add_argument("--kv-fp8", action="store_true", help="prefill engine: fp8 KV cache")
+    ap.add_argument("--override", help="reference engine: safetensors of NVFP4 weights replacing the checkpoint's "
+                                       "(tools/requant_nvfp4.py output; 'requant' = its default path)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -63,6 +65,24 @@ def main():
         model = to_fast(load_fast_model(path), kv_fp8=args.kv_fp8)
     else:
         model = load_model(path, emulate=args.emulate)
+        if args.override:
+            from safetensors import safe_open
+
+            from engine.weights.loader import PREFIX, dequant_nvfp4
+            ov = args.override
+            if ov == "requant":
+                sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+                from requant_nvfp4 import default_out
+                ov = default_out(path)
+            n = 0
+            with safe_open(ov, "pt", device="cuda") as f:
+                for k in f.keys():
+                    if k.endswith(".weight"):
+                        base = k[: -len(".weight")]
+                        w = dequant_nvfp4(f.get_tensor(k), f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2"))
+                        model.get_submodule(base[len(PREFIX):]).weight.data.copy_(w)
+                        n += 1
+            print(f"[ppl] override: {n} linears from {ov}")
     nll, count = 0.0, 0
     t0 = time.time()
     for w in range(n_win):
@@ -79,7 +99,8 @@ def main():
         if (w + 1) % 8 == 0 or w == n_win - 1:
             print(f"[ppl] {w + 1}/{n_win} windows  running ppl {math.exp(nll / count):.4f}  ({time.time() - t0:.0f}s)")
     ppl = math.exp(nll / count)
-    print(f"[ppl] RESULT ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} kv_fp8={args.kv_fp8} ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
+    print(f"[ppl] RESULT ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} kv_fp8={args.kv_fp8} "
+          f"ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
     if args.json:
         json.dump(dict(ckpt=args.ckpt, emulate=args.emulate, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)
 
