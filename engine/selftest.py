@@ -1,0 +1,101 @@
+"""Startup self-test of every matmul path (PLAN.md 4.7, Phase 3 week 8).
+
+A CUTLASS FP4 kernel compiled for the wrong ISA has produced wrong answers on sm_121 with no CUDA error,
+and library upgrades can silently change dispatch. Before serving, each path runs a small random problem
+against an fp32 reference built from independently dequantized operands; any mismatch aborts startup.
+Takes well under a second.
+"""
+from __future__ import annotations
+
+import time
+
+import torch
+
+from engine.kernels import ops
+from engine.weights.loader import dequant_nvfp4
+from engine.weights.quant_emul import fake_quant_nvfp4_unscaled
+
+TOL = 5e-3
+
+
+def _rel(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
+
+
+def run_selftest(verbose: bool = False) -> dict:
+    o = ops()
+    g = torch.Generator(device="cuda").manual_seed(1234)
+    dev = "cuda"
+    res = {}
+    t0 = time.perf_counter()
+
+    def rand_nvfp4(N, K):
+        w = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=dev, generator=g)
+        sf = (torch.rand(N, K // 16, device=dev, generator=g) * 2 + 0.25).to(torch.float8_e4m3fn)
+        return w, sf
+
+    # NVFP4 GEMV (decode), M = 1..4, bf16 and fp32 outputs, residual
+    w, sf = rand_nvfp4(512, 1024)
+    for M in (1, 4):
+        x = torch.randn(M, 1024, device=dev, generator=g).bfloat16()
+        ref = x.float() @ dequant_nvfp4(w, sf, torch.tensor(0.3), torch.float32).T
+        out = torch.empty(M, 512, device=dev)
+        o.nvfp4_gemv(x, w, sf, 0.3, None, out)
+        res[f"nvfp4_gemv_m{M}"] = _rel(out, ref)
+    # fused SwiGLU GEMV
+    w2, sf2 = rand_nvfp4(512, 1024)
+    x = torch.randn(2, 1024, device=dev, generator=g).bfloat16()
+    gref = x.float() @ dequant_nvfp4(w, sf, torch.tensor(0.3), torch.float32).T
+    uref = x.float() @ dequant_nvfp4(w2, sf2, torch.tensor(0.2), torch.float32).T
+    out = torch.empty(2, 512, device=dev, dtype=torch.bfloat16)
+    o.nvfp4_swiglu(x, w, sf, 0.3, w2, sf2, 0.2, out)
+    res["nvfp4_swiglu"] = _rel(out, torch.nn.functional.silu(gref) * uref)
+    # FP8 GEMV with per-row scales, BF16 GEMV
+    w8 = (torch.randn(384, 1024, device=dev, generator=g) * 30).to(torch.float8_e4m3fn)
+    rs = torch.rand(384, device=dev, generator=g) * 0.01 + 0.001
+    out = torch.empty(3, 384, device=dev, dtype=torch.bfloat16)
+    x3 = torch.randn(3, 1024, device=dev, generator=g).bfloat16()
+    o.fp8_gemv(x3, w8, 1.0, None, out, rs)
+    res["fp8_gemv_rowscale"] = _rel(out, x3.float() @ (w8.float() * rs[:, None]).T)
+    wb = torch.randn(96, 1024, device=dev, generator=g).bfloat16()
+    out = torch.empty(3, 96, device=dev, dtype=torch.bfloat16)
+    o.bf16_gemv(x3, wb, out)
+    res["bf16_gemv"] = _rel(out, x3.float() @ wb.float().T)
+    # NVFP4 x NVFP4 CUTLASS GEMM (prefill), both tiles, with residual
+    M, N, K = 384, 256, 1024
+    xa = torch.randn(M, K, device=dev, generator=g).bfloat16()
+    s_in = float(xa.float().abs().max()) / (6 * 448)
+    a = torch.empty(M, K // 2, dtype=torch.uint8, device=dev)
+    sfa = torch.empty(o.nvfp4_sf_size(M, K), dtype=torch.uint8, device=dev)
+    o.nvfp4_quant(xa, s_in, a, sfa)
+    wq, wsf = rand_nvfp4(N, K)
+    sfb = torch.empty(o.nvfp4_sf_size(N, K), dtype=torch.uint8, device=dev)
+    o.nvfp4_swizzle_sf(wsf.view(torch.uint8), sfb, K)
+    resid = torch.randn(M, N, device=dev, generator=g).bfloat16()
+    ref = (fake_quant_nvfp4_unscaled(xa, s_in).float() * s_in) @ dequant_nvfp4(wq, wsf, torch.tensor(0.01), torch.float32).T + resid.float()
+    for tile in (0, 1):
+        out = torch.empty(M, N, device=dev, dtype=torch.bfloat16)
+        o.nvfp4_gemm(a, sfa, wq, sfb, s_in * 0.01, resid, out, tile)
+        res[f"nvfp4_gemm_tile{tile}"] = _rel(out, ref)
+    # FP8 W8A8 cuBLASLt (prefill), row-wise scales
+    x8 = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=dev)
+    o.fp8_quant(xa, 0.02, x8)
+    out = torch._scaled_mm(x8, w8.t(), scale_a=torch.full((M, 1), 0.02, device=dev),
+                           scale_b=rs.view(1, -1), out_dtype=torch.bfloat16)
+    res["fp8_scaled_mm"] = _rel(out, (x8.float() * 0.02) @ (w8.float() * rs[:, None]).T)
+    # decode attention (FP8 KV)
+    q = torch.randn(1, 24, 1, 256, device=dev, generator=g).bfloat16()
+    kc = torch.randn(1, 4, 600, 256, device=dev, generator=g).to(torch.float8_e4m3fn)
+    vc = torch.randn(1, 4, 600, 256, device=dev, generator=g).to(torch.float8_e4m3fn)
+    out = torch.empty_like(q)
+    o.attn_decode(q, kc, vc, torch.tensor([600], dtype=torch.int32, device=dev), out, 8, 256 ** -0.5)
+    ref = torch.nn.functional.scaled_dot_product_attention(q.float(), kc.float(), vc.float(), enable_gqa=True)
+    res["attn_decode_fp8kv"] = _rel(out, ref)
+    torch.cuda.synchronize()
+    bad = {k: v for k, v in res.items() if not v < TOL}
+    if verbose:
+        print(f"[selftest] {len(res)} paths in {(time.perf_counter() - t0) * 1e3:.0f} ms: " +
+              ", ".join(f"{k} {v:.1e}" for k, v in res.items()))
+    if bad:
+        raise RuntimeError(f"kernel self-test failed (relative error >= {TOL}): {bad}")
+    return res

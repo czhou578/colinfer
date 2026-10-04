@@ -68,3 +68,9 @@ def test_gemm_matches_reference(M, N, K, tile):
     ref = (fake_quant_nvfp4_unscaled(x, s_in).float() * s_in) @ dequant_nvfp4(w, wsf, torch.tensor(w_scale), torch.float32).T + res.float()
     rel = ((out.float() - ref).norm() / ref.norm()).item()
     assert rel < 5e-3, rel
+
+
+def test_startup_selftest_passes():
+    from engine.selftest import run_selftest
+    res = run_selftest()
+    assert len(res) >= 9 and all(v < 5e-3 for v in res.values())

@@ -61,6 +61,12 @@ a Phase 6 candidate.
   prefill plus a sampled request; a 7,980-token second chat turn reuses 7,958 tokens: **TTFT 0.115 s vs
   2.70 s from scratch**, identical output.
 
+## Startup self-test (engine/selftest.py)
+
+Every matmul path (NVFP4 GEMV and SwiGLU GEMV, FP8 row-scaled GEMV, BF16 GEMV, CUTLASS NVFP4 GEMM both
+tiles, cuBLASLt FP8, FP8-KV decode attention) runs a small random problem against an fp32 reference at
+engine start (~0.6 s) and the engine refuses to start on a mismatch: the sm_121 silent-wrong-answer guard.
+
 ## Remaining for Phase 3
 
 - The frozen 3,500 tok/s target: candidates are a CUTLASS epilogue producing SiLU*up NVFP4 directly

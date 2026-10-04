@@ -67,7 +67,10 @@ class Slot:
 
 
 class Engine:
-    def __init__(self, model: FastQwen35, n_slots: int = 3, max_seq_len: int = 32768, n_checkpoints: int = 32):
+    def __init__(self, model: FastQwen35, n_slots: int = 3, max_seq_len: int = 32768, n_checkpoints: int = 32, selftest: bool = True):
+        if selftest:
+            from engine.selftest import run_selftest
+            run_selftest(verbose=True)  # refuses to start if any matmul path is numerically wrong
         self.model = model
         prepare_prefill(model)
         self.state = model.new_state(n_slots, max_seq_len)
