@@ -1,4 +1,4 @@
-// gemv.cu -- weight-streaming GEMV for decode (PLAN.md 4.3 item 2), W4A16 / W8A16, M <= 4.
+// gemv.cu -- weight-streaming GEMV for decode (PLAN.md 4.3 item 2), W4A16 / W8A16, M <= 8.
 //
 //   out[m, n] = sum_k x[m, k] * W[n, k]  (+ residual[m, n])
 //

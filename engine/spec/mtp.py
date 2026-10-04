@@ -6,8 +6,10 @@ h_i) where h_i is the target's post-final-norm hidden state at position i, and p
     x = fc([pre_fc_norm_embedding(embed(x_{i+1})), pre_fc_norm_hidden(h_i)]) -> decoder layer -> mtp.norm
     -> shared lm_head.  Chained steps feed the MTP's own normed output as the next hidden.
 
-MtpCycle captures one CUDA graph per decode cycle (k = 3):
-  1. verify [y, d1..dk] on the target (hidden states kept), greedy acceptance, commit n tokens;
+MtpCycle captures one CUDA graph per decode cycle for B slots (k drafts each):
+  1. verify [y, d1..dk] of every slot on the target (hidden states kept); acceptance (greedy, or speculative
+     sampling for slots with temperature > 0); the accepted length is cut after the first accepted stop token
+     so the state never runs past the end of a reply; commit n[b] tokens per slot (0 for inactive slots);
   2. MTP catch-up: rows for the n newly committed positions with the true target hidden states (rows past
      n are padding, overwritten later); the last valid row yields the next d1;
   3. k-1 chained MTP steps yield d2..dk; the next cycle's input [y', d1'..dk'] is written in place.
@@ -23,11 +25,9 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import DecodeGraph, FastQwen35, FastState, KernelAttention, KernelRMSNorm, fast_layer_forward
+from engine.model.fast import MAX_M, DecodeGraph, FastQwen35, FastState, KernelAttention, KernelRMSNorm, fast_layer_forward
 from engine.model.prefill import prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm
-
-MAX_M = 4
 
 
 class Bf16Linear(nn.Module):
@@ -72,17 +72,23 @@ class Bf16MLP(nn.Module):
 
 
 class MtpState(FastState):
-    """KV cache of the single MTP attention layer (index 0) plus its own device position."""
+    """KV cache of the single MTP attention layer (index 0) for `batch` slots plus their device positions.
+    active: share the target state's mask so a graph step never writes the MTP cache of an inactive slot."""
 
-    def __init__(self, cfg, max_seq_len, device):
+    def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None):
         self.cfg, self.max_seq_len, self.kv_fp8, self.pos = cfg, max_seq_len, False, 0
         self.conv, self.rec = {}, {}
-        self.k = {0: torch.zeros(1, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=torch.bfloat16)}
+        self.k = {0: torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=torch.bfloat16)}
         self.v = {0: torch.zeros_like(self.k[0])}
-        self.pos_t = torch.zeros(1, dtype=torch.int32, device=device)
-        self.active = torch.ones(1, dtype=torch.int32, device=device)
+        self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
+        self.active = active if active is not None else torch.ones(batch, dtype=torch.int32, device=device)
         self.arange = torch.arange(16, device=device)
 
+    def slot(self, b: int) -> FastState:
+        """Single-slot view with its own all-ones mask, for eager (non-graph) MTP work on one slot."""
+        v = self.view(b, b + 1)
+        v.active = torch.ones(1, dtype=torch.int32, device=self.pos_t.device)
+        return v
 
 class Mtp(nn.Module):
     """fp8: MTP linears stream FP8 (per-row scales) instead of BF16 when drafting.
@@ -165,7 +171,7 @@ class Mtp(nn.Module):
         return KernelRMSNorm(n)
 
     def forward(self, tokens: torch.Tensor, hidden: torch.Tensor, st: MtpState):
-        """tokens [1, T], hidden [1, T, H] at positions st.pos_t + t (T <= 16): MTP output (normed) [1, T, H]."""
+        """tokens [B, T], hidden [B, T, H] at positions st.pos_t + t (B * T <= 16): MTP output (normed) [B, T, H]."""
         x = self.fc(torch.cat([self.pre_e(self.embed(tokens)), self.pre_h(hidden)], -1))
         return self.norm(self.layer(x, None, None, st))
 
@@ -194,16 +200,38 @@ class Mtp(nn.Module):
             st.pos_t += T
         return g
 
+    @torch.inference_mode()
+    def first_drafts(self, tokens: torch.Tensor, hidden: torch.Tensor, st: FastState, k: int) -> list[int]:
+        """MTP rows for (tokens[i], hidden[i]) from position st.pos_t (eager, one slot), then k-1 chained steps:
+        the k drafts that follow the last token. st: a single-slot view with an all-ones mask (MtpState.slot)."""
+        g = self.prefill(tokens, hidden, st)
+        d = [self.draft(g).view(1, 1)]
+        gp = g.view(1, 1, -1)
+        for _ in range(k - 1):
+            gp = self(d[-1], gp, st)
+            d.append(self.draft(gp).view(1, 1))
+            st.pos_t += 1
+        return torch.cat(d, 1)[0].tolist()
+
 
 class MtpCycle:
-    """CUDA graph of one speculative cycle with the MTP drafter (single slot, k drafts)."""
+    """CUDA graph of one speculative cycle with the MTP drafter for B slots (k drafts each).
 
-    def __init__(self, model: FastQwen35, mtp: Mtp, state: FastState, mst: MtpState, k: int = 3, params=None):
-        """params: SamplerParams (1 slot) -> sampled cycle (rejection sampling, engine/spec/accept.py);
-        None -> greedy cycle."""
+    tok [B, k+1] (the next cycle's input [y, d1..dk] per slot), stop_ids [B, S] (int64, -1 = unused) and
+    params may be views into buffers shared by the graphs of every batch width, so a slot keeps its pending
+    input when the width changes. params: SamplerParams -> sampled cycle (speculative sampling for slots with
+    temperature > 0, greedy for the rest; engine/spec/accept.py); None -> greedy cycle.
+    After replay: out_tok [B, k+1] (first n[b] valid), n [B] int32, logits [B, k+1, V] fp32 (verify rows,
+    raw), H [B, k+1, hidden] (target post-norm hidden of the verify rows)."""
+
+    def __init__(self, model: FastQwen35, mtp: Mtp, state: FastState, mst: MtpState, k: int = 3, params=None,
+                 tok: torch.Tensor | None = None, stop_ids: torch.Tensor | None = None):
         self.model, self.mtp, self.state, self.mst, self.k, self.params = model, mtp, state, mst, k, params
         dev = state.pos_t.device
-        self.tok = torch.zeros(1, k + 1, dtype=torch.long, device=dev)  # [y, d1..dk]; rewritten by each replay
+        B = state.pos_t.shape[0]
+        self.tok = tok if tok is not None else torch.zeros(B, k + 1, dtype=torch.long, device=dev)
+        self.stop_ids = stop_ids if stop_ids is not None else torch.full((B, 1), -1, dtype=torch.long, device=dev)
+        assert self.tok.shape == (B, k + 1) and self.stop_ids.shape[0] == B
         self.idx = torch.arange(k + 1, device=dev)
         state.reset()
         s = torch.cuda.Stream()
@@ -214,61 +242,78 @@ class MtpCycle:
         torch.cuda.current_stream().wait_stream(s)
         self.graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(self.graph):
-            self.out_tok, self.n = self._body()
+            self.out_tok, self.n, self.logits, self.H = self._body()
         state.reset()
+        mst.pos_t.zero_()
+        if params is not None:
+            params.offset.zero_()
 
     def _body(self):
-        k, m, mtp = self.k, self.model, self.mtp
+        k, m, mtp, st = self.k, self.model, self.mtp, self.state
         tok = self.tok
-        logits, H = m.verify(tok, self.state, return_hidden=True)   # [1, k+1, V], [1, k+1, H]
-        if self.params is None:                                      # greedy: argmax must match the next draft
-            pred = logits.argmax(-1)                                 # [1, k+1]
-            match = (pred[:, :k] == tok[:, 1:]).int()
-            n = (1 + match.cumprod(-1).sum(-1)).int()                # [1] accepted inputs, 1..k+1
-            bonus = pred.gather(1, (n.long() - 1)[:, None])          # [1, 1]
-        else:                                                        # sampled: distribution-preserving acceptance
+        B = tok.shape[0]
+        logits, H = m.verify(tok, st, return_hidden=True)            # [B, k+1, V], [B, k+1, H]
+        pred = logits.argmax(-1)                                     # [B, k+1]
+        match = (pred[:, :k] == tok[:, 1:]).int()
+        n = (1 + match.cumprod(-1).sum(-1)).int()                    # [B] accepted inputs, 1..k+1
+        bonus = pred.gather(1, (n.long() - 1)[:, None])[:, 0]        # [B]
+        if self.params is not None:                                  # distribution-preserving acceptance per sampled slot
             from engine.spec.accept import accept_sample, processed_probs
             pp = self.params
-            P = processed_probs(logits[0], pp.temperature, pp.top_k, pp.top_p, pp.log_min_p)
-            u = torch.rand(k, device=tok.device)
-            n, nxt = accept_sample(P, tok[0, 1:], u, pp.seed, pp.offset)
+            u = torch.empty(B, k, device=tok.device)
+            ops().philox_uniform(pp.seed, pp.offset, u)              # seeded per slot: reproducible, independent of other slots
+            ns, xs = [], []
+            for b in range(B):
+                P = processed_probs(logits[b], pp.temperature[b:b + 1], pp.top_k[b:b + 1], pp.top_p[b:b + 1], pp.log_min_p[b:b + 1])
+                nb, xb = accept_sample(P, tok[b, 1:], u[b], pp.seed[b:b + 1], pp.offset[b:b + 1])
+                ns.append(nb)
+                xs.append(xb)
             pp.offset += 1 << 20
-            bonus = nxt.view(1, 1)
-        p0 = self.state.pos_t.clone()
-        m.commit(self.state, n)
+            hot = pp.temperature > 0
+            n = torch.where(hot, torch.cat(ns), n)
+            bonus = torch.where(hot, torch.cat(xs), bonus)
+        # cut after the first accepted stop token: drafts d1..dk are out positions 0..k-1, accepted while < n-1
+        d = tok[:, 1:]
+        hit = (d[:, :, None] == self.stop_ids[:, None, :]).any(-1) & (self.idx[None, :k] < (n - 1)[:, None])
+        first = hit.int().argmax(-1)
+        has = hit.any(-1)
+        n = torch.where(has, (first + 1).int(), n) * st.active
+        bonus = torch.where(has, d.gather(1, first[:, None])[:, 0], bonus)
+        p0 = st.pos_t.clone()
+        m.commit(st, n)
         nl = n.long()
-        out_tok = torch.cat([tok[:, 1:], bonus], 1)                  # accepted drafts are tok[1..n-1]; the bonus is out_tok[n-1]
-        out_tok = torch.where(self.idx[None] == nl[:, None] - 1, bonus, out_tok)
+        out_tok = torch.cat([d, bonus[:, None]], 1)                  # accepted drafts are d[:n-1]; the bonus is out_tok[n-1]
+        out_tok = torch.where(self.idx[None] == nl[:, None] - 1, bonus[:, None], out_tok)
         # MTP catch-up: rows at positions p0 .. p0+k with tokens x_{i+1} (= out_tok[i] for i < n) and true hidden H[i]
         self.mst.pos_t.copy_(p0)
-        g = mtp(out_tok, H, self.mst)                                # [1, k+1, H]
-        g1 = g.gather(1, (nl - 1)[:, None, None].expand(1, 1, g.shape[-1]))
-        d = [mtp.draft(g1)]                                           # [1, 1]
-        gp = g1
+        g = mtp(out_tok, H, self.mst)                                # [B, k+1, H]
+        last = (nl - 1).clamp_min(0)
+        gp = g.gather(1, last[:, None, None].expand(B, 1, g.shape[-1]))
+        dr = [mtp.draft(gp)]                                         # [B, 1]
         self.mst.pos_t.copy_(p0 + n)
         for _ in range(k - 1):
-            gp = mtp(d[-1], gp, self.mst)
-            d.append(mtp.draft(gp))
+            gp = mtp(dr[-1], gp, self.mst)
+            dr.append(mtp.draft(gp))
             self.mst.pos_t += 1
-        nxt = torch.cat([bonus] + d, 1)                              # [1, k+1] = [y', d1'..dk']
-        self.tok.copy_(nxt)
-        return out_tok, n
+        nxt = torch.cat([bonus[:, None]] + dr, 1)                    # [B, k+1] = [y', d1'..dk']
+        self.tok.copy_(torch.where(st.active[:, None] > 0, nxt, tok))
+        return out_tok, n, logits, H
 
 
 class MtpGenerator:
-    """Greedy generation with MTP speculation for one slot; output identical to plain greedy decode."""
+    """Generation with MTP speculation for one slot; greedy output identical to plain greedy decode."""
 
     def __init__(self, model: FastQwen35, path: str, max_seq_len: int = 32768, k: int = 3, fp8: bool = True, draft_vocab: int | None = 65536):
         prepare_prefill(model)
         self.model, self.k = model, k
         self.mtp = Mtp(model, path, fp8=fp8, draft_vocab=draft_vocab)
         self.state = model.new_state(1, max_seq_len)
-        self.mst = MtpState(model.cfg, max_seq_len, "cuda")
+        self.mst = MtpState(model.cfg, max_seq_len, "cuda", active=self.state.active)
         from engine.runtime.sampler import SamplerParams
         self.plain = DecodeGraph(model, self.state)
         self.params = SamplerParams(1, model.cfg.vocab_size, "cuda")
         self.cycle = MtpCycle(model, self.mtp, self.state, self.mst, k)
-        self.cycle_s = MtpCycle(model, self.mtp, self.state, self.mst, k, params=self.params)
+        self.cycle_s = MtpCycle(model, self.mtp, self.state, self.mst, k, params=self.params, tok=self.cycle.tok)
         self.stats = dict(steps=0, spec_steps=0, tokens=0, drafted=0, accepted=0)
 
     @torch.inference_mode()
@@ -293,14 +338,7 @@ class MtpGenerator:
             return out
         # MTP over the prompt: rows (x_{i+1}, h_i), i = 0..T-1, with x_T = y; the last row drafts d1
         toks = torch.tensor(list(input_ids[1:]) + [y], device="cuda")
-        g = self.mtp.prefill(toks, H, mst)
-        d = [self.mtp.draft(g).view(1, 1)]
-        gp = g.view(1, 1, -1)
-        for _ in range(k - 1):
-            gp = self.mtp(d[-1], gp, mst)
-            d.append(self.mtp.draft(gp).view(1, 1))
-            mst.pos_t += 1
-        cyc.tok.copy_(torch.cat([torch.tensor([[y]], device="cuda")] + d, 1))
+        cyc.tok.copy_(torch.tensor([[y] + self.mtp.first_drafts(toks, H, mst, k)], device="cuda"))
         while len(out) < max_new_tokens and y not in eos:
             cyc.graph.replay()
             n = int(cyc.n)

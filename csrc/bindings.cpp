@@ -161,7 +161,7 @@ void rmsnorm(torch::Tensor x, torch::Tensor w, double eps, torch::Tensor out) {
     CHECK_LAUNCH(launch_rmsnorm(x.data_ptr(), w.data_ptr(), out.data_ptr(), x.size(0), x.size(1), (float)eps, at::cuda::getCurrentCUDAStream()));
 }
 
-// out = x @ W^T with bf16 W [N, K]; M <= 4.
+// out = x @ W^T with bf16 W [N, K]; M <= 8.
 void bf16_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
     CHECK_CUDA_TENSOR(w, torch::kBFloat16);
     check_x_out(x, out, w.size(0));
@@ -331,7 +331,20 @@ void gdn_delta_multi(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch:
                                         at::cuda::getCurrentCUDAStream()));
 }
 
+cudaError_t launch_philox_uniform(const int64_t*, const int64_t*, float*, int, int, cudaStream_t);
+
+// out fp32 [B, n] = per-slot seeded uniforms in [0, 1) at counters offset[b] + i (seed, offset: int64 [B], device).
+void philox_uniform(torch::Tensor seed, torch::Tensor offset, torch::Tensor out) {
+    CHECK_CUDA_TENSOR(seed, torch::kInt64);
+    CHECK_CUDA_TENSOR(offset, torch::kInt64);
+    CHECK_CUDA_TENSOR(out, torch::kFloat32);
+    TORCH_CHECK(out.dim() == 2 && seed.numel() == out.size(0) && offset.numel() == out.size(0), "out [B, n], seed / offset [B]");
+    CHECK_LAUNCH(launch_philox_uniform(seed.data_ptr<int64_t>(), offset.data_ptr<int64_t>(), out.data_ptr<float>(), out.size(0), out.size(1),
+                                       at::cuda::getCurrentCUDAStream()));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (speculative sampling)");
     m.def("gdn_conv_multi", &gdn_conv_multi, "spec verify: GDN conv over T tokens, state read-only");
     m.def("gdn_conv_commit", &gdn_conv_commit, "spec commit: advance the GDN conv state by n tokens");
     m.def("gdn_delta_multi", &gdn_delta_multi, "spec verify / commit: GDN delta rule over T tokens", py::arg("qkv"), py::arg("z"), py::arg("b"),
@@ -351,7 +364,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm", &nvfp4_gemm, "CUTLASS SM120 NVFP4 x NVFP4 GEMM, bf16 out", py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
           py::arg("alpha"), py::arg("residual"), py::arg("out"), py::arg("tile") = 0);
     m.def("rmsnorm", &rmsnorm, "zero-centered RMSNorm (1 + w)");
-    m.def("bf16_gemv", &bf16_gemv, "bf16-weight GEMV, M<=4");
+    m.def("bf16_gemv", &bf16_gemv, "bf16-weight GEMV, M<=8");
     m.def("gdn_conv", &gdn_conv, "GDN decode: causal conv step + SiLU", py::arg("mixed"), py::arg("conv_state"), py::arg("w"), py::arg("out"),
           py::arg("active") = py::none());
     m.def("gdn_delta", &gdn_delta, "GDN decode: gated delta rule + gated RMSNorm", py::arg("qkv"), py::arg("z"), py::arg("b"), py::arg("a"),
@@ -362,9 +375,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + KV write", py::arg("qp"), py::arg("kp"), py::arg("vp"),
           py::arg("qn_w"), py::arg("kn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("k_cache"), py::arg("v_cache"), py::arg("q_out"),
           py::arg("eps"), py::arg("active") = py::none());
-    m.def("nvfp4_gemv", &nvfp4_gemv, "NVFP4 W4A16 GEMV, M<=4", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gscale"),
+    m.def("nvfp4_gemv", &nvfp4_gemv, "NVFP4 W4A16 GEMV, M<=8", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gscale"),
           py::arg("residual"), py::arg("out"));
-    m.def("nvfp4_swiglu", &nvfp4_swiglu, "fused silu(gate)*up NVFP4 GEMV, M<=4");
-    m.def("fp8_gemv", &fp8_gemv, "FP8 per-tensor (or per-row) W8A16 GEMV, M<=4", py::arg("x"), py::arg("w"), py::arg("scale"),
+    m.def("nvfp4_swiglu", &nvfp4_swiglu, "fused silu(gate)*up NVFP4 GEMV, M<=8");
+    m.def("fp8_gemv", &fp8_gemv, "FP8 per-tensor (or per-row) W8A16 GEMV, M<=8", py::arg("x"), py::arg("w"), py::arg("scale"),
           py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
 }

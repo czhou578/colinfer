@@ -1,0 +1,25 @@
+# systemd user unit for the OpenAI-compatible server (PLAN.md Phase 5).
+#   systemctl --user link ~/Projects/colin-inference-engine/deploy/colinfer.service
+#   systemctl --user enable --now colinfer        # start now and at login
+#   loginctl enable-linger $USER                  # optional: start at boot without a login session
+#   journalctl --user -u colinfer -f              # logs (one line per finished request)
+# The engine holds ~57 GB of the 121 GB unified memory (weights 21 GB, KV 3 x 262k tokens 26 GB, checkpoint ring
+# 5 GB, drafter KV 3 GB) for as long as it runs; stop it before using the GPU for anything else.
+[Unit]
+Description=colin-inference-engine: Qwen3.8-27B NVFP4, OpenAI API on 127.0.0.1:8000
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/colin-inference-engine
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/Projects/colin-inference-engine/.venv/bin/python -m engine.server --host 127.0.0.1 --port 8000 --mem-cap-gb 80
+# any engine failure (CUDA error, OOM against the cap) exits the process; come back in a few seconds
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

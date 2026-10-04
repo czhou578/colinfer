@@ -4,8 +4,8 @@ Weights stay quantized on the GPU (~22 GB). Everything that is not a quantized l
 GDN conv / delta rule, attention, rotary) is still the Phase 1 PyTorch code and is replaced
 kernel by kernel in later steps.
 
-Linears take any number of rows and issue the GEMV in chunks of 4, so prefill works (slowly:
-every 4 prompt tokens stream all weights once) until Phase 3 brings a real prefill path.
+Linears take any number of rows and issue the GEMV in chunks of MAX_M, so prefill works (slowly:
+every MAX_M prompt tokens stream all weights once) until Phase 3 brings a real prefill path.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from engine.kernels import ops
 from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
 from engine.weights.loader import PREFIX, SCALE_SUFFIXES, SKIP_PREFIXES, resolve
 
-MAX_M = 4
+MAX_M = 8  # rows per GEMV launch (csrc/gemv.cu takes M <= 8; rows are bit-identical for every M)
 
 
 class Nvfp4Linear(nn.Module):

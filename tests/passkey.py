@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from transformers import AutoTokenizer  # noqa: E402
 
 from engine.model.fast import load_fast_model, to_fast  # noqa: E402
-from engine.runtime.engine import Engine, Request  # noqa: E402
+from engine.runtime.scheduler import Request, Scheduler  # noqa: E402
 from engine.weights.loader import resolve  # noqa: E402
 
 FILLER = ("The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. ")
@@ -46,7 +46,7 @@ def main():
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
-    eng = Engine(to_fast(load_fast_model(path), kv_fp8=a.kv_fp8), n_slots=1, max_seq_len=max(a.lens) + 64, n_checkpoints=0)
+    eng = Scheduler(to_fast(load_fast_model(path), kv_fp8=a.kv_fp8), n_slots=1, max_seq_len=max(a.lens) + 64, n_checkpoints=0)
     rng = random.Random(0)
     hits = 0
     print(f"KV {'fp8' if a.kv_fp8 else 'bf16'}")
