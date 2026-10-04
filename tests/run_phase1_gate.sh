@@ -3,6 +3,7 @@
 # perplexity per checkpoint. Sequential: each step owns the GPU. Logs in tests/parity_out/logs/.
 set -u
 cd "$(dirname "$0")/.."
+export PYTHONUNBUFFERED=1
 O=tests/parity_out; L=$O/logs
 step() { local name=$1; shift; echo "=== $(date '+%H:%M:%S') START $name"; "$@" > "$L/$name.log" 2>&1; local rc=$?; echo "=== $(date '+%H:%M:%S') END $name rc=$rc"; tail -n 3 "$L/$name.log" | sed 's/^/    /'; }
 PY="uv run --no-sync python"
@@ -15,4 +16,8 @@ step cmp_nvfp4   $PY tests/parity_vllm.py $O/vllm_nvfp4.json $O/ours_nvfp4.pt
 step ppl_bf16    $PY tests/perplexity.py --ckpt Qwen/Qwen3.8-27B --json $O/ppl_bf16.json
 step ppl_fp8     $PY tests/perplexity.py --ckpt Qwen/Qwen3.8-27B-FP8 --json $O/ppl_fp8.json
 step ppl_nvfp4   $PY tests/perplexity.py --ckpt nvidia/Qwen3.8-27B-NVFP4 --json $O/ppl_nvfp4.json
+# W4A4 emulation (engine/weights/quant_emul.py): the reference for any quantized kernel path
+step ppl_nvfp4_w4a4  $PY tests/perplexity.py --ckpt nvidia/Qwen3.8-27B-NVFP4 --emulate all --json $O/ppl_nvfp4_w4a4.json
+step ours_nvfp4_w4a4 $PY tests/parity_hf.py ours --ckpt nvidia/Qwen3.8-27B-NVFP4 --emulate all --out $O/ours_nvfp4_w4a4.pt
+step cmp_nvfp4_w4a4  $PY tests/parity_vllm.py $O/vllm_nvfp4.json $O/ours_nvfp4_w4a4.pt
 echo "PHASE 1 GATE DONE"

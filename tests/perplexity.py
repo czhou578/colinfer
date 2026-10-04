@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--max-tokens", type=int, default=65536)
     ap.add_argument("--json")
+    ap.add_argument("--emulate", help="quant emulation effects: act_nvfp4,act_fp8,fp8_requant or all")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -53,7 +54,7 @@ def main():
     n_win = min(args.max_tokens, n_total) // args.ctx
     print(f"[ppl] {args.ckpt}: WikiText test {n_total} tokens; scoring {n_win} windows x {args.ctx}")
 
-    model = load_model(path)
+    model = load_model(path, emulate=args.emulate)
     nll, count = 0.0, 0
     t0 = time.time()
     for w in range(n_win):
@@ -67,9 +68,9 @@ def main():
         if (w + 1) % 8 == 0 or w == n_win - 1:
             print(f"[ppl] {w + 1}/{n_win} windows  running ppl {math.exp(nll / count):.4f}  ({time.time() - t0:.0f}s)")
     ppl = math.exp(nll / count)
-    print(f"[ppl] RESULT ckpt={args.ckpt} ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
+    print(f"[ppl] RESULT ckpt={args.ckpt} emulate={args.emulate} ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
     if args.json:
-        json.dump(dict(ckpt=args.ckpt, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)
+        json.dump(dict(ckpt=args.ckpt, emulate=args.emulate, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)
 
 
 if __name__ == "__main__":

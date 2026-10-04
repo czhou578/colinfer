@@ -69,7 +69,7 @@ def run_ours(args):
     path = resolve(args.ckpt)
     tok = AutoTokenizer.from_pretrained(path)
     t0 = time.time()
-    model = load_model(path)
+    model = load_model(path, emulate=args.emulate)
     print(f"[ours] loaded in {time.time() - t0:.0f}s")
     import json
     gc = json.load(open(os.path.join(path, "generation_config.json")))
@@ -82,7 +82,7 @@ def run_ours(args):
         gen, logits = generate(model, ids, args.max_new_tokens, eos_ids=eos, keep_logits=args.keep_logits)
         results.append(dict(prompt=p, input_ids=ids[0].cpu(), tokens=gen, logits=logits.cpu() if logits is not None else None))
         print(f"[ours] {i:2d} {len(gen):3d} tok {time.time() - t0:5.1f}s  {tok.decode(gen[:24])!r}")
-    torch.save(dict(side="ours", ckpt=args.ckpt, results=results, eos=eos), args.out)
+    torch.save(dict(side="ours", ckpt=args.ckpt, emulate=args.emulate, results=results, eos=eos), args.out)
     print(f"[ours] wrote {args.out}")
 
 
@@ -130,6 +130,7 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--keep-logits", type=int, default=32)
     ap.add_argument("--prompts", type=int, default=30)
+    ap.add_argument("--emulate", help="ours only: quant emulation effects (see engine/weights/quant_emul.py)")
     args = ap.parse_args()
     if args.mode == "compare":
         ok = compare(*args.files[:2])
