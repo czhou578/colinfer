@@ -15,7 +15,7 @@ def ops():
         os.makedirs(build, exist_ok=True)
         _ext = load(
             name="colinfer_kernels",
-            sources=[os.path.join(_ROOT, "csrc", f) for f in ("bindings.cpp", "gemv.cu", "attn_decode.cu", "gdn_step.cu", "norm.cu", "gemm_nvfp4.cu", "prefill_ops.cu", "sampling.cu")],
+            sources=[os.path.join(_ROOT, "csrc", f) for f in ("bindings.cpp", "gemv.cu", "attn_decode.cu", "gdn_step.cu", "norm.cu", "gemm_nvfp4.cu", "prefill_ops.cu", "sampling.cu", "skinny.cu")],
             extra_cflags=["-O3"],
             extra_include_paths=[os.path.join(_ROOT, "csrc", "third_party", "cutlass", p) for p in ("include", "tools/util/include")],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "-lineinfo", "--expt-relaxed-constexpr", "--fmad=false",

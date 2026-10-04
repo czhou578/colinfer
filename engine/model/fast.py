@@ -4,8 +4,8 @@ Weights stay quantized on the GPU (~22 GB). Everything that is not a quantized l
 GDN conv / delta rule, attention, rotary) is still the Phase 1 PyTorch code and is replaced
 kernel by kernel in later steps.
 
-Linears take any number of rows and issue the GEMV in chunks of MAX_M, so prefill works (slowly:
-every MAX_M prompt tokens stream all weights once) until Phase 3 brings a real prefill path.
+Linears take any number of rows and stream the weights once per MAX_M rows, so prefill works (slowly)
+on this path too; Phase 3's prefill path (engine/model/prefill.py) is the real one.
 """
 from __future__ import annotations
 
@@ -21,7 +21,44 @@ from engine.kernels import ops
 from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
 from engine.weights.loader import PREFIX, SCALE_SUFFIXES, SKIP_PREFIXES, resolve
 
-MAX_M = 8  # rows per GEMV launch (csrc/gemv.cu takes M <= 8; rows are bit-identical for every M)
+# Decode linears run on the tensor-core skinny GEMM (csrc/skinny.cu, M <= 16) or, with COLINFER_SKINNY=0, on the
+# CUDA-core GEMV (csrc/gemv.cu, M <= 8). Either way a row's result is bit-identical for every M, and every decode
+# path (plain steps, speculative verify, the MTP drafter) uses the same kernel, so speculation never changes outputs.
+SKINNY = os.environ.get("COLINFER_SKINNY", "1") != "0"
+GEMV_M = 8                       # rows per CUDA-core GEMV launch
+MAX_M = 16 if SKINNY else GEMV_M  # rows per weight pass
+
+
+def set_linear_kernel(name: str):
+    """'skinny' (tensor cores: any row count up to 16 costs about one weight pass; the speculative path) or 'gemv'
+    (CUDA cores: ~4% faster at 1-3 rows, compute-bound beyond ~4; plain decode). Set before capturing graphs: the
+    choice is baked into them, and all decode paths of a process must use the same kernel to stay bit-identical."""
+    global SKINNY, MAX_M
+    SKINNY = name == "skinny"
+    MAX_M = 16 if SKINNY else GEMV_M
+
+
+def _skinny_ok(K: int, fp4: bool) -> bool:
+    return SKINNY and K % (512 if fp4 else 256) == 0
+
+
+def nvfp4_rows(x2, w, sf, gscale, r2, out):
+    """out = x2 @ dequant(w)^T * gscale (+ r2), any number of rows, in passes of MAX_M rows."""
+    if _skinny_ok(x2.shape[1], True):
+        for i in range(0, x2.shape[0], 16):
+            ops().skinny_nvfp4(x2[i:i + 16], w, sf, gscale, None if r2 is None else r2[i:i + 16], out[i:i + 16])
+    else:
+        for i in range(0, x2.shape[0], GEMV_M):
+            ops().nvfp4_gemv(x2[i:i + GEMV_M], w, sf, gscale, None if r2 is None else r2[i:i + GEMV_M], out[i:i + GEMV_M])
+
+
+def fp8_rows(x2, w, scale, r2, out, row_scale=None):
+    if _skinny_ok(x2.shape[1], False):
+        for i in range(0, x2.shape[0], 16):
+            ops().skinny_fp8(x2[i:i + 16], w, scale, None if r2 is None else r2[i:i + 16], out[i:i + 16], row_scale)
+    else:
+        for i in range(0, x2.shape[0], GEMV_M):
+            ops().fp8_gemv(x2[i:i + GEMV_M], w, scale, None if r2 is None else r2[i:i + GEMV_M], out[i:i + GEMV_M], row_scale)
 
 
 class Nvfp4Linear(nn.Module):
@@ -37,8 +74,7 @@ class Nvfp4Linear(nn.Module):
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.float32 if self.out_fp32 else torch.bfloat16)
         r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
-        for i in range(0, x2.shape[0], MAX_M):
-            ops().nvfp4_gemv(x2[i:i + MAX_M], self.w, self.sf, self.gscale, None if r2 is None else r2[i:i + MAX_M], out[i:i + MAX_M])
+        nvfp4_rows(x2, self.w, self.sf, self.gscale, r2, out)
         return out.view(*shp[:-1], self.out_features)
 
 
@@ -54,8 +90,7 @@ class Fp8Linear(nn.Module):
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
         r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
-        for i in range(0, x2.shape[0], MAX_M):
-            ops().fp8_gemv(x2[i:i + MAX_M], self.w, self.scale, None if r2 is None else r2[i:i + MAX_M], out[i:i + MAX_M])
+        fp8_rows(x2, self.w, self.scale, r2, out)
         return out.view(*shp[:-1], self.out_features)
 
 
@@ -82,8 +117,7 @@ class StackedFp8Linear(nn.Module):
         shp = x.shape
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], sum(self.sizes), device=x.device, dtype=torch.bfloat16)
-        for i in range(0, x2.shape[0], MAX_M):
-            ops().fp8_gemv(x2[i:i + MAX_M], self.w, 1.0, None, out[i:i + MAX_M], self.rs)
+        fp8_rows(x2, self.w, 1.0, None, out, self.rs)
         return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
 
 
@@ -98,8 +132,13 @@ class SwiGLUMLP(nn.Module):
         shp = x.shape
         x2 = x.reshape(-1, self.gate.in_features).contiguous()
         h = torch.empty(x2.shape[0], self.gate.out_features, device=x.device, dtype=torch.bfloat16)
-        for i in range(0, x2.shape[0], MAX_M):
-            ops().nvfp4_swiglu(x2[i:i + MAX_M], self.gate.w, self.gate.sf, self.gate.gscale, self.up.w, self.up.sf, self.up.gscale, h[i:i + MAX_M])
+        g, u = self.gate, self.up
+        if _skinny_ok(x2.shape[1], True):
+            for i in range(0, x2.shape[0], 16):
+                ops().skinny_swiglu(x2[i:i + 16], g.w, g.sf, g.gscale, u.w, u.sf, u.gscale, h[i:i + 16])
+        else:
+            for i in range(0, x2.shape[0], GEMV_M):
+                ops().nvfp4_swiglu(x2[i:i + GEMV_M], g.w, g.sf, g.gscale, u.w, u.sf, u.gscale, h[i:i + GEMV_M])
         return self.down(h.view(*shp[:-1], -1), residual)
 
 
@@ -297,8 +336,8 @@ def _gdn_verify(self, x, state, layer_idx: int, residual=None):
     mixed, z = mixed.reshape(B, T, -1).contiguous(), z.reshape(B, T, -1).contiguous()
     ba = torch.empty(B * T, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
     x2 = x.reshape(B * T, -1)
-    for i in range(0, B * T, MAX_M):
-        ops().bf16_gemv(x2[i:i + MAX_M], self.w_ba, ba[i:i + MAX_M])
+    for i in range(0, B * T, GEMV_M):
+        ops().bf16_gemv(x2[i:i + GEMV_M], self.w_ba, ba[i:i + GEMV_M])
     ba = ba.view(B, T, -1)
     b, a = ba[..., : self.num_v_heads].contiguous(), ba[..., self.num_v_heads:].contiguous()
     qkv = torch.empty_like(mixed)

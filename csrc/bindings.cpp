@@ -331,6 +331,75 @@ void gdn_delta_multi(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch:
                                         at::cuda::getCurrentCUDAStream()));
 }
 
+cudaError_t launch_skinny_nvfp4(const void*, const void*, const void*, float, const void*, void*, bool, int, int, int, float*, cudaStream_t);
+cudaError_t launch_skinny_swiglu(const void*, const void*, const void*, float, const void*, const void*, float, void*, int, int, int, float*,
+                                 cudaStream_t);
+cudaError_t launch_skinny_fp8(const void*, const void*, float, const float*, const void*, void*, bool, int, int, int, float*, cudaStream_t);
+int skinny_ws_floats(int, bool, int, int, int);
+
+// split-K workspace for one skinny call (fp32, from the caching allocator: graph-capture safe)
+static float* skinny_ws(int fmt, bool swiglu, const torch::Tensor& x, int64_t N, int64_t K, torch::Tensor& hold) {
+    const int n = skinny_ws_floats(fmt, swiglu, x.size(0), N, K);
+    if (!n) return nullptr;
+    hold = torch::empty({n}, x.options().dtype(torch::kFloat32));
+    return hold.data_ptr<float>();
+}
+
+static void check_skinny(const torch::Tensor& x, const torch::Tensor& out, int64_t N, int64_t K) {
+    CHECK_CUDA_TENSOR(x, torch::kBFloat16);
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 16 && x.size(1) == K && K % 512 == 0 && N % 8 == 0,
+                "skinny GEMM: x [M<=16, K], K % 256 == 0, N % 8 == 0");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == x.size(0) && out.size(1) == N, "out must be [M, N]");
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16 || out.scalar_type() == torch::kFloat32, "out must be bf16 or fp32");
+}
+
+static const void* residual_ptr(const c10::optional<torch::Tensor>& r, const torch::Tensor& out) {
+    if (!r) return nullptr;
+    CHECK_CUDA_TENSOR(*r, torch::kBFloat16);
+    TORCH_CHECK(r->sizes() == out.sizes(), "residual must match out");
+    return r->data_ptr();
+}
+
+// Tensor-core skinny GEMM (csrc/skinny.cu): same contract as nvfp4_gemv / nvfp4_swiglu / fp8_gemv, M <= 16 rows.
+void skinny_nvfp4(torch::Tensor x, torch::Tensor w, torch::Tensor sf, double gscale, c10::optional<torch::Tensor> residual, torch::Tensor out) {
+    CHECK_CUDA_TENSOR(w, torch::kUInt8);
+    TORCH_CHECK(sf.is_cuda() && sf.is_contiguous() && sf.element_size() == 1, "sf must be 1-byte contiguous CUDA");
+    const int64_t N = w.size(0), K = w.size(1) * 2;
+    check_skinny(x, out, N, K);
+    TORCH_CHECK(sf.size(0) == N && sf.size(1) == K / 16, "scale shape");
+    torch::Tensor hold;
+    float* ws = skinny_ws(0, false, x, N, K, hold);
+    CHECK_LAUNCH(launch_skinny_nvfp4(x.data_ptr(), w.data_ptr(), sf.data_ptr(), (float)gscale, residual_ptr(residual, out), out.data_ptr(),
+                                     out.scalar_type() == torch::kFloat32, x.size(0), N, K, ws, at::cuda::getCurrentCUDAStream()));
+}
+
+void skinny_swiglu(torch::Tensor x, torch::Tensor wg, torch::Tensor sg, double gg, torch::Tensor wu, torch::Tensor su, double gu, torch::Tensor out) {
+    CHECK_CUDA_TENSOR(wg, torch::kUInt8);
+    CHECK_CUDA_TENSOR(wu, torch::kUInt8);
+    const int64_t N = wg.size(0), K = wg.size(1) * 2;
+    TORCH_CHECK(wu.sizes() == wg.sizes() && sg.sizes() == su.sizes() && sg.size(0) == N && sg.size(1) == K / 16, "shape mismatch");
+    TORCH_CHECK(sg.is_contiguous() && su.is_contiguous(), "scales must be contiguous");
+    check_skinny(x, out, N, K);
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16);
+    torch::Tensor hold;
+    float* ws = skinny_ws(0, true, x, N, K, hold);
+    CHECK_LAUNCH(launch_skinny_swiglu(x.data_ptr(), wg.data_ptr(), sg.data_ptr(), (float)gg, wu.data_ptr(), su.data_ptr(), (float)gu,
+                                      out.data_ptr(), x.size(0), N, K, ws, at::cuda::getCurrentCUDAStream()));
+}
+
+void skinny_fp8(torch::Tensor x, torch::Tensor w, double scale, c10::optional<torch::Tensor> residual, torch::Tensor out,
+                c10::optional<torch::Tensor> row_scale) {
+    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.element_size() == 1 && w.dim() == 2, "w must be 1-byte [N, K]");
+    const int64_t N = w.size(0), K = w.size(1);
+    check_skinny(x, out, N, K);
+    const float* rs = nullptr;
+    if (row_scale) { CHECK_CUDA_TENSOR(*row_scale, torch::kFloat32); TORCH_CHECK(row_scale->numel() == N); rs = row_scale->data_ptr<float>(); }
+    torch::Tensor hold;
+    float* ws = skinny_ws(1, false, x, N, K, hold);
+    CHECK_LAUNCH(launch_skinny_fp8(x.data_ptr(), w.data_ptr(), (float)scale, rs, residual_ptr(residual, out), out.data_ptr(),
+                                   out.scalar_type() == torch::kFloat32, x.size(0), N, K, ws, at::cuda::getCurrentCUDAStream()));
+}
+
 cudaError_t launch_philox_uniform(const int64_t*, const int64_t*, float*, int, int, cudaStream_t);
 
 // out fp32 [B, n] = per-slot seeded uniforms in (0, 1] at counters offset[b] + i (seed, offset: int64 [B], device).
@@ -344,6 +413,11 @@ void philox_uniform(torch::Tensor seed, torch::Tensor offset, torch::Tensor out)
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("skinny_nvfp4", &skinny_nvfp4, "tensor-core NVFP4 x bf16 skinny GEMM, M<=16", py::arg("x"), py::arg("w"), py::arg("sf"),
+          py::arg("gscale"), py::arg("residual"), py::arg("out"));
+    m.def("skinny_swiglu", &skinny_swiglu, "tensor-core silu(x Wg^T) * (x Wu^T), NVFP4, M<=16");
+    m.def("skinny_fp8", &skinny_fp8, "tensor-core FP8 x bf16 skinny GEMM, M<=16", py::arg("x"), py::arg("w"), py::arg("scale"),
+          py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
     m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (speculative sampling)");
     m.def("gdn_conv_multi", &gdn_conv_multi, "spec verify: GDN conv over T tokens, state read-only");
     m.def("gdn_conv_commit", &gdn_conv_commit, "spec commit: advance the GDN conv state by n tokens");

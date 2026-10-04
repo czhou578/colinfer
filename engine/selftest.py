@@ -61,6 +61,23 @@ def run_selftest(verbose: bool = False) -> dict:
     out = torch.empty(3, 96, device=dev, dtype=torch.bfloat16)
     o.bf16_gemv(x3, wb, out)
     res["bf16_gemv"] = _rel(out, x3.float() @ wb.float().T)
+    # tensor-core skinny GEMM (decode / verify), M = 1 and 12, residual, fp32 out, row scales, SwiGLU
+    ws, wss = rand_nvfp4(264, 1024)
+    resid = torch.randn(12, 264, device=dev, generator=g).bfloat16()
+    for M in (1, 12):
+        x = torch.randn(M, 1024, device=dev, generator=g).bfloat16()
+        out = torch.empty(M, 264, device=dev)
+        o.skinny_nvfp4(x, ws, wss, 0.3, None, out)
+        res[f"skinny_nvfp4_m{M}"] = _rel(out, x.float() @ dequant_nvfp4(ws, wss, torch.tensor(0.3), torch.float32).T)
+    x = torch.randn(12, 1024, device=dev, generator=g).bfloat16()
+    out = torch.empty(12, 512, device=dev, dtype=torch.bfloat16)
+    o.skinny_swiglu(x, w, sf, 0.3, w2, sf2, 0.2, out)
+    res["skinny_swiglu"] = _rel(out, torch.nn.functional.silu(x.float() @ dequant_nvfp4(w, sf, torch.tensor(0.3), torch.float32).T)
+                                * (x.float() @ dequant_nvfp4(w2, sf2, torch.tensor(0.2), torch.float32).T))
+    w8s = w8[:264].contiguous()
+    out = torch.empty(12, 264, device=dev, dtype=torch.bfloat16)
+    o.skinny_fp8(x, w8s, 1.0, resid, out, rs[:264].contiguous())
+    res["skinny_fp8_rowscale"] = _rel(out, x.float() @ (w8s.float() * rs[:264, None]).T + resid.float())
     # NVFP4 x NVFP4 CUTLASS GEMM (prefill), both tiles, with residual
     M, N, K = 384, 256, 1024
     xa = torch.randn(M, K, device=dev, generator=g).bfloat16()

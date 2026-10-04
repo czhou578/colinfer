@@ -61,7 +61,9 @@ class Worker(threading.Thread):
     def _build(self):
         a, t0 = self.args, time.perf_counter()
         from engine.kernels import ops
-        from engine.model.fast import load_fast_model, to_fast
+        from engine.model.fast import load_fast_model, set_linear_kernel, to_fast
+        # speculation verifies many rows per weight pass: tensor-core skinny GEMM; plain decode (1-3 rows): GEMV
+        set_linear_kernel("skinny" if a.spec == "mtp" else "gemv")
         from engine.runtime.scheduler import Scheduler
         from engine.weights.loader import resolve
         ops()  # build / load the CUDA extension
@@ -550,7 +552,7 @@ def main(argv=None):
     ap.add_argument("--slots", type=int, default=3)
     ap.add_argument("--max-seq-len", type=int, default=262144, help="tokens per slot (prompt + output)")
     ap.add_argument("--spec", choices=("mtp", "none"), default="mtp")
-    ap.add_argument("--k", type=int, default=3, help="MTP draft length")
+    ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
     ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP drafts among this many frequent tokens (+ prompt tokens); 0 = full")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")

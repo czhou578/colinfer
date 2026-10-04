@@ -43,13 +43,18 @@ def chat_ids(tok, msgs):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--k", type=int, default=7)
+    ap.add_argument("--only-alone", action="store_true", help="just the single-request speeds")
+    a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
     model = to_fast(load_fast_model(path), kv_fp8=True)
     mtp = Mtp(model, path, fp8=True, draft_vocab=65536)
     t0 = time.perf_counter()
     ref = Scheduler(model, n_slots=1, max_seq_len=8192, n_checkpoints=0, selftest=True)
-    spec = Scheduler(model, n_slots=3, max_seq_len=32768, n_checkpoints=32, mtp=mtp, k=3, selftest=False, boundary_token=IM_START)
+    spec = Scheduler(model, n_slots=3, max_seq_len=32768, n_checkpoints=32, mtp=mtp, k=a.k, selftest=False, boundary_token=IM_START)
     print(f"schedulers built in {time.perf_counter() - t0:.1f} s; {torch.cuda.memory_allocated() / 1e9:.1f} GB allocated")
     ok = True
     names = list(PROMPTS)
@@ -68,6 +73,9 @@ def main():
         ok &= same
         dt = r.t_done - r.t_first
         print(f"[alone] {n:9s} {'IDENTICAL' if same else 'DIFFERENT'} {len(r.output)} tok, {(len(r.output) - 1) / dt:5.1f} tok/s")
+    if a.only_alone:
+        print("SCHEDULER CHECK", "PASSED" if ok else "FAILED")
+        return
 
     # 2. all together (3 slots, the 4th waits)
     rs = spec.run([R(p) for p in prompts])
@@ -91,7 +99,7 @@ def main():
     a3 = spec.run([R(prompts[0]), R(prompts[3], **kw), R(prompts[2], temperature=1.0, seed=5)])[1].output
     rep = plain == a1 == a2 == a3
     ok &= rep
-    print(f"[seeded] T=0.8 plain decode vs MTP alone / next to one / next to two (k=1 cycles): "
+    print(f"[seeded] T=0.8 plain decode vs MTP alone / next to one / next to two: "
           f"{'IDENTICAL' if rep else 'DIFFERENT'} ({len(a1)} tok; agree {[sum(x == y for x, y in zip(plain, o)) for o in (a1, a2, a3)]})")
 
     # 5. multi-turn: turn 2 restores the end of turn 1

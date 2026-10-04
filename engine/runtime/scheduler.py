@@ -2,10 +2,12 @@
 
 * One batched FastState holds every slot (KV cache, GDN conv / recurrent state, positions); with speculation
   also a batched MtpState (the drafter's own KV cache).
-* Decode with MTP (the default): one CUDA graph per (contiguous slot range [lo, hi), greedy | sampled) runs a
-  whole speculative cycle for those slots: verify, acceptance, commit, drafting (engine/spec/mtp.py). Without
-  MTP, one plain decode graph per range. A step uses the smallest range covering the decoding slots; idle and
-  prefilling slots inside it are masked off (state.active), so a step never touches them. Greedy output does not depend on what the other slots are doing: every kernel computes a
+* Decode with MTP (the default): one CUDA graph per (contiguous slot range [lo, hi), greedy | sampled, draft length
+  k) runs a whole speculative cycle for those slots: verify, acceptance, commit, drafting (engine/spec/mtp.py).
+  Without MTP, one plain decode graph per range. A step uses the smallest range covering the decoding slots; idle
+  and prefilling slots inside it are masked off (state.active), so a step never touches them. Each cycle picks k
+  (3 or 7, when the verify rows fit one weight pass) for the most expected tokens per second given each slot's
+  running acceptance rate and the cycle times measured at startup: code and structured output draft 7, prose 3. Greedy output does not depend on what the other slots are doing: every kernel computes a
   slot's rows the same way at any batch width.
 * Prefill: at most one chunk per engine step on a single-slot view (engine/model/prefill.py), then one decode
   step for the decoding slots, so a long prompt stalls the others for one chunk at a time. With MTP the
@@ -33,12 +35,15 @@ from typing import Any
 
 import torch
 
-from engine.model.fast import MAX_M, DecodeGraph, FastQwen35
+from engine.model import fast as fast_model
+from engine.model.fast import DecodeGraph, FastQwen35
 from engine.model.prefill import CHUNK, prefill, prepare_prefill
 from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, sample
 
 MAX_STOP_IDS = 8  # stop token ids per slot visible to the GPU-side cut (more are still honored on the host)
+K_OPTIONS = (3, 7)  # draft lengths a cycle chooses between (capped by the scheduler's k)
+ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
 
 
 @dataclasses.dataclass
@@ -88,6 +93,8 @@ class Slot:
         self.y = None                # last output token, not yet fed
         self.h_last = None           # MTP: target post-norm hidden state at the last fed position
         self.last_used = 0.0
+        self.acc_s, self.acc_t = 1.5, 2.5  # decayed accepted / tried drafts (per-token acceptance estimate; prior 0.6)
+        self.fresh = 0                     # drafts in the slot's pending input that the last cycle produced
         self.salt = None             # cache_salt of the request that produced this slot's history
 
 
@@ -114,12 +121,22 @@ class Scheduler:
             self.mst = MtpState(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active)
             self.tok = torch.zeros(n_slots, k + 1, dtype=torch.long, device=dev)
             self.stop_buf = torch.full((n_slots, MAX_STOP_IDS), -1, dtype=torch.long, device=dev)
-            self.cycles = {}
+            self.cycles, self.cycle_s = {}, {}
             for lo, hi in self._ranges():
-                sv, mv, kw = self.state.view(lo, hi), self.mst.view(lo, hi), self.k_for(hi - lo)
-                for sampled in (False, True):
-                    self.cycles[(lo, hi, sampled)] = MtpCycle(model, mtp, sv, mv, kw, params=self.params.view(lo, hi) if sampled else None,
-                                                              tok=self.tok[lo:hi, :kw + 1], stop_ids=self.stop_buf[lo:hi])
+                sv, mv = self.state.view(lo, hi), self.mst.view(lo, hi)
+                for kw in self.k_options(hi - lo):
+                    for sampled in (False, True):
+                        self.cycles[(lo, hi, sampled, kw)] = MtpCycle(model, mtp, sv, mv, kw, params=self.params.view(lo, hi) if sampled else None,
+                                                                      tok=self.tok[lo:hi, :kw + 1], stop_ids=self.stop_buf[lo:hi])
+                    if lo == 0:  # cycle time per (width, k), for choosing k (the state is garbage here and reset below)
+                        g = self.cycles[(lo, hi, False, kw)]
+                        g.graph.replay()
+                        torch.cuda.synchronize()
+                        t0 = time.perf_counter()
+                        for _ in range(3):
+                            g.graph.replay()
+                        torch.cuda.synchronize()
+                        self.cycle_s[(hi - lo, kw)] = (time.perf_counter() - t0) / 3
             self.mst.pos_t.zero_()
         else:
             self.graphs = {(lo, hi): DecodeGraph(model, self.state.view(lo, hi), self.params.view(lo, hi)) for lo, hi in self._ranges()}
@@ -141,11 +158,25 @@ class Scheduler:
         self._evt = torch.cuda.Event()
         torch.cuda.synchronize()
 
-    def k_for(self, width: int) -> int:
-        """Draft length for a batch width: verify rows (width * (k+1)) stay within one GEMV pass (MAX_M rows), since a
-        second pass streams every weight again. k=3 at widths 1-2, k=1 at width 3. A slot's pending drafts are a chain,
-        so a narrower k just uses a prefix of them."""
-        return min(self.k, max(1, MAX_M // width - 1))
+    def k_options(self, width: int) -> list[int]:
+        """Draft lengths with a graph at this batch width: those of K_OPTIONS (capped by k) whose verify rows
+        (width * (k+1)) fit one weight pass (fast_model.MAX_M rows: 16 with the skinny GEMM, 8 with the GEMV), since a
+        second pass streams every weight again. A slot's pending drafts are a chain, so a shorter k uses a prefix."""
+        opts = sorted({min(kk, self.k) for kk in K_OPTIONS + (self.k,)})
+        fit = [kk for kk in opts if width * (kk + 1) <= fast_model.MAX_M]
+        return fit or [max(1, fast_model.MAX_M // width - 1)]
+
+    def _pick_k(self, width: int, dec) -> int:
+        """The draft length with the most expected tokens per second: sum over slots of (1 - a^(k+1)) / (1 - a), a = the
+        slot's per-token acceptance estimate, over the measured cycle time."""
+        opts = self.k_options(width)
+        if len(opts) == 1:
+            return opts[0]
+
+        def expected(s, kk):
+            a = min(s.acc_s / max(s.acc_t, 1e-6), 0.999)
+            return (1 - a ** (kk + 1)) / (1 - a)
+        return max(opts, key=lambda kk: sum(expected(s, kk) for s in dec) / self.cycle_s[(width, kk)])
 
     def _ranges(self):
         """Every contiguous slot range [lo, hi): a step runs the graph of the smallest range covering the decoding
@@ -249,6 +280,7 @@ class Scheduler:
             req.slot, req.reused, req.t_admit = b, len(s.tokens), time.perf_counter()
             s.salt = req.cache_salt
             s.req, s.phase, s.todo, s.y = req, "prefill", list(P[len(s.tokens):]), None
+            s.acc_s, s.acc_t = 1.5, 2.5
             s.splits = []
             if self.boundary is not None and (self.free_bufs or self.ckpts):
                 # message starts, without the last one (it opens the reply being generated: the prompt-end snapshot)
@@ -328,6 +360,7 @@ class Scheduler:
                 mv.pos_t.fill_(len(s.tokens) - 1)
                 d = self.mtp.first_drafts(torch.tensor([tok], device=self.dev), s.h_last.view(1, -1), mv, self.k)
                 self.tok[b] = torch.tensor([tok] + d)
+                s.fresh = self.k
         torch.cuda.synchronize()
         self.metrics.step_seconds.observe(time.perf_counter() - t0, kind="prefill")
 
@@ -340,7 +373,8 @@ class Scheduler:
         self.state.active.copy_(torch.tensor(act, dtype=torch.int32))
         m = self.metrics
         if self.mtp is not None:
-            g = self.cycles[(lo, hi, any(s.req.temperature > 0 for s in dec))]
+            kk = self._pick_k(hi - lo, dec)
+            g = self.cycles[(lo, hi, any(s.req.temperature > 0 for s in dec), kk)]
             g.graph.replay()
             self._evt.record()
             self._evt.synchronize()  # releases the GIL while the GPU works
@@ -352,7 +386,11 @@ class Scheduler:
                 s.tokens.append(s.y)
                 s.tokens += o[:-1]
                 s.y, s.h_last = o[-1], g.H[b, nb - 1]
-                m.drafted.inc(g.k)
+                kf = min(kk, s.fresh)  # drafts beyond the last cycle's k are stale: they say nothing about acceptance
+                s.acc_s = ACC_DECAY * s.acc_s + min(nb - 1, kf)
+                s.acc_t = ACC_DECAY * s.acc_t + min(nb - 1, kf) + (1 if nb - 1 < kf else 0)
+                s.fresh = kk
+                m.drafted.inc(kk)
                 m.accepted.inc(nb - 1)
                 m.tokens_per_cycle.observe(nb)
                 lp = self._logprobs(g.logits[b, :nb], o, s.req.logprobs) if s.req.logprobs is not None else None

@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import MAX_M, DecodeGraph, FastQwen35, FastState, KernelAttention, KernelRMSNorm, fast_layer_forward
+from engine.model.fast import GEMV_M, DecodeGraph, fp8_rows, FastQwen35, FastState, KernelAttention, KernelRMSNorm, fast_layer_forward
 from engine.model.prefill import prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm
 
@@ -52,11 +52,11 @@ class Bf16Linear(nn.Module):
         x2 = x.reshape(-1, self.in_features).contiguous()
         if x2.shape[0] <= 16:
             out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
-            for i in range(0, x2.shape[0], MAX_M):
-                if self.w8 is not None:
-                    ops().fp8_gemv(x2[i:i + MAX_M], self.w8, 1.0, None, out[i:i + MAX_M], self.rs)
-                else:
-                    ops().bf16_gemv(x2[i:i + MAX_M], self.w, out[i:i + MAX_M])
+            if self.w8 is not None:
+                fp8_rows(x2, self.w8, 1.0, None, out, self.rs)
+            else:
+                for i in range(0, x2.shape[0], GEMV_M):
+                    ops().bf16_gemv(x2[i:i + GEMV_M], self.w, out[i:i + GEMV_M])
         else:
             out = F.linear(x2, self.w)
         out = out.view(*shp[:-1], self.out_features)

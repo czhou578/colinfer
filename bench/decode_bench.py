@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""decode_bench.py -- end-to-end decode speed of the Phase 2 path (one CUDA graph per step).
+"""Decode step and speculative cycle times on the real model (PLAN.md 4.7 bench/decode_bench.py).
 
-Reports ms/token and tok/s at each context length (the KV cache and GDN state are synthetic: the
-step cost does not depend on their contents), with the host reading back every token as a real
-generation loop does, plus a per-kernel GPU-time breakdown at the last context length.
+Plain decode graph (T=1 per slot) at 1-3 slots, and the MTP cycle graph at widths 1-3 and draft lengths k,
+at a given context length. COLINFER_SKINNY=0 switches the decode linears to the CUDA-core GEMV.
 
-  uv run python bench/decode_bench.py [--ctx 64 8192 32768 131072] [--steps 40] [--profile]
+   uv run python bench/decode_bench.py [--ctx 8192] [--ks 1 3 5 7]
 """
 import argparse
 import os
@@ -15,47 +14,61 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.model.fast import DecodeGraph, load_fast_model, to_fast  # noqa: E402
+from engine.model.fast import SKINNY, DecodeGraph, load_fast_model, to_fast  # noqa: E402
+from engine.weights.loader import resolve  # noqa: E402
+
+
+def timed(fn, n=20):
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / n
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="nvidia/Qwen3.8-27B-NVFP4")
-    ap.add_argument("--ctx", type=int, nargs="+", default=[64, 8192, 32768])
-    ap.add_argument("--steps", type=int, default=40)
-    ap.add_argument("--profile", action="store_true")
-    ap.add_argument("--kv-fp8", action="store_true")
-    ap.add_argument("--batch", type=int, default=1, help="concurrent slots decoded in one step (<= 4)")
+    ap.add_argument("--ctx", type=int, default=8192)
+    ap.add_argument("--ks", type=int, nargs="+", default=[1, 3, 5, 7])
+    ap.add_argument("--widths", type=int, nargs="+", default=[1, 2, 3])
     a = ap.parse_args()
-    m = to_fast(load_fast_model(a.ckpt), kv_fp8=a.kv_fp8)
-    print(f"KV cache: {'fp8 e4m3' if a.kv_fp8 else 'bf16'}")
-    st = m.new_state(a.batch, max(a.ctx) + a.steps + 8)
-    g = DecodeGraph(m, st)
-    tok = torch.full((a.batch,), 42, device="cuda")
-    print(f"slots: {a.batch}")
-    print(f"{'context':>8s} {'ms/step':>9s} {'tok/s/slot':>11s} {'aggregate':>10s}")
-    for ctx in a.ctx:
-        st.pos = ctx
-        st.pos_t.fill_(ctx)
-        for _ in range(3):
-            tok = g.step(tok)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(a.steps):
-            tok = g.step(tok)
-            tok.tolist()
-        dt = (time.perf_counter() - t0) / a.steps
-        print(f"{ctx:8d} {dt * 1e3:9.2f} {1 / dt:11.2f} {a.batch / dt:10.2f}", flush=True)
-    if a.profile:
-        from torch.profiler import ProfilerActivity, profile
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            for _ in range(3):
-                g.step(tok)
-            torch.cuda.synchronize()
-        ev = [(e.key, e.self_device_time_total / 3, e.count // 3) for e in prof.key_averages()]
-        print(f"\nGPU time per step at ctx {a.ctx[-1]}: {sum(t for _, t, _ in ev) / 1e3:.1f} ms")
-        for k, t, c in sorted(ev, key=lambda x: -x[1])[:16]:
-            print(f"  {t / 1e3:7.2f} ms {c:5d}x  {k[:84]}")
+    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
+    model = to_fast(load_fast_model(path), kv_fp8=True)
+    from engine.model.prefill import prepare_prefill
+    from engine.spec.mtp import Mtp, MtpCycle, MtpState
+    prepare_prefill(model)
+    print(f"linears: {'tensor-core skinny GEMM' if SKINNY else 'CUDA-core GEMV'}; context {a.ctx}")
+    st = model.new_state(3, a.ctx + 64)
+    for B in a.widths:
+        v = st.view(0, B)
+        g = DecodeGraph(model, v)
+        v.pos_t.fill_(a.ctx)
+        tok = torch.zeros(B, dtype=torch.long, device="cuda")
+
+        def step():
+            g.state.pos = 0
+            g.step(tok)
+            v.pos_t.fill_(a.ctx)
+        dt = timed(step)
+        print(f"plain decode  width {B}: {dt * 1e3:6.1f} ms/step  -> {B / dt:5.1f} tok/s aggregate")
+    mtp = Mtp(model, path, fp8=True, draft_vocab=65536)
+    mst = MtpState(model.cfg, a.ctx + 64, "cuda", batch=3, active=st.active)
+    for B in a.widths:
+        for k in a.ks:
+            if B * (k + 1) > 16:
+                continue
+            v, mv = st.view(0, B), mst.view(0, B)
+            cyc = MtpCycle(model, mtp, v, mv, k)
+
+            def run():
+                cyc.graph.replay()
+                v.pos_t.fill_(a.ctx)
+            dt = timed(run)
+            print(f"MTP cycle     width {B} k={k}: {dt * 1e3:6.1f} ms/cycle ({B * (k + 1)} verify rows)", flush=True)
+            del cyc
 
 
 if __name__ == "__main__":
