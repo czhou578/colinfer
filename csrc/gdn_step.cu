@@ -22,10 +22,12 @@ constexpr int DK = 128, DV = 128, THREADS = 512;
 __device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16(x)); }
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
 
+// active (optional, int32 [B]): slots with active[b] == 0 keep their conv state (idle or mid-prefill slots)
 __global__ void k_conv(const __nv_bfloat16* __restrict__ mixed, __nv_bfloat16* __restrict__ conv_state, const __nv_bfloat16* __restrict__ w,
-                       __nv_bfloat16* __restrict__ out, int C) {
+                       __nv_bfloat16* __restrict__ out, int C, const int* __restrict__ active) {
     const int b = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
+    const bool upd = active == nullptr || active[b] != 0;
     __nv_bfloat16* cs = conv_state + ((size_t)b * C + c) * 3;
     const float x0 = __bfloat162float(cs[0]), x1 = __bfloat162float(cs[1]), x2 = __bfloat162float(cs[2]);
     const __nv_bfloat16 xn = mixed[(size_t)b * C + c];
@@ -36,9 +38,11 @@ __global__ void k_conv(const __nv_bfloat16* __restrict__ mixed, __nv_bfloat16* _
     acc = fmaf(__bfloat162float(wc[2]), x2, acc);
     acc = fmaf(__bfloat162float(wc[3]), x3, acc);
     out[(size_t)b * C + c] = __float2bfloat16(silu(bf(acc)));
-    cs[0] = cs[1];
-    cs[1] = cs[2];
-    cs[2] = xn;
+    if (upd) {
+        cs[0] = cs[1];
+        cs[1] = cs[2];
+        cs[2] = xn;
+    }
 }
 
 __device__ __forceinline__ float block_sum_128(float v, float* red, int tid) {
@@ -55,8 +59,9 @@ __global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restri
                                                     const __nv_bfloat16* __restrict__ bvec, const __nv_bfloat16* __restrict__ avec,
                                                     const __nv_bfloat16* __restrict__ A_log, const __nv_bfloat16* __restrict__ dt_bias,
                                                     const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ state,
-                                                    __nv_bfloat16* __restrict__ out, int Hk, int Hv, float eps) {
+                                                    __nv_bfloat16* __restrict__ out, int Hk, int Hv, float eps, const int* __restrict__ active) {
     const int b = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const bool upd = active == nullptr || active[b] != 0;  // inactive slots: compute, but leave the state untouched
     const int kh = h / (Hv / Hk), C = 2 * Hk * DK + Hv * DV;
     const __nv_bfloat16* src = qkv + (size_t)b * C;
     __shared__ float qs[DK], ks[DK], vs[DV], red[4], colred[4][DV];
@@ -96,7 +101,7 @@ __global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restri
 #pragma unroll
     for (int r = 0; r < 32; ++r) {
         s[r] = fmaf(ks[rg * 32 + r], delta, s[r]);
-        S[(size_t)r * DV] = s[r];
+        if (upd) S[(size_t)r * DV] = s[r];
         part = fmaf(s[r], qs[rg * 32 + r], part);
     }
     colred[rg][col] = part;
@@ -115,17 +120,17 @@ __global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restri
 
 }  // namespace gdn
 
-cudaError_t launch_gdn_conv(const void* mixed, void* conv_state, const void* w, void* out, int B, int C, cudaStream_t st) {
+cudaError_t launch_gdn_conv(const void* mixed, void* conv_state, const void* w, void* out, int B, int C, const int* active, cudaStream_t st) {
     dim3 grid((C + 255) / 256, B);
-    gdn::k_conv<<<grid, 256, 0, st>>>((const __nv_bfloat16*)mixed, (__nv_bfloat16*)conv_state, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, C);
+    gdn::k_conv<<<grid, 256, 0, st>>>((const __nv_bfloat16*)mixed, (__nv_bfloat16*)conv_state, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, C, active);
     return cudaGetLastError();
 }
 
 cudaError_t launch_gdn_delta(const void* qkv, const void* z, const void* b, const void* a, const void* A_log, const void* dt_bias,
-                             const void* norm_w, float* state, void* out, int B, int Hk, int Hv, float eps, cudaStream_t st) {
+                             const void* norm_w, float* state, void* out, int B, int Hk, int Hv, float eps, const int* active, cudaStream_t st) {
     dim3 grid(Hv, B);
     gdn::k_delta<<<grid, gdn::THREADS, 0, st>>>((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)z, (const __nv_bfloat16*)b, (const __nv_bfloat16*)a,
                                                 (const __nv_bfloat16*)A_log, (const __nv_bfloat16*)dt_bias, (const __nv_bfloat16*)norm_w, state,
-                                                (__nv_bfloat16*)out, Hk, Hv, eps);
+                                                (__nv_bfloat16*)out, Hk, Hv, eps, active);
     return cudaGetLastError();
 }

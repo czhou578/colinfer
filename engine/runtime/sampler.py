@@ -27,6 +27,14 @@ class SamplerParams:
         self.seed = torch.zeros(batch, dtype=torch.int64, device=device)
         self.offset = torch.zeros(batch, dtype=torch.int64, device=device)
 
+    def view(self, lo: int, hi: int) -> "SamplerParams":
+        """Parameters of slots [lo, hi), sharing this object's device buffers."""
+        v = SamplerParams.__new__(SamplerParams)
+        v.vocab = self.vocab
+        for name in ("temperature", "top_k", "top_p", "log_min_p", "seed", "offset"):
+            setattr(v, name, getattr(self, name)[lo:hi])
+        return v
+
     def set(self, slot: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0, seed: int = 0):
         """top_k <= 0 disables top-k; min_p <= 0 disables min-p."""
         self.temperature[slot] = float(temperature)

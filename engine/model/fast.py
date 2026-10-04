@@ -180,11 +180,23 @@ class FastState(ModelState):
                 for i in d:
                     d[i] = torch.zeros_like(d[i], dtype=torch.float8_e4m3fn)
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
+        self.active = torch.ones(batch, dtype=torch.int32, device=device)  # decode updates only slots with active == 1
         self.arange = torch.arange(16, device=device)
 
     def reset(self):
         super().reset()
         self.pos_t.zero_()
+
+    def view(self, lo: int, hi: int) -> "FastState":
+        """A FastState over slots [lo, hi) sharing this state's tensors (slices along the batch dim)."""
+        v = FastState.__new__(FastState)
+        v.cfg, v.max_seq_len, v.kv_fp8, v.pos = self.cfg, self.max_seq_len, self.kv_fp8, self.pos
+        v.conv = {i: t[lo:hi] for i, t in self.conv.items()}
+        v.rec = {i: t[lo:hi] for i, t in self.rec.items()}
+        v.k = {i: t[lo:hi] for i, t in self.k.items()}
+        v.v = {i: t[lo:hi] for i, t in self.v.items()}
+        v.pos_t, v.active, v.arange = self.pos_t[lo:hi], self.active[lo:hi], self.arange
+        return v
 
 
 class KernelAttention(Attention):
@@ -200,7 +212,7 @@ class KernelAttention(Attention):
         qp = qp.reshape(B, T, -1)
         q = torch.empty(B, self.num_heads, T, self.head_dim, device=x.device, dtype=torch.bfloat16)
         ops().attn_prologue(qp, kp, vp, self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t,
-                            kc, vc, q, self.q_norm.eps)
+                            kc, vc, q, self.q_norm.eps, state.active)
         attn = torch.empty(B, T, self.num_heads * self.head_dim, device=x.device, dtype=torch.bfloat16)
         ops().attn_decode(q, kc, vc, state.pos_t + T, attn, ATTN_SPLITS, self.head_dim ** -0.5, qp.contiguous())
         return self.o_proj(attn, residual)
@@ -257,10 +269,11 @@ class KernelGDN(GatedDeltaNet):
         main.wait_stream(side)
         b, a = ba[:, : self.num_v_heads].contiguous(), ba[:, self.num_v_heads:].contiguous()
         qkv = torch.empty_like(mixed)
-        ops().gdn_conv(mixed, state.conv[layer_idx], self.conv1d.weight, qkv)
+        active = getattr(state, "active", None)
+        ops().gdn_conv(mixed, state.conv[layer_idx], self.conv1d.weight, qkv, active)
         o = torch.empty_like(z)
         ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], o,
-                        self.num_k_heads, self.norm.eps)
+                        self.num_k_heads, self.norm.eps, active)
         return self.out_proj(o.view(B, 1, -1), residual)
 
 
@@ -293,7 +306,7 @@ class FastQwen35(Qwen35ForCausalLM):
         if last_only:
             x = x[:, -1:]
         logits = self.lm_head(x).float()
-        state.pos_t += T
+        state.pos_t += T * state.active
         state.pos += T
         return logits
 
@@ -330,13 +343,14 @@ class DecodeGraph:
     Per step the host writes the input tokens into a static buffer, replays, and reads back the
     argmax ids (and optionally the logits)."""
 
-    def __init__(self, model: FastQwen35, state: FastState):
+    def __init__(self, model: FastQwen35, state: FastState, params=None):
+        """params: optional SamplerParams (B slots) shared with other graphs; default: a private one."""
         from engine.model.prefill import prepare_prefill
         from engine.runtime.sampler import SamplerParams, sample
         prepare_prefill(model)  # re-points weights (stacking); must happen before the graph records addresses
         self.model, self.state = model, state
         B = state.pos_t.shape[0]
-        self.params = SamplerParams(B, model.cfg.vocab_size, state.pos_t.device)
+        self.params = params if params is not None else SamplerParams(B, model.cfg.vocab_size, state.pos_t.device)
         self.tok = torch.zeros(B, 1, dtype=torch.long, device=state.pos_t.device)
         state.reset()
         state.pos = 1  # record the decode (has-previous-state) branches

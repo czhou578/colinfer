@@ -8,11 +8,18 @@ cudaError_t launch_fp8_gemv(const void*, const void*, float, const float*, const
 cudaError_t launch_attn_decode(const void*, const void*, const void*, const int*, void*, float*, void*, int, int, int, int, int, int, int, float,
                                bool, const void*, cudaStream_t);
 cudaError_t launch_attn_prologue(const void*, const void*, const void*, int, int, int, const void*, const void*, const float*, const int*, void*, void*, void*,
-                                 int, int, int, int, int, int, float, bool, cudaStream_t);
+                                 int, int, int, int, int, int, float, bool, const int*, cudaStream_t);
 
 #define CHECK_CUDA_TENSOR(t, dt) \
     TORCH_CHECK((t).is_cuda() && (t).is_contiguous() && (t).scalar_type() == (dt), #t " must be a contiguous CUDA " #dt " tensor")
 #define CHECK_LAUNCH(e) TORCH_CHECK((e) == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(e))
+
+// optional per-slot activity mask (int32 [B]) for the decode kernels
+static const int* active_ptr(const c10::optional<torch::Tensor>& a, int64_t B) {
+    if (!a) return nullptr;
+    TORCH_CHECK(a->is_cuda() && a->is_contiguous() && a->scalar_type() == torch::kInt32 && a->numel() == B, "active: int32 [B]");
+    return a->data_ptr<int>();
+}
 
 static void check_x_out(const torch::Tensor& x, const torch::Tensor& out, int64_t N) {
     CHECK_CUDA_TENSOR(x, torch::kBFloat16);
@@ -88,8 +95,10 @@ void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, 
 // Fused q/k RMSNorm + partial RoPE + KV-cache write at the device positions pos_t[b] + t.
 // qp, kp, vp: bf16 [.., features] views with unit-stride rows (e.g. column slices of one stacked q|k|v GEMM output):
 // qp rows hold [Hq, 512] (q | gate per head), kp / vp rows [Hkv, 256]. inv_freq: fp32 [R/2]; q_out: [B, Hq, T, 256].
+// active (optional): int32 [B]; slots with 0 do not write KV.
 void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::Tensor qn_w, torch::Tensor kn_w, torch::Tensor inv_freq,
-                   torch::Tensor pos_t, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor q_out, double eps) {
+                   torch::Tensor pos_t, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor q_out, double eps,
+                   c10::optional<torch::Tensor> active) {
     for (auto* t : {&qp, &kp, &vp}) TORCH_CHECK(t->is_cuda() && t->scalar_type() == torch::kBFloat16 && t->stride(-1) == 1, "q/k/v rows must be unit-stride bf16");
     for (auto* t : {&qn_w, &kn_w, &q_out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     CHECK_CUDA_TENSOR(inv_freq, torch::kFloat32);
@@ -103,16 +112,16 @@ void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::
                 v2.size(1) == Hkv * 256 && q_out.size(3) == 256 && pos_t.numel() == B, "bad shapes / strides");
     CHECK_LAUNCH(launch_attn_prologue(q2.data_ptr(), k2.data_ptr(), v2.data_ptr(), (int)q2.stride(0), (int)k2.stride(0), (int)v2.stride(0), qn_w.data_ptr(), kn_w.data_ptr(), inv_freq.data_ptr<float>(),
                                       pos_t.data_ptr<int>(), k_cache.data_ptr(), v_cache.data_ptr(), q_out.data_ptr(), B, T, Hq, Hkv, Lmax,
-                                      2 * inv_freq.numel(), (float)eps, kv_fp8, at::cuda::getCurrentCUDAStream()));
+                                      2 * inv_freq.numel(), (float)eps, kv_fp8, active_ptr(active, B), at::cuda::getCurrentCUDAStream()));
 }
 
-cudaError_t launch_gdn_conv(const void*, void*, const void*, void*, int, int, cudaStream_t);
+cudaError_t launch_gdn_conv(const void*, void*, const void*, void*, int, int, const int*, cudaStream_t);
 cudaError_t launch_gdn_delta(const void*, const void*, const void*, const void*, const void*, const void*, const void*, float*, void*, int, int,
-                             int, float, cudaStream_t);
+                             int, float, const int*, cudaStream_t);
 
 // GDN decode step, part 1: depthwise causal conv (kernel 4) + SiLU, updating conv_state in place.
 // mixed, out: bf16 [B, C]; conv_state: bf16 [B, C, 3]; w: bf16 [C, 4] (or [C, 1, 4]).
-void gdn_conv(torch::Tensor mixed, torch::Tensor conv_state, torch::Tensor w, torch::Tensor out) {
+void gdn_conv(torch::Tensor mixed, torch::Tensor conv_state, torch::Tensor w, torch::Tensor out, c10::optional<torch::Tensor> active) {
     CHECK_CUDA_TENSOR(mixed, torch::kBFloat16);
     CHECK_CUDA_TENSOR(conv_state, torch::kBFloat16);
     CHECK_CUDA_TENSOR(w, torch::kBFloat16);
@@ -120,14 +129,15 @@ void gdn_conv(torch::Tensor mixed, torch::Tensor conv_state, torch::Tensor w, to
     const int64_t B = mixed.size(0), C = mixed.size(1);
     TORCH_CHECK(mixed.dim() == 2 && conv_state.size(0) == B && conv_state.size(1) == C && conv_state.size(2) == 3 && w.numel() == C * 4 &&
                 out.sizes() == mixed.sizes(), "bad shapes");
-    CHECK_LAUNCH(launch_gdn_conv(mixed.data_ptr(), conv_state.data_ptr(), w.data_ptr(), out.data_ptr(), B, C, at::cuda::getCurrentCUDAStream()));
+    CHECK_LAUNCH(launch_gdn_conv(mixed.data_ptr(), conv_state.data_ptr(), w.data_ptr(), out.data_ptr(), B, C, active_ptr(active, B),
+                                 at::cuda::getCurrentCUDAStream()));
 }
 
 // GDN decode step, part 2: gated delta rule on the fp32 state + gated RMSNorm.
 // qkv: bf16 [B, 2*Hk*128 + Hv*128]; z: bf16 [B, Hv*128]; b, a: bf16 [B, Hv]; A_log, dt_bias: bf16 [Hv];
 // norm_w: bf16 [128]; state: fp32 [B, Hv, 128, 128] (in place); out: bf16 [B, Hv*128].
 void gdn_delta(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tensor a, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor norm_w,
-               torch::Tensor state, torch::Tensor out, int64_t Hk, double eps) {
+               torch::Tensor state, torch::Tensor out, int64_t Hk, double eps, c10::optional<torch::Tensor> active) {
     for (auto* t : {&qkv, &z, &b, &a, &A_log, &dt_bias, &norm_w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     CHECK_CUDA_TENSOR(state, torch::kFloat32);
     const int64_t B = qkv.size(0), Hv = state.size(1);
@@ -135,7 +145,8 @@ void gdn_delta(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tenso
                 z.size(1) == Hv * 128 && b.numel() == B * Hv && a.numel() == B * Hv && A_log.numel() == Hv && dt_bias.numel() == Hv &&
                 norm_w.numel() == 128 && out.sizes() == z.sizes() && Hv % Hk == 0, "bad shapes");
     CHECK_LAUNCH(launch_gdn_delta(qkv.data_ptr(), z.data_ptr(), b.data_ptr(), a.data_ptr(), A_log.data_ptr(), dt_bias.data_ptr(), norm_w.data_ptr(),
-                                  state.data_ptr<float>(), out.data_ptr(), B, Hk, Hv, (float)eps, at::cuda::getCurrentCUDAStream()));
+                                  state.data_ptr<float>(), out.data_ptr(), B, Hk, Hv, (float)eps, active_ptr(active, B),
+                                  at::cuda::getCurrentCUDAStream()));
 }
 
 cudaError_t launch_rmsnorm(const void*, const void*, void*, int, int, float, cudaStream_t);
@@ -297,11 +308,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("alpha"), py::arg("residual"), py::arg("out"), py::arg("tile") = 0);
     m.def("rmsnorm", &rmsnorm, "zero-centered RMSNorm (1 + w)");
     m.def("bf16_gemv", &bf16_gemv, "bf16-weight GEMV, M<=4");
-    m.def("gdn_conv", &gdn_conv, "GDN decode: causal conv step + SiLU");
-    m.def("gdn_delta", &gdn_delta, "GDN decode: gated delta rule + gated RMSNorm");
+    m.def("gdn_conv", &gdn_conv, "GDN decode: causal conv step + SiLU", py::arg("mixed"), py::arg("conv_state"), py::arg("w"), py::arg("out"),
+          py::arg("active") = py::none());
+    m.def("gdn_delta", &gdn_delta, "GDN decode: gated delta rule + gated RMSNorm", py::arg("qkv"), py::arg("z"), py::arg("b"), py::arg("a"),
+          py::arg("A_log"), py::arg("dt_bias"), py::arg("norm_w"), py::arg("state"), py::arg("out"), py::arg("Hk"), py::arg("eps"),
+          py::arg("active") = py::none());
     m.def("attn_decode", &attn_decode, "split-KV GQA decode attention, head_dim 256", py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),
           py::arg("seq_lens"), py::arg("out"), py::arg("splits"), py::arg("scale"), py::arg("gate") = py::none());
-    m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + KV write");
+    m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + KV write", py::arg("qp"), py::arg("kp"), py::arg("vp"),
+          py::arg("qn_w"), py::arg("kn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("k_cache"), py::arg("v_cache"), py::arg("q_out"),
+          py::arg("eps"), py::arg("active") = py::none());
     m.def("nvfp4_gemv", &nvfp4_gemv, "NVFP4 W4A16 GEMV, M<=4", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gscale"),
           py::arg("residual"), py::arg("out"));
     m.def("nvfp4_swiglu", &nvfp4_swiglu, "fused silu(gate)*up NVFP4 GEMV, M<=4");

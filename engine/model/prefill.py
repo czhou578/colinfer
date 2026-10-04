@@ -118,7 +118,12 @@ def _attention(attn, q8, state: FastState, li: int):
     q = torch.empty(1, attn.num_heads, T, attn.head_dim, device=q8.device, dtype=torch.bfloat16)
     ops().attn_prologue(qp, kp, vp, attn.q_norm.weight, attn.k_norm.weight, attn.inv_freq, state.pos_t, kc, vc, q, attn.q_norm.eps)
     L = state.pos + T
-    o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kc[0, :, :L], vc[0, :, :L], causal=True, kv_layout="HND",
+    kk, vv = kc[0, :, :L], vc[0, :, :L]
+    if kk.dtype == torch.float8_e4m3fn:
+        # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix
+        # to a BF16 scratch first costs a few ms per layer at 128k and saves tens (exact: e4m3 -> bf16 is lossless)
+        kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
+    o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
                                                 sm_scale=attn.head_dim ** -0.5)
     o8 = torch.empty(T, attn.num_heads * attn.head_dim, dtype=torch.float8_e4m3fn, device=q8.device)
     ops().gate_fp8(o.reshape(T, -1), qp, attn.head_dim, attn.o_proj.in_scale, o8)

@@ -184,8 +184,9 @@ template <typename KV>
 __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bfloat16* __restrict__ kp, const __nv_bfloat16* __restrict__ vp, int ldq, int ldk, int ldv,
                            const __nv_bfloat16* __restrict__ qn_w, const __nv_bfloat16* __restrict__ kn_w, const float* __restrict__ inv_freq,
                            const int* __restrict__ pos_t, typename KV::Elem* __restrict__ kc, typename KV::Elem* __restrict__ vc,
-                           __nv_bfloat16* __restrict__ q_out, int Hq, int Hkv, int T, int Lmax, int R, float eps) {
+                           __nv_bfloat16* __restrict__ q_out, int Hq, int Hkv, int T, int Lmax, int R, float eps, const int* __restrict__ active) {
     const int bt = blockIdx.x, b = bt / T, t = bt % T, hh = blockIdx.y, d = threadIdx.x;
+    const bool upd = active == nullptr || active[b] != 0;  // inactive slots: no KV write
     const int pos = pos_t[b] + t;
     __shared__ float xs[D], red[D / 32];
     float x;
@@ -196,7 +197,7 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
     else if (hh < Hq + Hkv) { x = __bfloat162float(kp[row * ldk + (size_t)(hh - Hq) * D + d]); w = kn_w; }
     else {
         const int h = hh - Hq - Hkv;
-        KV::store(vc + (((size_t)b * Hkv + h) * Lmax + pos) * D + d, __bfloat162float(vp[row * ldv + (size_t)h * D + d]));
+        if (upd) KV::store(vc + (((size_t)b * Hkv + h) * Lmax + pos) * D + d, __bfloat162float(vp[row * ldv + (size_t)h * D + d]));
         return;
     }
     float ss = x * x;
@@ -219,7 +220,7 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
         y = d < half ? xn * cs - xs[d + half] * sn : xn * cs + xs[d - half] * sn;
     }
     if (hh < Hq) q_out[(((size_t)b * Hq + hh) * T + t) * D + d] = __float2bfloat16(y);
-    else KV::store(kc + (((size_t)b * Hkv + (hh - Hq)) * Lmax + pos) * D + d, __bfloat162float(__float2bfloat16(y)));
+    else if (upd) KV::store(kc + (((size_t)b * Hkv + (hh - Hq)) * Lmax + pos) * D + d, __bfloat162float(__float2bfloat16(y)));
 }
 
 }  // namespace attn
@@ -247,15 +248,15 @@ cudaError_t launch_attn_decode(const void* q, const void* kc, const void* vc, co
 
 cudaError_t launch_attn_prologue(const void* qp, const void* kp, const void* vp, int ldq, int ldk, int ldv, const void* qn_w, const void* kn_w, const float* inv_freq,
                                  const int* pos_t, void* kc, void* vc, void* q_out, int B, int T, int Hq, int Hkv, int Lmax, int R, float eps,
-                                 bool kv_fp8, cudaStream_t st) {
+                                 bool kv_fp8, const int* active, cudaStream_t st) {
     dim3 grid(B * T, Hq + 2 * Hkv);
     if (kv_fp8)
         attn::k_prologue<attn::KvFp8><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp, ldq, ldk, ldv,
                                                                 (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
-                                                                (uint8_t*)kc, (uint8_t*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps);
+                                                                (uint8_t*)kc, (uint8_t*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps, active);
     else
         attn::k_prologue<attn::KvBf16><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp, ldq, ldk, ldv,
                                                                  (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
-                                                                 (__nv_bfloat16*)kc, (__nv_bfloat16*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps);
+                                                                 (__nv_bfloat16*)kc, (__nv_bfloat16*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps, active);
     return cudaGetLastError();
 }
