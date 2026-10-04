@@ -4,9 +4,11 @@
 
 cudaError_t launch_nvfp4_gemv(const void*, const void*, const void*, float, const void*, void*, bool, int, int, int, cudaStream_t);
 cudaError_t launch_nvfp4_swiglu(const void*, const void*, const void*, float, const void*, const void*, float, void*, int, int, int, cudaStream_t);
-cudaError_t launch_fp8_gemv(const void*, const void*, float, const void*, void*, bool, int, int, int, cudaStream_t);
+cudaError_t launch_fp8_gemv(const void*, const void*, float, const float*, const void*, void*, bool, int, int, int, cudaStream_t);
 cudaError_t launch_attn_decode(const void*, const void*, const void*, const int*, void*, float*, void*, int, int, int, int, int, int, int, float,
-                               bool, cudaStream_t);
+                               bool, const void*, cudaStream_t);
+cudaError_t launch_attn_prologue(const void*, const void*, const void*, const void*, const void*, const float*, const int*, void*, void*, void*, int,
+                                 int, int, int, int, int, float, bool, cudaStream_t);
 
 #define CHECK_CUDA_TENSOR(t, dt) \
     TORCH_CHECK((t).is_cuda() && (t).is_contiguous() && (t).scalar_type() == (dt), #t " must be a contiguous CUDA " #dt " tensor")
@@ -44,36 +46,61 @@ void nvfp4_swiglu(torch::Tensor x, torch::Tensor wg, torch::Tensor sg, double gg
                                      out.data_ptr(), x.size(0), N, K, at::cuda::getCurrentCUDAStream()));
 }
 
-// out = (x @ W^T) * scale (+ residual). w: float8_e4m3fn or uint8 [N, K].
-void fp8_gemv(torch::Tensor x, torch::Tensor w, double scale, c10::optional<torch::Tensor> residual, torch::Tensor out) {
+// out = (x @ W^T) * scale (+ residual). w: float8_e4m3fn or uint8 [N, K]. row_scale: optional fp32 [N]
+// per-row scales (several projections with their own per-tensor scales stacked into one launch).
+void fp8_gemv(torch::Tensor x, torch::Tensor w, double scale, c10::optional<torch::Tensor> residual, torch::Tensor out,
+              c10::optional<torch::Tensor> row_scale) {
     TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.element_size() == 1 && w.dim() == 2, "w must be 1-byte [N, K]");
     const int64_t N = w.size(0), K = w.size(1);
     check_x_out(x, out, N);
     TORCH_CHECK(x.size(1) == K, "shape mismatch");
     const void* r = nullptr;
     if (residual) { CHECK_CUDA_TENSOR(*residual, torch::kBFloat16); TORCH_CHECK(residual->sizes() == out.sizes()); r = residual->data_ptr(); }
-    CHECK_LAUNCH(launch_fp8_gemv(x.data_ptr(), w.data_ptr(), (float)scale, r, out.data_ptr(), out.scalar_type() == torch::kFloat32,
+    const float* rs = nullptr;
+    if (row_scale) { CHECK_CUDA_TENSOR(*row_scale, torch::kFloat32); TORCH_CHECK(row_scale->numel() == N); rs = row_scale->data_ptr<float>(); }
+    CHECK_LAUNCH(launch_fp8_gemv(x.data_ptr(), w.data_ptr(), (float)scale, rs, r, out.data_ptr(), out.scalar_type() == torch::kFloat32,
                                  x.size(0), N, K, at::cuda::getCurrentCUDAStream()));
 }
 
 // out[b, h, t] = softmax(q k^T * scale) v over the first seq_lens[b] - (T-1-t) cached positions.
 // q, out: bf16 [B, Hq, T, 256]; k_cache, v_cache: bf16 or float8_e4m3fn [B, Hkv, Lmax, 256]; seq_lens: int32 [B] (device).
+// gate (optional): the q_proj output [B, T, Hq, 2*256]; then out is [B, T, Hq*256] = attn * sigmoid(gate).
 void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor seq_lens, torch::Tensor out, int64_t splits,
-                 double scale) {
+                 double scale, c10::optional<torch::Tensor> gate) {
     CHECK_CUDA_TENSOR(q, torch::kBFloat16);
     const bool kv_fp8 = k_cache.scalar_type() == torch::kFloat8_e4m3fn;
     CHECK_CUDA_TENSOR(k_cache, kv_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16);
     CHECK_CUDA_TENSOR(v_cache, k_cache.scalar_type());
     CHECK_CUDA_TENSOR(seq_lens, torch::kInt32);
     CHECK_CUDA_TENSOR(out, torch::kBFloat16);
-    TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes() && out.sizes() == q.sizes(), "bad shapes");
+    TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes() && out.numel() == q.numel(), "bad shapes");
+    const void* gp = nullptr;
+    if (gate) { CHECK_CUDA_TENSOR(*gate, torch::kBFloat16); TORCH_CHECK(gate->numel() == 2 * q.numel()); gp = gate->data_ptr(); }
     const int64_t B = q.size(0), Hq = q.size(1), T = q.size(2), Dh = q.size(3), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
     TORCH_CHECK(k_cache.size(0) == B && k_cache.size(3) == Dh && seq_lens.numel() == B && splits >= 1, "bad shapes");
     auto part_acc = torch::empty({B * Hq * T * splits, Dh}, q.options().dtype(torch::kFloat32));
     auto part_ml = torch::empty({B * Hq * T * splits, 2}, q.options().dtype(torch::kFloat32));
     CHECK_LAUNCH(launch_attn_decode(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), seq_lens.data_ptr<int>(), out.data_ptr(),
                                     part_acc.data_ptr<float>(), part_ml.data_ptr(), B, Hq, Hkv, T, Lmax, Dh, splits, (float)scale, kv_fp8,
-                                    at::cuda::getCurrentCUDAStream()));
+                                    gp, at::cuda::getCurrentCUDAStream()));
+}
+
+// Fused q/k RMSNorm + partial RoPE + KV-cache write at the device positions pos_t[b] + t.
+// qp: [B, T, Hq, 512] bf16 (q | gate per head); kp, vp: [B, T, Hkv, 256]; inv_freq: fp32 [R/2]; q_out: [B, Hq, T, 256].
+void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::Tensor qn_w, torch::Tensor kn_w, torch::Tensor inv_freq,
+                   torch::Tensor pos_t, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor q_out, double eps) {
+    for (auto* t : {&qp, &kp, &vp, &qn_w, &kn_w, &q_out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(inv_freq, torch::kFloat32);
+    CHECK_CUDA_TENSOR(pos_t, torch::kInt32);
+    const bool kv_fp8 = k_cache.scalar_type() == torch::kFloat8_e4m3fn;
+    CHECK_CUDA_TENSOR(k_cache, kv_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16);
+    CHECK_CUDA_TENSOR(v_cache, k_cache.scalar_type());
+    const int64_t B = q_out.size(0), Hq = q_out.size(1), T = q_out.size(2), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
+    TORCH_CHECK(q_out.size(3) == 256 && qp.numel() == B * T * Hq * 512 && kp.numel() == B * T * Hkv * 256 && vp.numel() == kp.numel() &&
+                pos_t.numel() == B, "bad shapes");
+    CHECK_LAUNCH(launch_attn_prologue(qp.data_ptr(), kp.data_ptr(), vp.data_ptr(), qn_w.data_ptr(), kn_w.data_ptr(), inv_freq.data_ptr<float>(),
+                                      pos_t.data_ptr<int>(), k_cache.data_ptr(), v_cache.data_ptr(), q_out.data_ptr(), B, T, Hq, Hkv, Lmax,
+                                      2 * inv_freq.numel(), (float)eps, kv_fp8, at::cuda::getCurrentCUDAStream()));
 }
 
 cudaError_t launch_gdn_conv(const void*, void*, const void*, void*, int, int, cudaStream_t);
@@ -133,10 +160,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bf16_gemv", &bf16_gemv, "bf16-weight GEMV, M<=4");
     m.def("gdn_conv", &gdn_conv, "GDN decode: causal conv step + SiLU");
     m.def("gdn_delta", &gdn_delta, "GDN decode: gated delta rule + gated RMSNorm");
-    m.def("attn_decode", &attn_decode, "split-KV GQA decode attention, head_dim 256");
+    m.def("attn_decode", &attn_decode, "split-KV GQA decode attention, head_dim 256", py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),
+          py::arg("seq_lens"), py::arg("out"), py::arg("splits"), py::arg("scale"), py::arg("gate") = py::none());
+    m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + KV write");
     m.def("nvfp4_gemv", &nvfp4_gemv, "NVFP4 W4A16 GEMV, M<=4", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gscale"),
           py::arg("residual"), py::arg("out"));
     m.def("nvfp4_swiglu", &nvfp4_swiglu, "fused silu(gate)*up NVFP4 GEMV, M<=4");
-    m.def("fp8_gemv", &fp8_gemv, "FP8 per-tensor W8A16 GEMV, M<=4", py::arg("x"), py::arg("w"), py::arg("scale"), py::arg("residual"),
-          py::arg("out"));
+    m.def("fp8_gemv", &fp8_gemv, "FP8 per-tensor (or per-row) W8A16 GEMV, M<=4", py::arg("x"), py::arg("w"), py::arg("scale"),
+          py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
 }

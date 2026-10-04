@@ -34,11 +34,15 @@ __device__ __forceinline__ void bf16x8_to_float(const uint4 v, float (&f)[8]) {
 struct KvBf16 {
     using Elem = __nv_bfloat16;
     using Vec = uint4;
+    static __device__ __forceinline__ void store(Elem* p, float v) { *p = __float2bfloat16(v); }
     static __device__ __forceinline__ void to_float(const Vec v, float (&f)[8]) { bf16x8_to_float(v, f); }
 };
 struct KvFp8 {
     using Elem = uint8_t;
     using Vec = uint2;
+    static __device__ __forceinline__ void store(Elem* p, float v) {
+        *p = (Elem)__nv_cvt_float_to_fp8(fminf(fmaxf(v, -448.f), 448.f), __NV_SATFINITE, __NV_E4M3);
+    }
     static __device__ __forceinline__ void to_float(const Vec v, float (&f)[8]) {
         const uint32_t u[2] = {v.x, v.y};
 #pragma unroll
@@ -143,7 +147,10 @@ __global__ void __launch_bounds__(WARPS * 32) k_split(const __nv_bfloat16* __res
     }
 }
 
-__global__ void k_combine(const float* __restrict__ part_acc, const float2* __restrict__ part_ml, __nv_bfloat16* __restrict__ out, int splits) {
+// gate == nullptr: out[b, h, t, :] (the q layout). gate != nullptr (the q_proj output [B, T, Hq, 2D],
+// gate in the second half of each head): out[b, t, h, :] = attn * sigmoid(gate), ready for o_proj.
+__global__ void k_combine(const float* __restrict__ part_acc, const float2* __restrict__ part_ml, __nv_bfloat16* __restrict__ out, int splits,
+                          const __nv_bfloat16* __restrict__ gate, int Hq, int T) {
     const size_t row = blockIdx.x;  // (b, h, t)
     const int d = threadIdx.x;
     float M = -CUDART_INF_F;
@@ -156,14 +163,68 @@ __global__ void k_combine(const float* __restrict__ part_acc, const float2* __re
             L += ml.y * c;
             A += part_acc[(row * splits + s) * D + d] * c;
         }
-    out[row * D + d] = __float2bfloat16(L > 0.f ? A / L : 0.f);
+    const float val = L > 0.f ? A / L : 0.f;
+    if (gate == nullptr) {
+        out[row * D + d] = __float2bfloat16(val);
+    } else {
+        const int t = row % T, h = (row / T) % Hq, b = row / ((size_t)T * Hq);
+        const size_t o = (((size_t)b * T + t) * Hq + h) * D + d;
+        const float g = __bfloat162float(gate[(((size_t)b * T + t) * Hq + h) * 2 * D + D + d]);
+        out[o] = __float2bfloat16(val / (1.f + __expf(-g)));
+    }
+}
+
+// Attention prologue for T new rows per slot, one block (D threads) per (b, t, head) over Hq q-heads,
+// then Hkv k-heads, then Hkv v-heads:
+//   q:  zero-centered RMSNorm (q_norm) + partial RoPE on the first R dims  -> q_out [B, Hq, T, D]
+//   k:  RMSNorm (k_norm) + RoPE, written to k_cache[b, h, pos_t[b] + t]   (bf16 or saturating e4m3)
+//   v:  written to v_cache[b, h, pos_t[b] + t]
+// qp: q_proj output [B, T, Hq, 2D] (q in the first D of each head); kp, vp: [B, T, Hkv, D].
+template <typename KV>
+__global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bfloat16* __restrict__ kp, const __nv_bfloat16* __restrict__ vp,
+                           const __nv_bfloat16* __restrict__ qn_w, const __nv_bfloat16* __restrict__ kn_w, const float* __restrict__ inv_freq,
+                           const int* __restrict__ pos_t, typename KV::Elem* __restrict__ kc, typename KV::Elem* __restrict__ vc,
+                           __nv_bfloat16* __restrict__ q_out, int Hq, int Hkv, int T, int Lmax, int R, float eps) {
+    const int bt = blockIdx.x, b = bt / T, t = bt % T, hh = blockIdx.y, d = threadIdx.x;
+    const int pos = pos_t[b] + t;
+    __shared__ float xs[D], red[D / 32];
+    float x;
+    const __nv_bfloat16* w;
+    if (hh < Hq) { x = __bfloat162float(qp[(((size_t)b * T + t) * Hq + hh) * 2 * D + d]); w = qn_w; }
+    else if (hh < Hq + Hkv) { x = __bfloat162float(kp[(((size_t)b * T + t) * Hkv + (hh - Hq)) * D + d]); w = kn_w; }
+    else {
+        const int h = hh - Hq - Hkv;
+        KV::store(vc + (((size_t)b * Hkv + h) * Lmax + pos) * D + d, __bfloat162float(vp[(((size_t)b * T + t) * Hkv + h) * D + d]));
+        return;
+    }
+    float ss = x * x;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((d & 31) == 0) red[d >> 5] = ss;
+    __syncthreads();
+    float tot = 0.f;
+#pragma unroll
+    for (int i = 0; i < D / 32; ++i) tot += red[i];
+    const float xn = __bfloat162float(__float2bfloat16(x * rsqrtf(tot / D + eps) * (1.f + __bfloat162float(w[d]))));
+    xs[d] = xn;
+    __syncthreads();
+    float y = xn;
+    if (d < R) {
+        const int half = R / 2, i = d % half;
+        const float ang = (float)pos * inv_freq[i];
+        float sn, cs;
+        sincosf(ang, &sn, &cs);
+        y = d < half ? xn * cs - xs[d + half] * sn : xn * cs + xs[d - half] * sn;
+    }
+    if (hh < Hq) q_out[(((size_t)b * Hq + hh) * T + t) * D + d] = __float2bfloat16(y);
+    else KV::store(kc + (((size_t)b * Hkv + (hh - Hq)) * Lmax + pos) * D + d, __bfloat162float(__float2bfloat16(y)));
 }
 
 }  // namespace attn
 
 cudaError_t launch_attn_decode(const void* q, const void* kc, const void* vc, const int* seq_lens, void* out, float* part_acc,
                                void* part_ml, int B, int Hq, int Hkv, int T, int Lmax, int Dh, int splits, float scale, bool kv_fp8,
-                               cudaStream_t st) {
+                               const void* gate, cudaStream_t st) {
     if (Dh != attn::D || Hq % Hkv) return cudaErrorInvalidValue;
     const int G = Hq / Hkv;
     dim3 grid(B * T, Hkv, splits), block(attn::WARPS * 32);
@@ -177,6 +238,22 @@ cudaError_t launch_attn_decode(const void* q, const void* kc, const void* vc, co
     else if (G == 4) ATTN_LAUNCH(4, KvBf16);
     else return cudaErrorInvalidValue;
 #undef ATTN_LAUNCH
-    attn::k_combine<<<B * Hq * T, attn::D, 0, st>>>(part_acc, (const float2*)part_ml, (__nv_bfloat16*)out, splits);
+    attn::k_combine<<<B * Hq * T, attn::D, 0, st>>>(part_acc, (const float2*)part_ml, (__nv_bfloat16*)out, splits,
+                                                    (const __nv_bfloat16*)gate, Hq, T);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_attn_prologue(const void* qp, const void* kp, const void* vp, const void* qn_w, const void* kn_w, const float* inv_freq,
+                                 const int* pos_t, void* kc, void* vc, void* q_out, int B, int T, int Hq, int Hkv, int Lmax, int R, float eps,
+                                 bool kv_fp8, cudaStream_t st) {
+    dim3 grid(B * T, Hq + 2 * Hkv);
+    if (kv_fp8)
+        attn::k_prologue<attn::KvFp8><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp,
+                                                                (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
+                                                                (uint8_t*)kc, (uint8_t*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps);
+    else
+        attn::k_prologue<attn::KvBf16><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp,
+                                                                 (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
+                                                                 (__nv_bfloat16*)kc, (__nv_bfloat16*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps);
     return cudaGetLastError();
 }

@@ -59,6 +59,31 @@ class Fp8Linear(nn.Module):
         return out.view(*shp[:-1], self.out_features)
 
 
+class StackedFp8Linear(nn.Module):
+    """Several FP8 linears that read the same input, stacked into one GEMV launch with per-row
+    scales (each keeps its own checkpoint scale exactly). forward returns one output per part."""
+
+    def __init__(self, parts: list):
+        super().__init__()
+        self.register_buffer("w", torch.cat([p.w for p in parts]).contiguous(), persistent=False)
+        self.register_buffer("rs", torch.cat([torch.full((p.out_features,), p.scale, dtype=torch.float32, device=p.w.device)
+                                              for p in parts]), persistent=False)
+        self.sizes = [p.out_features for p in parts]
+        self.in_features = parts[0].in_features
+        off = 0
+        for p in parts:  # the parts keep working (prefill path) as views into the stacked weight
+            p.w = self.w[off:off + p.out_features]
+            off += p.out_features
+
+    def forward(self, x):
+        shp = x.shape
+        x2 = x.reshape(-1, self.in_features).contiguous()
+        out = torch.empty(x2.shape[0], sum(self.sizes), device=x.device, dtype=torch.bfloat16)
+        for i in range(0, x2.shape[0], MAX_M):
+            ops().fp8_gemv(x2[i:i + MAX_M], self.w, 1.0, None, out[i:i + MAX_M], self.rs)
+        return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
+
+
 class SwiGLUMLP(nn.Module):
     """silu(gate) * up in one fused GEMV launch, then down."""
 
@@ -118,6 +143,8 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
     leftover = [n for n, p in model.named_parameters() if p.is_meta] + [n for n, b in model.named_buffers() if b.is_meta]
     if leftover:
         raise RuntimeError(f"tensors left on meta: {leftover[:5]}")
+    del raw, plain
+    torch.cuda.empty_cache()
     model.eval()
     if verbose:
         n4 = sum(isinstance(m, Nvfp4Linear) for m in model.modules())
@@ -159,25 +186,17 @@ class KernelAttention(Attention):
 
     def forward(self, x, cos, sin, state: FastState, layer_idx: int, residual=None):
         B, T, _ = x.shape
-        q, gate = torch.chunk(self.q_proj(x).view(B, T, -1, self.head_dim * 2), 2, dim=-1)
-        gate = gate.reshape(B, T, -1)
-        q = self.q_norm(q.reshape(B, T, -1, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(B, T, -1, self.head_dim)).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, -1, self.head_dim).transpose(1, 2)
-        q, k = apply_rotary(q, k, cos, sin)
+        if hasattr(self, "qkv"):
+            qp, kp, vp = self.qkv(x)
+        else:
+            qp, kp, vp = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         kc, vc = state.k[layer_idx], state.v[layer_idx]
-        idx = state.pos_t.long()[:, None] + state.arange[:T]  # [B, T]
-        kw, vw = kc, vc
-        if kc.dtype == torch.float8_e4m3fn:  # index_copy_ has no fp8 kernel: copy the bytes
-            k = k.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
-            v = v.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
-            kw, vw = kc.view(torch.uint8), vc.view(torch.uint8)
-        for b in range(B):
-            kw[b].index_copy_(1, idx[b], k[b])
-            vw[b].index_copy_(1, idx[b], v[b])
-        out = torch.empty_like(q)
-        ops().attn_decode(q.contiguous(), kc, vc, state.pos_t + T, out, ATTN_SPLITS, self.head_dim ** -0.5)
-        attn = out.transpose(1, 2).reshape(B, T, -1) * torch.sigmoid(gate)
+        qp = qp.reshape(B, T, -1).contiguous()
+        q = torch.empty(B, self.num_heads, T, self.head_dim, device=x.device, dtype=torch.bfloat16)
+        ops().attn_prologue(qp, kp.contiguous(), vp.contiguous(), self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t,
+                            kc, vc, q, self.q_norm.eps)
+        attn = torch.empty(B, T, self.num_heads * self.head_dim, device=x.device, dtype=torch.bfloat16)
+        ops().attn_decode(q, kc, vc, state.pos_t + T, attn, ATTN_SPLITS, self.head_dim ** -0.5, qp)
         return self.o_proj(attn, residual)
 
 
@@ -204,8 +223,12 @@ class KernelGDN(GatedDeltaNet):
         if T != 1 or state is None:
             out = super().forward(x, state, layer_idx)
             return out if residual is None else residual + out
-        mixed = self.in_proj_qkv(x).view(B, -1)
-        z = self.in_proj_z(x).view(B, -1)
+        if hasattr(self, "qkvz"):
+            mixed, z = self.qkvz(x)
+            mixed, z = mixed.reshape(B, -1).contiguous(), z.reshape(B, -1).contiguous()
+        else:
+            mixed = self.in_proj_qkv(x).view(B, -1)
+            z = self.in_proj_z(x).view(B, -1)
         if not hasattr(self, "w_ba"):  # in_proj_b and in_proj_a stacked: one tiny GEMV launch
             self.w_ba = torch.cat([self.in_proj_b.weight, self.in_proj_a.weight]).contiguous()
         ba = torch.empty(B, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
@@ -265,9 +288,18 @@ def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False) -> FastQwen35:
     model.kv_fp8 = kv_fp8
     for layer in model.layers:
         if layer.block_type == "full_attention":
-            layer.self_attn.__class__ = KernelAttention
+            a = layer.self_attn
+            a.__class__ = KernelAttention
+            d = model.cfg.rotary_dim
+            a.inv_freq = 1.0 / (model.cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=model.embed_tokens.weight.device) / d))
+            if isinstance(a.q_proj, Fp8Linear):  # one launch for q, k, v (the parts are dropped, memory reused)
+                a.qkv = StackedFp8Linear([a.q_proj, a.k_proj, a.v_proj])
         else:
-            layer.linear_attn.__class__ = KernelGDN
+            g = layer.linear_attn
+            g.__class__ = KernelGDN
+            if isinstance(g.in_proj_qkv, Fp8Linear):
+                g.qkvz = StackedFp8Linear([g.in_proj_qkv, g.in_proj_z])
+                g.w_ba = torch.cat([g.in_proj_b.weight, g.in_proj_a.weight]).contiguous()
         layer.input_layernorm = KernelRMSNorm(layer.input_layernorm)
         layer.post_attention_layernorm = KernelRMSNorm(layer.post_attention_layernorm)
         layer.forward = fast_layer_forward.__get__(layer)

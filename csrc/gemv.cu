@@ -160,7 +160,8 @@ __device__ __forceinline__ void dot_fp8_chunk(const uint4 w, const __nv_bfloat16
 
 template <int M, int UNROLL, typename OutT>
 __global__ void __launch_bounds__(WARPS * 32) k_fp8(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, float scale,
-                                                     const __nv_bfloat16* residual, OutT* __restrict__ out, int N, int K) {
+                                                     const float* __restrict__ row_scale, const __nv_bfloat16* residual,
+                                                     OutT* __restrict__ out, int N, int K) {
     const int lane = threadIdx.x & 31, n = blockIdx.x * WARPS + (threadIdx.x >> 5);
     if (n >= N) return;
     float acc[M];
@@ -177,20 +178,19 @@ __global__ void __launch_bounds__(WARPS * 32) k_fp8(const __nv_bfloat16* __restr
         for (int u = 0; u < UNROLL; ++u) dot_fp8_chunk<M>(wr[u], x, K, (c + 32 * u) * 16, acc);
     }
     for (; c < chunks; c += 32) dot_fp8_chunk<M>(__ldcs(w4 + c), x, K, c * 16, acc);
-    store_row<M>(out, residual, N, n, acc, scale, lane);
+    store_row<M>(out, residual, N, n, acc, row_scale ? row_scale[n] : scale, lane);
 }
 
-// ---- BF16 weights (tiny projections only) ----
+// ---- BF16 weights (tiny projections only): one block per row, K split over the 8 warps ----
 template <int M>
 __global__ void __launch_bounds__(WARPS * 32) k_bf16(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                                       __nv_bfloat16* __restrict__ out, int N, int K) {
-    const int lane = threadIdx.x & 31, n = blockIdx.x * WARPS + (threadIdx.x >> 5);
-    if (n >= N) return;
+    const int n = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     float acc[M];
 #pragma unroll
     for (int m = 0; m < M; ++m) acc[m] = 0.f;
     const uint4* w4 = reinterpret_cast<const uint4*>(w + (size_t)n * K);
-    for (int c = lane; c < K / 8; c += 32) {
+    for (int c = tid; c < K / 8; c += WARPS * 32) {
         const uint4 wv = __ldcs(w4 + c);
         const uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
 #pragma unroll
@@ -204,7 +204,19 @@ __global__ void __launch_bounds__(WARPS * 32) k_bf16(const __nv_bfloat16* __rest
             }
         }
     }
-    store_row<M>(out, (const __nv_bfloat16*)nullptr, N, n, acc, 1.f, lane);
+    __shared__ float red[M][WARPS];
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        const float v = warp_sum(acc[m]);
+        if (lane == 0) red[m][warp] = v;
+    }
+    __syncthreads();
+    if (tid < M) {
+        float v = 0.f;
+#pragma unroll
+        for (int i = 0; i < WARPS; ++i) v += red[tid][i];
+        out[(size_t)tid * N + n] = __float2bfloat16(v);
+    }
 }
 
 }  // namespace gemv
@@ -243,20 +255,20 @@ cudaError_t launch_nvfp4_swiglu(const void* x, const void* wg, const void* sg, f
     return cudaGetLastError();
 }
 
-cudaError_t launch_fp8_gemv(const void* x, const void* w, float scale, const void* residual, void* out, bool out_fp32, int M_, int N, int K,
-                            cudaStream_t st) {
+cudaError_t launch_fp8_gemv(const void* x, const void* w, float scale, const float* row_scale, const void* residual, void* out, bool out_fp32,
+                            int M_, int N, int K, cudaStream_t st) {
     if (K % 16) return cudaErrorInvalidValue;
     dim3 grid((N + gemv::WARPS - 1) / gemv::WARPS), block(gemv::WARPS * 32);
     auto xb = (const __nv_bfloat16*)x;
     auto rb = (const __nv_bfloat16*)residual;
-    DISPATCH_M(M_, if (out_fp32) gemv::k_fp8<M, UNROLL_FP8, float><<<grid, block, 0, st>>>(xb, (const uint8_t*)w, scale, rb, (float*)out, N, K);
-                   else gemv::k_fp8<M, UNROLL_FP8, __nv_bfloat16><<<grid, block, 0, st>>>(xb, (const uint8_t*)w, scale, rb, (__nv_bfloat16*)out, N, K));
+    DISPATCH_M(M_, if (out_fp32) gemv::k_fp8<M, UNROLL_FP8, float><<<grid, block, 0, st>>>(xb, (const uint8_t*)w, scale, row_scale, rb, (float*)out, N, K);
+                   else gemv::k_fp8<M, UNROLL_FP8, __nv_bfloat16><<<grid, block, 0, st>>>(xb, (const uint8_t*)w, scale, row_scale, rb, (__nv_bfloat16*)out, N, K));
     return cudaGetLastError();
 }
 
 cudaError_t launch_bf16_gemv(const void* x, const void* w, void* out, int M_, int N, int K, cudaStream_t st) {
     if (K % 8) return cudaErrorInvalidValue;
-    dim3 grid((N + gemv::WARPS - 1) / gemv::WARPS), block(gemv::WARPS * 32);
+    dim3 grid(N), block(gemv::WARPS * 32);
     DISPATCH_M(M_, gemv::k_bf16<M><<<grid, block, 0, st>>>((const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, N, K));
     return cudaGetLastError();
 }
