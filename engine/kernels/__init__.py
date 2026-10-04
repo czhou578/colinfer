@@ -15,7 +15,7 @@ def ops():
         os.makedirs(build, exist_ok=True)
         _ext = load(
             name="colinfer_kernels",
-            sources=[os.path.join(_ROOT, "csrc", f) for f in ("bindings.cpp", "gemv.cu")],
+            sources=[os.path.join(_ROOT, "csrc", f) for f in ("bindings.cpp", "gemv.cu", "attn_decode.cu", "gdn_step.cu", "norm.cu")],
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "--use_fast_math", "-lineinfo",
                                "-Xptxas=-v" if os.environ.get("COLINFER_PTXAS_VERBOSE") else "-DNOVERBOSE"],

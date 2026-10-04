@@ -69,7 +69,15 @@ def run_ours(args):
     path = resolve(args.ckpt)
     tok = AutoTokenizer.from_pretrained(path)
     t0 = time.time()
-    model = load_model(path, emulate=args.emulate)
+    gen_obj = None
+    if args.engine in ("fast", "graph"):
+        from engine.model.fast import load_fast_model, to_fast
+        model = load_fast_model(path)
+        if args.engine == "graph":
+            from engine.runtime.fast_generate import FastGenerator
+            gen_obj = FastGenerator(to_fast(model, kv_fp8=args.kv_fp8), max_seq_len=1024)
+    else:
+        model = load_model(path, emulate=args.emulate)
     print(f"[ours] loaded in {time.time() - t0:.0f}s")
     import json
     gc = json.load(open(os.path.join(path, "generation_config.json")))
@@ -79,10 +87,13 @@ def run_ours(args):
     for i, p in enumerate(PROMPTS[: args.prompts]):
         ids = build_inputs(tok, p).to("cuda")
         t0 = time.time()
-        gen, logits = generate(model, ids, args.max_new_tokens, eos_ids=eos, keep_logits=args.keep_logits)
+        if gen_obj is not None:
+            gen, logits = gen_obj.generate(ids, args.max_new_tokens, eos_ids=eos, keep_logits=args.keep_logits)
+        else:
+            gen, logits = generate(model, ids, args.max_new_tokens, eos_ids=eos, keep_logits=args.keep_logits)
         results.append(dict(prompt=p, input_ids=ids[0].cpu(), tokens=gen, logits=logits.cpu() if logits is not None else None))
         print(f"[ours] {i:2d} {len(gen):3d} tok {time.time() - t0:5.1f}s  {tok.decode(gen[:24])!r}")
-    torch.save(dict(side="ours", ckpt=args.ckpt, emulate=args.emulate, results=results, eos=eos), args.out)
+    torch.save(dict(side="ours", ckpt=args.ckpt, emulate=args.emulate, engine=args.engine, results=results, eos=eos), args.out)
     print(f"[ours] wrote {args.out}")
 
 
@@ -131,6 +142,9 @@ def main():
     ap.add_argument("--keep-logits", type=int, default=32)
     ap.add_argument("--prompts", type=int, default=30)
     ap.add_argument("--emulate", help="ours only: quant emulation effects (see engine/weights/quant_emul.py)")
+    ap.add_argument("--engine", choices=["reference", "fast", "graph"], default="reference",
+                    help="ours only: Phase 1 PyTorch reference, or the Phase 2 kernel decode path")
+    ap.add_argument("--kv-fp8", action="store_true", help="graph engine: fp8 e4m3 KV cache")
     args = ap.parse_args()
     if args.mode == "compare":
         ok = compare(*args.files[:2])

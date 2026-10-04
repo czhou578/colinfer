@@ -1,0 +1,131 @@
+// gdn_step.cu -- fused Gated DeltaNet decode step (PLAN.md 4.3 item 5), T = 1 per slot.
+//
+// k_conv:  qkv[b, c] = bf16(silu(bf16(sum_k w[c,k] * [conv_state[b,c,0..2], mixed[b,c]][k])));
+//          conv_state[b, c] <- last three inputs. One thread per channel.
+// k_delta: one block per (slot, value head h), 512 threads. Head h reads q/k of key head h / (Hv/Hk)
+//          and v of head h from qkv, L2-normalises q and k, then on its fp32 state S [dk=128, dv=128]:
+//              S *= exp(g);  kv = S^T k;  delta = (v - kv) * beta;  S += k delta^T;  o = S^T q
+//          followed by the gated RMSNorm  out = bf16( bf16(w * bf16(rmsnorm(bf16(o)))) * silu(z) ).
+//          beta = bf16(sigmoid(b)), g = -exp(A_log) * softplus(a + dt_bias). Rounding points follow
+//          transformers' torch_recurrent_gated_delta_rule + Qwen3_5RMSNormGated.
+//          Warp w owns rows [32 (w/4), +32) and columns [32 (w%4), +32): lane = column, so every
+//          state load/store is a coalesced 128-byte row segment. Column sums over the 4 row groups
+//          go through shared memory.
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+namespace gdn {
+
+constexpr int DK = 128, DV = 128, THREADS = 512;
+
+__device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16(x)); }
+__device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
+
+__global__ void k_conv(const __nv_bfloat16* __restrict__ mixed, __nv_bfloat16* __restrict__ conv_state, const __nv_bfloat16* __restrict__ w,
+                       __nv_bfloat16* __restrict__ out, int C) {
+    const int b = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    __nv_bfloat16* cs = conv_state + ((size_t)b * C + c) * 3;
+    const float x0 = __bfloat162float(cs[0]), x1 = __bfloat162float(cs[1]), x2 = __bfloat162float(cs[2]);
+    const __nv_bfloat16 xn = mixed[(size_t)b * C + c];
+    const float x3 = __bfloat162float(xn);
+    const __nv_bfloat16* wc = w + (size_t)c * 4;
+    float acc = __bfloat162float(wc[0]) * x0;
+    acc = fmaf(__bfloat162float(wc[1]), x1, acc);
+    acc = fmaf(__bfloat162float(wc[2]), x2, acc);
+    acc = fmaf(__bfloat162float(wc[3]), x3, acc);
+    out[(size_t)b * C + c] = __float2bfloat16(silu(bf(acc)));
+    cs[0] = cs[1];
+    cs[1] = cs[2];
+    cs[2] = xn;
+}
+
+__device__ __forceinline__ float block_sum_128(float v, float* red, int tid) {
+    // sum of v over threads 0..127 (4 warps); result broadcast to all 512 threads
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (tid < 128 && (tid & 31) == 0) red[tid >> 5] = v;
+    __syncthreads();
+    const float s = red[0] + red[1] + red[2] + red[3];
+    __syncthreads();
+    return s;
+}
+
+__global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ z,
+                                                    const __nv_bfloat16* __restrict__ bvec, const __nv_bfloat16* __restrict__ avec,
+                                                    const __nv_bfloat16* __restrict__ A_log, const __nv_bfloat16* __restrict__ dt_bias,
+                                                    const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ state,
+                                                    __nv_bfloat16* __restrict__ out, int Hk, int Hv, float eps) {
+    const int b = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int kh = h / (Hv / Hk), C = 2 * Hk * DK + Hv * DV;
+    const __nv_bfloat16* src = qkv + (size_t)b * C;
+    __shared__ float qs[DK], ks[DK], vs[DV], red[4], colred[4][DV];
+    if (tid < DK) {
+        qs[tid] = __bfloat162float(src[kh * DK + tid]);
+        ks[tid] = __bfloat162float(src[Hk * DK + kh * DK + tid]);
+        vs[tid] = __bfloat162float(src[2 * Hk * DK + h * DV + tid]);
+    }
+    __syncthreads();
+    // l2norm (eps 1e-6) and the 1/sqrt(dk) query scale, in fp32
+    const float qq = block_sum_128(tid < DK ? qs[tid] * qs[tid] : 0.f, red, tid);
+    const float kk = block_sum_128(tid < DK ? ks[tid] * ks[tid] : 0.f, red, tid);
+    if (tid < DK) {
+        qs[tid] = qs[tid] * rsqrtf(qq + 1e-6f) * rsqrtf((float)DK);
+        ks[tid] = ks[tid] * rsqrtf(kk + 1e-6f);
+    }
+    __syncthreads();
+    const float beta = bf(1.f / (1.f + __expf(-__bfloat162float(bvec[(size_t)b * Hv + h]))));
+    const float av = __bfloat162float(avec[(size_t)b * Hv + h]) + __bfloat162float(dt_bias[h]);
+    const float softplus = av > 20.f ? av : log1pf(__expf(av));
+    const float decay = __expf(-__expf(__bfloat162float(A_log[h])) * softplus);
+
+    const int rg = warp >> 2, col = ((warp & 3) << 5) + lane;
+    float* S = state + ((size_t)b * Hv + h) * DK * DV + (size_t)(rg * 32) * DV + col;
+    float s[32];
+#pragma unroll
+    for (int r = 0; r < 32; ++r) s[r] = S[(size_t)r * DV] * decay;
+    float part = 0.f;
+#pragma unroll
+    for (int r = 0; r < 32; ++r) part = fmaf(s[r], ks[rg * 32 + r], part);
+    colred[rg][col] = part;
+    __syncthreads();
+    const float kv = colred[0][col] + colred[1][col] + colred[2][col] + colred[3][col];
+    const float delta = (vs[col] - kv) * beta;
+    __syncthreads();
+    part = 0.f;
+#pragma unroll
+    for (int r = 0; r < 32; ++r) {
+        s[r] = fmaf(ks[rg * 32 + r], delta, s[r]);
+        S[(size_t)r * DV] = s[r];
+        part = fmaf(s[r], qs[rg * 32 + r], part);
+    }
+    colred[rg][col] = part;
+    __syncthreads();
+    // gated RMSNorm over the 128 outputs of this head (threads 0..127 hold columns 0..127)
+    float o = 0.f;
+    if (tid < DV) o = bf(colred[0][tid] + colred[1][tid] + colred[2][tid] + colred[3][tid]);
+    const float var = block_sum_128(tid < DV ? o * o : 0.f, red, tid) / DV;
+    if (tid < DV) {
+        const float xn = bf(o * rsqrtf(var + eps));
+        const float y = bf(__bfloat162float(norm_w[tid]) * xn);
+        const float g = __bfloat162float(z[(size_t)b * Hv * DV + h * DV + tid]);
+        out[(size_t)b * Hv * DV + h * DV + tid] = __float2bfloat16(y * silu(g));
+    }
+}
+
+}  // namespace gdn
+
+cudaError_t launch_gdn_conv(const void* mixed, void* conv_state, const void* w, void* out, int B, int C, cudaStream_t st) {
+    dim3 grid((C + 255) / 256, B);
+    gdn::k_conv<<<grid, 256, 0, st>>>((const __nv_bfloat16*)mixed, (__nv_bfloat16*)conv_state, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, C);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_gdn_delta(const void* qkv, const void* z, const void* b, const void* a, const void* A_log, const void* dt_bias,
+                             const void* norm_w, float* state, void* out, int B, int Hk, int Hv, float eps, cudaStream_t st) {
+    dim3 grid(Hv, B);
+    gdn::k_delta<<<grid, gdn::THREADS, 0, st>>>((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)z, (const __nv_bfloat16*)b, (const __nv_bfloat16*)a,
+                                                (const __nv_bfloat16*)A_log, (const __nv_bfloat16*)dt_bias, (const __nv_bfloat16*)norm_w, state,
+                                                (__nv_bfloat16*)out, Hk, Hv, eps);
+    return cudaGetLastError();
+}

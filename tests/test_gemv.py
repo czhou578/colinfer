@@ -86,3 +86,19 @@ def test_rejects_bad_shapes():
         ops().nvfp4_gemv(rand_x(5, 5120), w, sf, g, None, torch.empty(5, 64, device="cuda"))
     with pytest.raises(RuntimeError):
         ops().nvfp4_gemv(rand_x(1, 4096), w, sf, g, None, torch.empty(1, 64, device="cuda"))
+
+
+def test_bf16_gemv_and_rmsnorm():
+    torch.manual_seed(5)
+    w = torch.randn(96, 5120, device="cuda").bfloat16()
+    x = rand_x(2, 5120)
+    out = torch.empty(2, 96, device="cuda", dtype=torch.bfloat16)
+    ops().bf16_gemv(x, w, out)
+    check(out, x.float() @ w.float().T, "bf16 gemv")
+    from engine.model.qwen35 import RMSNorm
+    n = RMSNorm(5120, 1e-6).cuda().bfloat16()
+    with torch.no_grad():
+        n.weight.normal_(0, 0.2)
+    y = torch.empty_like(x)
+    ops().rmsnorm(x, n.weight.data, 1e-6, y)
+    assert torch.equal(y, n(x)), (y.float() - n(x).float()).abs().max()

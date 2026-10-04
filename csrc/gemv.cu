@@ -180,6 +180,33 @@ __global__ void __launch_bounds__(WARPS * 32) k_fp8(const __nv_bfloat16* __restr
     store_row<M>(out, residual, N, n, acc, scale, lane);
 }
 
+// ---- BF16 weights (tiny projections only) ----
+template <int M>
+__global__ void __launch_bounds__(WARPS * 32) k_bf16(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                                      __nv_bfloat16* __restrict__ out, int N, int K) {
+    const int lane = threadIdx.x & 31, n = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    if (n >= N) return;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+    const uint4* w4 = reinterpret_cast<const uint4*>(w + (size_t)n * K);
+    for (int c = lane; c < K / 8; c += 32) {
+        const uint4 wv = __ldcs(w4 + c);
+        const uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x + (size_t)m * K) + c);
+            const uint32_t xu[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 a = bf16x2_to_float2(wu[j]), b = bf16x2_to_float2(xu[j]);
+                acc[m] = fmaf(a.x, b.x, fmaf(a.y, b.y, acc[m]));
+            }
+        }
+    }
+    store_row<M>(out, (const __nv_bfloat16*)nullptr, N, n, acc, 1.f, lane);
+}
+
 }  // namespace gemv
 
 // ---------------------------------------------------------------------------------------------
@@ -224,5 +251,12 @@ cudaError_t launch_fp8_gemv(const void* x, const void* w, float scale, const voi
     auto rb = (const __nv_bfloat16*)residual;
     DISPATCH_M(M_, if (out_fp32) gemv::k_fp8<M, UNROLL_FP8, float><<<grid, block, 0, st>>>(xb, (const uint8_t*)w, scale, rb, (float*)out, N, K);
                    else gemv::k_fp8<M, UNROLL_FP8, __nv_bfloat16><<<grid, block, 0, st>>>(xb, (const uint8_t*)w, scale, rb, (__nv_bfloat16*)out, N, K));
+    return cudaGetLastError();
+}
+
+cudaError_t launch_bf16_gemv(const void* x, const void* w, void* out, int M_, int N, int K, cudaStream_t st) {
+    if (K % 8) return cudaErrorInvalidValue;
+    dim3 grid((N + gemv::WARPS - 1) / gemv::WARPS), block(gemv::WARPS * 32);
+    DISPATCH_M(M_, gemv::k_bf16<M><<<grid, block, 0, st>>>((const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, N, K));
     return cudaGetLastError();
 }

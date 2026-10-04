@@ -404,7 +404,7 @@ class Qwen35ForCausalLM(nn.Module):
         return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]
 
     def new_state(self, batch: int, max_seq_len: int) -> ModelState:
-        p = self.lm_head.weight
+        p = self.embed_tokens.weight  # the embedding is never quantized; lm_head may be a kernel module
         return ModelState(self.cfg, batch, max_seq_len, p.device, p.dtype)
 
     def forward(self, input_ids: torch.Tensor, state: ModelState | None = None, last_only: bool = False) -> torch.Tensor:
