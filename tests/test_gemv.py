@@ -83,7 +83,7 @@ def test_fp8_gemv(N, K, M):
 def test_rejects_bad_shapes():
     w, sf, g = rand_nvfp4(64, 5120)
     with pytest.raises(RuntimeError):
-        ops().nvfp4_gemv(rand_x(5, 5120), w, sf, g, None, torch.empty(5, 64, device="cuda"))
+        ops().nvfp4_gemv(rand_x(9, 5120), w, sf, g, None, torch.empty(9, 64, device="cuda"))  # M <= 8
     with pytest.raises(RuntimeError):
         ops().nvfp4_gemv(rand_x(1, 4096), w, sf, g, None, torch.empty(1, 64, device="cuda"))
 

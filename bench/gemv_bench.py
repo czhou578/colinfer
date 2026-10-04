@@ -79,7 +79,7 @@ def bench(kind, N, K, M, iters):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--m", type=int, nargs="+", default=[1, 2, 3, 4])
+    ap.add_argument("--m", type=int, nargs="+", default=[1, 2, 3, 4])  # up to 8
     ap.add_argument("--iters", type=int, default=50)
     a = ap.parse_args()
     print(f"{'shape':24s} {'N x K':>14s} {'MB':>7s} " + " ".join(f"{'M=' + str(m) + ' us':>9s} {'GB/s':>6s} {'%BW':>4s}" for m in a.m))

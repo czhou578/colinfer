@@ -51,6 +51,9 @@ def main():
     ap.add_argument("--drafter", default="ngram", choices=["ngram", "mtp"])
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--max-new", type=int, default=256)
+    ap.add_argument("--mtp-bf16", action="store_true", help="draft with the BF16 MTP weights (default: FP8)")
+    ap.add_argument("--draft-vocab", type=int, default=65536, help="0 = full vocabulary")
+    ap.add_argument("--temperature", type=float, default=0.0, help="> 0: sampled (no identity check; speed and acceptance only)")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
@@ -60,22 +63,26 @@ def main():
         spec = SpecGenerator(model, max_seq_len=8192, k=a.k)
     else:
         from engine.spec.mtp import MtpGenerator
-        spec = MtpGenerator(model, path, max_seq_len=8192, k=a.k)
+        spec = MtpGenerator(model, path, max_seq_len=8192, k=a.k, fp8=not a.mtp_bf16, draft_vocab=a.draft_vocab or None)
     all_same, tot_tok, tot_t = True, 0, 0.0
     for name, text in PROMPTS.items():
         ids = chat(tok, text)
         # baseline: the same generator (same prefill, same decode graph) with drafting off
-        t0 = time.perf_counter(); ref = spec.generate(ids, a.max_new, eos_ids=EOS, use_spec=False); t_plain = time.perf_counter() - t0
+        kw = dict(temperature=a.temperature, top_p=0.95, top_k=20, seed=1) if a.temperature > 0 else {}
+        t0 = time.perf_counter(); ref = spec.generate(ids, a.max_new, eos_ids=EOS, use_spec=False, **kw); t_plain = time.perf_counter() - t0
         st0 = dict(spec.stats)
-        t0 = time.perf_counter(); out = spec.generate(ids, a.max_new, eos_ids=EOS); t_spec = time.perf_counter() - t0
+        t0 = time.perf_counter(); out = spec.generate(ids, a.max_new, eos_ids=EOS, **kw); t_spec = time.perf_counter() - t0
         d = {k: spec.stats[k] - st0[k] for k in spec.stats}
-        same = out == ref
+        same = out == ref if a.temperature == 0 else True
         all_same &= same
         tot_tok += len(out); tot_t += t_spec
         acc = d["accepted"] / max(1, d["drafted"])
-        print(f"{name:10s} {'IDENTICAL' if same else 'DIFFERENT'}  {len(out):4d} tok  plain {len(ref) / t_plain:5.1f} tok/s  "
+        tag = ("IDENTICAL" if same else "DIFFERENT") if a.temperature == 0 else "sampled  "
+        print(f"{name:10s} {tag}  {len(out):4d} tok  plain {len(ref) / t_plain:5.1f} tok/s  "
               f"spec {len(out) / t_spec:5.1f} tok/s  ({d['spec_steps']}/{d['steps']} steps drafted, acceptance {acc:.2f}, "
               f"{len(out) / max(1, d['steps']):.2f} tok/step)", flush=True)
+        if a.temperature > 0:
+            print("   ", repr(tok.decode(out[:30])))
         if not same:
             i = next(i for i in range(min(len(out), len(ref))) if out[i] != ref[i])
             print(f"   first difference at token {i}: {tok.decode(ref[max(0, i - 8):i + 4])!r} vs {tok.decode(out[max(0, i - 8):i + 4])!r}")

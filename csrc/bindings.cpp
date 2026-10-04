@@ -23,7 +23,7 @@ static const int* active_ptr(const c10::optional<torch::Tensor>& a, int64_t B) {
 
 static void check_x_out(const torch::Tensor& x, const torch::Tensor& out, int64_t N) {
     CHECK_CUDA_TENSOR(x, torch::kBFloat16);
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 4, "x must be [M<=4, K]");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 8, "x must be [M<=8, K]");
     TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == x.size(0) && out.size(1) == N, "out must be [M, N]");
     TORCH_CHECK(out.scalar_type() == torch::kBFloat16 || out.scalar_type() == torch::kFloat32, "out must be bf16 or fp32");
 }

@@ -230,6 +230,10 @@ __global__ void __launch_bounds__(WARPS * 32) k_bf16(const __nv_bfloat16* __rest
         case 2: { constexpr int M = 2; __VA_ARGS__; break; }      \
         case 3: { constexpr int M = 3; __VA_ARGS__; break; }      \
         case 4: { constexpr int M = 4; __VA_ARGS__; break; }      \
+        case 5: { constexpr int M = 5; __VA_ARGS__; break; }      \
+        case 6: { constexpr int M = 6; __VA_ARGS__; break; }      \
+        case 7: { constexpr int M = 7; __VA_ARGS__; break; }      \
+        case 8: { constexpr int M = 8; __VA_ARGS__; break; }      \
         default: return cudaErrorInvalidValue;                    \
     }
 
