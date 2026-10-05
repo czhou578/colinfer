@@ -611,6 +611,35 @@ rounds once (q × s has up to 9 significant bits; ~0.2% relative). Rows stay bit
   rebuild FP8 weights from the INT copies every chunk: ~12 GB more traffic per 2,048-token chunk (~5-8% slower prefill)
   and a second rounding of the prefill weights, for memory that is not short (61 GB allocated, 80 GB cap).
 
+## 11. Sub-4-bit MLP weights: not viable as scalar formats
+
+The MLP is 17.1B parameters, ~9.6 GB of the ~15.5 GB decode reads per token; each bit per weight saved is ~2.1 GB (~13%).
+`tools/lowbit_sim.py` quantizes the BF16 originals to scalar codebooks with an e4m3 scale per block. Weight error vs BF16
+(gate / up / down of layers 2, 31, 60, all alike):
+
+| Format | Bits / weight | Error |
+|---|---|---|
+| NVFP4 as shipped | 4.5 | 8.4-8.8% |
+| INT4, block 16 | 4.5 | 8.3-8.4% |
+| INT3 (±0.5 .. ±3.5), block 8 | 4.0 | 13.5% |
+| **NF3 (8 normal quantiles), block 16** | **3.5** | **14.8%** |
+| INT3 (±0.5 .. ±3.5), block 16 | 3.5 | 15.7% |
+| INT3 (-3 .. 3), block 16 | 3.5 | 18% |
+| INT3 (±0.5 .. ±3.5), block 32 | 3.25 | 17.4% |
+| INT2 (±0.5, ±1.5), block 16 | 2.5 | 32% |
+
+Perplexity with NF3 (the best 3.5-bit format), attention / GDN as shipped (6.9698 / 1.7257):
+
+| MLP in NF3 | WikiText | Python code |
+|---|---|---|
+| All 64 layers | 7.2742 (+4.4%) | 1.8701 (+8.4%) |
+| Layers 16-47 | 7.1142 (+2.1%) | 1.8095 (+4.9%) |
+
+The default (section 9) leaves ~0.27% of the code budget; even a few NF3 layers would spend it. Below 4 bits the
+remaining route is vector / trellis quantization with Hessian-aware rounding (QTIP, EXL3), which published results put
+at roughly +1-2% perplexity at 3 bits on large models over 16-bit weights, also beyond the gate here (the shipped NVFP4
+MLP is already +0.4% over BF16: 6.9698 vs 6.9404). Not pursued.
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Section 7.
