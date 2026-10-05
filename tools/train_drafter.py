@@ -61,26 +61,38 @@ def extract(a):
     rows = [json.loads(l) for l in open(src)]
     stem = os.path.splitext(os.path.basename(src))[0]
     prefix = "" if stem == "data" else stem + "_"  # data.jsonl -> shard_*.pt, data2.jsonl -> data2_shard_*.pt
-    os.makedirs(os.path.join(DIR, "feat"), exist_ok=True)
+    layers = tuple(int(x) for x in a.layers.split(",")) if a.layers else ()
+    feat = os.path.join(DIR, a.feat)
+    os.makedirs(feat, exist_ok=True)
     t0 = time.time()
     shard, n = [], 0
     for j, r in enumerate(rows):
         ids = (r["prompt"] + r["output"])[-MAXLEN:]
         P = max(0, len(ids) - len(r["output"]))  # reply starts here
         st = model.new_state(1, len(ids))
-        logits, H = prefill(model, torch.tensor([ids], device="cuda"), st, all_logits=True, return_hidden=True)
+        if layers:
+            logits, H, Lh = prefill(model, torch.tensor([ids], device="cuda"), st, all_logits=True, return_hidden=True, return_layers=layers)
+        else:
+            logits, H = prefill(model, torch.tensor([ids], device="cuda"), st, all_logits=True, return_hidden=True)
         lp = torch.log_softmax(logits.float(), -1)
         tv, ti = lp.topk(TOPK, -1)
-        shard.append(dict(ids=torch.tensor(ids, dtype=torch.int32), P=P, H=H.cpu(), tv=tv.half().cpu(), ti=ti.int().cpu(), kind=r["kind"]))
+        item = dict(ids=torch.tensor(ids, dtype=torch.int32), P=P, H=H.cpu(), tv=tv.half().cpu(), ti=ti.int().cpu(), kind=r["kind"])
+        if layers:
+            item["L"], item["layers"] = Lh.cpu(), layers
+        shard.append(item)
         if len(shard) == 100 or j == len(rows) - 1:
-            torch.save(shard, os.path.join(DIR, "feat", f"{prefix}shard_{n:03d}.pt"))
+            torch.save(shard, os.path.join(feat, f"{prefix}shard_{n:03d}.pt"))
             shard, n = [], n + 1
             print(f"[extract] {j + 1}/{len(rows)} ({time.time() - t0:.0f}s)", flush=True)
 
 
 # ------------------------------------------------------------------------------------------------ 2. the head
 class Head(torch.nn.Module):
-    def __init__(self, t, cfg):
+    """layers: target layers whose residual streams feed an EAGLE-3-style fusion with the final hidden h_i:
+    h0 = h_i + B A [rms(l_1), .., rms(l_n)] (rank-r A, B) replaces h_i as the depth-1 hidden input. B starts at zero,
+    i.e. exactly the plain head. (A full-rank fusion [0 .. 0 I] + learned, 105M parameters, drifted from the identity
+    faster than 3.8k replies could train it: held-out agreement -2 points after one epoch.)"""
+    def __init__(self, t, cfg, layers=(), rank=256):
         super().__init__()
         P = lambda n: torch.nn.Parameter(t["mtp." + n].float())  # noqa: E731
         self.fc = P("fc.weight")
@@ -91,8 +103,25 @@ class Head(torch.nn.Module):
         self.qn, self.kn = P(L + "self_attn.q_norm.weight"), P(L + "self_attn.k_norm.weight")
         self.gate, self.up, self.down = (P(L + f"mlp.{n}_proj.weight") for n in ("gate", "up", "down"))
         self.eps, self.H, self.Hq, self.Hkv, self.D = cfg.rms_norm_eps, cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        self.layers = tuple(layers)
+        if self.layers:
+            n, Hd = len(self.layers), cfg.hidden_size
+            if "mtp.eagle_a.weight" in t:
+                self.fa, self.fb, self.lnorm = P("eagle_a.weight"), P("eagle_b.weight"), P("eagle_norm.weight")
+            else:
+                g = torch.Generator(device=self.fc.device).manual_seed(0)
+                self.fa = torch.nn.Parameter(torch.randn(rank, n * Hd, device=self.fc.device, generator=g) / math.sqrt(n * Hd))
+                self.fb = torch.nn.Parameter(torch.zeros(Hd, rank, device=self.fc.device))
+                self.lnorm = torch.nn.Parameter(torch.zeros(n, Hd, device=self.fc.device))
         d = cfg.rotary_dim
         self.register_buffer("inv_freq", 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d)), persistent=False)
+
+    def features(self, H, L):
+        """H [T, Hd] final hidden, L [T, n, Hd] residual streams -> the depth-1 hidden input [T, Hd]."""
+        if not self.layers:
+            return H
+        x = torch.cat([self.rms(L[:, i], self.lnorm[i]) for i in range(len(self.layers))], -1)
+        return H + (x @ self.fa.t().to(x.dtype)) @ self.fb.t().to(x.dtype)
 
     def rms(self, x, w):
         xf = x.float()
@@ -162,11 +191,17 @@ class Head(torch.nn.Module):
             t[L + f"self_attn.{n}_proj.weight"] = p
         for n, p in zip(("gate", "up", "down"), (self.gate, self.up, self.down)):
             t[L + f"mlp.{n}_proj.weight"] = p
-        return {k: v.detach().to(torch.bfloat16).contiguous().cpu() for k, v in t.items()}
+        out = {k: v.detach().to(torch.bfloat16).contiguous().cpu() for k, v in t.items()}
+        if self.layers:
+            out["mtp.eagle_a.weight"] = self.fa.detach().to(torch.bfloat16).contiguous().cpu()
+            out["mtp.eagle_b.weight"] = self.fb.detach().to(torch.bfloat16).contiguous().cpu()
+            out["mtp.eagle_norm.weight"] = self.lnorm.detach().to(torch.bfloat16).contiguous().cpu()
+            out["mtp.eagle_layers"] = torch.tensor(self.layers, dtype=torch.int32)
+        return out
 
 
-def shards():
-    return sorted(glob.glob(os.path.join(DIR, "feat", "*shard_*.pt")))
+def shards(feat="feat"):
+    return sorted(glob.glob(os.path.join(DIR, feat, "*shard_*.pt")))
 
 
 def setup():
@@ -198,6 +233,8 @@ def seq_loss(head, item, embed, lm_draft, remap, depth, train=True):
     ids = item["ids"].long().cuda()
     T, P = ids.numel(), item["P"]
     H = item["H"].cuda()
+    if head.layers:
+        H = head.features(H, item["L"].cuda())
     e = embed[torch.cat([ids[1:], ids[-1:]])]  # row i consumes x_{i+1} (the last row is never scored)
     outs = head.unroll(e, H, depth)
     rows = torch.arange(max(P - 2, 0), T - 2, device="cuda")  # x_{i+2} in the reply
@@ -218,20 +255,39 @@ def seq_loss(head, item, embed, lm_draft, remap, depth, train=True):
 
 
 def train(a):
+    from safetensors import safe_open
     from safetensors.torch import save_file
     cfg, path, embed, lm_draft, remap = setup()
-    head = Head(mtp_tensors(path), cfg).cuda()
-    files = shards()
+    t = mtp_tensors(path)
+    if a.init:  # start from an earlier fine-tune (e.g. mtp_ft.safetensors)
+        with safe_open(os.path.expanduser(a.init), framework="pt", device="cuda") as f:
+            for n in f.keys():
+                if n != "mtp.eagle_layers":
+                    t[n] = f.get_tensor(n).to(torch.bfloat16)
+    layers = tuple(int(x) for x in a.layers.split(",")) if a.layers else ()
+    head = Head(t, cfg, layers, a.rank).cuda()
+    files = shards(a.feat)
     first = [f for f in files if os.path.basename(f).startswith("shard_")]  # data.jsonl: the held-out split comes from here only,
-    data = [x for f in first for x in torch.load(f)]                         # so it stays the same as more data files are added
+    sizes = {f: len(torch.load(f, mmap=True)) for f in files}               # so it stays the same as more data files are added
+    refs = [(f, i) for f in first for i in range(sizes[f])]
     rng = random.Random(0)
-    rng.shuffle(data)
-    nval = max(20, len(data) // 20)
-    val, tr = data[:nval], data[nval:]
-    tr += [x for f in files if f not in first for x in torch.load(f)]
-    print(f"[train] {len(tr)} train / {len(val)} held-out replies, depth {a.depth}")
-    opt = torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=0.0, betas=(0.9, 0.95))
-    total = a.epochs * len(tr) // a.accum
+    rng.shuffle(refs)  # the same permutation as shuffling the items themselves (it depends only on the length)
+    nval = max(20, len(refs) // 20)
+    vset = set(refs[:nval])
+    val = []
+    for f in first:
+        items = torch.load(f)
+        val += [(f, i, items[i]) for i in range(len(items)) if (f, i) in vset]
+    order = {r: k for k, r in enumerate(refs[:nval])}
+    val = [it for _, _, it in sorted(val, key=lambda x: order[(x[0], x[1])])]
+    ntr = sum(sizes.values()) - nval
+    print(f"[train] {ntr} train / {len(val)} held-out replies, depth {a.depth}, layers {layers or 'none'}")
+    main_p = [p for n, p in head.named_parameters() if n not in ("fa", "fb", "lnorm")]
+    groups = [dict(params=main_p, lr=a.lr)]
+    if layers:
+        groups.append(dict(params=[head.fa, head.fb, head.lnorm], lr=a.fuse_lr))
+    opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
+    total = a.epochs * ntr // a.accum
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, (st + 1) / 20) * 0.5 * (1 + math.cos(math.pi * min(st, total) / total)))
 
     def evaluate():
@@ -243,12 +299,23 @@ def train(a):
                 agg = [x + y for x, y in zip(agg, ag)]
         head.train()
         return [round(x / len(val), 4) for x in agg]
+
+    def stream(rng):
+        """Training replies, one shard in memory at a time: shard order and order within a shard shuffled."""
+        fs = list(files)
+        rng.shuffle(fs)
+        for f in fs:
+            items = torch.load(f)
+            idx = [i for i in range(len(items)) if (f, i) not in vset]
+            rng.shuffle(idx)
+            for i in idx:
+                yield items[i]
+            del items
     print(f"[train] held-out top-1 agreement per depth before: {evaluate()}", flush=True)
     t0, step = time.time(), 0
     w = [a.decay ** (s - 1) for s in range(1, a.depth + 1)]
     for ep in range(a.epochs):
-        rng.shuffle(tr)
-        for j, it in enumerate(tr):
+        for j, it in enumerate(stream(rng)):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 losses, _, _ = seq_loss(head, it, embed, lm_draft, remap, a.depth)
                 loss = sum(wi * l for wi, l in zip(w, losses)) / sum(w)
@@ -279,6 +346,12 @@ def main():
     ap.add_argument("--out", default=os.path.join(DIR, "mtp_ft.safetensors"))
     ap.add_argument("--data", default=os.path.join(DIR, "data.jsonl"), help="--extract: replies (tools/drafter_data.py output)")
     ap.add_argument("--decay", type=float, default=0.9, help="loss weight decay per depth")
+    ap.add_argument("--feat", default="feat", help="feature directory under ~/.cache/colinfer/drafter")
+    ap.add_argument("--layers", default="", help="EAGLE-3-style fused features: target layers (e.g. 3,23,43); --extract stores "
+                    "their residual streams, --train fuses them with the final hidden state")
+    ap.add_argument("--fuse-lr", type=float, default=1e-4, help="learning rate of the fusion weights")
+    ap.add_argument("--rank", type=int, default=256, help="rank of the layer fusion")
+    ap.add_argument("--init", default="", help="--train: start from these mtp.* weights instead of the checkpoint's")
     a = ap.parse_args()
     if a.extract:
         extract(a)

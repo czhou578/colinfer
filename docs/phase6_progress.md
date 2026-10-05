@@ -395,8 +395,26 @@ differs slightly from the table above (section 6 changed its softmax reduction o
 - Run 4 is now `~/.cache/colinfer/drafter/mtp_ft.safetensors`, which the server loads by default (`--drafter-weights
   auto`); run 1 is kept as `mtp_ft_r1.safetensors`.
 - Prose is stuck at ~0.5 acceptance per token with this head. Fine-tuning a one-layer head on more of the same data
-  helps code-like text, not prose. The next lever is a bigger drafter (EAGLE-3 multi-layer features, or a small
-  parallel drafter), not more fine-tuning.
+  helps code-like text, not prose.
+
+**EAGLE-3-style multi-layer features: no gain.** EAGLE-3 feeds its drafter the target's low, middle and high-layer
+hidden states, not only the last one. `prefill(return_layers=...)` returns the residual stream after given layers, and
+`train_drafter.py --layers 3,23,43` fuses them into the depth-1 hidden input:
+h0 = h + B A [rms(l3), rms(l23), rms(l43)], rank 256, B = 0 at the start (exactly run 4), trained from run 4 on the same
+3,827 replies (features 80 GB, streamed from disk a shard at a time).
+
+| | Depth 1 | Depth 2 | Depth 3 | Depth 4 | Depth 5 |
+|---|---|---|---|---|---|
+| Run 4 (start) | 0.812 | 0.739 | 0.700 | 0.680 | 0.667 |
+| + layer fusion, epoch 0 | 0.806 | 0.730 | 0.691 | 0.667 | 0.653 |
+| + layer fusion, epoch 1 (end) | 0.811 | 0.737 | 0.701 | 0.681 | 0.667 |
+
+- The trained fusion term is under 1% of the final hidden's RMS: the gradient found no draft signal in the earlier
+  layers that the final hidden lacks. (Epoch 0's dip is the restart at full learning rate; run 4 shows the same dip.)
+- A full-rank fusion ([0 0 0 I] + learned, 105M parameters, lr 1e-4) was worse: -2 points after one epoch, stopped.
+- Not integrated into the engine. With one decoder layer and ~1.4M training tokens the drafter's limit on prose is
+  its capacity and data, not its inputs. Remaining routes: a larger drafter (several layers, or a small parallel
+  drafter model) trained on far more data, which is days of generation and training on this machine.
 
 ## Next
 

@@ -174,17 +174,18 @@ def _split(t, sizes):
 
 @torch.inference_mode()
 def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk: int = CHUNK, all_logits: bool = False,
-            return_hidden: bool = False):
+            return_hidden: bool = False, return_layers: tuple = ()):
     """input_ids [1, T]. Runs the prompt through the model in chunks, advancing `state`; returns the
     fp32 logits of the last token [1, vocab], or with all_logits the bf16 logits of every token
     [T, vocab] (lm_head as a W4A4 GEMM; for perplexity). return_hidden: also return the post-final-norm
-    hidden state of every prompt position [T, H] (the MTP drafter's input)."""
+    hidden state of every prompt position [T, H] (the MTP drafter's input). return_layers: also return the residual stream
+    after each of these layers, [T, len(return_layers), H] (EAGLE-3-style drafter features; return_hidden required)."""
     assert input_ids.shape[0] == 1, "one slot at a time"
     prepare_prefill(model)
     T_all = input_ids.shape[1]
     if state.pos + T_all > state.max_seq_len:
         raise ValueError("prompt exceeds the slot's max_seq_len")
-    x_last, outs, hid = None, [], []
+    x_last, outs, hid, lay = None, [], [], []
     for c0 in range(0, T_all, chunk):
         ids = input_ids[0, c0:c0 + chunk]
         T = ids.numel()
@@ -194,6 +195,8 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
             n, q8 = _norm_in(layer, x, need_bf16=gdn)
             y = _gdn(layer.linear_attn, n, q8, state, li) if gdn else _attention(layer.self_attn, q8, state, li)
             x = _mlp(layer, x, y)
+            if li in return_layers:
+                lay.append((li, x.clone()))
         state.pos += T
         state.pos_t += T
         x_last = x[-1:]
@@ -204,7 +207,15 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
             xsf = torch.empty(ops().nvfp4_sf_size(T, x.shape[1]), dtype=torch.uint8, device=x.device)
             ops().add_rmsnorm(x, None, model.norm.weight, model.norm.eps, q4=xq, sf4=xsf, in_scale4=model.p_lm["in_scale"])
             outs.append(_gemm_nvfp4(xq, xsf, model.p_lm))
+    if return_layers:  # chunk-major list -> [T, n_layers, H] in return_layers order
+        per = {li: torch.cat([t for l, t in lay if l == li]) for li in return_layers}
+        hid = [torch.cat(hid)]
+        L = torch.stack([per[li] for li in return_layers], 1)
     if all_logits:
+        if return_layers:
+            return torch.cat(outs), hid[0], L
         return (torch.cat(outs), torch.cat(hid)) if return_hidden else torch.cat(outs)
     logits = model.lm_head(model.norm(x_last)).float()
+    if return_layers:
+        return logits, hid[0], L
     return (logits, torch.cat(hid)) if return_hidden else logits
