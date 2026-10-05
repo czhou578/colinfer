@@ -16,6 +16,8 @@ Only the logits of the last token are computed.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -23,6 +25,7 @@ from engine.kernels import ops
 from engine.model.fast import FastQwen35, FastState, Nvfp4Linear, StackedFp8Linear
 
 CHUNK = 2048
+_EMU_Q_FP8 = os.environ.get("COLINFER_EMU_Q_FP8") == "1"
 
 
 def _nvfp4_operands(lin_list):
@@ -130,7 +133,11 @@ def _attention(attn, q8, state: FastState, li: int):
         # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix
         # to a BF16 scratch first costs a few ms per layer at 128k and saves tens (exact: e4m3 -> bf16 is lossless)
         kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
-    o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
+    qq = q[0].transpose(0, 1)
+    if _EMU_Q_FP8:  # experiment: Q rounded to e4m3 with a per-(token, head) scale, as an FP8 QK^T kernel would see it
+        sc = qq.float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448.0
+        qq = ((qq.float() / sc).to(torch.float8_e4m3fn).float() * sc).to(torch.bfloat16)
+    o = flashinfer.single_prefill_with_kv_cache(qq, kk, vv, causal=True, kv_layout="HND",
                                                 sm_scale=attn.head_dim ** -0.5)
     o8 = torch.empty(T, attn.num_heads * attn.head_dim, dtype=torch.float8_e4m3fn, device=q8.device)
     ops().gate_fp8(o.reshape(T, -1), qp, attn.head_dim, attn.o_proj.in_scale, o8)

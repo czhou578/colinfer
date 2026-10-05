@@ -28,10 +28,11 @@ def main():
     ap.add_argument("--kv-fp8", action="store_true")
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--profile", action="store_true", help="per-kernel breakdown of one 2048-token prefill")
+    ap.add_argument("--profile-at", type=int, default=0, help="--profile: the chunk that follows this many prompt tokens")
     a = ap.parse_args()
     m = to_fast(load_fast_model(a.ckpt), kv_fp8=a.kv_fp8)
     prepare_prefill(m)
-    st = m.new_state(1, max(a.lens) + 16)
+    st = m.new_state(1, max(a.lens + [a.profile_at + a.chunk]) + 16)
     print(f"KV {'fp8' if a.kv_fp8 else 'bf16'}, chunk {a.chunk}")
     print(f"{'prompt':>7s} {'TTFT s':>8s} {'tok/s':>8s}")
     for L in a.lens:
@@ -49,14 +50,17 @@ def main():
         print(f"{L:7d} {best:8.3f} {L / best:8.0f}", flush=True)
     if a.profile:
         from torch.profiler import ProfilerActivity, profile
-        ids = torch.randint(0, 200000, (1, 2048), device="cuda")
         st.reset(); st.pos = 0
+        if a.profile_at:  # the prompt so far, then profile the next chunk
+            prefill(m, torch.randint(0, 200000, (1, a.profile_at), device="cuda"), st, chunk=a.chunk)
+        ids = torch.randint(0, 200000, (1, a.chunk), device="cuda")
+        torch.cuda.synchronize()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             prefill(m, ids, st, chunk=a.chunk)
             torch.cuda.synchronize()
         ev = [(e.key, e.self_device_time_total, e.count) for e in prof.key_averages()]
         tot = sum(t for _, t, _ in ev)
-        print(f"\nGPU time for a 2048-token prefill: {tot / 1e3:.1f} ms")
+        print(f"\nGPU time for a {a.chunk}-token prefill chunk at position {a.profile_at}: {tot / 1e3:.1f} ms")
         for k, t, c in sorted(ev, key=lambda x: -x[1])[:18]:
             print(f"  {t / 1e3:8.2f} ms {100 * t / tot:5.1f}% {c:5d}x  {k[:80]}")
 

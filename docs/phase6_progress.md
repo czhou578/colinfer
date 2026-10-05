@@ -445,7 +445,43 @@ h0 = h + B A [rms(l3), rms(l23), rms(l43)], rank 256, B = 0 at the start (exactl
   its capacity and data, not its inputs. Remaining routes: a larger drafter (several layers, or a small parallel
   drafter model) trained on far more data, which is days of generation and training on this machine.
 
+## 8. Long-prompt prefill: where the time goes
+
+Prefill (`bench/prefill_bench.py --kv-fp8`, chunk 2048): 3,057 tok/s at 8k, 2,556 at 32k, 2,017 at 64k.
+Per-kernel GPU time of the 2,048-token chunk that follows 30,720 prompt tokens (`--profile --profile-at 30720`), 998 ms:
+
+| Kernel | ms | Share | Rate |
+|---|---|---|---|
+| FlashInfer causal prefill attention (16 layers) | 327 | 33% | 78 TFLOPS |
+| CUTLASS NVFP4 W4A4 GEMMs (MLP) | 239 | 24% | ~293 TFLOPS (peak ~355) |
+| cuBLASLt FP8 GEMMs (attention / GDN projections) | 180 | 18% | ~164 TFLOPS (peak ~200) |
+| SiLU-mul + quantize, add + RMSNorm, GDN chunk kernels, conv, norms | ~250 | 25% | |
+
+The GEMMs are near their peaks; attention is the term that grows with context. Its alternatives on this shape (2,048
+queries, 6:1 GQA, head_dim 256, lower-right causal; `torch` 2.13):
+
+| Context | FlashInfer | torch SDPA flash | torch SDPA mem-efficient | cuDNN |
+|---|---|---|---|---|
+| 8k | 87 TFLOPS | 68 | 27 | no kernel for sm_121 |
+| 32k | 79 | 62 | 25 | |
+| 64k | 79 | 62 | 25 | |
+
+FlashInfer runs at ~81% of the measured BF16 GEMM peak (96 TFLOPS), so a BF16 kernel of our own has little room. The
+lever is FP8 tensor cores (~200 TFLOPS): Q K^T in e4m3 can read the FP8 K cache as it is (a lane's m16n8k32 fragment is 4
+consecutive head dims of one key, no permutation needed) with Q quantized per (token, head). Quality, emulated in the
+prefill engine (`COLINFER_EMU_Q_FP8=1`, Q rounded to e4m3 before FlashInfer; FP8 KV, perplexity):
+
+| | WikiText ctx 2048 | Code ctx 2048 | Code ctx 8192 |
+|---|---|---|---|
+| BF16 Q | 7.0909 | 1.8012 | 1.6085 |
+| e4m3 Q, per (token, head) scale | 7.0777 | 1.7985 | 1.6105 (+0.12%) |
+
+Estimate for a kernel doing Q K^T in FP8 and P V in f16 (P rounded to f16, V converted from the FP8 cache), each at 75%
+of its peak: ~97 TFLOPS-equivalent vs FlashInfer's 79, i.e. attention 1.2× faster: ~6% shorter prefill at 32k, ~10-12%
+at 64k-128k. Not built yet.
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Section 7.
 - Tensor-core multi-row decode attention: done (section 6).
+- FP8 (Q K^T) prefill attention for long prompts (section 8): ~6% at 32k, ~10-12% at 64k-128k.
