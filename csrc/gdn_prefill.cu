@@ -69,9 +69,10 @@ __device__ __forceinline__ void chunk_cumsum(const float* __restrict__ g, int Hv
 }
 
 // ---- k_wy: T = (I + A)^-1 per (chunk, value head), bf16 [Hv][chunks][64][64] ----
+// Also writes each chunk's G and beta (fp32 [Hv][chunks][64]) for k_chunk to stream with its K tile.
 __global__ void __launch_bounds__(WARPS * 32) k_wy(const __nv_bfloat16* __restrict__ k, const float* __restrict__ g,
-                                                   const __nv_bfloat16* __restrict__ beta, __nv_bfloat16* __restrict__ Tout, int T, int Hk,
-                                                   int Hv) {
+                                                   const __nv_bfloat16* __restrict__ beta, __nv_bfloat16* __restrict__ Tout, float* __restrict__ Gout,
+                                                   float* __restrict__ Bout, int T, int Hk, int Hv) {
     extern __shared__ __align__(16) uint8_t wsm[];
     __nv_bfloat16* Ks = reinterpret_cast<__nv_bfloat16*>(wsm);           // [C][KS]
     float* Am = reinterpret_cast<float*>(Ks + C * KS);                     // [C][AS], then X [3][16][16]; T reuses Ks's space
@@ -87,6 +88,10 @@ __global__ void __launch_bounds__(WARPS * 32) k_wy(const __nv_bfloat16* __restri
     for (int i = tid; i < C; i += WARPS * 32) Bs[i] = i < nt ? __bfloat162float(beta[(size_t)(t0 + i) * Hv + h]) : 0.f;
     cp_async_wait0();
     __syncthreads();
+    if (tid < C) {
+        Gout[((size_t)h * gridDim.x + c) * C + tid] = Gs[tid];
+        Bout[((size_t)h * gridDim.x + c) * C + tid] = Bs[tid];
+    }
     // K K^T: warp w rows 16w .. 16w + 15, all 64 columns
     float acc[8][4];
 #pragma unroll
@@ -160,35 +165,59 @@ __global__ void __launch_bounds__(WARPS * 32) k_wy(const __nv_bfloat16* __restri
 }
 
 // ---- k_chunk: the recurrence, one block per (value head, V slice), sequential over chunks ----
+// Shared: K (double buffered: read until the state update), V / T / Q (single, refilled as soon as the chunk is done with
+// them: T after V_new, V and Q after the state update; V's buffer meanwhile holds V_new decayed to the chunk end, rounded
+// once from fp32 as FLA does), S (bf16, for the mma), V_new, and each chunk's G / beta (from k_wy).
 __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __restrict__ qg, const __nv_bfloat16* __restrict__ k,
-                                                         const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
-                                                         const __nv_bfloat16* __restrict__ beta, const __nv_bfloat16* __restrict__ Tm,
+                                                         const __nv_bfloat16* __restrict__ v, const float* __restrict__ Gin,
+                                                         const float* __restrict__ Bin, const __nv_bfloat16* __restrict__ Tm,
                                                          float* __restrict__ state, __nv_bfloat16* __restrict__ o, int T, int Hk, int Hv,
                                                          float scale) {
     extern __shared__ __align__(16) uint8_t smem[];
     __nv_bfloat16* Ksm = reinterpret_cast<__nv_bfloat16*>(smem);  // [2][C][KS]
-    __nv_bfloat16* Vsm = Ksm + 2 * C * KS;                         // [2][C][VS]
-    __nv_bfloat16* Sb = Vsm + 2 * C * VS;                          // [DK][VS]   S (bf16) for the mma
-    __nv_bfloat16* Vn = Sb + DK * VS;                              // [C][VS]    V_new
-    __nv_bfloat16* Vd = Vn + C * VS;                               // [C][VS]    V_new * e^(G_C - G_j)
-    float* Gs = reinterpret_cast<float*>(Vd + C * VS);             // [2][C]
+    __nv_bfloat16* Qsm = Ksm + 2 * C * KS;                         // [C][KS]
+    __nv_bfloat16* Vsm = Qsm + C * KS;                             // [C][VS]
+    __nv_bfloat16* Tsm = Vsm + C * VS;                             // [C][VS]  T (64 x 64)
+    __nv_bfloat16* Sb = Tsm + C * VS;                              // [DK][VS] S (bf16) for the mma
+    __nv_bfloat16* Vn = Sb + DK * VS;                              // [C][VS]  V_new
+    float* Gs = reinterpret_cast<float*>(Vn + C * VS);             // [2][C]
     float* Bs = Gs + 2 * C;                                        // [2][C]
 
     const int h = blockIdx.x, vs = blockIdx.y, hk = h / (Hv / Hk);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gq = lane >> 2, q = lane & 3;
     const int nchunks = (T + C - 1) / C;
 
-    auto load = [&](int c, int buf) {
+    auto load_k = [&](int c, int buf) {  // K, G, beta
         const int t0 = c * C, nt = min(C, T - t0);
         for (int idx = tid; idx < C * (DK / 8); idx += WARPS * 32) {
             const int r = idx / (DK / 8), u = idx % (DK / 8);
             cp_async16(Ksm + (buf * C + r) * KS + u * 8, k + ((size_t)(t0 + min(r, nt - 1)) * Hk + hk) * DK + u * 8, r < nt);
         }
+        if (tid < 32) {
+            const size_t off = ((size_t)h * nchunks + c) * C;
+            cp_async16((tid < 16 ? Gs : Bs) + buf * C + (tid & 15) * 4, (tid < 16 ? Gin : Bin) + off + (tid & 15) * 4, true);
+        }
+    };
+    auto load_q = [&](int c) {
+        const int t0 = c * C, nt = min(C, T - t0);
+        for (int idx = tid; idx < C * (DK / 8); idx += WARPS * 32) {
+            const int r = idx / (DK / 8), u = idx % (DK / 8);
+            cp_async16(Qsm + r * KS + u * 8, qg + ((size_t)(t0 + min(r, nt - 1)) * Hk + hk) * DK + u * 8, r < nt);
+        }
+    };
+    auto load_v = [&](int c) {
+        const int t0 = c * C, nt = min(C, T - t0);
         for (int idx = tid; idx < C * (BV / 8); idx += WARPS * 32) {
             const int r = idx / (BV / 8), u = idx % (BV / 8);
-            cp_async16(Vsm + (buf * C + r) * VS + u * 8, v + ((size_t)(t0 + min(r, nt - 1)) * Hv + h) * DV + vs * BV + u * 8, r < nt);
+            cp_async16(Vsm + r * VS + u * 8, v + ((size_t)(t0 + min(r, nt - 1)) * Hv + h) * DV + vs * BV + u * 8, r < nt);
         }
-        cp_async_commit();
+    };
+    auto load_t = [&](int c) {
+        const __nv_bfloat16* tr = Tm + (((size_t)h * nchunks + c) * C) * C;
+        for (int idx = tid; idx < C * (C / 8); idx += WARPS * 32) {
+            const int r = idx / (C / 8), u = idx % (C / 8);
+            cp_async16(Tsm + r * VS + u * 8, tr + r * C + u * 8, true);
+        }
     };
 
     // S rows (k) 32w .. 32w + 31 of this V slice, fp32 in registers: [m-tile][n-tile][4]
@@ -214,36 +243,28 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
                 }
     };
     store_sb();
-    load(0, 0);
+    load_k(0, 0);
+    load_q(0);
+    load_v(0);
+    load_t(0);
+    cp_async_commit();
 
     for (int c = 0; c < nchunks; ++c) {
         const int buf = c & 1, t0 = c * C, nt = min(C, T - t0);
         const __nv_bfloat16* Kc = Ksm + buf * C * KS;
-        const __nv_bfloat16* Vc = Vsm + buf * C * VS;
-        float* G = Gs + buf * C;
-        float* Bt = Bs + buf * C;
-        if (warp == 0) chunk_cumsum(g, Hv, h, t0, nt, G, lane);
-        for (int i = tid; i < C; i += WARPS * 32) Bt[i] = i < nt ? __bfloat162float(beta[(size_t)(t0 + i) * Hv + h]) : 0.f;
+        const float* G = Gs + buf * C;
+        const float* Bt = Bs + buf * C;
         cp_async_wait0();
-        __syncthreads();  // chunk c's K / V / G / beta, and S (bf16) of the chunk start, visible to all
-        if (c + 1 < nchunks) load(c + 1, buf ^ 1);
+        __syncthreads();  // chunk c's tiles, and S (bf16) of the chunk start, visible to all
+        if (c + 1 < nchunks) load_k(c + 1, buf ^ 1);
+        cp_async_commit();
         const float GC = G[nt - 1];
         const int r0 = warp * 16 + gq, r1 = r0 + 8;  // this lane's two token rows
 
-        // T rows r0, r1 (A fragments, k = token j), from k_wy
+        // T rows r0, r1 as A fragments (k = token j), column-scaled: diag(beta) for U, diag(beta e^G) for W
         uint32_t ta[4][4];
-        {
-            const __nv_bfloat16* tr = Tm + (((size_t)h * nchunks + c) * C) * C;
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const int j = s * 16 + 2 * q;
-                ta[s][0] = *reinterpret_cast<const uint32_t*>(tr + r0 * C + j);
-                ta[s][1] = *reinterpret_cast<const uint32_t*>(tr + r1 * C + j);
-                ta[s][2] = *reinterpret_cast<const uint32_t*>(tr + r0 * C + j + 8);
-                ta[s][3] = *reinterpret_cast<const uint32_t*>(tr + r1 * C + j + 8);
-            }
-        }
-        // column scales: W uses T diag(beta e^G), U uses T diag(beta)
+        for (int s = 0; s < 4; ++s) ldsm4(ta[s], Tsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * VS + s * 16 + (lane >> 4) * 8);
         auto scaled = [&](int s, bool decay, uint32_t (&a)[4]) {
             const int j0 = s * 16 + 2 * q, j1 = j0 + 8;
             const float s00 = Bt[j0] * (decay ? __expf(G[j0]) : 1.f), s01 = Bt[j0 + 1] * (decay ? __expf(G[j0 + 1]) : 1.f);
@@ -266,7 +287,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
             for (int np = 0; np < 4; ++np) {
                 uint32_t b[4];
-                ldsm4t(b, Vc + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
+                ldsm4t(b, Vsm + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
                 mma(vn[2 * np], a, b[0], b[1]);
                 mma(vn[2 * np + 1], a, b[2], b[3]);
             }
@@ -287,9 +308,8 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
                     mma(w[2 * np + 1], a, b[2], b[3]);
                 }
             }
-            // vn -= W S: A = -W (C -> A fragments), B = S [k][v] (ldsm4t)
 #pragma unroll
-            for (int s = 0; s < DK / 16; ++s) {
+            for (int s = 0; s < DK / 16; ++s) {  // vn -= W S
                 const uint32_t a[4] = {pack(-w[2 * s][0], -w[2 * s][1]), pack(-w[2 * s][2], -w[2 * s][3]), pack(-w[2 * s + 1][0], -w[2 * s + 1][1]),
                                        pack(-w[2 * s + 1][2], -w[2 * s + 1][3])};
 #pragma unroll
@@ -301,43 +321,28 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
                 }
             }
         }
-        // V_new rows -> shared, plain and decayed to the chunk end (for the state update)
-        {
-            const float d0 = r0 < nt ? __expf(GC - G[r0]) : 0.f, d1 = r1 < nt ? __expf(GC - G[r1]) : 0.f;
 #pragma unroll
-            for (int nt8 = 0; nt8 < 8; ++nt8) {
-                const int vc = nt8 * 8 + 2 * q;
-                *reinterpret_cast<uint32_t*>(Vn + r0 * VS + vc) = pack(vn[nt8][0], vn[nt8][1]);
-                *reinterpret_cast<uint32_t*>(Vn + r1 * VS + vc) = pack(vn[nt8][2], vn[nt8][3]);
-                *reinterpret_cast<uint32_t*>(Vd + r0 * VS + vc) = pack(vn[nt8][0] * d0, vn[nt8][1] * d0);
-                *reinterpret_cast<uint32_t*>(Vd + r1 * VS + vc) = pack(vn[nt8][2] * d1, vn[nt8][3] * d1);
-            }
-        }
-        // Q rows r0, r1 (A fragments over the key dims)
-        uint32_t qa[8][4];
-#pragma unroll
-        for (int s = 0; s < 8; ++s) {
-            const int kk = s * 16 + 2 * q;
-            const __nv_bfloat16* q0 = qg + ((size_t)(t0 + min(r0, nt - 1)) * Hk + hk) * DK;
-            const __nv_bfloat16* q1 = qg + ((size_t)(t0 + min(r1, nt - 1)) * Hk + hk) * DK;
-            qa[s][0] = *reinterpret_cast<const uint32_t*>(q0 + kk);
-            qa[s][1] = *reinterpret_cast<const uint32_t*>(q1 + kk);
-            qa[s][2] = *reinterpret_cast<const uint32_t*>(q0 + kk + 8);
-            qa[s][3] = *reinterpret_cast<const uint32_t*>(q1 + kk + 8);
+        for (int nt8 = 0; nt8 < 8; ++nt8) {
+            const int vc = nt8 * 8 + 2 * q;
+            *reinterpret_cast<uint32_t*>(Vn + r0 * VS + vc) = pack(vn[nt8][0], vn[nt8][1]);
+            *reinterpret_cast<uint32_t*>(Vn + r1 * VS + vc) = pack(vn[nt8][2], vn[nt8][3]);
         }
         // P = (Q K^T) o M  (rows r0, r1; 64 key tokens)
         float p[8][4];
 #pragma unroll
         for (int i = 0; i < 8; ++i) p[i][0] = p[i][1] = p[i][2] = p[i][3] = 0.f;
 #pragma unroll
-        for (int s = 0; s < 8; ++s)
+        for (int s = 0; s < DK / 16; ++s) {
+            uint32_t a[4];
+            ldsm4(a, Qsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
 #pragma unroll
             for (int np = 0; np < 4; ++np) {
                 uint32_t b[4];
                 ldsm4(b, Kc + (np * 16 + (lane & 7) + (lane >> 4) * 8) * KS + s * 16 + ((lane >> 3) & 1) * 8);
-                mma(p[2 * np], qa[s], b[0], b[1]);
-                mma(p[2 * np + 1], qa[s], b[2], b[3]);
+                mma(p[2 * np], a, b[0], b[1]);
+                mma(p[2 * np + 1], a, b[2], b[3]);
             }
+        }
 #pragma unroll
         for (int nt8 = 0; nt8 < 8; ++nt8)
 #pragma unroll
@@ -345,21 +350,35 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
                 const int i = e < 2 ? r0 : r1, j = nt8 * 8 + 2 * q + (e & 1);
                 p[nt8][e] = j <= i ? p[nt8][e] * __expf(G[i] - G[j]) : 0.f;
             }
-        __syncthreads();  // V_new / V_d of every row
+        __syncthreads();  // V_new of every row; T and V of this chunk are no longer read
+        if (c + 1 < nchunks) load_t(c + 1);
+        cp_async_commit();
+        {  // V_new decayed to the chunk end, rounded once from fp32 (as FLA), into V's buffer for the state update
+            const float d0 = r0 < nt ? __expf(GC - G[r0]) : 0.f, d1 = r1 < nt ? __expf(GC - G[r1]) : 0.f;
+#pragma unroll
+            for (int nt8 = 0; nt8 < 8; ++nt8) {
+                const int vc = nt8 * 8 + 2 * q;
+                *reinterpret_cast<uint32_t*>(Vsm + r0 * VS + vc) = pack(vn[nt8][0] * d0, vn[nt8][1] * d0);
+                *reinterpret_cast<uint32_t*>(Vsm + r1 * VS + vc) = pack(vn[nt8][2] * d1, vn[nt8][3] * d1);
+            }
+        }
         // O = scale (e^G Q S + P V_new)
         {
             float acc[8][4];
 #pragma unroll
             for (int i = 0; i < 8; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
 #pragma unroll
-            for (int s = 0; s < DK / 16; ++s)
+            for (int s = 0; s < DK / 16; ++s) {
+                uint32_t a[4];
+                ldsm4(a, Qsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
 #pragma unroll
                 for (int np = 0; np < 4; ++np) {
                     uint32_t b[4];
                     ldsm4t(b, Sb + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
-                    mma(acc[2 * np], qa[s], b[0], b[1]);
-                    mma(acc[2 * np + 1], qa[s], b[2], b[3]);
+                    mma(acc[2 * np], a, b[0], b[1]);
+                    mma(acc[2 * np + 1], a, b[2], b[3]);
                 }
+            }
             const float e0 = __expf(G[r0]), e1 = __expf(G[r1]);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
@@ -384,7 +403,8 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
                 if (r1 < nt) *reinterpret_cast<uint32_t*>(o + ((size_t)(t0 + r1) * Hv + h) * DV + vc) = pack(acc[nt8][2] * scale, acc[nt8][3] * scale);
             }
         }
-        // S = e^(G_C) S + K^T V_d  (rows k 32w .. 32w + 31): A = K^T from K [j][k] (ldsm4t), B = V_d [j][v] (ldsm4t)
+        __syncthreads();  // decayed V_new of every row
+        // S = e^(G_C) S + K^T V_d  (rows k 32w .. 32w + 31): A = K^T (ldsm4t of K [j][k]), B = V_d (ldsm4t of [j][v])
         {
             const float eC = __expf(GC);
 #pragma unroll
@@ -402,14 +422,19 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
                     for (int np = 0; np < 4; ++np) {
                         uint32_t b[4];
-                        ldsm4t(b, Vd + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
+                        ldsm4t(b, Vsm + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
                         mma(S[mt][2 * np], a, b[0], b[1]);
                         mma(S[mt][2 * np + 1], a, b[2], b[3]);
                     }
                 }
             }
         }
-        __syncthreads();  // every warp is done reading Sb, Vn, Vd of this chunk
+        __syncthreads();  // every warp is done reading Sb, Vn, V_d and Q of this chunk
+        if (c + 1 < nchunks) {
+            load_q(c + 1);
+            load_v(c + 1);
+        }
+        cp_async_commit();
         store_sb();
     }
     cp_async_wait0();
@@ -425,12 +450,15 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 }
 
 constexpr int wy_smem() { return C * KS * 2 + C * AS * 4 + 3 * 256 * 4; }  // C * KS * 2 >= C * AS * 4: T fits in K's space
-constexpr int chunk_smem() { return (2 * C * KS + 2 * C * VS + DK * VS + 2 * C * VS) * 2 + 4 * C * 4; }
+constexpr int chunk_smem() { return (3 * C * KS + 3 * C * VS + DK * VS) * 2 + 4 * C * 4; }
 
 }  // namespace gdn
 
-// workspace: bf16 [Hv][ceil(T / 64)][64][64] (the T matrices)
-size_t gdn_prefill_ws_bytes(int T, int Hv) { return (size_t)Hv * ((T + gdn::C - 1) / gdn::C) * gdn::C * gdn::C * 2; }
+// workspace: the T matrices, bf16 [Hv][ceil(T / 64)][64][64], then G and beta, fp32 [Hv][ceil(T / 64)][64] each
+size_t gdn_prefill_ws_bytes(int T, int Hv) {
+    const size_t n = (size_t)Hv * ((T + gdn::C - 1) / gdn::C) * gdn::C;
+    return n * gdn::C * 2 + n * 4 * 2;
+}
 
 cudaError_t launch_gdn_prefill(const void* q, const void* k, const void* v, const float* g, const void* beta, float* state, void* o, void* ws, int T,
                                int Hk, int Hv, float scale, cudaStream_t st) {
@@ -441,14 +469,18 @@ cudaError_t launch_gdn_prefill(const void* q, const void* k, const void* v, cons
         cudaFuncSetAttribute(gdn::k_wy, cudaFuncAttributeMaxDynamicSharedMemorySize, gdn::wy_smem());
         init_wy = true;
     }
-    gdn::k_wy<<<dim3(nchunks, Hv), gdn::WARPS * 32, gdn::wy_smem(), st>>>((const __nv_bfloat16*)k, g, (const __nv_bfloat16*)beta, (__nv_bfloat16*)ws, T, Hk, Hv);
+    const size_t n = (size_t)Hv * nchunks * gdn::C;
+    __nv_bfloat16* Tws = (__nv_bfloat16*)ws;
+    float* Gws = (float*)(Tws + n * gdn::C);
+    float* Bws = Gws + n;
+    gdn::k_wy<<<dim3(nchunks, Hv), gdn::WARPS * 32, gdn::wy_smem(), st>>>((const __nv_bfloat16*)k, g, (const __nv_bfloat16*)beta, Tws, Gws, Bws, T, Hk,
+                                                                          Hv);
     static bool init = false;
     if (!init) {
         cudaFuncSetAttribute(gdn::k_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, gdn::chunk_smem());
         init = true;
     }
     gdn::k_chunk<<<dim3(Hv, gdn::DV / gdn::BV), gdn::WARPS * 32, gdn::chunk_smem(), st>>>(
-        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, g, (const __nv_bfloat16*)beta, (const __nv_bfloat16*)ws, state,
-        (__nv_bfloat16*)o, T, Hk, Hv, scale);
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, Gws, Bws, Tws, state, (__nv_bfloat16*)o, T, Hk, Hv, scale);
     return cudaGetLastError();
 }

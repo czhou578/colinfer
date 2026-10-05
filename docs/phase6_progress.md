@@ -705,19 +705,27 @@ decay G; see the file header):
   chunk's K / V stream in with cp.async.
 
 Against FLA (`tests/test_gdn_prefill.py`): output and final state within 0.2-0.35% relative (bf16 rounding).
-Per layer at 2,048 tokens: FLA 1.93 ms, CUDA 0.95 ms (k_chunk 0.76, k_wy 0.19). A first k_wy solved column by column
-(64 threads, local-memory chains: 0.575 ms); the blocked inverse and sharing K's shared memory for T brought it to 0.19.
+
+Per layer at 2,048 tokens: FLA 1.93 ms, CUDA **0.82 ms** (k_chunk 0.61, k_wy 0.19). How it got there:
+
+- k_wy first solved column by column (64 threads, local-memory chains: 0.575 ms); the blocked inverse, and T sharing K's
+  shared memory (two blocks per SM), brought it to 0.19 ms.
+- k_chunk first loaded T and Q rows and the strided g / β with synchronous global loads at every chunk (0.76 ms). Now
+  k_wy also writes each chunk's G and β contiguously, and T, Q, V stream into single shared buffers refilled as soon as
+  the chunk is done with them (T after V_new, V and Q after the state update): 0.61 ms in 99.3 KB of shared memory.
+- The state update reads V_new decayed to the chunk end, rounded to bf16 once from fp32, as FLA does. (Scaling the
+  stored bf16 V_new instead, a second rounding, moved WikiText perplexity +0.27%.)
 
 | Prompt | FLA | CUDA |
 |---|---|---|
-| 2k | 0.593 s | **0.558 s** (3,672 tok/s) |
-| 8k | 2.485 s | **2.340 s** (3,501 tok/s) |
-| 32k | 11.64 s | **11.05 s** |
-| 126k (passkey TTFT) | 76.6 s | **65.9 s** |
+| 2k | 0.593 s | **0.536 s** (3,818 tok/s) |
+| 8k | 2.485 s | **2.290 s** (3,577 tok/s) |
+| 32k | 11.64 s | **10.87 s** (3,014 tok/s) |
+| 126k (passkey TTFT) | 76.6 s | **66-67 s** |
 
-Perplexity (prefill engine, FP8 KV): WikiText 7.0807, code 1.8010, code ctx 8192 1.6073 (7.0707 / 1.8026 / 1.6085 with
-FLA: within the noise of different rounding). Passkey 6/6 at 31k and 126k; `tests/scheduler_check.py` passes.
-`COLINFER_GDN_CUDA=0` selects FLA.
+Perplexity (prefill engine, FP8 KV): WikiText 7.0807, code 1.8010, code ctx 8192 1.6073 against 7.0707 / 1.8026 / 1.6107
+with FLA (differences of both signs, the size other rounding-only changes produce). Passkey 6/6 at 31k and 126k;
+`tests/scheduler_check.py` passes. `COLINFER_GDN_CUDA=0` selects FLA.
 
 ## Next
 
