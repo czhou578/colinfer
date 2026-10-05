@@ -223,12 +223,8 @@ class FastState(ModelState):
     kv_fp8: store the attention KV cache as e4m3 with unit scale (saturating), halving its traffic."""
 
     def __init__(self, cfg, batch, max_seq_len, device, dtype=torch.bfloat16, kv_fp8: bool = False):
-        super().__init__(cfg, batch, max_seq_len, device, dtype)
+        super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.float8_e4m3fn if kv_fp8 else None)
         self.kv_fp8 = kv_fp8
-        if kv_fp8:
-            for d in (self.k, self.v):
-                for i in d:
-                    d[i] = torch.zeros_like(d[i], dtype=torch.float8_e4m3fn)
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
         self.active = torch.ones(batch, dtype=torch.int32, device=device)  # decode updates only slots with active == 1
         self.arange = torch.arange(16, device=device)

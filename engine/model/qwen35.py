@@ -82,7 +82,7 @@ class Qwen35Config:
 class ModelState:
     """Explicit per-sequence state for one slot (batch of B identical-length sequences)."""
 
-    def __init__(self, cfg: Qwen35Config, batch: int, max_seq_len: int, device, dtype=torch.bfloat16):
+    def __init__(self, cfg: Qwen35Config, batch: int, max_seq_len: int, device, dtype=torch.bfloat16, kv_dtype=None):
         self.cfg = cfg
         self.pos = 0
         self.max_seq_len = max_seq_len
@@ -97,7 +97,7 @@ class ModelState:
                 self.rec[i] = torch.zeros(batch, cfg.linear_num_value_heads, cfg.linear_key_head_dim,
                                           cfg.linear_value_head_dim, device=device, dtype=torch.float32)
             else:
-                self.k[i] = torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=dtype)
+                self.k[i] = torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=kv_dtype or dtype)
                 self.v[i] = torch.zeros_like(self.k[i])
 
     def reset(self):

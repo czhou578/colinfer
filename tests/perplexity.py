@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--max-tokens", type=int, default=65536)
     ap.add_argument("--json")
+    ap.add_argument("--override-filter", default=None, help="regex: only override linears whose name matches")
+    ap.add_argument("--text", help="score this corpus instead of WikiText: a text file, or 'code' (Python standard library sources)")
     ap.add_argument("--emulate", help="quant emulation effects: act_nvfp4,act_fp8,fp8_requant or all")
     ap.add_argument("--engine", choices=["reference", "prefill"], default="reference",
                     help="reference: Phase 1 PyTorch model; prefill: Phase 3 W4A4 / W8A8 kernel prefill path")
@@ -54,10 +56,18 @@ def main():
     from engine.weights.loader import load_model, resolve
     path = resolve(args.ckpt)
     tok = AutoTokenizer.from_pretrained(path)
-    ids = tok(wikitext_test(), return_tensors="pt").input_ids[0]
+    if args.text == "code":
+        import sysconfig
+        lib = sysconfig.get_paths()["stdlib"]
+        text = "\n\n".join(open(os.path.join(lib, f), errors="replace").read() for f in sorted(os.listdir(lib)) if f.endswith(".py"))
+    elif args.text:
+        text = open(args.text, errors="replace").read()
+    else:
+        text = wikitext_test()
+    ids = tok(text, return_tensors="pt").input_ids[0]
     n_total = ids.numel()
     n_win = min(args.max_tokens, n_total) // args.ctx
-    print(f"[ppl] {args.ckpt}: WikiText test {n_total} tokens; scoring {n_win} windows x {args.ctx}")
+    print(f"[ppl] {args.ckpt}: {args.text or 'WikiText test'} {n_total} tokens; scoring {n_win} windows x {args.ctx}")
 
     if args.engine == "prefill":
         from engine.model.fast import load_fast_model, to_fast
@@ -76,8 +86,9 @@ def main():
                 ov = default_out(path)
             n = 0
             with safe_open(ov, "pt", device="cuda") as f:
+                import re
                 for k in f.keys():
-                    if k.endswith(".weight"):
+                    if k.endswith(".weight") and (not args.override_filter or re.search(args.override_filter, k)):
                         base = k[: -len(".weight")]
                         w = dequant_nvfp4(f.get_tensor(k), f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2"))
                         model.get_submodule(base[len(PREFIX):]).weight.data.copy_(w)
@@ -99,7 +110,7 @@ def main():
         if (w + 1) % 8 == 0 or w == n_win - 1:
             print(f"[ppl] {w + 1}/{n_win} windows  running ppl {math.exp(nll / count):.4f}  ({time.time() - t0:.0f}s)")
     ppl = math.exp(nll / count)
-    print(f"[ppl] RESULT ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} kv_fp8={args.kv_fp8} "
+    print(f"[ppl] RESULT text={args.text or 'wikitext'} ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} filter={args.override_filter} kv_fp8={args.kv_fp8} "
           f"ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
     if args.json:
         json.dump(dict(ckpt=args.ckpt, emulate=args.emulate, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)
