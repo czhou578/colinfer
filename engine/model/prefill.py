@@ -25,7 +25,14 @@ from engine.kernels import ops
 from engine.model.fast import FastQwen35, FastState, Nvfp4Linear, StackedFp8Linear
 
 CHUNK = 2048
-_EMU_Q_FP8 = os.environ.get("COLINFER_EMU_Q_FP8") == "1"
+_EMU_Q_FP8 = os.environ.get("COLINFER_EMU_Q_FP8") == "1"  # FlashInfer path only: Q rounded as the FP8 kernel rounds it
+# Attention over an fp8 cache, for chunks whose context passes ATTN_FP8_MIN_CTX: csrc/attn_prefill.cu (Q K^T in e4m3,
+# ~1.25x FlashInfer's rate; prefill 4% faster at 32k, 6% at 64k; perplexity +0.25-0.3%, from rounding Q to e4m3).
+# Shorter contexts keep FlashInfer FA2 over a bf16 copy of the cached prefix (attention is a small share there).
+# COLINFER_ATTN_FP8_PREFILL=0 turns it off; COLINFER_ATTN_FP8_MIN_CTX moves the threshold.
+ATTN_FP8 = os.environ.get("COLINFER_ATTN_FP8_PREFILL", "1") != "0"
+ATTN_FP8_MIN_CTX = int(os.environ.get("COLINFER_ATTN_FP8_MIN_CTX", "16384"))
+ATTN_FP8_BN = 32  # KV tile: 32 keys (2 blocks per SM) beat 64 (102-106 vs 86-87 TFLOPS)
 
 
 def _nvfp4_operands(lin_list):
@@ -121,6 +128,12 @@ def _attention(attn, q8, state: FastState, li: int):
     q = torch.empty(1, attn.num_heads, T, attn.head_dim, device=q8.device, dtype=torch.bfloat16)
     ops().attn_prologue(qp, kp, vp, attn.q_norm.weight, attn.k_norm.weight, attn.inv_freq, state.pos_t, kc, vc, q, attn.q_norm.eps)
     L = state.pos + T
+    if ATTN_FP8 and kc.dtype == torch.float8_e4m3fn and L > ATTN_FP8_MIN_CTX:  # FP8 Q K^T over the cache as stored
+        o = torch.empty(T, attn.num_heads * attn.head_dim, device=q8.device, dtype=torch.bfloat16)
+        ops().attn_prefill_fp8(q, kc, vc, o, state.pos, attn.head_dim ** -0.5, ATTN_FP8_BN)
+        o8 = torch.empty(T, attn.num_heads * attn.head_dim, dtype=torch.float8_e4m3fn, device=q8.device)
+        ops().gate_fp8(o, qp, attn.head_dim, attn.o_proj.in_scale, o8)
+        return _fp8_gemm(o8, attn.o_proj)
     kk, vv = kc[0, :, :L], vc[0, :, :L]
     if kk.dtype == torch.uint8:  # fp4 cache rows: dequantize the prefix per head into bf16 for FlashInfer
         k16 = torch.empty(kk.shape[0], L, attn.head_dim, device=kk.device, dtype=torch.bfloat16)

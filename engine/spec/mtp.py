@@ -27,7 +27,7 @@ from safetensors import safe_open
 
 from engine.kernels import ops
 from engine.model.fast import GEMV_M, DecodeGraph, fp8_rows, FastQwen35, FastState, KernelAttention, KernelRMSNorm, fast_layer_forward
-from engine.model.prefill import prefill, prepare_prefill
+from engine.model.prefill import ATTN_FP8, ATTN_FP8_BN, ATTN_FP8_MIN_CTX, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm
 
 
@@ -204,12 +204,18 @@ class Mtp(nn.Module):
             qp, kp, vp = a.q_proj(h), a.k_proj(h), a.v_proj(h)
             q = torch.empty(1, a.num_heads, T, a.head_dim, device=x.device, dtype=torch.bfloat16)
             ops().attn_prologue(qp, kp, vp, a.q_norm.weight, a.k_norm.weight, a.inv_freq, st.pos_t, st.k[0], st.v[0], q, a.q_norm.eps)
-            L = int(st.pos_t) + T
-            kk, vv = st.k[0][0, :, :L], st.v[0][0, :, :L]
-            if kk.dtype == torch.float8_e4m3fn:  # as the target's prefill (engine/model/prefill.py): bf16 copy for FlashInfer
-                kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
-            o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
-                                                        sm_scale=a.head_dim ** -0.5)
+            p0 = int(st.pos_t)
+            L = p0 + T
+            kk, vv = st.k[0][0:1], st.v[0][0:1]
+            if kk.dtype == torch.float8_e4m3fn and ATTN_FP8 and L > ATTN_FP8_MIN_CTX:  # as the target's prefill
+                o = torch.empty(T, a.num_heads, a.head_dim, device=x.device, dtype=torch.bfloat16)
+                ops().attn_prefill_fp8(q, kk, vv, o.view(T, -1), p0, a.head_dim ** -0.5, ATTN_FP8_BN)
+            else:
+                kk, vv = kk[0, :, :L], vv[0, :, :L]
+                if kk.dtype == torch.float8_e4m3fn:  # FlashInfer reads a bf16 copy
+                    kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
+                o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
+                                                            sm_scale=a.head_dim ** -0.5)
             gate = qp.view(T, a.num_heads, 2 * a.head_dim)[:, :, a.head_dim:]
             x = a.o_proj((o * torch.sigmoid(gate)).reshape(T, -1), x)
             x = layer.mlp(layer.post_attention_layernorm(x), x)

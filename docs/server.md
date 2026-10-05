@@ -83,6 +83,9 @@ Other endpoints:
 
 ## Behavior worth knowing
 
+- **Prefill past 16k tokens of context uses FP8 attention** (Q K^T on FP8 tensor cores, `csrc/attn_prefill.cu`): 6%
+  faster at 64k, 11% at 128k, perplexity +0.25-0.3% for those chunks. `COLINFER_ATTN_FP8_PREFILL=0` turns it off,
+  `COLINFER_ATTN_FP8_MIN_CTX` moves the threshold (`docs/phase6_progress.md` section 8).
 - **Speculation is always on unless the server runs with `--spec none`.** Its output is token-identical to plain decode, greedy or sampled (with the same seed).
 - **Draft length adapts.** (The rest of this item describes Phase 5; with the Phase 6 tensor-core verify kernel, a
   cycle verifies up to 16 rows in one weight pass and picks k=3 or 7 per cycle from each request's acceptance.)

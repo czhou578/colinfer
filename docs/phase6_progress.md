@@ -476,12 +476,57 @@ prefill engine (`COLINFER_EMU_Q_FP8=1`, Q rounded to e4m3 before FlashInfer; FP8
 | BF16 Q | 7.0909 | 1.8012 | 1.6085 |
 | e4m3 Q, per (token, head) scale | 7.0777 | 1.7985 | 1.6105 (+0.12%) |
 
-Estimate for a kernel doing Q K^T in FP8 and P V in f16 (P rounded to f16, V converted from the FP8 cache), each at 75%
-of its peak: ~97 TFLOPS-equivalent vs FlashInfer's 79, i.e. attention 1.2× faster: ~6% shorter prefill at 32k, ~10-12%
-at 64k-128k. Not built yet.
+### The FP8-QK prefill attention kernel (`csrc/attn_prefill.cu`)
+
+- FA2 structure: a block is 64 query rows of one query head (4 warps × 16 rows), KV tiles of 32 keys double-buffered
+  with cp.async, two blocks per SM; the heaviest causal tiles start first, and the 6 heads of a KV head are adjacent so
+  their KV stream is shared in L2.
+- S = Q K^T on `mma.m16n8k32` e4m3. Q is rounded to e4m3 in the kernel (per (token, head) scale, held as A fragments in
+  registers); K is read as stored. A lane loads 16 consecutive bytes of a K row (one 128-bit shared load per two
+  k32 steps; the head-dim order inside the dot product is permuted identically for Q). Rows are 256 bytes apart with
+  chunks XOR'ed by row parity: no bank conflicts.
+- Online softmax in registers; P rounded to f16 and reused as the A fragment of P V (f16 `m16n8k16`, V converted from
+  e4m3 to an f16 tile, `ldmatrix.trans`).
+- Accuracy against fp32 attention given the same e4m3 Q: 0.4-0.8% relative on random data, 0.17-0.35% on the model's
+  own attention inputs, the same as FlashInfer's error given that Q. `tests/test_attn_prefill_fp8.py`.
+
+**Attention alone** (2,048 queries after L - 2,048 cached tokens):
+
+| Context | FlashInfer | FP8 kernel, 32-key tiles | 64-key tiles |
+|---|---|---|---|
+| 8k | 4.24 ms (85 TFLOPS) | 3.40 ms (106) | 4.15 ms (87) |
+| 32k | 19.4 ms (82) | 15.4 ms (104) | 18.6 ms (86) |
+| 64k | 39.4 ms (82) | 32.0 ms (102) | 37.4 ms (87) |
+
+**The cost is Q's rounding, layer by layer.** On real activations (a 2,048-token Python file), rounding Q to e4m3 moves
+attention outputs by 0.4-1.3% in the first and last few attention layers and by 2-4% in layers 23-51: their scores are
+dominated by a few large q·k terms, which e4m3's 3-bit mantissa rounds. Perplexity (prefill engine, FP8 KV):
+
+| | FlashInfer | FP8 kernel |
+|---|---|---|
+| WikiText, ctx 2048 | 7.0909 | 7.1086 (+0.25%) |
+| Code, ctx 2048 | 1.8012 | 1.8053 (+0.23%) |
+| Code, ctx 8192 | 1.6085 | 1.6135 (+0.31%) |
+| Code, ctx 16384 | 1.5650 | 1.5691 (+0.26%) |
+
+**Default: the FP8 kernel for chunks whose context passes 16k** (`COLINFER_ATTN_FP8_MIN_CTX`, 16384; off with
+`COLINFER_ATTN_FP8_PREFILL=0`), where attention is a large share of the time. Shorter prompts are computed exactly as
+before; the MTP head's prefill follows the same rule.
+
+| Prompt | FlashInfer | Default (FP8 past 16k) |
+|---|---|---|
+| 8k | 2.64 s | 2.65 s (unchanged path) |
+| 32k | 12.70 s | 12.44 s (-2%) |
+| 64k | 32.05-32.32 s | 30.27-30.49 s (-5.6%) |
+| 128k | 90.9 s | 80.9 s (-11%) |
+
+Passkey retrieval with it: 6/6 at 31k and 126k. `tests/scheduler_check.py` with the threshold at 0 (every prefill on the
+kernel, chunked prefill, prefix reuse, MTP): passed.
 
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Section 7.
 - Tensor-core multi-row decode attention: done (section 6).
-- FP8 (Q K^T) prefill attention for long prompts (section 8): ~6% at 32k, ~10-12% at 64k-128k.
+- FP8 (Q K^T) prefill attention for long prompts: done (section 8), 6% at 64k, 11% at 128k.
+- A scheme that keeps Q's precision in layers 23-51 (their outputs move 2-4% under e4m3 Q) would remove most of its
+  +0.25-0.3% perplexity.

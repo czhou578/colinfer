@@ -11,6 +11,7 @@ cudaError_t launch_attn_prologue(const void*, const void*, const void*, int, int
                                  int, int, int, int, int, int, float, int, const int*, cudaStream_t);
 cudaError_t launch_kv4_to_bf16(const void*, void*, long, cudaStream_t);
 int attn_decode_tc_nb();
+cudaError_t launch_attn_prefill_fp8(const void*, const void*, const void*, void*, int, int, int, int, int, float, int, cudaStream_t);
 cudaError_t launch_attn_decode_tc(const void*, const void*, const void*, const int*, void*, float*, void*, int, int, int, int, int, int, float, int,
                                   const void*, cudaStream_t);
 
@@ -135,6 +136,22 @@ void attn_decode_tc(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cach
     CHECK_LAUNCH(launch_attn_decode_tc(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), seq_lens.data_ptr<int>(), out.data_ptr(),
                                        part_acc.data_ptr<float>(), part_ml.data_ptr(), B, Hq, Hkv, T, Lmax, Dh, (float)scale, kv_kind, gp,
                                        at::cuda::getCurrentCUDAStream()));
+}
+
+// Causal prefill attention over one slot's e4m3 KV cache, Q K^T on FP8 tensor cores (attn_prefill.cu).
+// q: bf16 [1, Hq, T, 256] (rows at positions pos .. pos + T - 1); k_cache, v_cache: e4m3 [1, Hkv, Lmax, 256] with the T
+// new rows written; out: bf16 [T, Hq * 256]. bn: KV tile, 32 or 64 keys.
+void attn_prefill_fp8(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor out, int64_t pos, double scale, int64_t bn) {
+    CHECK_CUDA_TENSOR(q, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(k_cache, torch::kFloat8_e4m3fn);
+    CHECK_CUDA_TENSOR(v_cache, torch::kFloat8_e4m3fn);
+    CHECK_CUDA_TENSOR(out, torch::kBFloat16);
+    TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(3) == 256 && k_cache.dim() == 4 && k_cache.size(0) == 1 &&
+                k_cache.sizes() == v_cache.sizes() && k_cache.size(3) == 256 && out.numel() == q.numel(), "bad shapes");
+    const int64_t Hq = q.size(1), T = q.size(2), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
+    TORCH_CHECK(pos >= 0 && pos + T <= Lmax, "positions past the cache");
+    CHECK_LAUNCH(launch_attn_prefill_fp8(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(), T, Hq, Hkv, Lmax, pos,
+                                         (float)scale, bn, at::cuda::getCurrentCUDAStream()));
 }
 
 // Fused q/k RMSNorm + partial RoPE + KV-cache write at the device positions pos_t[b] + t.
@@ -492,6 +509,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("seq_lens"), py::arg("out"), py::arg("splits"), py::arg("scale"), py::arg("gate") = py::none());
     m.def("attn_decode_tc", &attn_decode_tc, "tensor-core multi-row GQA decode attention (fp8 / fp4 KV)", py::arg("q"), py::arg("k_cache"),
           py::arg("v_cache"), py::arg("seq_lens"), py::arg("out"), py::arg("scale"), py::arg("gate") = py::none());
+    m.def("attn_prefill_fp8", &attn_prefill_fp8, "causal prefill attention, FP8 Q K^T over an e4m3 KV cache", py::arg("q"),
+          py::arg("k_cache"), py::arg("v_cache"), py::arg("out"), py::arg("pos"), py::arg("scale"), py::arg("bn") = 64);
     m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + KV write", py::arg("qp"), py::arg("kp"), py::arg("vp"),
           py::arg("qn_w"), py::arg("kn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("k_cache"), py::arg("v_cache"), py::arg("q_out"),
           py::arg("eps"), py::arg("active") = py::none());
