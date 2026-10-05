@@ -170,7 +170,7 @@ def _gdn(g, n, q8, state: FastState, li: int):
     k = torch.empty(T, g.key_dim, device=dev, dtype=torch.bfloat16)
     v = torch.empty(T, g.value_dim, device=dev, dtype=torch.bfloat16)
     cs = state.conv[li][0]  # [C, K-1]
-    ops().causal_conv_silu(mixed, cs, g.conv1d.weight, [q, k, v])
+    ops().causal_conv_silu(mixed, cs, g.conv1d.weight, [q, k, v], 1e-6)  # q, k come out L2-normalized per head (FLA's eps)
     if T >= K - 1:
         cs.copy_(mixed[-(K - 1):].t())
     else:
@@ -179,7 +179,7 @@ def _gdn(g, n, q8, state: FastState, li: int):
     gg = (-g.A_log.float().exp() * F.softplus(a.float() + g.dt_bias))[None]
     o, s = chunk_gated_delta_rule(q.view(1, T, -1, g.head_k_dim), k.view(1, T, -1, g.head_k_dim), v.view(1, T, -1, g.head_v_dim), g=gg,
                                   beta=beta, initial_state=state.rec[li], output_final_state=True,
-                                  use_qk_l2norm_in_kernel=True)  # GVA: 16 key heads, 48 value heads
+                                  use_qk_l2norm_in_kernel=False)  # GVA: 16 key heads, 48 value heads
     state.rec[li].copy_(s)
     on = torch.empty(T * g.num_v_heads, g.head_v_dim, device=dev, dtype=torch.bfloat16)
     ops().gated_rmsnorm(o.reshape(-1, g.head_v_dim), z, g.norm.weight, g.norm.eps, on)

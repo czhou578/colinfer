@@ -19,11 +19,11 @@ def main(path):
     db = sqlite3.connect(path)
     rows = db.execute("""SELECT k.start, k.end, s.value FROM CUPTI_ACTIVITY_KIND_KERNEL k
                          JOIN StringIds s ON k.shortName = s.id ORDER BY k.start""").fetchall()
-    # lm_head is the only k_nvfp4 instance whose duration is ~3 ms; use duration to find it
+    # lm_head is the only NVFP4 GEMV / skinny GEMM instance whose duration is ~3 ms; use duration to find it
     steps, cur = [], []
     for st, en, name in rows:
         cur.append((st, en, name))
-        if "k_nvfp4" in name and "swiglu" not in name and (en - st) > 2_000_000:
+        if ("k_nvfp4" in name or "k_skinny" in name) and "swiglu" not in name and (en - st) > 2_000_000:
             steps.append(cur)
             cur = []
     steps = [s for s in steps if len(s) > 300]  # full decode steps only (skip warm-up fragments)
@@ -51,6 +51,19 @@ def main(path):
         key = name.split("(")[0]
         by[key][0] += en - st
         by[key][1] += 1
+    gaps = collections.defaultdict(lambda: [0, 0])  # idle time by (previous kernel, next kernel)
+    st_ = steps[1:][med]
+    last_end, last_name = st_[0][1], st_[0][2]
+    for st, en, name in st_[1:]:
+        if st > last_end:
+            k = (last_name.split("(")[0][:40], name.split("(")[0][:40])
+            gaps[k][0] += st - last_end
+            gaps[k][1] += 1
+        if en > last_end:
+            last_end, last_name = en, name
+    print(f"\n{'idle gap: previous kernel -> next kernel':84s} {'ms':>7s} {'count':>6s}")
+    for (a, b), (t, c) in sorted(gaps.items(), key=lambda x: -x[1][0])[:12]:
+        print(f"{a:40s} -> {b:40s} {t / 1e6:7.3f} {c:6d}")
     print(f"\n{'kernel':60s} {'ms':>7s} {'count':>6s} {'%':>5s}")
     for k, (t, c) in sorted(by.items(), key=lambda x: -x[1][0]):
         print(f"{k[:60]:60s} {t / 1e6:7.2f} {c:6d} {100 * t / busy:5.1f}")

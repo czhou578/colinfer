@@ -138,6 +138,11 @@ class Scheduler:
                         torch.cuda.synchronize()
                         self.cycle_s[(hi - lo, kw)] = (time.perf_counter() - t0) / 3
             self.mst.pos_t.zero_()
+            # cycle_s is measured at ~0 context; per token of a slot's context a cycle also reads the target's KV once
+            # (multi-row attention: whatever k) and the drafter's KV once per draft step (seconds per token, ~240 GB/s)
+            kv = lambda d: sum(t.shape[1] * t.shape[-1] * t.element_size() * 2 for t in d.values())  # noqa: E731 (K + V)
+            self.ctx_s = kv(self.state.k) / 2.4e11
+            self.ctx_draft_s = kv(self.mst.k) / 2.4e11
         else:
             self.graphs = {(lo, hi): DecodeGraph(model, self.state.view(lo, hi), self.params.view(lo, hi)) for lo, hi in self._ranges()}
         self.state.reset()
@@ -168,7 +173,9 @@ class Scheduler:
 
     def _pick_k(self, width: int, dec) -> int:
         """The draft length with the most expected tokens per second: sum over slots of (1 - a^(k+1)) / (1 - a), a = the
-        slot's per-token acceptance estimate, over the measured cycle time."""
+        slot's per-token acceptance estimate, over the cycle time: measured at startup, plus the KV reads that grow with
+        the slots' context (the target's once, the drafter's once per draft step; per slot at 128k: ~17 ms + ~1.1 ms per
+        draft step)."""
         opts = self.k_options(width)
         if len(opts) == 1:
             return opts[0]
@@ -176,7 +183,9 @@ class Scheduler:
         def expected(s, kk):
             a = min(s.acc_s / max(s.acc_t, 1e-6), 0.999)
             return (1 - a ** (kk + 1)) / (1 - a)
-        return max(opts, key=lambda kk: sum(expected(s, kk) for s in dec) / self.cycle_s[(width, kk)])
+        ctx = sum(len(s.tokens) for s in dec)
+        return max(opts, key=lambda kk: sum(expected(s, kk) for s in dec) /
+                   (self.cycle_s[(width, kk)] + ctx * (self.ctx_s + kk * self.ctx_draft_s)))
 
     def _ranges(self):
         """Every contiguous slot range [lo, hi): a step runs the graph of the smallest range covering the decoding

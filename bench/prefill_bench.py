@@ -61,7 +61,7 @@ def main():
         ev = [(e.key, e.self_device_time_total, e.count) for e in prof.key_averages()]
         tot = sum(t for _, t, _ in ev)
         print(f"\nGPU time for a {a.chunk}-token prefill chunk at position {a.profile_at}: {tot / 1e3:.1f} ms")
-        for k, t, c in sorted(ev, key=lambda x: -x[1])[:18]:
+        for k, t, c in sorted(ev, key=lambda x: -x[1])[:int(os.environ.get("PROFILE_TOP", "18"))]:
             print(f"  {t / 1e3:8.2f} ms {100 * t / tot:5.1f}% {c:5d}x  {k[:80]}")
 
 

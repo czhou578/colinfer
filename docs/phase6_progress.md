@@ -237,7 +237,9 @@ what this machine streams (238-240 GB/s). Of the remaining 5%:
 - **GDN state read / write:** 0.3 GB.
 - **KV reads:** 0.27 GB at 8k.
 
-A persistent megakernel could recover at most the gaps, about 2%. The two cheaper changes below captured more:
+A persistent megakernel could recover at most the gaps, about 2%. The two cheaper changes below captured more (with them,
+a later trace of an MTP cycle on the INT6 / INT5 weights of section 9 shows 0.09 ms idle in 83.7 ms, 0.1%: nothing is
+left for a megakernel to take):
 
 - **L2 prefetch.** Before its first activation read, the skinny GEMM pulls its next two chunks into L2.
 - **Programmatic dependent launch** (`csrc/pdl.cuh`).
@@ -521,6 +523,16 @@ before; the MTP head's prefill follows the same rule.
 | 64k | 32.05-32.32 s | 30.27-30.49 s (-5.6%) |
 | 128k | 90.9 s | 80.9 s (-11%) |
 
+**Trying to remove the quality cost.**
+
+- FlashInfer for layers 23-51 (their outputs move most): WikiText back to +0.03%, but code +0.27% at ctx 2048 and
+  +0.43% at 8k (no better than all-FP8): the per-layer output error does not predict code perplexity.
+- Which head dims carry the error (real activations): keeping the 32 dims with the largest mean |q|·|k| in bf16 cuts
+  the middle layers' error from 3-4% to 1-1.5% (64 dims: ~1%). They are not the RoPE dims and are spread over most
+  16-dim chunks, while the kernel can only treat whole 16-byte K chunks specially, so a residual-Q correction would cost
+  most of the speedup.
+- Conclusion: +0.25-0.4% is the price of e4m3 Q at this speed; it stays limited to chunks past 16k.
+
 Passkey retrieval with it: 6/6 at 31k and 126k. `tests/scheduler_check.py` with the threshold at 0 (every prefill on the
 kernel, chunked prefill, prefix reuse, MTP): passed.
 
@@ -577,6 +589,27 @@ rounds once (q × s has up to 9 significant bits; ~0.2% relative). Rows stay bit
   startup 61.1 GB allocated, was 57.5).
 - `tests/scheduler_check.py --requant`: every output identical with and without speculation.
 - Tool calling (85 tasks, 2048 tokens): 51, the same as the FP8 projections (two schema tasks swap, one each way).
+
+## 10. Smaller items
+
+- **Draft length vs context.** `_pick_k` compared k = 3 / 7 by cycle times measured at startup (~0 context). At long
+  context a cycle also reads the target's KV once (the multi-row attention of section 6, whatever k) and the drafter's
+  KV once per draft step; both are now added per slot from the cache formats (~240 GB/s: at 128k ~17 ms + ~1.1 ms per
+  draft step), so the k = 7 / k = 3 trade-off reflects the real cost (calibrated on `bench/decode_bench.py` 8k vs 128k).
+- **Kernel gaps.** A trace of an MTP cycle on the INT6 / INT5 weights (`bench/trace_summary.py`, which now also splits
+  idle time by kernel pair) has 0.09 ms idle in 83.7 ms: programmatic dependent launch already overlaps every boundary
+  that matters. No megakernel work is left to do.
+- **FP8 prefill attention quality.** Section 8: per-layer fallback and per-dim analysis; the +0.25-0.4% stays.
+- **GDN prefill.** A 2,048-token chunk at position 0 is 626 ms of GPU time; FLA's chunked delta-rule kernels are 92 ms of
+  it (state recurrence 31, output 27, WY recompute 22, L2 norm 6.6, KK^T solve 5.5), SwiGLU + NVFP4 quantization 44.5,
+  add + RMSNorm 30.5. The causal conv kernel now normalizes q and k per head itself (one warp per head, FLA's eps), so
+  FLA runs without its l2norm pass: prefill 1-2% faster (2k 0.620 s, 8k 2.613 s); perplexity within the noise of the
+  changed reduction order (WikiText 7.0785, code 1.8027 vs 7.0909 / 1.8012). The recurrence kernel is pinned to 2 warps
+  on Blackwell by FLA (a Triton race) and the rest is autotuned; more needs a CUDA port of the chunked delta rule
+  (~7% if it halved those 92 ms), as does fusing SwiGLU + quantization into the GEMM epilogue (up to ~7%).
+- **Dropping the FP8 copies of the re-quantized projections (5.2 GB) was not done.** Prefill's W8A8 GEMMs would have to
+  rebuild FP8 weights from the INT copies every chunk: ~12 GB more traffic per 2,048-token chunk (~5-8% slower prefill)
+  and a second rounding of the prefill weights, for memory that is not short (61 GB allocated, 80 GB cap).
 
 ## Next
 

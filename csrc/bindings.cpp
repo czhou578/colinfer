@@ -276,7 +276,7 @@ void nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tens
 
 cudaError_t launch_fp8_quant(const void*, void*, size_t, float, cudaStream_t);
 cudaError_t launch_silu_mul_quant(const void*, void*, void*, int, int, float, cudaStream_t);
-cudaError_t launch_causal_conv_silu(const void*, int, const void*, const void*, void*, void*, void*, int, int, int, int, cudaStream_t);
+cudaError_t launch_causal_conv_silu(const void*, int, const void*, const void*, void*, void*, void*, int, int, int, int, float, cudaStream_t);
 cudaError_t launch_add_rmsnorm(const void*, const void*, const void*, float, int, int, void*, void*, void*, void*, float, void*, float, cudaStream_t);
 cudaError_t launch_gate_fp8(const void*, const void*, int, int, int, int, void*, float, cudaStream_t);
 cudaError_t launch_gated_rmsnorm(const void*, const void*, int, int, const void*, void*, int, float, cudaStream_t);
@@ -300,7 +300,8 @@ void silu_mul_quant(torch::Tensor gu, double in_scale, torch::Tensor q, torch::T
 
 // bf16(silu(bf16(depthwise causal conv(x)))) for x [T, C] bf16 (rows may be strided), state [C, 3] (previous 3 inputs), w [C, 4];
 // output channels are split into three contiguous tensors outs[0..2] = [T, c1], [T, c2 - c1], [T, C - c2].
-void causal_conv_silu(torch::Tensor x, torch::Tensor state, torch::Tensor w, std::vector<torch::Tensor> outs) {
+// l2_eps >= 0: also L2-normalize the first two outputs (q, k) per 128-channel head, as FLA's l2norm (eps 1e-6).
+void causal_conv_silu(torch::Tensor x, torch::Tensor state, torch::Tensor w, std::vector<torch::Tensor> outs, double l2_eps) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.stride(1) == 1, "x: bf16 [T, C], unit-stride rows");
     TORCH_CHECK(outs.size() == 3, "three outputs");
     for (auto* t : {&state, &w, &outs[0], &outs[1], &outs[2]}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
@@ -308,7 +309,7 @@ void causal_conv_silu(torch::Tensor x, torch::Tensor state, torch::Tensor w, std
     TORCH_CHECK(state.numel() == C * 3 && w.numel() == C * 4 && c2 + outs[2].size(-1) == C, "bad shapes");
     for (auto& o : outs) TORCH_CHECK(o.numel() == T * o.size(-1), "outputs must be [T, channels]");
     CHECK_LAUNCH(launch_causal_conv_silu(x.data_ptr(), (int)x.stride(0), state.data_ptr(), w.data_ptr(), outs[0].data_ptr(), outs[1].data_ptr(),
-                                         outs[2].data_ptr(), (int)c1, (int)c2, T, C, at::cuda::getCurrentCUDAStream()));
+                                         outs[2].data_ptr(), (int)c1, (int)c2, T, C, (float)l2_eps, at::cuda::getCurrentCUDAStream()));
 }
 
 // Fused residual add + zero-centered RMSNorm + quantization, one row of K per block. All outputs optional:
@@ -508,7 +509,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("n") = py::none());
     m.def("fp8_quant", &fp8_quant, "bf16 -> e4m3, static scale");
     m.def("silu_mul_quant", &silu_mul_quant, "fused silu(gate)*up -> NVFP4 (swizzled scales)");
-    m.def("causal_conv_silu", &causal_conv_silu, "GDN causal depthwise conv (k=4) + SiLU, token-major, split q|k|v outputs");
+    m.def("causal_conv_silu", &causal_conv_silu, "GDN causal depthwise conv (k=4) + SiLU, token-major, split q|k|v outputs", py::arg("x"),
+          py::arg("state"), py::arg("w"), py::arg("outs"), py::arg("l2_eps") = -1.0);
     m.def("add_rmsnorm", &add_rmsnorm, "fused residual add + RMSNorm (+ NVFP4 / FP8 quantization)", py::arg("x"), py::arg("y"), py::arg("w"),
           py::arg("eps"), py::arg("x_out") = py::none(), py::arg("n_out") = py::none(), py::arg("q4") = py::none(), py::arg("sf4") = py::none(),
           py::arg("in_scale4") = 1.0, py::arg("q8") = py::none(), py::arg("in_scale8") = 1.0);

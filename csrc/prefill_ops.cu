@@ -2,7 +2,7 @@
 //   k_fp8_quant         bf16 [M, K] -> e4m3 [M, K] = sat(x / in_scale)            (W8A8 inputs)
 //   k_silu_mul_quant    gu bf16 [M, 2I] (gate | up) -> h = bf16(bf16(silu(g)) * u) quantized to NVFP4:
 //                       packed e2m1 [M, I/2] + CUTLASS-swizzled e4m3 scales     (down_proj input)
-//   k_causal_conv_silu  mixed bf16 [T, C] (token-major), state bf16 [C, 3] -> bf16(silu(bf16(conv)))
+//   k_causal_conv_silu  mixed bf16 [T, C] (token-major), state bf16 [C, 3] -> bf16(silu(bf16(conv))) (_l2: + q / k L2 norm)
 //   k_gated_rmsnorm     o, z bf16 [N, 128] -> bf16(bf16(w * bf16(rmsnorm(o))) * silu(z))
 // Rounding points follow the PyTorch reference (engine/model/qwen35.py).
 #include <cuda_bf16.h>
@@ -96,6 +96,50 @@ __global__ void k_causal_conv_silu(const __nv_bfloat16* __restrict__ x, int ldx,
     }
     __nv_bfloat16* dst = c < c1 ? o0 + (size_t)t * c1 + c : c < c2 ? o1 + (size_t)t * (c2 - c1) + (c - c1) : o2 + (size_t)t * (C - c2) + (c - c2);
     *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(silu(bf(acc0)), silu(bf(acc1)));
+}
+
+// One warp per (t, 128-channel head): lane l owns channels 4l .. 4l+3. l2_eps >= 0: the q and k outputs (channels < c2) are
+// also L2-normalized per head, as FLA's l2norm would (x / sqrt(sum x^2 + eps) on the bf16 values), so
+// chunk_gated_delta_rule runs with use_qk_l2norm_in_kernel=False and its separate l2norm pass goes away.
+__global__ void k_causal_conv_silu_l2(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ state,
+                                      const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ o0, __nv_bfloat16* __restrict__ o1,
+                                      __nv_bfloat16* __restrict__ o2, int c1, int c2, int T, int C, float l2_eps) {
+    const size_t wi = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31, G = C / 128;
+    if (wi >= (size_t)T * G) return;
+    const int t = wi / G, c = (wi % G) * 128 + lane * 4;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int tt = t - 3 + k;
+        float xv[4];
+        if (tt >= 0) {
+            const uint2 v = *reinterpret_cast<const uint2*>(x + (size_t)tt * ldx + c);
+            xv[0] = __uint_as_float(v.x << 16); xv[1] = __uint_as_float(v.x & 0xffff0000u);
+            xv[2] = __uint_as_float(v.y << 16); xv[3] = __uint_as_float(v.y & 0xffff0000u);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) xv[i] = __bfloat162float(state[(size_t)(c + i) * 3 + (3 + tt)]);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[i] = fmaf(__bfloat162float(w[(size_t)(c + i) * 4 + k]), xv[i], acc[i]);
+    }
+    float y[4], ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        y[i] = bf(silu(bf(acc[i])));
+        ss += y[i] * y[i];
+    }
+    if (l2_eps >= 0.f && c < c2) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float r = 1.f / sqrtf(ss + l2_eps);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) y[i] *= r;
+    }
+    __nv_bfloat16* dst = c < c1 ? o0 + (size_t)t * c1 + c : c < c2 ? o1 + (size_t)t * (c2 - c1) + (c - c1) : o2 + (size_t)t * (C - c2) + (c - c2);
+    const __nv_bfloat162 a = __floats2bfloat162_rn(y[0], y[1]), b = __floats2bfloat162_rn(y[2], y[3]);
+    *reinterpret_cast<uint2*>(dst) = make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
 }
 
 // one warp per row of 128; row = token * heads + head. z row (token, head) lives at z + token * ldz + head * 128.
@@ -262,8 +306,15 @@ cudaError_t launch_silu_mul_quant(const void* gu, void* q, void* sf, int M, int 
 }
 
 cudaError_t launch_causal_conv_silu(const void* x, int ldx, const void* state, const void* w, void* o0, void* o1, void* o2, int c1, int c2, int T,
-                                    int C, cudaStream_t st) {
-    if (C % 2 || ldx % 2 || c1 % 2 || c2 % 2) return cudaErrorInvalidValue;
+                                    int C, float l2_eps, cudaStream_t st) {
+    if (C % 128 == 0 && c1 % 128 == 0 && c2 % 128 == 0 && ldx % 4 == 0) {
+        const size_t threads = (size_t)T * (C / 128) * 32;
+        pf::k_causal_conv_silu_l2<<<(threads + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, ldx, (const __nv_bfloat16*)state,
+                                                                         (const __nv_bfloat16*)w, (__nv_bfloat16*)o0, (__nv_bfloat16*)o1,
+                                                                         (__nv_bfloat16*)o2, c1, c2, T, C, l2_eps);
+        return cudaGetLastError();
+    }
+    if (l2_eps >= 0.f || C % 2 || ldx % 2 || c1 % 2 || c2 % 2) return cudaErrorInvalidValue;
     const size_t n = (size_t)T * (C / 2);
     pf::k_causal_conv_silu<<<(n + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, ldx, (const __nv_bfloat16*)state, (const __nv_bfloat16*)w,
                                                             (__nv_bfloat16*)o0, (__nv_bfloat16*)o1, (__nv_bfloat16*)o2, c1, c2, T, C);

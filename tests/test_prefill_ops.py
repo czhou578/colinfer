@@ -113,3 +113,24 @@ def test_gate_fp8():
     gate = qp.reshape(T, H, 2 * D)[:, :, D:].reshape(T, -1)
     ref = ((o * torch.sigmoid(gate)) .float() / 0.05).clamp(-448, 448).to(torch.float8_e4m3fn)
     assert torch.equal(out.float(), ref.float())
+
+
+@pytest.mark.parametrize("T", [1, 5, 300])
+def test_causal_conv_silu_l2norm(T):
+    """The fused per-head L2 norm of q and k matches FLA's l2norm applied to the plain conv outputs."""
+    from fla.modules.l2norm import l2norm_fwd
+
+    from engine.kernels import ops
+    torch.manual_seed(T)
+    c1, c2, C = 256, 512, 896
+    x = torch.randn(T, C, device="cuda").bfloat16()
+    st = torch.randn(C, 3, device="cuda").bfloat16()
+    w = torch.randn(C, 4, device="cuda").bfloat16() * 0.5
+    plain = [torch.empty(T, n, device="cuda", dtype=torch.bfloat16) for n in (c1, c2 - c1, C - c2)]
+    fused = [torch.empty_like(t) for t in plain]
+    ops().causal_conv_silu(x, st, w, plain)
+    ops().causal_conv_silu(x, st, w, fused, 1e-6)
+    for p, f in zip(plain[:2], fused[:2]):
+        ref = l2norm_fwd(p.view(T, -1, 128), eps=1e-6)[0].view(T, -1).float()
+        assert (f.float() - ref).abs().max().item() < 1e-2 * ref.abs().max().item()
+    assert torch.equal(plain[2], fused[2])
