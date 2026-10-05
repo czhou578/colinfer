@@ -34,17 +34,19 @@ def main():
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--ks", type=int, nargs="+", default=[1, 3, 5, 7])
     ap.add_argument("--widths", type=int, nargs="+", default=[1, 2, 3])
+    ap.add_argument("--kv", choices=("fp8", "fp4"), default="fp8")
     ap.add_argument("--requant", action="store_true", help="decode streams the NVFP4 re-quantized attention / GDN projections")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    model = to_fast(load_fast_model(path), kv_fp8=True)
+    model = to_fast(load_fast_model(path), kv_fp8=a.kv == "fp8", kv_fp4=a.kv == "fp4")
     if a.requant:
         from engine.model.fast import attach_requant, requant_path
         print(f"requant: {attach_requant(model, requant_path(path))} linears decode from NVFP4")
     from engine.model.prefill import prepare_prefill
     from engine.spec.mtp import Mtp, MtpCycle, MtpState
     prepare_prefill(model)
-    print(f"linears: {'tensor-core skinny GEMM' if SKINNY else 'CUDA-core GEMV'}; context {a.ctx}")
+    print(f"linears: {'tensor-core skinny GEMM' if SKINNY else 'CUDA-core GEMV'}; context {a.ctx}; KV {a.kv}; "
+          f"PDL {os.environ.get('COLINFER_PDL', '1')}")
     st = model.new_state(3, a.ctx + 64)
     for B in a.widths:
         v = st.view(0, B)
