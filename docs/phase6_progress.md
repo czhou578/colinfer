@@ -640,9 +640,45 @@ remaining route is vector / trellis quantization with Hessian-aware rounding (QT
 at roughly +1-2% perplexity at 3 bits on large models over 16-bit weights, also beyond the gate here (the shipped NVFP4
 MLP is already +0.4% over BF16: 6.9698 vs 6.9404). Not pursued.
 
+## 12. Two draft chains per cycle: measured, not built
+
+A second chain from the drafter's second-choice first token (PLAN.md 4.5 item 3, the smallest tree) only helps when the
+first draft is wrong and the second right; after that it continues exactly like the teacher-forced unroll. So
+`tools/twochain_sim.py` replays speculative cycles along the 75 held-out replies with the fine-tuned head and counts
+tokens per cycle; its one-chain numbers reproduce the engine's (`tools/eval_drafter.py`: 2.76 / 3.39).
+
+| | k=3, one chain | two chains | gain | k=7, one chain | two chains | gain |
+|---|---|---|---|---|---|---|
+| All | 2.76 | 2.96 | +7.2% | 3.41 | 3.71 | +8.8% |
+| Prose | 2.60 | 2.81 | +8.2% | 3.05 | 3.35 | +9.8% |
+| Q&A | 2.60 | 2.82 | +8.4% | 3.09 | 3.38 | +9.4% |
+| Code | 3.15 | 3.31 | +5.0% | 4.43 | 4.74 | +7.0% |
+| Structured | 2.82 | 3.00 | +6.4% | 3.58 | 3.83 | +6.9% |
+
+The second chain doubles the verify rows: a k=3 cycle 4 -> 8 rows costs +5.5% (91.8 -> 96.9 ms), k=7 8 -> 16 rows +9%
+(103.6 -> 112.6 ms), plus GDN rows and its own drafting. Net: about +1.5% at k=3 and nothing at k=7, and nothing when
+two or three requests share a cycle. Not built.
+
+## 13. A two-layer drafter: no gain
+
+`tools/train_drafter.py --extra-layers 1` stacks a second decoder layer on the MTP head: a copy of the trained layer with
+its output projections (o_proj, down_proj) at zero, so training starts exactly at run 4 (checked: identical unroll
+outputs); +372M parameters, lr 5e-5 for the new layer, 2 epochs on the same 3,827 replies.
+
+| Held-out agreement | Depth 1 | Depth 2 | Depth 3 | Depth 4 | Depth 5 |
+|---|---|---|---|---|---|
+| Run 4 (start) | 0.812 | 0.739 | 0.700 | 0.680 | 0.667 |
+| After epoch 0 | 0.804 | 0.729 | 0.691 | 0.667 | 0.653 |
+| After epoch 1 | 0.811 | 0.737 | 0.701 | 0.681 | 0.667 |
+
+With the multi-layer features of section 7 and two chains (section 12), that rules out the drafter's inputs, its depth
+and the verify structure as the limit: on 1.4M tokens of the target's replies, this head has learned what the data holds.
+The remaining drafter lever is far more data (5-10x: about a day of generation and training on this machine).
+
 ## Next
 
-- A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Section 7.
+- A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:
+  features, two chains and a second layer do not help; more data is what is left.
 - Tensor-core multi-row decode attention: done (section 6).
 - FP8 (Q K^T) prefill attention for long prompts: done (section 8), 6% at 64k, 11% at 128k.
 - GDN projections below 8 bits: done (section 9), INT5 GDN + INT6 attention, decode 9.5% faster than FP8.

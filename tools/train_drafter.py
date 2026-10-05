@@ -92,7 +92,7 @@ class Head(torch.nn.Module):
     h0 = h_i + B A [rms(l_1), .., rms(l_n)] (rank-r A, B) replaces h_i as the depth-1 hidden input. B starts at zero,
     i.e. exactly the plain head. (A full-rank fusion [0 .. 0 I] + learned, 105M parameters, drifted from the identity
     faster than 3.8k replies could train it: held-out agreement -2 points after one epoch.)"""
-    def __init__(self, t, cfg, layers=(), rank=256):
+    def __init__(self, t, cfg, layers=(), rank=256, extra_layers=0):
         super().__init__()
         P = lambda n: torch.nn.Parameter(t["mtp." + n].float())  # noqa: E731
         self.fc = P("fc.weight")
@@ -113,6 +113,21 @@ class Head(torch.nn.Module):
                 self.fa = torch.nn.Parameter(torch.randn(rank, n * Hd, device=self.fc.device, generator=g) / math.sqrt(n * Hd))
                 self.fb = torch.nn.Parameter(torch.zeros(Hd, rank, device=self.fc.device))
                 self.lnorm = torch.nn.Parameter(torch.zeros(n, Hd, device=self.fc.device))
+        # extra decoder layers (--extra-layers): from the file if it has them, else copies of layer 0 whose output
+        # projections (o, down) start at zero, so the head starts exactly as it was
+        self.extra = torch.nn.ModuleList()
+        names = dict(in_ln="input_layernorm", post_ln="post_attention_layernorm", q="self_attn.q_proj", k="self_attn.k_proj",
+                     v="self_attn.v_proj", o="self_attn.o_proj", qn="self_attn.q_norm", kn="self_attn.k_norm", gate="mlp.gate_proj",
+                     up="mlp.up_proj", down="mlp.down_proj")
+        self.lnames = names
+        for li in range(1, 1 + extra_layers):
+            pre = f"mtp.layers.{li}."
+            if pre + "input_layernorm.weight" in t:
+                prm = {key: torch.nn.Parameter(t[pre + n + ".weight"].float()) for key, n in names.items()}
+            else:
+                prm = {key: torch.nn.Parameter(getattr(self, key).detach().clone() * (0.0 if key in ("o", "down") else 1.0))
+                       for key in names}
+            self.extra.append(torch.nn.ParameterDict(prm))
         d = cfg.rotary_dim
         self.register_buffer("inv_freq", 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d)), persistent=False)
 
@@ -135,11 +150,55 @@ class Head(torch.nn.Module):
         rot = torch.cat([-xr[..., R // 2:], xr[..., :R // 2]], -1)
         return torch.cat([xr * cos + rot * sin, xp], -1)
 
+    def layer_params(self):
+        """Decoder layers: the checkpoint's (layer 0), then any added ones (--extra-layers)."""
+        base = dict(in_ln=self.in_ln, post_ln=self.post_ln, q=self.q, k=self.k, v=self.v, o=self.o, qn=self.qn, kn=self.kn,
+                    gate=self.gate, up=self.up, down=self.down)
+        return [base] + [dict(p) for p in self.extra]
+
+    def _layer(self, x, prm, kv, s, pos, T, G, scale):
+        """One decoder layer at draft depth s; kv: this layer's (keys, values) lists, one entry per depth so far."""
+        ks, vs = kv
+        h1 = self.rms(x, prm["in_ln"])
+        qg = (h1 @ prm["q"].t().to(h1.dtype)).view(T, self.Hq, 2 * self.D)
+        q, gate = qg[..., :self.D], qg[..., self.D:].reshape(T, -1)
+        q = self.rope(self.rms(q, prm["qn"]).transpose(0, 1), pos)                                # [Hq, T, D]
+        k = self.rope(self.rms((h1 @ prm["k"].t().to(h1.dtype)).view(T, self.Hkv, self.D), prm["kn"]).transpose(0, 1), pos)
+        v = (h1 @ prm["v"].t().to(h1.dtype)).view(T, self.Hkv, self.D).transpose(0, 1)
+        ks.append(k.repeat_interleave(G, 0))
+        vs.append(v.repeat_interleave(G, 0))
+        # depth-1 keys at positions <= i - s + 1, plus the chain's own rows: depth t at position i - s + t
+        s1 = (q @ ks[0].transpose(1, 2)).float() * scale                                       # [Hq, T, T]
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-(s - 1))
+        s1 = s1.masked_fill(~mask, float("-inf"))
+        diag = []
+        for t in range(2, s + 1):
+            sh = s - t  # key row i - sh
+            kt = torch.cat([torch.zeros_like(ks[t - 1][:, :sh]), ks[t - 1][:, :T - sh]], 1) if sh else ks[t - 1]
+            dsc = (q * kt).sum(-1).float() * scale                                              # [Hq, T]
+            if sh:
+                dsc[:, :sh] = float("-inf")
+            diag.append(dsc)
+        allsc = torch.cat([s1] + [d[..., None] for d in diag], -1)
+        p = torch.softmax(allsc, -1)
+        p = torch.nan_to_num(p)  # rows with no visible key (i < s - 1): never scored
+        att = p[..., :T].to(v.dtype) @ vs[0]
+        for idx, t in enumerate(range(2, s + 1)):
+            sh = s - t
+            vt = torch.cat([torch.zeros_like(vs[t - 1][:, :sh]), vs[t - 1][:, :T - sh]], 1) if sh else vs[t - 1]
+            att = att + p[..., T + idx:T + idx + 1].to(v.dtype) * vt
+        att = att.transpose(0, 1).reshape(T, -1) * torch.sigmoid(gate)
+        x = x + att @ prm["o"].t().to(att.dtype)
+        m = self.rms(x, prm["post_ln"])
+        x = x + (F.silu(m @ prm["gate"].t().to(m.dtype)) * (m @ prm["up"].t().to(m.dtype))) @ prm["down"].t().to(m.dtype)
+        return x
+
     def unroll(self, e, h0, depth):
         """e [T, H]: embeddings of x_{i+1}; h0 [T, H]: target hidden h_i. Returns the normed outputs per depth [T, H]."""
         T = e.shape[0]
         pos = torch.arange(T, device=e.device)
-        ks, vs, outs = [], [], []
+        outs = []
+        kvs = [([], []) for _ in self.layer_params()]  # per decoder layer: keys / values per depth
         hid = h0
         scale = self.D ** -0.5
         G = self.Hq // self.Hkv
@@ -147,38 +206,8 @@ class Head(torch.nn.Module):
             if s > 1:  # row i takes the previous depth's output at row i - 1
                 hid = torch.cat([torch.zeros_like(outs[-1][:1]), outs[-1][:-1]])
             x = torch.cat([self.rms(e, self.pre_e), self.rms(hid, self.pre_h)], -1) @ self.fc.t().to(e.dtype)
-            h1 = self.rms(x, self.in_ln)
-            qg = (h1 @ self.q.t().to(h1.dtype)).view(T, self.Hq, 2 * self.D)
-            q, gate = qg[..., :self.D], qg[..., self.D:].reshape(T, -1)
-            q = self.rope(self.rms(q, self.qn).transpose(0, 1), pos)                                # [Hq, T, D]
-            k = self.rope(self.rms((h1 @ self.k.t().to(h1.dtype)).view(T, self.Hkv, self.D), self.kn).transpose(0, 1), pos)
-            v = (h1 @ self.v.t().to(h1.dtype)).view(T, self.Hkv, self.D).transpose(0, 1)
-            ks.append(k.repeat_interleave(G, 0))
-            vs.append(v.repeat_interleave(G, 0))
-            # depth-1 keys at positions <= i - s + 1, plus the chain's own rows: depth t at position i - s + t
-            s1 = (q @ ks[0].transpose(1, 2)).float() * scale                                       # [Hq, T, T]
-            mask = torch.ones(T, T, dtype=torch.bool, device=e.device).tril(-(s - 1))
-            s1 = s1.masked_fill(~mask, float("-inf"))
-            diag = []
-            for t in range(2, s + 1):
-                sh = s - t  # key row i - sh
-                kt = torch.cat([torch.zeros_like(ks[t - 1][:, :sh]), ks[t - 1][:, :T - sh]], 1) if sh else ks[t - 1]
-                dsc = (q * kt).sum(-1).float() * scale                                              # [Hq, T]
-                if sh:
-                    dsc[:, :sh] = float("-inf")
-                diag.append(dsc)
-            allsc = torch.cat([s1] + [d[..., None] for d in diag], -1)
-            p = torch.softmax(allsc, -1)
-            p = torch.nan_to_num(p)  # rows with no visible key (i < s - 1): never scored
-            att = p[..., :T].to(v.dtype) @ vs[0]
-            for idx, t in enumerate(range(2, s + 1)):
-                sh = s - t
-                vt = torch.cat([torch.zeros_like(vs[t - 1][:, :sh]), vs[t - 1][:, :T - sh]], 1) if sh else vs[t - 1]
-                att = att + p[..., T + idx:T + idx + 1].to(v.dtype) * vt
-            att = att.transpose(0, 1).reshape(T, -1) * torch.sigmoid(gate)
-            x = x + att @ self.o.t().to(att.dtype)
-            m = self.rms(x, self.post_ln)
-            x = x + (F.silu(m @ self.gate.t().to(m.dtype)) * (m @ self.up.t().to(m.dtype))) @ self.down.t().to(m.dtype)
+            for li, prm in enumerate(self.layer_params()):
+                x = self._layer(x, prm, kvs[li], s, pos, T, G, scale)
             outs.append(self.rms(x, self.norm))
         return outs
 
@@ -191,6 +220,9 @@ class Head(torch.nn.Module):
             t[L + f"self_attn.{n}_proj.weight"] = p
         for n, p in zip(("gate", "up", "down"), (self.gate, self.up, self.down)):
             t[L + f"mlp.{n}_proj.weight"] = p
+        for li, prm in enumerate(self.extra, start=1):
+            for key, n in self.lnames.items():
+                t[f"mtp.layers.{li}.{n}.weight"] = prm[key]
         out = {k: v.detach().to(torch.bfloat16).contiguous().cpu() for k, v in t.items()}
         if self.layers:
             out["mtp.eagle_a.weight"] = self.fa.detach().to(torch.bfloat16).contiguous().cpu()
@@ -265,7 +297,7 @@ def train(a):
                 if n != "mtp.eagle_layers":
                     t[n] = f.get_tensor(n).to(torch.bfloat16)
     layers = tuple(int(x) for x in a.layers.split(",")) if a.layers else ()
-    head = Head(t, cfg, layers, a.rank).cuda()
+    head = Head(t, cfg, layers, a.rank, a.extra_layers).cuda()
     files = shards(a.feat)
     first = [f for f in files if os.path.basename(f).startswith("shard_")]  # data.jsonl: the held-out split comes from here only,
     sizes = {f: len(torch.load(f, mmap=True)) for f in files}               # so it stays the same as more data files are added
@@ -282,10 +314,12 @@ def train(a):
     val = [it for _, _, it in sorted(val, key=lambda x: order[(x[0], x[1])])]
     ntr = sum(sizes.values()) - nval
     print(f"[train] {ntr} train / {len(val)} held-out replies, depth {a.depth}, layers {layers or 'none'}")
-    main_p = [p for n, p in head.named_parameters() if n not in ("fa", "fb", "lnorm")]
+    main_p = [p for n, p in head.named_parameters() if n not in ("fa", "fb", "lnorm") and not n.startswith("extra.")]
     groups = [dict(params=main_p, lr=a.lr)]
     if layers:
         groups.append(dict(params=[head.fa, head.fb, head.lnorm], lr=a.fuse_lr))
+    if a.extra_layers:
+        groups.append(dict(params=list(head.extra.parameters()), lr=a.extra_lr))
     opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
     total = a.epochs * ntr // a.accum
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, (st + 1) / 20) * 0.5 * (1 + math.cos(math.pi * min(st, total) / total)))
@@ -351,6 +385,8 @@ def main():
                     "their residual streams, --train fuses them with the final hidden state")
     ap.add_argument("--fuse-lr", type=float, default=1e-4, help="learning rate of the fusion weights")
     ap.add_argument("--rank", type=int, default=256, help="rank of the layer fusion")
+    ap.add_argument("--extra-layers", type=int, default=0, help="decoder layers added to the head (start as identity)")
+    ap.add_argument("--extra-lr", type=float, default=1e-4, help="learning rate of the added layers")
     ap.add_argument("--init", default="", help="--train: start from these mtp.* weights instead of the checkpoint's")
     a = ap.parse_args()
     if a.extract:
