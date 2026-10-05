@@ -74,3 +74,34 @@ def test_startup_selftest_passes():
     from engine.selftest import run_selftest
     res = run_selftest()
     assert len(res) >= 9 and all(v < 5e-3 for v in res.values())
+
+
+@pytest.mark.parametrize("M", [1, 37, 256, 2048])
+def test_gemm_swiglu_fused(M):
+    """Up GEMM with silu(gate) * acc and NVFP4 quantization in the epilogue == the unfused silu_mul_quant path (up to
+    rounding ties: the fused path does not round u and the product to bf16 first)."""
+    from engine.kernels import ops
+    torch.manual_seed(M)
+    K, I = 1024, 2048
+
+    def q4(x, s):
+        q = torch.empty(x.shape[0], x.shape[1] // 2, dtype=torch.uint8, device="cuda")
+        sf = torch.empty(ops().nvfp4_sf_size(x.shape[0], x.shape[1]), dtype=torch.uint8, device="cuda")
+        ops().nvfp4_quant(x, s, q, sf)
+        return q, sf
+    x = torch.randn(M, K, device="cuda").bfloat16()
+    wg, wu = (torch.randn(I, K, device="cuda") * 0.05).bfloat16(), (torch.randn(I, K, device="cuda") * 0.05).bfloat16()
+    sx, sw, sh = x.float().abs().max().item() / 2688, 0.25 / 2688, 0.02
+    xq, xsf = q4(x, sx)
+    (gq, gsf), (uq, usf) = q4(wg, sw), q4(wu, sw)
+    tile = 0 if M >= 1536 else 1
+    gate, up = (torch.empty(M, I, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    ops().nvfp4_gemm(xq, xsf, gq, gsf, sx * sw, None, gate, tile)
+    ops().nvfp4_gemm(xq, xsf, uq, usf, sx * sw, None, up, tile)
+    hq_ref = torch.empty(M, I // 2, dtype=torch.uint8, device="cuda")
+    hsf_ref = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device="cuda")
+    ops().silu_mul_quant(torch.cat([gate, up], 1).contiguous(), sh, hq_ref, hsf_ref)
+    hq, hsf = torch.empty_like(hq_ref), torch.empty_like(hsf_ref)
+    ops().nvfp4_gemm_swiglu(xq, xsf, uq, usf, sx * sw, gate, hq, hsf, torch.tensor([1.0 / sh], device="cuda"), tile)
+    assert (hq == hq_ref).float().mean().item() > 0.97
+    assert (hsf == hsf_ref).float().mean().item() > 0.97

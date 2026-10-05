@@ -675,6 +675,21 @@ With the multi-layer features of section 7 and two chains (section 12), that rul
 and the verify structure as the limit: on 1.4M tokens of the target's replies, this head has learned what the data holds.
 The remaining drafter lever is far more data (5-10x: about a day of generation and training on this machine).
 
+## 14. SwiGLU + NVFP4 quantization in the up GEMM's epilogue
+
+The prefill MLP ran the stacked gate | up GEMM to bf16 [M, 2 × 17,408], then `k_silu_mul_quant` read that back to write
+the NVFP4 input of the down GEMM: ~300 MB of traffic per layer at 2,048 tokens around the GEMMs, 44.5 ms per chunk
+(section 10). Now the gate GEMM writes bf16 g, and the up GEMM's epilogue computes silu(g) · α · acc and quantizes it
+to NVFP4 with e4m3 scales per 16 in the layout the down GEMM reads (`csrc/gemm_nvfp4.cu`, `SwigluNvfp4`: a CUTLASS
+epilogue visitor tree on SM120's block-scale-factor store, which scales by amax · nc / 6 with nc = 1 / the down
+projection's input scale, as `quant_nvfp4` does). Traffic per layer drops to ~160 MB.
+
+- Same output as the unfused path up to rounding ties (99% of the e2m1 codes equal; the fused path no longer rounds u
+  and the product to bf16): error against fp32 0.131 / 0.158 both ways; `tests/test_gemm_nvfp4.py`.
+- Per layer at 2,048 tokens: 2.81 ms (GEMM 2.10 + silu_mul_quant 0.71) -> 2.34 ms.
+- Prefill: 2k 0.619 -> 0.596 s (3,434 tok/s), 8k 2.598 -> 2.503 s (3,273 tok/s), 3.7% faster.
+- Perplexity (prefill engine): WikiText 7.0707, code 1.8026 (7.0785 / 1.8027 before). `COLINFER_FUSED_SWIGLU=0`: old path.
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:

@@ -49,6 +49,122 @@ struct Cfg {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
+// ---- the MLP's SwiGLU fused into the up GEMM's epilogue ------------------------------------------------------------------
+// D = NVFP4(silu(C) * alpha * acc), e4m3 scale per 16 outputs, in the CUTLASS scale layout the down GEMM reads as its A
+// scales; C = the gate GEMM's bf16 output. Block scale = e4m3(amax * nc / 6), values * nc / scale with nc = 1 / in_scale of
+// the down projection (Sm120BlockScaleFactorRowStore), the same as quant_nvfp4. The traits come from
+// LinCombBlockScaleFactor (NVFP4 output, bf16 source); the callbacks are the tree below.
+struct SwigluNvfp4 : cutlass::epilogue::fusion::LinCombBlockScaleFactor<16, cutlass::float_e2m1_t, float, cutlass::float_ue4m3_t,
+                                                                       cutlass::layout::RowMajor, cutlass::bfloat16_t> {};
+
+}  // namespace g4
+
+namespace cutlass::epilogue::fusion {
+template <int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore, class CtaTileShapeMNK, class EpilogueTile>
+struct FusionCallbacks<epilogue::Sm120TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>, g4::SwigluNvfp4,
+                       CtaTileShapeMNK, EpilogueTile>
+    : Sm90EVT<Sm120BlockScaleFactorRowStore<16, EpilogueTile, CtaTileShapeMNK, FragmentSize, float_e2m1_t, float, float_ue4m3_t,
+                                            FloatRoundStyle::round_to_nearest>,
+              Sm90EVT<Sm90Compute<multiplies, float, float, FloatRoundStyle::round_to_nearest>,
+                      Sm90EVT<Sm90Compute<epilogue::thread::SiLu, float, float, FloatRoundStyle::round_to_nearest>, Sm90SrcFetch<bfloat16_t>>,
+                      Sm90EVT<Sm90Compute<multiplies, float, float, FloatRoundStyle::round_to_nearest>, Sm90ScalarBroadcast<float>,
+                              Sm90AccFetch>>> {
+    using Impl =
+        Sm90EVT<Sm120BlockScaleFactorRowStore<16, EpilogueTile, CtaTileShapeMNK, FragmentSize, float_e2m1_t, float, float_ue4m3_t,
+                                              FloatRoundStyle::round_to_nearest>,
+                Sm90EVT<Sm90Compute<multiplies, float, float, FloatRoundStyle::round_to_nearest>,
+                        Sm90EVT<Sm90Compute<epilogue::thread::SiLu, float, float, FloatRoundStyle::round_to_nearest>, Sm90SrcFetch<bfloat16_t>>,
+                        Sm90EVT<Sm90Compute<multiplies, float, float, FloatRoundStyle::round_to_nearest>, Sm90ScalarBroadcast<float>,
+                                Sm90AccFetch>>>;
+    using Operation = g4::SwigluNvfp4;
+
+    struct Arguments {
+        float alpha = 1.f;
+        float_ue4m3_t* block_scale_factor_ptr = nullptr;
+        float const* norm_constant_ptr = nullptr;
+        using StrideNormConst = Stride<_0, _0, int64_t>;
+        StrideNormConst dNormConst = {_0{}, _0{}, 0};
+
+        operator typename Impl::Arguments() const {
+            return {
+                {
+                    // silu(C) * (alpha * acc)
+                    {{}, {}},                                                // silu(C): source, silu
+                    {{{alpha}, {nullptr}, {}}, {}, {}},                     // alpha * acc
+                    {}                                                       // multiplies
+                },
+                {block_scale_factor_ptr, norm_constant_ptr, dNormConst}     // scale factors, norm constant
+            };
+        }
+    };
+
+    using Impl::Impl;
+};
+}  // namespace cutlass::epilogue::fusion
+
+namespace g4 {
+
+template <int TM, int TN, int TK>
+struct CfgSwiglu {
+    using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using ElementC = cutlass::bfloat16_t;
+    using ElementD = cutlass::float_e2m1_t;
+    using TileShape = Shape<Int<TM>, Int<TN>, Int<TK>>;
+    using ClusterShape = Shape<_1, _1, _1>;
+    using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
+        float, float, ElementC, cutlass::layout::RowMajor, 8, ElementD, cutlass::layout::RowMajor, 32,
+        cutlass::epilogue::collective::EpilogueScheduleAuto, SwigluNvfp4>::CollectiveOp;
+    using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ElementA, cutlass::layout::RowMajor, 32, ElementB,
+        cutlass::layout::ColumnMajor, 32, float, TileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+    using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Main, Epi, void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+
+template <class C>
+cudaError_t run_swiglu(const void* a, const void* sfa, const void* b, const void* sfb, float alpha, const void* c, void* d, void* sfd,
+                       const float* norm_const, int M, int N, int K, void* workspace, size_t ws_bytes, size_t* ws_needed, cudaStream_t st) {
+    using Gemm = typename C::Gemm;
+    using SfCfg = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+    auto sA = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, {M, K, 1});
+    auto sB = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, {N, K, 1});
+    auto sC = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideC{}, {M, N, 1});
+    auto sD = cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideD{}, {M, N, 1});
+    auto lSFA = SfCfg::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
+    auto lSFB = SfCfg::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
+    typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                  {M, N, K, 1},
+                                  {(const typename C::ElementA::DataType*)a, sA, (const typename C::ElementB::DataType*)b, sB,
+                                   (const typename C::ElementA::ScaleFactorType*)sfa, lSFA, (const typename C::ElementB::ScaleFactorType*)sfb, lSFB},
+                                  {{}, (const typename C::ElementC*)c, sC, (typename C::ElementD*)d, sD}};
+    args.epilogue.thread.alpha = alpha;
+    args.epilogue.thread.block_scale_factor_ptr = (cutlass::float_ue4m3_t*)sfd;
+    args.epilogue.thread.norm_constant_ptr = norm_const;
+    args.scheduler.max_swizzle_size = 8;
+    static int sm_count = 0, device = -1;
+    if (sm_count == 0) {
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    }
+    args.hw_info.device_id = device;
+    args.hw_info.sm_count = sm_count;
+    const size_t need = Gemm::get_workspace_size(args);
+    if (ws_needed) {
+        *ws_needed = need;
+        return cudaSuccess;
+    }
+    if (need > ws_bytes) return cudaErrorMemoryAllocation;
+    Gemm gemm;
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return cudaErrorInvalidValue;
+    if (gemm.initialize(args, workspace, st) != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    if (gemm.run(st) != cutlass::Status::kSuccess) return cudaErrorLaunchFailure;
+    return cudaGetLastError();
+}
+
 template <class C>
 cudaError_t run(const void* a, const void* sfa, const void* b, const void* sfb, float alpha, const void* c, void* d, int M, int N, int K,
                 void* workspace, size_t ws_bytes, size_t* ws_needed, cudaStream_t st) {
@@ -155,6 +271,17 @@ cudaError_t launch_nvfp4_swizzle_sf(const void* src, void* dst, int R, int K, cu
     const size_t n = (size_t)R * (K / 16);
     g4::k_swizzle_sf<<<(n + 255) / 256, 256, 0, st>>>((const uint8_t*)src, (uint8_t*)dst, R, K / 16);
     return cudaGetLastError();
+}
+
+// The up GEMM of the MLP with the SwiGLU fused: d = NVFP4(silu(c) * alpha * a.b^T) + its swizzled e4m3 scales (sfd, zeroed
+// here), c = the gate GEMM's bf16 output [M, N], norm_const = device float 1 / in_scale (down projection).
+cudaError_t launch_nvfp4_gemm_swiglu(const void* a, const void* sfa, const void* b, const void* sfb, float alpha, const void* c, void* d, void* sfd,
+                                     const float* norm_const, int M, int N, int K, int tile, void* ws, size_t ws_bytes, size_t* ws_needed,
+                                     cudaStream_t st) {
+    if (!ws_needed) cudaMemsetAsync(sfd, 0, nvfp4_sf_bytes(M, N), st);
+    if (tile == 0)
+        return g4::run_swiglu<g4::CfgSwiglu<256, 128, 128>>(a, sfa, b, sfb, alpha, c, d, sfd, norm_const, M, N, K, ws, ws_bytes, ws_needed, st);
+    return g4::run_swiglu<g4::CfgSwiglu<128, 128, 256>>(a, sfa, b, sfb, alpha, c, d, sfd, norm_const, M, N, K, ws, ws_bytes, ws_needed, st);
 }
 
 // tile: 0 = 256x128x128 cooperative (large M), 1 = 128x128x256 cooperative (small M)

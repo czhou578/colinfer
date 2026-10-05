@@ -25,6 +25,9 @@ from engine.kernels import ops
 from engine.model.fast import FastQwen35, FastState, Nvfp4Linear, StackedFp8Linear
 
 CHUNK = 2048
+# The MLP's SwiGLU + NVFP4 quantization in the up GEMM's epilogue (csrc/gemm_nvfp4.cu SwigluNvfp4) instead of a bf16
+# [gate | up] round trip through k_silu_mul_quant: ~0.5 ms per layer at 2,048 tokens. COLINFER_FUSED_SWIGLU=0: the old path.
+FUSED_SWIGLU = os.environ.get("COLINFER_FUSED_SWIGLU", "1") != "0"
 _EMU_Q_FP8 = os.environ.get("COLINFER_EMU_Q_FP8") == "1"  # FlashInfer path only: Q rounded as the FP8 kernel rounds it
 # Attention over an fp8 cache, for chunks whose context passes ATTN_FP8_MIN_CTX: csrc/attn_prefill.cu (Q K^T in e4m3,
 # ~1.25x FlashInfer's rate; prefill 4% faster at 32k, 6% at 64k; perplexity +0.25-0.3%, from rounding Q to e4m3).
@@ -62,6 +65,12 @@ def prepare_prefill(model: FastQwen35):
         mlp = layer.mlp
         mlp.p_gu = _nvfp4_operands([mlp.gate, mlp.up])
         mlp.p_down = _nvfp4_operands([mlp.down])
+        # gate and up halves of the stacked operand for the fused SwiGLU (rows: I is a multiple of 128, so the up half's
+        # swizzled scales are a contiguous slice)
+        I, sfh = mlp.gate.out_features, mlp.p_gu["sf"].numel() // 2
+        mlp.p_g = dict(mlp.p_gu, w=mlp.p_gu["w"][:I], sf=mlp.p_gu["sf"][:sfh], N=I)
+        mlp.p_u = dict(mlp.p_gu, w=mlp.p_gu["w"][I:], sf=mlp.p_gu["sf"][sfh:], N=I)
+        mlp.p_down["nc"] = torch.tensor([1.0 / mlp.p_down["in_scale"]], dtype=torch.float32, device=mlp.p_gu["w"].device)
     if isinstance(model.lm_head, Nvfp4Linear):  # for all-token logits (perplexity); decode uses the GEMV
         model.p_lm = _nvfp4_operands([model.lm_head])
     torch.cuda.empty_cache()
@@ -111,11 +120,16 @@ def _mlp(layer, x, y):
     xsf = torch.empty(ops().nvfp4_sf_size(M, K), dtype=torch.uint8, device=x.device)
     ops().add_rmsnorm(x, y, layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps, x_out=x_new, q4=xq, sf4=xsf,
                       in_scale4=mlp.p_gu["in_scale"])
-    gu = _gemm_nvfp4(xq, xsf, mlp.p_gu)
-    I = gu.shape[1] // 2
-    hq = torch.empty(M, I // 2, dtype=torch.uint8, device=gu.device)
-    hsf = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device=gu.device)
-    ops().silu_mul_quant(gu, mlp.p_down["in_scale"], hq, hsf)
+    I = mlp.p_gu["N"] // 2
+    hq = torch.empty(M, I // 2, dtype=torch.uint8, device=x.device)
+    hsf = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device=x.device)
+    if FUSED_SWIGLU:  # gate GEMM, then the up GEMM computes silu(gate) * up and quantizes it in its epilogue
+        g = _gemm_nvfp4(xq, xsf, mlp.p_g)
+        u = mlp.p_u
+        ops().nvfp4_gemm_swiglu(xq, xsf, u["w"], u["sf"], u["alpha"], g, hq, hsf, mlp.p_down["nc"], 0 if M >= 1536 else 1)
+    else:
+        gu = _gemm_nvfp4(xq, xsf, mlp.p_gu)
+        ops().silu_mul_quant(gu, mlp.p_down["in_scale"], hq, hsf)
     return _gemm_nvfp4(hq, hsf, mlp.p_down, x_new)
 
 

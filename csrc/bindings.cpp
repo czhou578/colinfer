@@ -274,6 +274,32 @@ void nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tens
                                    ws.data_ptr(), need, nullptr, at::cuda::getCurrentCUDAStream()));
 }
 
+cudaError_t launch_nvfp4_gemm_swiglu(const void*, const void*, const void*, const void*, float, const void*, void*, void*, const float*, int, int,
+                                     int, int, void*, size_t, size_t*, cudaStream_t);
+
+// The MLP's up GEMM with the SwiGLU fused: hq / hsf = NVFP4(silu(gate) * alpha * (a . b^T)), quantized for the down GEMM
+// (norm_const: float32 [1] on the device = 1 / the down projection's input scale). gate: bf16 [M, N] (the gate GEMM).
+void nvfp4_gemm_swiglu(torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, double alpha, torch::Tensor gate, torch::Tensor hq,
+                       torch::Tensor hsf, torch::Tensor norm_const, int64_t tile) {
+    CHECK_CUDA_TENSOR(a, torch::kUInt8);
+    CHECK_CUDA_TENSOR(b, torch::kUInt8);
+    CHECK_CUDA_TENSOR(gate, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(hq, torch::kUInt8);
+    CHECK_CUDA_TENSOR(norm_const, torch::kFloat32);
+    const int64_t M = a.size(0), K = a.size(1) * 2, N = b.size(0);
+    TORCH_CHECK(b.size(1) * 2 == K && gate.size(0) == M && gate.size(1) == N && hq.size(0) == M && hq.size(1) * 2 == N && K % 128 == 0 &&
+                N % 128 == 0, "bad shapes");
+    TORCH_CHECK(sfa.numel() >= (int64_t)nvfp4_sf_bytes(M, K) && sfb.numel() >= (int64_t)nvfp4_sf_bytes(N, K) &&
+                hsf.numel() >= (int64_t)nvfp4_sf_bytes(M, N), "scale tensors too small");
+    size_t need = 0;
+    launch_nvfp4_gemm_swiglu(a.data_ptr(), sfa.data_ptr(), b.data_ptr(), sfb.data_ptr(), (float)alpha, gate.data_ptr(), hq.data_ptr(),
+                             hsf.data_ptr(), norm_const.data_ptr<float>(), M, N, K, (int)tile, nullptr, 0, &need, at::cuda::getCurrentCUDAStream());
+    auto ws = torch::empty({(int64_t)std::max<size_t>(need, 1)}, a.options());
+    CHECK_LAUNCH(launch_nvfp4_gemm_swiglu(a.data_ptr(), sfa.data_ptr(), b.data_ptr(), sfb.data_ptr(), (float)alpha, gate.data_ptr(), hq.data_ptr(),
+                                          hsf.data_ptr(), norm_const.data_ptr<float>(), M, N, K, (int)tile, ws.data_ptr(), need, nullptr,
+                                          at::cuda::getCurrentCUDAStream()));
+}
+
 cudaError_t launch_fp8_quant(const void*, void*, size_t, float, cudaStream_t);
 cudaError_t launch_silu_mul_quant(const void*, void*, void*, int, int, float, cudaStream_t);
 cudaError_t launch_causal_conv_silu(const void*, int, const void*, const void*, void*, void*, void*, int, int, int, int, float, cudaStream_t);
@@ -519,6 +545,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_sf_size", &nvfp4_sf_size, "bytes of a swizzled NVFP4 scale tensor for [rows, K]");
     m.def("nvfp4_quant", &nvfp4_quant, "bf16 -> NVFP4 (packed e2m1 + swizzled e4m3 scales), static global scale");
     m.def("nvfp4_swizzle_sf", &nvfp4_swizzle_sf, "row-major NVFP4 scales -> CUTLASS 128x4 layout");
+    m.def("nvfp4_gemm_swiglu", &nvfp4_gemm_swiglu, "NVFP4 up GEMM with silu(gate) * acc and NVFP4 quantization fused in the epilogue",
+          py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("alpha"), py::arg("gate"), py::arg("hq"), py::arg("hsf"),
+          py::arg("norm_const"), py::arg("tile") = 0);
     m.def("nvfp4_gemm", &nvfp4_gemm, "CUTLASS SM120 NVFP4 x NVFP4 GEMM, bf16 out", py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
           py::arg("alpha"), py::arg("residual"), py::arg("out"), py::arg("tile") = 0);
     m.def("rmsnorm", &rmsnorm, "zero-centered RMSNorm (1 + w)");
