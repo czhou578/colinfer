@@ -339,7 +339,66 @@ The head's K and V sit well inside e4m3's range (|K| median 0.95, max 19; |V| me
 
 At 128k a k=7 cycle went from 2.2× a plain step to 1.3×; at 8k cycles are 2-10% shorter.
 
+## 7. Fine-tuning the MTP head as a multi-step drafter
+
+The checkpoint's MTP head is trained for one step: (embedding of x_{i+1}, target hidden h_i) → x_{i+2}. The engine
+chains it, so drafts 2..k feed the head its own output instead of a target hidden state, inputs it never trained on.
+`tools/train_drafter.py` fine-tunes it EAGLE-3 style ("training-time test"): each row is unrolled to depth D exactly
+as drafting runs, against the target's top-32 next-token distribution (soft cross-entropy, 64k draft vocabulary), on
+the target's own replies (`tools/drafter_data.py`). Embedding and lm_head stay frozen. `tests/test_drafter_train.py`
+checks the unroll against incremental chained drafting.
+
+**Data:** 1,500 sampled replies (T = 0.7) to generated prompts, 490k tokens: 45% prose, 15% Q&A, 25% code, 15%
+structured; thinking on for half. 75 are held out.
+
+**Runs** (held-out top-1 agreement with the target, per draft depth):
+
+| | lr | Depth | Epochs | Depth 1 | Depth 3 | Depth 5 | Depth 7 |
+|---|---|---|---|---|---|---|---|
+| Checkpoint head | | | | 0.802 | 0.672 | 0.619 | 0.586 |
+| Run 1 | 3e-5 | 5 | 2 | 0.808 | 0.694 | 0.655 | |
+| Run 2 (stopped after epoch 0: worse than before) | 1e-4 | 7 | 3 | 0.769 | 0.626 | 0.582 | 0.561 |
+| Run 3 | 3e-5 | 7 | 4 | 0.807 | 0.692 | 0.657 | 0.635 |
+| Run 4 (the default), 2.7× the data | 3e-5 | 5 | 2 | 0.812 | 0.700 | 0.668 | |
+
+**End to end** (`tools/eval_drafter.py`: 40 fresh prompts, greedy, the engine's real speculative cycle; tokens per
+cycle, acceptance in parentheses):
+
+| | Code | Prose | Q&A | Structured | All |
+|---|---|---|---|---|---|
+| Checkpoint head, k=3 | 3.25 (0.75) | 2.45 (0.49) | 2.57 | 2.71 | 2.67 |
+| Run 1, k=3 | 3.45 (0.82) | 2.50 (0.50) | 2.67 | 2.77 | 2.75 |
+| Run 3, k=3 | 3.41 (0.80) | 2.50 (0.50) | 2.63 | 2.76 | 2.74 |
+| Checkpoint head, k=7 | 4.46 (0.50) | 2.74 (0.25) | 3.01 | 3.22 | 3.16 |
+| Run 1, k=7 | 5.29 (0.62) | 2.84 (0.27) | 3.16 | 3.39 | 3.36 |
+| Run 3, k=7 | 5.18 (0.61) | 2.84 (0.27) | 3.19 | 3.40 | 3.36 |
+
+- Fine-tuning helps most on code (+19% tokens per cycle at k=7) and least on prose (+4%).
+- Run 3's deeper unroll and twice the epochs gained nothing end to end over run 1. Training longer on the same
+  1,500 replies has stopped paying.
+
+**Run 4: more data.** 2,402 more replies from new prompts (`drafter_data.py --seed 2`; seed 1 is the evaluation's), 942k
+tokens, so 3,827 training replies and 1.43M tokens. The held-out split is the same 75 replies as before (it is drawn
+from the first data file only). Same evaluation, rerun with the current attention kernel: the target's greedy text
+differs slightly from the table above (section 6 changed its softmax reduction order), so compare within this table:
+
+| | Code | Prose | Q&A | Structured | All |
+|---|---|---|---|---|---|
+| Checkpoint head, k=3 | 3.13 | 2.44 | 2.66 | 2.70 | 2.67 |
+| Run 1, k=3 | 3.31 | 2.49 | 2.75 | 2.76 | 2.75 |
+| Run 4, k=3 | 3.36 | 2.48 | 2.72 | 2.82 | 2.76 |
+| Checkpoint head, k=7 | 4.16 | 2.72 | 3.12 | 3.19 | 3.14 |
+| Run 1, k=7 | 4.80 | 2.82 | 3.39 | 3.34 | 3.35 |
+| Run 4, k=7 | 4.97 | 2.82 | 3.34 | 3.46 | 3.39 |
+
+- 2.7× the data: held-out agreement +1.3 points at depth 5, code and structured output +3-4% at k=7, prose flat.
+- Run 4 is now `~/.cache/colinfer/drafter/mtp_ft.safetensors`, which the server loads by default (`--drafter-weights
+  auto`); run 1 is kept as `mtp_ft_r1.safetensors`.
+- Prose is stuck at ~0.5 acceptance per token with this head. Fine-tuning a one-layer head on more of the same data
+  helps code-like text, not prose. The next lever is a bigger drafter (EAGLE-3 multi-layer features, or a small
+  parallel drafter), not more fine-tuning.
+
 ## Next
 
-- A better drafter for prose. Acceptance there is about 0.45, so speculation adds about 1.15×.
+- A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Section 7.
 - Tensor-core multi-row decode attention: done (section 6).

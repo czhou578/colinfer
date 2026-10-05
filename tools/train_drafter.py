@@ -15,7 +15,7 @@ Depth s, row i (the draft for x_{i+2} made s-1 chain steps after a catch-up row 
             the engine drafts from), soft cross-entropy
 Rows are scored only where x_{i+2} lies in the reply. The embedding and lm_head stay frozen (shared with the target).
 
-   uv run python tools/train_drafter.py --extract      # target hidden states + top-k distributions (once)
+   uv run python tools/train_drafter.py --extract      # target hidden states + top-k distributions (once per --data file)
    uv run python tools/train_drafter.py --train        # fine-tune; writes ~/.cache/colinfer/drafter/mtp_ft.safetensors
    uv run python tools/train_drafter.py --eval         # per-depth agreement with the target on held-out replies
 """
@@ -57,7 +57,10 @@ def extract(a):
     from engine.model.prefill import prefill
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     model = to_fast(load_fast_model(path), kv_fp8=True)
-    rows = [json.loads(l) for l in open(os.path.join(DIR, "data.jsonl"))]
+    src = os.path.expanduser(a.data)
+    rows = [json.loads(l) for l in open(src)]
+    stem = os.path.splitext(os.path.basename(src))[0]
+    prefix = "" if stem == "data" else stem + "_"  # data.jsonl -> shard_*.pt, data2.jsonl -> data2_shard_*.pt
     os.makedirs(os.path.join(DIR, "feat"), exist_ok=True)
     t0 = time.time()
     shard, n = [], 0
@@ -70,7 +73,7 @@ def extract(a):
         tv, ti = lp.topk(TOPK, -1)
         shard.append(dict(ids=torch.tensor(ids, dtype=torch.int32), P=P, H=H.cpu(), tv=tv.half().cpu(), ti=ti.int().cpu(), kind=r["kind"]))
         if len(shard) == 100 or j == len(rows) - 1:
-            torch.save(shard, os.path.join(DIR, "feat", f"shard_{n:03d}.pt"))
+            torch.save(shard, os.path.join(DIR, "feat", f"{prefix}shard_{n:03d}.pt"))
             shard, n = [], n + 1
             print(f"[extract] {j + 1}/{len(rows)} ({time.time() - t0:.0f}s)", flush=True)
 
@@ -163,7 +166,7 @@ class Head(torch.nn.Module):
 
 
 def shards():
-    return sorted(glob.glob(os.path.join(DIR, "feat", "shard_*.pt")))
+    return sorted(glob.glob(os.path.join(DIR, "feat", "*shard_*.pt")))
 
 
 def setup():
@@ -219,11 +222,13 @@ def train(a):
     cfg, path, embed, lm_draft, remap = setup()
     head = Head(mtp_tensors(path), cfg).cuda()
     files = shards()
-    data = [x for f in files for x in torch.load(f)]
+    first = [f for f in files if os.path.basename(f).startswith("shard_")]  # data.jsonl: the held-out split comes from here only,
+    data = [x for f in first for x in torch.load(f)]                         # so it stays the same as more data files are added
     rng = random.Random(0)
     rng.shuffle(data)
     nval = max(20, len(data) // 20)
     val, tr = data[:nval], data[nval:]
+    tr += [x for f in files if f not in first for x in torch.load(f)]
     print(f"[train] {len(tr)} train / {len(val)} held-out replies, depth {a.depth}")
     opt = torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=0.0, betas=(0.9, 0.95))
     total = a.epochs * len(tr) // a.accum
@@ -258,7 +263,7 @@ def train(a):
                     print(f"[train] epoch {ep} step {step}/{total} loss {loss.item():.4f} per depth {[round(l.item(), 3) for l in losses]} "
                           f"({time.time() - t0:.0f}s)", flush=True)
         print(f"[train] held-out top-1 agreement per depth after epoch {ep}: {evaluate()}", flush=True)
-    out = os.path.join(DIR, "mtp_ft.safetensors")
+    out = a.out
     save_file(head.export(), out)
     print(f"[train] saved {out}")
 
@@ -271,6 +276,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--lr", type=float, default=3e-5)
     ap.add_argument("--accum", type=int, default=4)
+    ap.add_argument("--out", default=os.path.join(DIR, "mtp_ft.safetensors"))
+    ap.add_argument("--data", default=os.path.join(DIR, "data.jsonl"), help="--extract: replies (tools/drafter_data.py output)")
     ap.add_argument("--decay", type=float, default=0.9, help="loss weight decay per depth")
     a = ap.parse_args()
     if a.extract:

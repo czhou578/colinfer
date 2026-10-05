@@ -17,9 +17,12 @@ Startup takes about 21 s with a warm page cache: 6 s to load weights, 10 s for t
 | `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. |
 | `--served-model-name` | the `--model` value | The id that `/v1/models` reports. Requests can name any model. |
 | `--slots` | 3 | Concurrent requests. Further requests wait in a FIFO queue. |
-| `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). KV costs 32 KB per token per slot. |
+| `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). KV costs 32 KB per token per slot (18 KB with `--kv fp4`). |
+| `--kv` | `fp8` | KV cache format. `fp4` stores e2m1 values plus e4m3 scales per 16 dims: 0.56× the memory (3 × 262k: 14.5 GB instead of 25.8 GB), perplexity +0.2-0.3%. At 128k: plain decode 89 vs 97 ms per step, a width-3 k=3 cycle 153 vs 175 ms. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
-| `--k` | 3 | MTP draft length. Three slots decoding together use k=1 (see below). |
+| `--k` | 7 | Longest MTP draft. Each cycle picks k=3 or 7 from measured acceptance (see below). |
+| `--drafter-weights` | `auto` | MTP head weights: `auto` uses `~/.cache/colinfer/drafter/mtp_ft.safetensors` (`tools/train_drafter.py`) when it exists; `none` the checkpoint's; or a path. Drafts change speed, never outputs. |
+| `--decode-weights` | `checkpoint` | `requant`: decode the attention / GDN projections from NVFP4 re-quantizations, about 18% faster, but code perplexity +1.5% (`docs/phase6_progress.md`). |
 | `--checkpoints` | 32 | Prefix-checkpoint ring, 154 MB each, allocated at startup. |
 | `--no-prefix-caching` | off | Never reuse a prompt prefix (same as `--checkpoints 0`). For raw-prefill benchmarks, like vLLM's `--no-enable-prefix-caching`. |
 | `--mem-cap-gb` | 80 | Hard cap on the torch allocator. Exceeding it raises an error, and the process exits and restarts. |
@@ -81,7 +84,8 @@ Other endpoints:
 ## Behavior worth knowing
 
 - **Speculation is always on unless the server runs with `--spec none`.** Its output is token-identical to plain decode, greedy or sampled (with the same seed).
-- **Draft length depends on how many slots are decoding.**
+- **Draft length adapts.** (The rest of this item describes Phase 5; with the Phase 6 tensor-core verify kernel, a
+  cycle verifies up to 16 rows in one weight pass and picks k=3 or 7 per cycle from each request's acceptance.)
   - A cycle verifies (k+1) rows per slot, and a weight-streaming pass handles 8 rows.
   - One or two decoding slots use k=3: 4 and 8 rows.
   - Three slots use k=1, which is 6 rows; with k=3 they would need 12 rows and a second pass over every weight.

@@ -79,7 +79,14 @@ class Worker(threading.Thread):
         mtp = None
         if a.spec == "mtp":
             from engine.spec.mtp import Mtp
-            mtp = Mtp(model, path, fp8=True, draft_vocab=a.draft_vocab or None, weights=a.drafter_weights)
+            dw = a.drafter_weights
+            if dw == "auto":
+                dw = os.path.expanduser("~/.cache/colinfer/drafter/mtp_ft.safetensors")
+                dw = dw if os.path.exists(dw) else None
+            elif dw == "none":
+                dw = None
+            mtp = Mtp(model, path, fp8=True, draft_vocab=a.draft_vocab or None, weights=dw)
+            log(f"[engine] MTP drafter: {dw or 'checkpoint weights'}")
         t2 = time.perf_counter()
         sched = Scheduler(model, n_slots=a.slots, max_seq_len=a.max_seq_len, n_checkpoints=a.checkpoints, mtp=mtp, k=a.k,
                           selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False, boundary_token=a.boundary_token)
@@ -561,7 +568,9 @@ def main(argv=None):
                     help="KV cache format: fp8 (32 KB / token) or fp4 (18 KB / token: e2m1 + block scales; perplexity +0.2-0.3%%, "
                          "faster decode at long context)")
     ap.add_argument("--spec", choices=("mtp", "none"), default="mtp")
-    ap.add_argument("--drafter-weights", default=None, help="fine-tuned MTP head (tools/train_drafter.py output)")
+    ap.add_argument("--drafter-weights", default="auto",
+                    help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors (tools/train_drafter.py) when it "
+                         "exists, none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
     ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
     ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP drafts among this many frequent tokens (+ prompt tokens); 0 = full")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
