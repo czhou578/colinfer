@@ -563,8 +563,8 @@ def main(argv=None):
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
     ap.add_argument("--decode-weights", choices=("requant", "checkpoint"), default="checkpoint",
                     help="checkpoint: decode the attention / GDN projections from their FP8 originals; requant: from NVFP4 "
-                         "re-quantizations (tools/requant_nvfp4.py) when the file exists: ~18%% faster decode, but WikiText "
-                         "perplexity +0.13%% and Python-code perplexity +2.3%% (docs/phase6_progress.md), so opt-in")
+                         "re-quantizations (tools/gptq_nvfp4.py --damp 0.3, else tools/requant_nvfp4.py) when present: ~18%% faster "
+                         "decode, but Python-code perplexity +1.5%% (WikiText +0.37%%; docs/phase6_progress.md), so opt-in")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto", help="default enable_thinking (auto: the template's default, on)")

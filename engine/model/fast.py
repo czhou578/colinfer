@@ -443,8 +443,11 @@ def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False) -> FastQwen35:
 
 
 def requant_path(path_or_repo: str) -> str:
-    """Where tools/requant_nvfp4.py writes the NVFP4 copies of a checkpoint's FP8 linears."""
-    return os.path.join(os.path.expanduser("~/.cache/colinfer/requant"), os.path.basename(resolve(path_or_repo)), "attn_gdn_nvfp4.safetensors")
+    """NVFP4 copies of a checkpoint's FP8 linears: tools/gptq_nvfp4.py --damp 0.3 if present (WikiText perplexity
+    +0.37%, Python code +1.5%), else tools/requant_nvfp4.py round-to-nearest (+0.13%, +2.3%); docs/phase6_progress.md."""
+    d = os.path.join(os.path.expanduser("~/.cache/colinfer/requant"), os.path.basename(resolve(path_or_repo)))
+    gptq = os.path.join(d, "attn_gdn_nvfp4_gptq_d0.3.safetensors")
+    return gptq if os.path.exists(gptq) else os.path.join(d, "attn_gdn_nvfp4.safetensors")
 
 
 def attach_requant(model: FastQwen35, file: str) -> int:
