@@ -41,7 +41,7 @@ def main():
     model = to_fast(load_fast_model(path), kv_fp8=a.kv == "fp8", kv_fp4=a.kv == "fp4")
     if a.requant:
         from engine.model.fast import attach_requant, requant_path
-        print(f"requant: {attach_requant(model, requant_path(path))} linears decode from NVFP4")
+        print(f"requant: {attach_requant(model, requant_path(path))} linears decode from re-quantized copies")
     from engine.model.prefill import prepare_prefill
     from engine.spec.mtp import Mtp, MtpCycle, MtpState
     prepare_prefill(model)

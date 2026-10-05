@@ -396,6 +396,8 @@ cudaError_t launch_skinny_swiglu(const void*, const void*, const void*, float, c
                                  cudaStream_t);
 cudaError_t launch_skinny_fp8(const void*, const void*, float, const float*, const void*, void*, bool, int, int, int, float*, cudaStream_t);
 int skinny_ws_floats(int, bool, int, int, int);
+cudaError_t launch_skinny_int(int, const void*, const void*, const void*, const void*, float, const void*, void*, bool, int, int, int, float*,
+                              cudaStream_t);
 
 // split-K workspace for one skinny call (fp32, from the caching allocator: graph-capture safe)
 static float* skinny_ws(int fmt, bool swiglu, const torch::Tensor& x, int64_t N, int64_t K, torch::Tensor& hold) {
@@ -447,6 +449,23 @@ void skinny_swiglu(torch::Tensor x, torch::Tensor wg, torch::Tensor sg, double g
                                       out.data_ptr(), x.size(0), N, K, ws, at::cuda::getCurrentCUDAStream()));
 }
 
+// INT6 / INT5 weights (tools/int6_requant.py): wlo uint8 [N, K/2] low nibbles, whi uint8 [N, K/4] (INT6: 2-bit fields) or
+// [N, K/8] (INT5: bits), sf e4m3 [N, K/16]. The width of whi gives the format.
+void skinny_int6(torch::Tensor x, torch::Tensor wlo, torch::Tensor whi, torch::Tensor sf, double gscale, c10::optional<torch::Tensor> residual,
+                 torch::Tensor out) {
+    CHECK_CUDA_TENSOR(wlo, torch::kUInt8);
+    CHECK_CUDA_TENSOR(whi, torch::kUInt8);
+    TORCH_CHECK(sf.is_cuda() && sf.is_contiguous() && sf.element_size() == 1, "sf must be 1-byte contiguous CUDA");
+    const int64_t N = wlo.size(0), K = wlo.size(1) * 2;
+    check_skinny(x, out, N, K);
+    const int bits = whi.size(1) == K / 4 ? 6 : whi.size(1) == K / 8 ? 5 : 0;
+    TORCH_CHECK(bits && whi.size(0) == N && sf.size(0) == N && sf.size(1) == K / 16, "plane / scale shapes");
+    torch::Tensor hold;
+    float* ws = skinny_ws(2, false, x, N, K, hold);
+    CHECK_LAUNCH(launch_skinny_int(bits, x.data_ptr(), wlo.data_ptr(), whi.data_ptr(), sf.data_ptr(), (float)gscale, residual_ptr(residual, out),
+                                    out.data_ptr(), out.scalar_type() == torch::kFloat32, x.size(0), N, K, ws, at::cuda::getCurrentCUDAStream()));
+}
+
 void skinny_fp8(torch::Tensor x, torch::Tensor w, double scale, c10::optional<torch::Tensor> residual, torch::Tensor out,
                 c10::optional<torch::Tensor> row_scale) {
     TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.element_size() == 1 && w.dim() == 2, "w must be 1-byte [N, K]");
@@ -476,6 +495,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("skinny_nvfp4", &skinny_nvfp4, "tensor-core NVFP4 x bf16 skinny GEMM, M<=16", py::arg("x"), py::arg("w"), py::arg("sf"),
           py::arg("gscale"), py::arg("residual"), py::arg("out"));
     m.def("skinny_swiglu", &skinny_swiglu, "tensor-core silu(x Wg^T) * (x Wu^T), NVFP4, M<=16");
+    m.def("skinny_int6", &skinny_int6, "tensor-core skinny GEMM, INT6 / INT5 block-16 weights, M<=16", py::arg("x"), py::arg("wlo"), py::arg("whi"),
+          py::arg("sf"), py::arg("gscale"), py::arg("residual"), py::arg("out"));
     m.def("skinny_fp8", &skinny_fp8, "tensor-core FP8 x bf16 skinny GEMM, M<=16", py::arg("x"), py::arg("w"), py::arg("scale"),
           py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
     m.def("kv4_to_bf16", &kv4_to_bf16, "fp4 KV cache rows -> bf16");

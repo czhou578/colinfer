@@ -61,7 +61,31 @@ def fp8_rows(x2, w, scale, r2, out, row_scale=None):
             ops().fp8_gemv(x2[i:i + GEMV_M], w, scale, None if r2 is None else r2[i:i + GEMV_M], out[i:i + GEMV_M], row_scale)
 
 
+def int6_rows(x2, wlo, whi, sf, gscale, r2, out):
+    """out = x2 @ dequant_int6(w)^T * gscale (+ r2), in passes of 16 rows (tensor-core skinny GEMM only)."""
+    for i in range(0, x2.shape[0], 16):
+        ops().skinny_int6(x2[i:i + 16], wlo, whi, sf, gscale, None if r2 is None else r2[i:i + 16], out[i:i + 16])
+
+
+class Int6Linear(nn.Module):
+    """Decode copy of an FP8 linear in INT6 (tools/int6_requant.py): two code planes + e4m3 block scales + global scale."""
+
+    def __init__(self, wlo: torch.Tensor, whi: torch.Tensor, sf: torch.Tensor, gscale: float):
+        super().__init__()
+        self.register_buffer("wlo", wlo, persistent=False)
+        self.register_buffer("whi", whi, persistent=False)
+        self.register_buffer("sf", sf, persistent=False)
+        self.gscale = float(gscale)
+        self.out_features, self.in_features = wlo.shape[0], wlo.shape[1] * 2
+
+    def rows(self, x2, r2, out):
+        int6_rows(x2, self.wlo, self.whi, self.sf, self.gscale, r2, out)
+
+
 class Nvfp4Linear(nn.Module):
+    def rows(self, x2, r2, out):
+        nvfp4_rows(x2, self.w, self.sf, self.gscale, r2, out)
+
     def __init__(self, w: torch.Tensor, sf: torch.Tensor, gscale: float, out_fp32: bool = False, in_scale: float = 1.0):
         super().__init__()
         self.register_buffer("w", w, persistent=False)
@@ -102,7 +126,7 @@ class Fp8Linear(nn.Module):
         out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
         r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
         if self.dec is not None:
-            nvfp4_rows(_awq_in(x2, self.dec), self.dec.w, self.dec.sf, self.dec.gscale, r2, out)
+            self.dec.rows(_awq_in(x2, self.dec), r2, out)
         else:
             fp8_rows(x2, self.w, self.scale, r2, out)
         return out.view(*shp[:-1], self.out_features)
@@ -133,7 +157,7 @@ class StackedFp8Linear(nn.Module):
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], sum(self.sizes), device=x.device, dtype=torch.bfloat16)
         if self.dec is not None:
-            nvfp4_rows(_awq_in(x2, self.dec), self.dec.w, self.dec.sf, self.dec.gscale, None, out)
+            self.dec.rows(_awq_in(x2, self.dec), None, out)
         else:
             fp8_rows(x2, self.w, 1.0, None, out, self.rs)
         return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
@@ -466,12 +490,16 @@ def requant_path(path_or_repo: str, kind: str = "requant") -> str:
     Python code +1.5%), else tools/requant_nvfp4.py round-to-nearest (+0.13%, +2.3%). ~18% faster decode.
     kind "awq-attn": the 64 attention linears only, tools/awq_nvfp4.py --groups self_attn (WikiText -0.05%, code
     +0.43%). ~3% faster decode.
-    COLINFER_REQUANT_FILE overrides either."""
+    kind "int": INT6 attention + INT5 GDN (tools/int6_requant.py --bits 6 --filter self_attn; --bits 5 --filter
+    linear_attn), a comma-separated pair (WikiText -0.21%, code +0.23%). ~9.5% faster decode.
+    COLINFER_REQUANT_FILE overrides any of them."""
     if os.environ.get("COLINFER_REQUANT_FILE"):  # an explicit file, e.g. a tools/awq_nvfp4.py output
         return os.path.expanduser(os.environ["COLINFER_REQUANT_FILE"])
     d = os.path.join(os.path.expanduser("~/.cache/colinfer/requant"), os.path.basename(resolve(path_or_repo)))
     if kind == "awq-attn":
         return os.path.join(d, "attn_gdn_nvfp4_awq_attn.safetensors")
+    if kind == "int":
+        return ",".join(os.path.join(d, f) for f in ("attn_gdn_int6_self_attn.safetensors", "attn_gdn_int5_linear_attn.safetensors"))
     gptq = os.path.join(d, "attn_gdn_nvfp4_gptq_d0.3.safetensors")
     return gptq if os.path.exists(gptq) else os.path.join(d, "attn_gdn_nvfp4.safetensors")
 
@@ -482,13 +510,21 @@ def attach_requant(model: FastQwen35, file: str) -> int:
     FP8 weights (W8A8 GEMM). Stacked projections share a global scale in the file, so they stay one launch.
     Call after to_fast (the stacking) and before capturing graphs. Returns the number of linears attached.
     AWQ files (tools/awq_nvfp4.py) carry per-input-channel scales s (W was quantized as W diag(s); decode feeds x / s)
-    and may leave groups out, which then keep decoding their FP8 weights."""
+    and may leave groups out, which then keep what they had (FP8, or an earlier file's copy). INT6 files
+    (tools/int6_requant.py) attach Int6Linear copies. `file` may list several, comma-separated, applied in order."""
+    if "," in file:
+        return sum(attach_requant(model, one) for one in file.split(","))
     from engine.weights.loader import PREFIX
     n = 0
     with safe_open(file, framework="pt", device=str(model.embed_tokens.weight.device)) as f:
         keys = set(f.keys())
 
         def nv(names):
+            if all(PREFIX + m + ".qweight_lo" in keys for m in names):  # INT6 (tools/int6_requant.py)
+                gs = {float(f.get_tensor(PREFIX + m + ".weight_scale_2")) for m in names}
+                assert len(gs) == 1, names
+                cat = lambda suffix: torch.cat([f.get_tensor(PREFIX + m + suffix) for m in names]).contiguous()  # noqa: E731
+                return Int6Linear(cat(".qweight_lo"), cat(".qweight_hi"), cat(".weight_scale"), gs.pop())
             if any(PREFIX + m + ".weight" not in keys for m in names):
                 return None
             ws = [f.get_tensor(PREFIX + m + ".weight") for m in names]
@@ -505,14 +541,15 @@ def attach_requant(model: FastQwen35, file: str) -> int:
             p = f"layers.{i}."
             if layer.block_type == "full_attention":
                 a = layer.self_attn
-                a.qkv.dec = nv([p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"])
-                a.o_proj.dec = nv([p + "self_attn.o_proj"])
-                n += 3 * (a.qkv.dec is not None) + (a.o_proj.dec is not None)
+                parts = ((a.qkv, [p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"]), (a.o_proj, [p + "self_attn.o_proj"]))
             else:
                 g = layer.linear_attn
-                g.qkvz.dec = nv([p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"])
-                g.out_proj.dec = nv([p + "linear_attn.out_proj"])
-                n += 2 * (g.qkvz.dec is not None) + (g.out_proj.dec is not None)
+                parts = ((g.qkvz, [p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"]), (g.out_proj, [p + "linear_attn.out_proj"]))
+            for mod, names in parts:
+                d = nv(names)
+                if d is not None:
+                    mod.dec = d
+                    n += len(names)
     return n
 
 

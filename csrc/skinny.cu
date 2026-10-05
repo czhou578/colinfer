@@ -23,6 +23,12 @@
 // B fragments are 8 (FP4) or 16 (FP8) contiguous scratch bytes per group and its A fragments 32 contiguous bytes of
 // each activation row (read straight from global memory: every warp reads the same few KB, from L1 / L2). The order
 // is fixed, so every output row is bit-identical whatever M is: rows >= M are zeros and never touch the other rows.
+//
+// INT6 / INT5 (tools/int6_requant.py): w = (c - 32 | 16) * e4m3 block scale (16 k) * global scale, c a 6- or 5-bit code
+// stored as two planes: the low 4 bits exactly like NVFP4's nibbles (so they stream and land in scratch the same way)
+// and the high 2 (1) bits as a [N, K/4] ([N, K/8]) plane, 128 (64) B per row per chunk. Dequantization: 0x4300 | c is
+// the bf16 value 128 + c, minus 160 (144) is q exactly, times the bf16 block scale rounds once (q * s has up to 9
+// significant bits, bf16 holds 8: ~0.2% relative, against the format's 2.2% / 4.2% quantization error).
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
@@ -35,16 +41,21 @@
 
 namespace skinny {
 
-enum Fmt { NVFP4 = 0, FP8 = 1 };
+enum Fmt { NVFP4 = 0, FP8 = 1, INT6 = 2, INT5 = 3 };
 
 constexpr int WARPS = 4;  // warps per block (each 16 weight rows, or 8 gate + 8 up rows)
 
 template <int F> struct Cfg {
-    static constexpr int KC = F == NVFP4 ? 512 : 256;     // k per chunk: 256 weight bytes per row
+    static constexpr bool BLK = F != FP8;                 // block-scaled (NVFP4, INT6): 4-bit plane, e4m3 scales per 16 k
+    static constexpr int KC = BLK ? 512 : 256;            // k per chunk: 256 weight bytes per row
     static constexpr int GROUPS = KC / 64;
-    static constexpr int ROWB = F == NVFP4 ? 288 : 320;   // scratch row stride: conflict-free fragment reads
-    static constexpr int SCH = 4;                         // NVFP4: chunks per scale load (128 B per row)
-    static constexpr int SCRATCH = 16 * ROWB + (F == NVFP4 ? 16 * 128 : 0);
+    static constexpr int ROWB = BLK ? 288 : 320;          // scratch row stride: conflict-free fragment reads
+    static constexpr int SCH = 4;                         // chunks per scale load (128 B per row)
+    static constexpr bool INT = F == INT6 || F == INT5;
+    static constexpr int HB = F == INT6 ? 2 : 1;          // INT6 / INT5: high bits per code
+    static constexpr int HC = 32 * HB * 2;                // high-plane bytes per row per chunk (512 k): 128 / 64
+    static constexpr int ROWH = HC + 16;                  // its scratch row (+ pad: conflict-free fragment reads)
+    static constexpr int SCRATCH = 16 * ROWB + (BLK ? 16 * 128 : 0) + (INT ? 16 * ROWH : 0);
 };
 
 __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -71,6 +82,23 @@ __device__ __forceinline__ uint32_t fp8x2_bf(uint32_t two) {
     return h2_to_bf2(*reinterpret_cast<__half2*>(&r));
 }
 
+// two (4 + HB)-bit codes (low nibbles in `lo`'s two halves, high fields in hb's bits 0..HB-1 and HB..2HB-1) times a
+// bf16x2 block scale -> bf16x2. Codes are q + 2^(3 + HB).
+template <int HB>
+__device__ __forceinline__ uint32_t intx2_scaled(uint32_t lo, uint32_t hb, __nv_bfloat162 sc) {
+    constexpr uint32_t M = (1u << HB) - 1;
+    const uint32_t c0 = (lo & 15u) | ((hb & M) << 4), c1 = ((lo >> 4) & 15u) | (((hb >> HB) & M) << 4);
+    const uint32_t w = 0x43004300u | c0 | (c1 << 16);
+    const __nv_bfloat162 q = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&w), __float2bfloat162_rn(128.f + (1 << (3 + HB))));
+    const __nv_bfloat162 r = __hmul2(q, sc);
+    return *reinterpret_cast<const uint32_t*>(&r);
+}
+
+__device__ __forceinline__ __nv_bfloat162 e4m3_to_bf2(uint32_t byte) {
+    __half_raw r = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)byte, __NV_E4M3);
+    return __float2bfloat162_rn(__half2float(*reinterpret_cast<__half*>(&r)));
+}
+
 __device__ __forceinline__ __half2 e4m3_to_h2(uint32_t byte) {
     __half_raw r = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)byte, __NV_E4M3);
     const __half h = *reinterpret_cast<__half*>(&r);
@@ -84,7 +112,8 @@ __device__ __forceinline__ __half2 e4m3_to_h2(uint32_t byte) {
 // to finish (a per-tile counter, self-resetting) adds them in order s = 0..S-1 and runs the epilogue.
 template <int F, bool SWIGLU, typename OutT>
 __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __restrict__ x, int M, int N, int K,
-                                                        const uint8_t* __restrict__ w, const uint8_t* __restrict__ sf, float scale,
+                                                        const uint8_t* __restrict__ w, const uint8_t* __restrict__ sf,
+                                                        const uint8_t* __restrict__ wh, float scale,
                                                         const float* __restrict__ row_scale,
                                                         const uint8_t* __restrict__ w2, const uint8_t* __restrict__ sf2, float scale2,
                                                         const __nv_bfloat16* __restrict__ residual, OutT* __restrict__ out,
@@ -98,11 +127,12 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
     const int n0 = tile * (SWIGLU ? 8 : 16);
     if (n0 >= N) return;
     uint8_t* wsc = smem + warp * C::SCRATCH;  // [16 rows][ROWB]: one chunk in fragment-friendly layout
-    uint8_t* ssc = wsc + 16 * C::ROWB;        // NVFP4: [16 rows][128]: block scales of 4 chunks
-    const size_t rowbytes = F == NVFP4 ? K / 2 : K;
+    uint8_t* ssc = wsc + 16 * C::ROWB;        // NVFP4 / INT6: [16 rows][128]: block scales of 4 chunks
+    uint8_t* hsc = ssc + 16 * 128;            // INT6: [16 rows][ROWH]: high-bit plane of the chunk
+    const size_t rowbytes = C::BLK ? K / 2 : K;
     const int chunks = K / C::KC;
-    // this item's chunk range; NVFP4 ranges start on a scale load boundary (multiples of SCH chunks)
-    const int unit = F == NVFP4 ? C::SCH : 1, units = (chunks + unit - 1) / unit;
+    // this item's chunk range; block-scaled ranges start on a scale load boundary (multiples of SCH chunks)
+    const int unit = C::BLK ? C::SCH : 1, units = (chunks + unit - 1) / unit;
     const int cb = split * units / S * unit, ce = min((split + 1) * units / S * unit, chunks);
     // logical row r (0..15) of this warp: tile r / 8, column g = r % 8
     auto wrow = [&](int r) -> const uint8_t* {
@@ -116,13 +146,20 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
     // prefetch registers: chunk = 16 rows x 256 B = 8 x 16 B per lane; instruction i covers rows 2i, 2i+1
     const int hr = lane >> 4, seg = lane & 15;
     constexpr int LD = NT * 4;  // 16-byte loads per lane per chunk
-    uint4 v[LD], sv[4];
+    uint4 v[LD], sv[4], hv[C::INT ? C::HC / 32 : 1];
     auto load_w = [&](int c) {
 #pragma unroll
         for (int i = 0; i < LD; ++i) v[i] = __ldcs(reinterpret_cast<const uint4*>(wrow(2 * i + hr) + (size_t)c * 256) + seg);
+        if constexpr (C::INT) {  // high bits of the chunk: 16 rows x HC bytes, 512 B per instruction
+            constexpr int LPR = C::HC / 16, RPI = 32 / LPR;  // lanes per row, rows per instruction
+#pragma unroll
+            for (int i = 0; i < 16 / RPI; ++i)
+                hv[i] = __ldcs(reinterpret_cast<const uint4*>(wh + (size_t)min(n0 + RPI * i + lane / LPR, N - 1) * (K / 16 * C::HB * 2) +
+                                                              (size_t)c * C::HC) + lane % LPR);
+        }
     };
     auto load_s = [&](int p) {  // scales of chunks 4p .. 4p+3: 16 rows x 128 B, 4 rows x 128 B per instruction
-        if constexpr (F == NVFP4) {
+        if constexpr (C::BLK) {
             const int have = K / 16 - p * 128, col = (lane & 7) * 16;  // a multiple of 32 bytes are left in the row
 #pragma unroll
             for (int i = 0; i < NT * 2; ++i)
@@ -149,7 +186,12 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
         // registers -> scratch (the previous chunk's readers finished at the trailing __syncwarp)
 #pragma unroll
         for (int i = 0; i < LD; ++i) *reinterpret_cast<uint4*>(wsc + (2 * i + hr) * C::ROWB + seg * 16) = v[i];
-        if constexpr (F == NVFP4) {
+        if constexpr (C::INT) {
+            constexpr int LPR = C::HC / 16, RPI = 32 / LPR;
+#pragma unroll
+            for (int i = 0; i < 16 / RPI; ++i) *reinterpret_cast<uint4*>(hsc + (RPI * i + lane / LPR) * C::ROWH + (lane % LPR) * 16) = hv[i];
+        }
+        if constexpr (C::BLK) {
             if (c % C::SCH == 0) {
 #pragma unroll
                 for (int i = 0; i < NT * 2; ++i) *reinterpret_cast<uint4*>(ssc + (4 * i + (lane >> 3)) * 128 + (lane & 7) * 16) = sv[i];
@@ -157,7 +199,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
         }
         __syncwarp();
         if (c + 1 < ce) load_w(c + 1);  // in flight while this chunk is multiplied
-        if constexpr (F == NVFP4) {
+        if constexpr (C::BLK) {
             if (c % C::SCH == 0 && (c / C::SCH + 1) * C::SCH < ce) load_s(c / C::SCH + 1);
         }
 #pragma unroll 2
@@ -181,6 +223,20 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
                         const uint32_t two = (ww[jj >> 1] >> (16 * (jj & 1))) & 0xffff;
                         const uint32_t a[4] = {lw[2 * jj], hw[2 * jj], lw[2 * jj + 1], hw[2 * jj + 1]};
                         mma_bf16(acc[j], a, fp4x2_scaled(two & 0xff, sc), fp4x2_scaled(two >> 8, sc));
+                    }
+                } else if constexpr (C::INT) {
+                    // this lane's 16 codes: 8 nibble bytes, and HB * 2 bytes of high bits (4 HB bits per k-step)
+                    const uint2 wv = *reinterpret_cast<const uint2*>(rowp + 32 * S + 8 * q);
+                    const uint8_t* hp = hsc + (8 * j + g) * C::ROWH + (16 * S + 4 * q) * C::HB / 2;
+                    const uint32_t hb = C::HB == 2 ? *reinterpret_cast<const uint32_t*>(hp) : *reinterpret_cast<const uint16_t*>(hp);
+                    const __nv_bfloat162 sc = e4m3_to_bf2(ssc[(8 * j + g) * 128 + (c % C::SCH) * 32 + 4 * S + q]);
+                    const uint32_t ww[2] = {wv.x, wv.y};
+#pragma unroll
+                    for (int jj = 0; jj < 4; ++jj) {
+                        const uint32_t two = (ww[jj >> 1] >> (16 * (jj & 1))) & 0xffff;
+                        const uint32_t h = (hb >> (4 * C::HB * jj)) & ((1u << (4 * C::HB)) - 1);
+                        const uint32_t a[4] = {lw[2 * jj], hw[2 * jj], lw[2 * jj + 1], hw[2 * jj + 1]};
+                        mma_bf16(acc[j], a, intx2_scaled<C::HB>(two & 0xff, h, sc), intx2_scaled<C::HB>(two >> 8, h >> (2 * C::HB), sc));
                     }
                 } else {
                     const uint4 wv = *reinterpret_cast<const uint4*>(rowp + 64 * S + 16 * q);
@@ -281,7 +337,7 @@ constexpr int CNT = 1 << 17;
 // Splits for a shape: enough work items (SKINNY_ITEMS) to keep every SM streaming to the end of the grid.
 inline int splits_for(int F, bool swiglu, int N, int K) {
     const int tiles = (N + (swiglu ? 8 : 16) - 1) / (swiglu ? 8 : 16);
-    const int kc = F == NVFP4 ? 512 : 256, unit = F == NVFP4 ? 4 : 1;
+    const int kc = F == FP8 ? 256 : 512, unit = F == FP8 ? 1 : 4;
     const int units = (K / kc + unit - 1) / unit;
     const int maxs = units * unit / SKINNY_MIN_CHUNKS;  // each split streams at least SKINNY_MIN_CHUNKS chunks
     const int S = (SKINNY_ITEMS + tiles - 1) / tiles;
@@ -290,7 +346,7 @@ inline int splits_for(int F, bool swiglu, int N, int K) {
 
 template <int F, bool SWIGLU, typename OutT>
 cudaError_t launch(const void* x, int M, int N, int K, const void* w, const void* sf, float scale, const float* row_scale, const void* w2,
-                   const void* sf2, float scale2, const void* residual, void* out, float* ws, cudaStream_t st) {
+                   const void* sf2, float scale2, const void* residual, void* out, float* ws, cudaStream_t st, const void* wh = nullptr) {
     using C = Cfg<F>;
     if (M < 1 || M > 16 || N % 8 || K % C::KC) return cudaErrorInvalidValue;
     const int rows = SWIGLU ? 8 : 16, tiles = (N + rows - 1) / rows;
@@ -311,7 +367,8 @@ cudaError_t launch(const void* x, int M, int N, int K, const void* w, const void
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     lc.attrs = attr;
     lc.numAttrs = pdl ? 1 : 0;
-    return cudaLaunchKernelEx(&lc, k_skinny<F, SWIGLU, OutT>, (const __nv_bfloat16*)x, M, N, K, (const uint8_t*)w, (const uint8_t*)sf, scale,
+    return cudaLaunchKernelEx(&lc, k_skinny<F, SWIGLU, OutT>, (const __nv_bfloat16*)x, M, N, K, (const uint8_t*)w, (const uint8_t*)sf,
+                              (const uint8_t*)wh, scale,
                               row_scale, (const uint8_t*)w2, (const uint8_t*)sf2, scale2, (const __nv_bfloat16*)residual, (OutT*)out, S, ws,
                               g_cnt);
 }
@@ -335,6 +392,18 @@ cudaError_t launch_skinny_swiglu(const void* x, const void* wg, const void* sg, 
                                  int M, int N, int K, float* ws, cudaStream_t st) {
     using namespace skinny;
     return launch<NVFP4, true, __nv_bfloat16>(x, M, N, K, wg, sg, gg, nullptr, wu, su, gu, nullptr, out, ws, st);
+}
+
+cudaError_t launch_skinny_int(int bits, const void* x, const void* wlo, const void* whi, const void* sf, float gscale, const void* residual,
+                              void* out, bool out_fp32, int M, int N, int K, float* ws, cudaStream_t st) {
+    using namespace skinny;
+    if (bits == 6)
+        return out_fp32 ? launch<INT6, false, float>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi)
+                        : launch<INT6, false, __nv_bfloat16>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi);
+    if (bits == 5)
+        return out_fp32 ? launch<INT5, false, float>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi)
+                        : launch<INT5, false, __nv_bfloat16>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi);
+    return cudaErrorInvalidValue;
 }
 
 cudaError_t launch_skinny_fp8(const void* x, const void* w, float scale, const float* row_scale, const void* residual, void* out,

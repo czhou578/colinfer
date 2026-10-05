@@ -71,14 +71,15 @@ class Worker(threading.Thread):
         path = resolve(a.model)
         model = to_fast(load_fast_model(path), kv_fp8=a.kv == "fp8", kv_fp4=a.kv == "fp4")
         dw = a.decode_weights
-        if dw == "auto":  # the quality-gated NVFP4 attention linears when they have been made
-            dw = "awq-attn" if os.path.exists(requant_path(path, "awq-attn")) else "checkpoint"
+        have = lambda kind: all(os.path.exists(f) for f in requant_path(path, kind).split(","))  # noqa: E731
+        if dw == "auto":  # the best quality-gated decode copies that have been made
+            dw = "int" if have("int") else "awq-attn" if have("awq-attn") else "checkpoint"
         if dw != "checkpoint":
             rq = requant_path(path, dw)
-            if os.path.exists(rq):
-                log(f"[engine] decode streams NVFP4 re-quantized projections ({dw}): {attach_requant(model, rq)} linears ({rq})")
+            if have(dw):
+                log(f"[engine] decode streams re-quantized projections ({dw}): {attach_requant(model, rq)} linears ({rq})")
             else:
-                log(f"[engine] no re-quantized weights at {rq} (tools/awq_nvfp4.py / requant_nvfp4.py): decoding the checkpoint's FP8 projections")
+                log(f"[engine] no re-quantized weights at {rq} (tools/int6_requant.py / awq_nvfp4.py / requant_nvfp4.py): decoding the checkpoint's FP8 projections")
         mtp = None
         if a.spec == "mtp":
             from engine.spec.mtp import Mtp
@@ -577,11 +578,12 @@ def main(argv=None):
     ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
     ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP drafts among this many frequent tokens (+ prompt tokens); 0 = full")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
-    ap.add_argument("--decode-weights", choices=("auto", "awq-attn", "requant", "checkpoint"), default="auto",
-                    help="checkpoint: decode the attention / GDN projections from their FP8 originals; awq-attn: the attention "
+    ap.add_argument("--decode-weights", choices=("auto", "int", "awq-attn", "requant", "checkpoint"), default="auto",
+                    help="checkpoint: decode the attention / GDN projections from their FP8 originals; int: INT6 attention + INT5 GDN "
+                         "(tools/int6_requant.py; ~9.5%% faster, perplexity within 0.25%%); awq-attn: the attention "
                          "projections from AWQ NVFP4 (tools/awq_nvfp4.py --groups self_attn; ~3%% faster, perplexity within 0.5%%); "
                          "requant: attention and GDN from NVFP4 (tools/gptq_nvfp4.py --damp 0.3, else tools/requant_nvfp4.py): ~18%% "
-                         "faster, but Python-code perplexity +1.5%% (docs/phase6_progress.md); auto: awq-attn if its file exists")
+                         "faster, but Python-code perplexity +1.5%% (docs/phase6_progress.md); auto: int if its files exist, else awq-attn, else checkpoint")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto", help="default enable_thinking (auto: the template's default, on)")

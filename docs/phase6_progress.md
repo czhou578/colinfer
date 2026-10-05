@@ -221,7 +221,8 @@ o_proj / out_proj ~10%. Perplexity (reference engine, ctx 2048, 65,504 tokens; s
 | Configuration | Tasks passed |
 |---|---|
 | Re-quantized weights | 48 |
-| AWQ attention only (the default since) | 50 |
+| AWQ attention only | 50 |
+| INT6 attention + INT5 GDN (the default since, section 9) | 51 |
 | Skinny GEMM with the FP8 projections | 51 |
 | Phase 5 / vLLM | 53 / 53 |
 
@@ -523,10 +524,65 @@ before; the MTP head's prefill follows the same rule.
 Passkey retrieval with it: 6/6 at 31k and 126k. `tests/scheduler_check.py` with the threshold at 0 (every prefill on the
 kernel, chunked prefill, prefix reuse, MTP): passed.
 
+## 9. INT5 / INT6 for the attention and GDN projections (the default)
+
+NVFP4 for the 144 Gated DeltaNet projections fails the quality gate whatever the method (sections 3: round-to-nearest,
+GPTQ, AWQ; +0.4-0.6% code perplexity per projection type). The checkpoint's FP8 weights themselves are 2.67% off the
+BF16 originals; a format with that error but fewer bits is what decode needs. Relative weight error on GDN layers 4 /
+30 / 52 (all three projections alike):
+
+| Format (e4m3 scale per 16 weights + fp32 global scale) | Bits / weight | Error vs BF16 |
+|---|---|---|
+| Checkpoint FP8 (per-tensor scale) | 8 | 2.67% |
+| INT6 | 6.5 | **2.24%** |
+| FP6 e2m3 | 6.5 | 2.58% |
+| INT5 | 5.5 | 4.2% |
+| FP6 e3m2 | 6.5 | 4.5% |
+| NVFP4 | 4.5 | 8.5% |
+
+`tools/int6_requant.py` quantizes from the BF16 originals (block scale searched among amax/qmax × {1 ... 0.8} by
+squared error; stacked projections share the global scale). Perplexity (reference engine, ctx 2048; shipped weights
+6.9698 / 1.7257):
+
+| Decode copies | WikiText | Python code | Bytes per token saved vs FP8 |
+|---|---|---|---|
+| INT6, all 208 | 6.9697 (0.00%) | 1.7250 (-0.04%) | 1.35 GB |
+| INT6 GDN + AWQ NVFP4 attention | 6.9445 (-0.36%) | 1.7310 (+0.31%) | 1.77 GB |
+| INT5 GDN, FP8 attention | 6.9387 (-0.45%) | 1.7288 (+0.18%) | 1.74 GB |
+| INT5, all 208 | 6.9431 (-0.38%) | 1.7333 (+0.44%) | 2.27 GB |
+| **INT5 GDN + INT6 attention (default)** | **6.9552 (-0.21%)** | **1.7296 (+0.23%)** | **2.06 GB** |
+
+INT6 is lossless here; INT5 on GDN costs a fifth of the gate.
+
+**Kernel** (`csrc/skinny.cu`, formats INT6 / INT5). The code's low 4 bits are stored exactly like NVFP4's nibbles
+([N, K/2]), so they stream and land in the per-warp scratch the same way; the high 2 (1) bits are a second plane
+[N, K/4] ([N, K/8]), 128 (64) bytes per row per 512-k chunk, where a k-step's 4 codes share one byte (nibble).
+Dequantization builds bf16 directly: 0x4300 | c is 128 + c, minus 160 (144) is q exactly, times the bf16 block scale
+rounds once (q × s has up to 9 significant bits; ~0.2% relative). Rows stay bit-identical for every M
+(`tests/test_skinny_int.py`). Against FP8 on the GDN shapes: INT6 1.17-1.27× (bytes: 1.23×), INT5 1.32-1.45× (1.45×).
+
+**Decode** (`bench/decode_bench.py`, 8k):
+
+| | FP8 | AWQ attention (previous default) | INT6 attention + INT5 GDN |
+|---|---|---|---|
+| Plain decode, width 1 | 81.8 ms | 78.8 ms | **74.0 ms** (13.5 tok/s) |
+| Plain decode, width 3 | 88.0 ms | 85.6 ms | 80.7 ms |
+| MTP cycle, width 1, k=3 / k=7 | 91.8 / 103.6 ms | 89.7 / 101.5 ms | **84.7 / 97.2 ms** |
+| MTP cycle, width 2, k=7 | 112.6 ms | 110.6 ms | 105.2 ms |
+| MTP cycle, width 3, k=3 | 101.8 ms | 99.1 ms | 95.5 ms |
+
+- `--decode-weights auto` (default) now picks `int` when both files exist (`tools/int6_requant.py --bits 6 --filter
+  self_attn` and `--bits 5 --filter linear_attn`), else `awq-attn`, else the FP8 weights.
+- The decode copies live next to the FP8 weights (prefill's W8A8 GEMM reads those): +5.2 GB of GPU memory (server
+  startup 61.1 GB allocated, was 57.5).
+- `tests/scheduler_check.py --requant`: every output identical with and without speculation.
+- Tool calling (85 tasks, 2048 tokens): 51, the same as the FP8 projections (two schema tasks swap, one each way).
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Section 7.
 - Tensor-core multi-row decode attention: done (section 6).
 - FP8 (Q K^T) prefill attention for long prompts: done (section 8), 6% at 64k, 11% at 128k.
+- GDN projections below 8 bits: done (section 9), INT5 GDN + INT6 attention, decode 9.5% faster than FP8.
 - A scheme that keeps Q's precision in layers 23-51 (their outputs move 2-4% under e4m3 Q) would remove most of its
   +0.25-0.3% perplexity.

@@ -86,9 +86,15 @@ def main():
                 from requant_nvfp4 import default_out
                 ov = default_out(path)
             n = 0
-            with safe_open(ov, "pt", device="cuda") as f:
+            for ov in ov.split(","):  # several files: e.g. AWQ attention + INT6 GDN
+              with safe_open(ov, "pt", device="cuda") as f:
                 import re
                 for k in f.keys():
+                    if k.endswith(".weight_deq") and (not args.override_filter or re.search(args.override_filter, k)):
+                        # dequantized weights of another format (tools/int6_requant.py --simulate)
+                        model.get_submodule(k[len(PREFIX):-len(".weight_deq")]).weight.data.copy_(f.get_tensor(k))
+                        n += 1
+                        continue
                     if k.endswith(".weight") and (not args.override_filter or re.search(args.override_filter, k)):
                         base = k[: -len(".weight")]
                         w = dequant_nvfp4(f.get_tensor(k), f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2"))
