@@ -108,13 +108,18 @@ def run_selftest(verbose: bool = False) -> dict:
     o.attn_decode(q, kc, vc, torch.tensor([600], dtype=torch.int32, device=dev), out, 8, 256 ** -0.5)
     ref = torch.nn.functional.scaled_dot_product_attention(q.float(), kc.float(), vc.float(), enable_gqa=True)
     res["attn_decode_fp8kv"] = _rel(out, ref)
+    o.attn_decode_tc(q, kc, vc, torch.tensor([600], dtype=torch.int32, device=dev), out, 256 ** -0.5)
+    res["attn_decode_tc_fp8kv"] = _rel(out, ref)
     # decode attention over an fp4 cache: against the values kv4_to_bf16 decodes
     k4 = torch.cat([torch.randint(0, 256, (1, 4, 600, 128), dtype=torch.uint8, device=dev, generator=g),
                     ((torch.rand(1, 4, 600, 16, device=dev, generator=g) + 0.5) * 16).to(torch.float8_e4m3fn).view(torch.uint8)], -1).contiguous()
     k16 = torch.empty(1, 4, 600, 256, device=dev, dtype=torch.bfloat16)
     o.kv4_to_bf16(k4, k16)
     o.attn_decode(q, k4, k4, torch.tensor([600], dtype=torch.int32, device=dev), out, 8, 256 ** -0.5)
-    res["attn_decode_fp4kv"] = _rel(out, torch.nn.functional.scaled_dot_product_attention(q.float(), k16.float(), k16.float(), enable_gqa=True))
+    ref4 = torch.nn.functional.scaled_dot_product_attention(q.float(), k16.float(), k16.float(), enable_gqa=True)
+    res["attn_decode_fp4kv"] = _rel(out, ref4)
+    o.attn_decode_tc(q, k4, k4, torch.tensor([600], dtype=torch.int32, device=dev), out, 256 ** -0.5)
+    res["attn_decode_tc_fp4kv"] = _rel(out, ref4)
     torch.cuda.synchronize()
     bad = {k: v for k, v in res.items() if not v < TOL}
     if verbose:

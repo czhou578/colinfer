@@ -10,6 +10,9 @@ cudaError_t launch_attn_decode(const void*, const void*, const void*, const int*
 cudaError_t launch_attn_prologue(const void*, const void*, const void*, int, int, int, const void*, const void*, const float*, const int*, void*, void*, void*,
                                  int, int, int, int, int, int, float, int, const int*, cudaStream_t);
 cudaError_t launch_kv4_to_bf16(const void*, void*, long, cudaStream_t);
+int attn_decode_tc_nb();
+cudaError_t launch_attn_decode_tc(const void*, const void*, const void*, const int*, void*, float*, void*, int, int, int, int, int, int, float, int,
+                                  const void*, cudaStream_t);
 
 
 
@@ -110,6 +113,28 @@ void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, 
     CHECK_LAUNCH(launch_attn_decode(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), seq_lens.data_ptr<int>(), out.data_ptr(),
                                     part_acc.data_ptr<float>(), part_ml.data_ptr(), B, Hq, Hkv, T, Lmax, Dh, splits, (float)scale, kv_kind,
                                     gp, at::cuda::getCurrentCUDAStream()));
+}
+
+// Tensor-core multi-row variant of attn_decode for fp8 / fp4 caches: one pass over the KV for all T rows of a slot, and
+// each row's bits independent of T (attn_decode.cu, namespace tc). Same arguments minus splits.
+void attn_decode_tc(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor seq_lens, torch::Tensor out, double scale,
+                    c10::optional<torch::Tensor> gate) {
+    CHECK_CUDA_TENSOR(q, torch::kBFloat16);
+    const int kv_kind = kv_kind_of(k_cache, v_cache);
+    TORCH_CHECK(kv_kind == 1 || kv_kind == 2, "attn_decode_tc: fp8 or fp4 cache");
+    CHECK_CUDA_TENSOR(seq_lens, torch::kInt32);
+    CHECK_CUDA_TENSOR(out, torch::kBFloat16);
+    TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes() && out.numel() == q.numel(), "bad shapes");
+    const void* gp = nullptr;
+    if (gate) { CHECK_CUDA_TENSOR(*gate, torch::kBFloat16); TORCH_CHECK(gate->numel() == 2 * q.numel()); gp = gate->data_ptr(); }
+    const int64_t B = q.size(0), Hq = q.size(1), T = q.size(2), Dh = q.size(3), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
+    TORCH_CHECK(k_cache.size(0) == B && Dh == 256 && seq_lens.numel() == B, "bad shapes");
+    const int NB = attn_decode_tc_nb();
+    auto part_acc = torch::empty({B * Hq * T * NB, Dh}, q.options().dtype(torch::kFloat32));
+    auto part_ml = torch::empty({B * Hq * T * NB, 2}, q.options().dtype(torch::kFloat32));
+    CHECK_LAUNCH(launch_attn_decode_tc(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), seq_lens.data_ptr<int>(), out.data_ptr(),
+                                       part_acc.data_ptr<float>(), part_ml.data_ptr(), B, Hq, Hkv, T, Lmax, Dh, (float)scale, kv_kind, gp,
+                                       at::cuda::getCurrentCUDAStream()));
 }
 
 // Fused q/k RMSNorm + partial RoPE + KV-cache write at the device positions pos_t[b] + t.
@@ -465,6 +490,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("active") = py::none());
     m.def("attn_decode", &attn_decode, "split-KV GQA decode attention, head_dim 256", py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),
           py::arg("seq_lens"), py::arg("out"), py::arg("splits"), py::arg("scale"), py::arg("gate") = py::none());
+    m.def("attn_decode_tc", &attn_decode_tc, "tensor-core multi-row GQA decode attention (fp8 / fp4 KV)", py::arg("q"), py::arg("k_cache"),
+          py::arg("v_cache"), py::arg("seq_lens"), py::arg("out"), py::arg("scale"), py::arg("gate") = py::none());
     m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + KV write", py::arg("qp"), py::arg("kp"), py::arg("vp"),
           py::arg("qn_w"), py::arg("kn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("k_cache"), py::arg("v_cache"), py::arg("q_out"),
           py::arg("eps"), py::arg("active") = py::none());

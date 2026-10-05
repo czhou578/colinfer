@@ -198,8 +198,148 @@ likely reason for leaving them in FP8.
 
 Gate for making it the default: ≤ 0.5% on both corpora.
 
+## 4. Decode-step overhead ("megakernel")
+
+A trace of a plain decode step (`nsys`) shows it is already 98% GPU-busy: 17.6 GB in 77.5 ms, 227 GB/s, about 95% of
+what this machine streams (238-240 GB/s). Of the remaining 5%:
+
+- **1.5 ms of idle gaps** between kernels.
+- **GDN state read / write:** 0.3 GB.
+- **KV reads:** 0.27 GB at 8k.
+
+A persistent megakernel could recover at most the gaps, about 2%. The two cheaper changes below captured more:
+
+- **L2 prefetch.** Before its first activation read, the skinny GEMM pulls its next two chunks into L2.
+- **Programmatic dependent launch** (`csrc/pdl.cuh`).
+  - Every decode-path kernel signals its dependents first.
+  - The GEMM is launched with programmatic serialization, so it starts streaming weights while the preceding norm,
+    attention or GDN kernel finishes, and waits (`griddepcontrol.wait`) only before it reads activations.
+
+| | Before | Prefetch + PDL |
+|---|---|---|
+| Plain decode step, 8k | 81.5 ms | 77-79 ms (12.6-13.0 tok/s) |
+| Cycle, width 1, k=3 / k=7 | 94.4 / 111.3 ms | 89-92 / 106-108 ms |
+| Cycle, width 3, k=3 | 110.5 ms | 103-106 ms |
+
+`COLINFER_PDL=0` turns PDL off.
+
+## 5. 4-bit KV cache
+
+Opt-in with `--kv fp4`.
+
+**Format.** A (token, head) row of 256 values is stored as 144 bytes: 128 bytes of e2m1 plus 16 e4m3 block scales,
+0.56× of FP8. The scales are stored ×16 so block maxima from 0.006 to 168 stay in e4m3's normal range (measured on
+this model: K 0.04-23, V 0.17-108).
+
+**Implementation.**
+
+- **Write:** the attention prologue quantizes on write, with 16-lane shuffles for the block maximum and nibble pairing.
+- **Read:** the decode kernel dequantizes per lane.
+- **Prefill:** dequantizes the cached prefix to BF16 for FlashInfer (`kv4_to_bf16`).
+- **Cross-slot copies:** rows stay one tensor, so cross-slot prefix copies work unchanged.
+
+**Quality.**
+
+| Prefill-engine perplexity (W4A4), ctx 2048 | WikiText | Python code |
+|---|---|---|
+| BF16 KV | 7.0910 | 1.8015 |
+| FP8 KV | 7.0909 | 1.8012 |
+| FP4 KV | 7.1141 (+0.33%) | 1.8054 (+0.23%) |
+
+- Passkey retrieval at 126k: 3/3.
+- Choosing each block's scale by squared error, allowing amax/5, made perplexity worse (+0.51%). Clipping a block
+  maximum hurts attention more than coarser steps do.
+
+**Speed at 128k context:**
+
+| | FP8 KV | FP4 KV |
+|---|---|---|
+| Plain decode step | 96.0 ms | 93.2 ms |
+| MTP cycle, k=3 / k=7 | 144 / 214 ms | 148 / 223 ms |
+
+The bytes halve but dequantizing costs more per element, so FP4 is mainly a memory option: 3 × 262k slots in
+14.5 GB instead of 25.8 GB. (With the tensor-core attention of section 6, fp4 is also faster at long context: 128k plain
+decode 89.1 vs 97.3 ms, MTP cycles 107 / 134 ms vs 115 / 140 ms for k=3 / k=7, width 3 k=3 153 vs 175 ms.)
+
+**The real long-context cost is in multi-row attention.** The decode kernel runs one block per verify row, so a
+k-draft cycle reads the KV cache k+1 times. At 128k a k=3 cycle costs 144 ms against 89 ms at 8k.
+
+**What I tried.** One block per (KV head, split) with one warp per verify row, which reads KV once and keeps every row
+bit-identical to plain decode. It was 1.7× slower: one warp per row on CUDA cores is too serial. Section 6 has the fix.
+
+## 6. Tensor-core multi-row decode attention
+
+`csrc/attn_decode.cu`, namespace `tc`; the default for fp8 and fp4 caches (`COLINFER_ATTN_TC=0` selects the split-KV
+kernel). One block owns (slot, KV head, stripe of key tiles) and serves every query row of the slot: up to 48 rows
+(6 query heads × T new tokens) as three m16 tiles of `mma.sync.m16n8k16` (f16 operands, fp32 accumulate).
+
+**Bit identity across T.** Plain decode (T = 1) and a k-draft verify must give a row the same bits, so nothing a row
+computes may depend on T:
+
+- Keys go in 32-key tiles at fixed positions; block z of 12 takes tiles z, z+12, z+24, ...; the combine folds the 12
+  partials in a fixed order. None of this depends on T or on the sequence length.
+- mma rows are independent. A row's softmax is 8 lanes with fixed reduction trees, the same code for every row.
+- A tile entirely past a row's length (a longer row of the same slot needs it) is an exact no-op: its scores are
+  -inf, p = 0, the running max does not move and the rescale factor is set to exactly 1.
+
+`tests/test_attn_decode_tc.py` checks each row of 2-12-row launches bit for bit against one-row launches, and
+`tests/spec_check.py` / `tests/scheduler_check.py` still pass (greedy and seeded-sampled output identical with and without
+speculation, at every batch width).
+
+**Operands.**
+
+- K is used straight from the raw cache bytes in shared memory. A lane's mma fragment for k-step j is head dims
+  16j + 4c .. +3 (c = lane % 4), one 32-bit load. That is a permutation of the k dimension, which Q's fragment
+  repeats (8 consecutive bytes of the f16 Q row). e4m3 values, and e2m1 × e4m3-scale values, are exact in f16.
+- V is converted to an f16 tile and read with `ldmatrix.trans`; P is rounded to f16. Error against fp32 attention is
+  ~5e-4 relative, below the bf16 output's own rounding.
+
+**Two things that mattered for speed.**
+
+| Change | 128k, fp8, T=1 | T=8 |
+|---|---|---|
+| First version (raw rows padded to 272 bytes against bank conflicts) | 189 GB/s | 189 GB/s |
+| Rows 256 bytes apart, XOR-swizzled 16-byte chunks instead | 233 GB/s | 188 GB/s |
+| Softmax on 8 lanes per row, 4 rows per warp at once (was a warp per row) | 232 GB/s | 232 GB/s |
+
+The padding cost 20% of the cp.async streaming rate even with the compute removed (a loads-only build streamed
+187 GB/s with 272-byte rows, 232 with 256-byte rows). More pipeline stages (2 → 4) and contiguous per-block chunks
+changed nothing.
+
+**Per layer** (`bench/attn_bench.py`, 128k context):
+
+| KV | Slots | T = 1 (plain) | T = 4 (k=3) | T = 8 (k=7) |
+|---|---|---|---|---|
+| fp8, split-KV | 1 | 1.21 ms | 3.11 ms | 6.09 ms |
+| fp8, tensor-core | 1 | 1.16 ms | 1.14 ms | 1.16 ms |
+| fp8, split-KV | 3 | 3.55 ms | 9.11 ms | 17.7 ms |
+| fp8, tensor-core | 3 | 3.45 ms | 3.51 ms | 3.53 ms |
+| fp4, split-KV | 1 | 1.06 ms | 3.29 ms | 6.46 ms |
+| fp4, tensor-core | 1 | 0.66 ms | 0.67 ms | 0.87 ms |
+
+fp8 streams 228-236 GB/s at every T: verifying 8 rows costs what plain decode costs. fp4 plain decode becomes 1.6×
+faster than before (227 GB/s); its T = 8 is compute-bound at ~175 GB/s (dequantization and the three m-tiles).
+
+**MTP drafter cache in fp8.** Each of the k draft steps of a cycle reads the drafter's own KV cache (the MTP layer's),
+which was bf16: 512 MB per step per slot at 128k. It is now e4m3 like the target's (`MtpState`, `COLINFER_MTP_KV_FP8=0`
+for bf16), read by the same kernel. Acceptance is unchanged: with the same target kernel, `tools/eval_drafter.py` gives
+2.76 / 3.39 tokens per cycle (k=3 / k=7) either way, every category within 0.01. (A first comparison suggested fp8 cost
+code acceptance; it compared against an evaluation run before the softmax change above, whose greedy text differs.)
+The head's K and V sit well inside e4m3's range (|K| median 0.95, max 19; |V| median 1.6, max 39).
+
+**Decode cycle** (`bench/decode_bench.py`, fp8 KV; before = split-KV attention and a bf16 drafter cache):
+
+| | 8k before | 8k after | 128k before | 128k after |
+|---|---|---|---|---|
+| Plain decode, width 1 | 80.8 ms | 80.7 ms | 98.7 ms | 97.3 ms |
+| MTP cycle, width 1, k=3 | 93.3 ms | 91.1 ms | 148.5 ms | **110.6 ms** |
+| MTP cycle, width 1, k=7 | 109.6 ms | 103.4 ms | 219.1 ms | **126.8 ms** |
+| MTP cycle, width 2, k=7 | 124.6 ms | 111.7 ms | 339.1 ms | **159.5 ms** |
+| MTP cycle, width 3, k=3 | 108.5 ms | 100.8 ms | 269.1 ms | **160.5 ms** |
+
+At 128k a k=7 cycle went from 2.2× a plain step to 1.3×; at 8k cycles are 2-10% shorter.
+
 ## Next
 
-- Megakernel decode.
 - A better drafter for prose. Acceptance there is about 0.45, so speculation adds about 1.15×.
-- 4-bit KV for > 128k contexts.
+- Tensor-core multi-row decode attention: done (section 6).

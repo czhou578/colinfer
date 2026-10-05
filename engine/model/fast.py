@@ -216,6 +216,9 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
 from engine.model.qwen35 import Attention, GatedDeltaNet, ModelState, apply_rotary  # noqa: E402
 
 ATTN_SPLITS = 32
+# fp8 / fp4 caches decode on the tensor-core multi-row kernel (csrc/attn_decode.cu, namespace tc): one KV pass for all
+# verify rows of a slot. COLINFER_ATTN_TC=0 selects the split-KV CUDA-core kernel (one KV pass per row).
+ATTN_TC = os.environ.get("COLINFER_ATTN_TC", "1") != "0"
 
 
 class FastState(ModelState):
@@ -264,7 +267,10 @@ class KernelAttention(Attention):
         ops().attn_prologue(qp, kp, vp, self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t,
                             kc, vc, q, self.q_norm.eps, state.active)
         attn = torch.empty(B, T, self.num_heads * self.head_dim, device=x.device, dtype=torch.bfloat16)
-        ops().attn_decode(q, kc, vc, state.pos_t + T, attn, ATTN_SPLITS, self.head_dim ** -0.5, qp.contiguous())
+        if ATTN_TC and kc.dtype != torch.bfloat16:
+            ops().attn_decode_tc(q, kc, vc, state.pos_t + T, attn, self.head_dim ** -0.5, qp.contiguous())
+        else:
+            ops().attn_decode(q, kc, vc, state.pos_t + T, attn, ATTN_SPLITS, self.head_dim ** -0.5, qp.contiguous())
         return self.o_proj(attn, residual)
 
 

@@ -74,12 +74,18 @@ class Bf16MLP(nn.Module):
 
 class MtpState(FastState):
     """KV cache of the single MTP attention layer (index 0) for `batch` slots plus their device positions.
-    active: share the target state's mask so a graph step never writes the MTP cache of an inactive slot."""
+    active: share the target state's mask so a graph step never writes the MTP cache of an inactive slot.
+    kv_fp8: e4m3 cache like the target's (default; COLINFER_MTP_KV_FP8=0 for bf16). Each of the k draft steps of a cycle
+    reads the drafter's whole cache (512 MB per step per slot at 128k in bf16), so fp8 makes long-context cycles ~10%
+    faster (126 vs 140 ms, k=7 at 128k) at unchanged acceptance (tools/eval_drafter.py). Drafts change speed, never outputs."""
 
-    def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None):
-        self.cfg, self.max_seq_len, self.kv_fp8, self.pos = cfg, max_seq_len, False, 0
+    def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None, kv_fp8: bool | None = None):
+        if kv_fp8 is None:
+            kv_fp8 = os.environ.get("COLINFER_MTP_KV_FP8", "1") != "0"
+        self.cfg, self.max_seq_len, self.kv_fp8, self.kv_fp4, self.pos = cfg, max_seq_len, kv_fp8, False, 0
         self.conv, self.rec = {}, {}
-        self.k = {0: torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=torch.bfloat16)}
+        self.k = {0: torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device,
+                                 dtype=torch.float8_e4m3fn if kv_fp8 else torch.bfloat16)}
         self.v = {0: torch.zeros_like(self.k[0])}
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
         self.active = active if active is not None else torch.ones(batch, dtype=torch.int32, device=device)
@@ -199,8 +205,11 @@ class Mtp(nn.Module):
             q = torch.empty(1, a.num_heads, T, a.head_dim, device=x.device, dtype=torch.bfloat16)
             ops().attn_prologue(qp, kp, vp, a.q_norm.weight, a.k_norm.weight, a.inv_freq, st.pos_t, st.k[0], st.v[0], q, a.q_norm.eps)
             L = int(st.pos_t) + T
-            o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), st.k[0][0, :, :L], st.v[0][0, :, :L], causal=True,
-                                                        kv_layout="HND", sm_scale=a.head_dim ** -0.5)
+            kk, vv = st.k[0][0, :, :L], st.v[0][0, :, :L]
+            if kk.dtype == torch.float8_e4m3fn:  # as the target's prefill (engine/model/prefill.py): bf16 copy for FlashInfer
+                kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
+            o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
+                                                        sm_scale=a.head_dim ** -0.5)
             gate = qp.view(T, a.num_heads, 2 * a.head_dim)[:, :, a.head_dim:]
             x = a.o_proj((o * torch.sigmoid(gate)).reshape(T, -1), x)
             x = layer.mlp(layer.post_attention_layernorm(x), x)
