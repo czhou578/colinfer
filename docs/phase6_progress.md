@@ -29,7 +29,26 @@ With the default FP8 projections:
 - Single requests run at 66 / 71 / 50 / 24 tok/s on code edit / JSON / code generation / prose.
 - Plain decode runs at 12.8 tok/s.
 
-Harness and llama-benchy against vLLM / SGLang: [harness numbers pending].
+**Harness.** `~/Projects/model-benchmarks` core_runner, same settings as the Phase 0 baselines; 256-token greedy
+outputs, 8 requests per concurrency level.
+
+**Concurrency, aggregate tok/s:**
+
+| Streams | Phase 6 (default: FP8 projections) | Phase 6, `--decode-weights requant` | Phase 5 | SGLang + MTP | vLLM |
+|---|---|---|---|---|---|
+| 1 | **68.5** | 75.6 | 41.3 | 34.1 | 12.2 |
+| 2 | **105.4** | 116.5 | 49.1 | 44.1 | 23.3 |
+| 3 | **97.0** | 108.0 | 46.6 | 70.5 | 30.7 |
+| 4 (3 slots + 1 queued) | **112.1** | 124.5 | 53.2 | 76.3 | 45.0 |
+
+**Single stream, prose with thinking on, tok/s:**
+
+| Phase 6 (default) | Phase 6, re-quantized | Phase 5 | SGLang + MTP |
+|---|---|---|---|
+| 25.8-30.9 | 29.7-35.1 | 25.4-27.1 | 22.2-24.8 |
+
+This is the harness's decode test. Without speculation, the default server decodes at 12.6-12.7 tok/s, and
+15.3-15.4 with the re-quantized weights.
 
 ## 1. Skinny GEMM on tensor cores
 
