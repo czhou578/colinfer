@@ -28,6 +28,8 @@ CHUNK = 2048
 # The MLP's SwiGLU + NVFP4 quantization in the up GEMM's epilogue (csrc/gemm_nvfp4.cu SwigluNvfp4) instead of a bf16
 # [gate | up] round trip through k_silu_mul_quant: ~0.5 ms per layer at 2,048 tokens. COLINFER_FUSED_SWIGLU=0: the old path.
 FUSED_SWIGLU = os.environ.get("COLINFER_FUSED_SWIGLU", "1") != "0"
+# Gated DeltaNet chunked forward: csrc/gdn_prefill.cu (2x FLA's chunk_gated_delta_rule per layer). COLINFER_GDN_CUDA=0: FLA.
+GDN_CUDA = os.environ.get("COLINFER_GDN_CUDA", "1") != "0"
 _EMU_Q_FP8 = os.environ.get("COLINFER_EMU_Q_FP8") == "1"  # FlashInfer path only: Q rounded as the FP8 kernel rounds it
 # Attention over an fp8 cache, for chunks whose context passes ATTN_FP8_MIN_CTX: csrc/attn_prefill.cu (Q K^T in e4m3,
 # ~1.25x FlashInfer's rate; prefill 4% faster at 32k, 6% at 64k; perplexity +0.25-0.3%, from rounding Q to e4m3).
@@ -191,10 +193,15 @@ def _gdn(g, n, q8, state: FastState, li: int):
         cs.copy_(torch.cat([cs, mixed.t()], dim=-1)[:, -(K - 1):])
     beta = b.sigmoid()[None]
     gg = (-g.A_log.float().exp() * F.softplus(a.float() + g.dt_bias))[None]
-    o, s = chunk_gated_delta_rule(q.view(1, T, -1, g.head_k_dim), k.view(1, T, -1, g.head_k_dim), v.view(1, T, -1, g.head_v_dim), g=gg,
-                                  beta=beta, initial_state=state.rec[li], output_final_state=True,
-                                  use_qk_l2norm_in_kernel=False)  # GVA: 16 key heads, 48 value heads
-    state.rec[li].copy_(s)
+    if GDN_CUDA:  # csrc/gdn_prefill.cu: continues state.rec in place
+        o = torch.empty(1, T, g.num_v_heads, g.head_v_dim, device=dev, dtype=torch.bfloat16)
+        ops().gdn_prefill(q.view(T, -1, g.head_k_dim), k.view(T, -1, g.head_k_dim), v.view(T, -1, g.head_v_dim), gg[0].contiguous(),
+                          beta[0].contiguous(), state.rec[li][0], o[0], g.head_k_dim ** -0.5)
+    else:
+        o, s = chunk_gated_delta_rule(q.view(1, T, -1, g.head_k_dim), k.view(1, T, -1, g.head_k_dim), v.view(1, T, -1, g.head_v_dim), g=gg,
+                                      beta=beta, initial_state=state.rec[li], output_final_state=True,
+                                      use_qk_l2norm_in_kernel=False)  # GVA: 16 key heads, 48 value heads
+        state.rec[li].copy_(s)
     on = torch.empty(T * g.num_v_heads, g.head_v_dim, device=dev, dtype=torch.bfloat16)
     ops().gated_rmsnorm(o.reshape(-1, g.head_v_dim), z, g.norm.weight, g.norm.eps, on)
     o8 = torch.empty(T, g.value_dim, dtype=torch.float8_e4m3fn, device=dev)

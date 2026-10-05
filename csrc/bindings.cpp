@@ -300,6 +300,25 @@ void nvfp4_gemm_swiglu(torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torc
                                           at::cuda::getCurrentCUDAStream()));
 }
 
+size_t gdn_prefill_ws_bytes(int, int);
+cudaError_t launch_gdn_prefill(const void*, const void*, const void*, const float*, const void*, float*, void*, void*, int, int, int, float, cudaStream_t);
+
+// Chunked Gated DeltaNet forward (gdn_prefill.cu): q, k bf16 [T, Hk, 128] (L2-normalized), v bf16 [T, Hv, 128], g fp32 [T, Hv]
+// (log decay), beta bf16 [T, Hv], state fp32 [Hv, 128, 128] (continued in place), o bf16 [T, Hv, 128].
+void gdn_prefill(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, torch::Tensor beta, torch::Tensor state, torch::Tensor o,
+                 double scale) {
+    for (auto* t : {&q, &k, &v, &beta, &o}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(g, torch::kFloat32);
+    CHECK_CUDA_TENSOR(state, torch::kFloat32);
+    const int64_t T = q.size(0), Hk = q.size(1), Hv = v.size(1);
+    TORCH_CHECK(q.dim() == 3 && q.sizes() == k.sizes() && q.size(2) == 128 && v.dim() == 3 && v.size(0) == T && v.size(2) == 128 &&
+                g.numel() == T * Hv && beta.numel() == T * Hv && state.numel() == Hv * 128 * 128 && o.sizes() == v.sizes() && Hv % Hk == 0,
+                "bad shapes");
+    auto ws = torch::empty({(int64_t)gdn_prefill_ws_bytes(T, Hv)}, q.options().dtype(torch::kUInt8));
+    CHECK_LAUNCH(launch_gdn_prefill(q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr<float>(), beta.data_ptr(), state.data_ptr<float>(),
+                                    o.data_ptr(), ws.data_ptr(), T, Hk, Hv, (float)scale, at::cuda::getCurrentCUDAStream()));
+}
+
 cudaError_t launch_fp8_quant(const void*, void*, size_t, float, cudaStream_t);
 cudaError_t launch_silu_mul_quant(const void*, void*, void*, int, int, float, cudaStream_t);
 cudaError_t launch_causal_conv_silu(const void*, int, const void*, const void*, void*, void*, void*, int, int, int, int, float, cudaStream_t);
@@ -548,6 +567,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nvfp4_gemm_swiglu", &nvfp4_gemm_swiglu, "NVFP4 up GEMM with silu(gate) * acc and NVFP4 quantization fused in the epilogue",
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("alpha"), py::arg("gate"), py::arg("hq"), py::arg("hsf"),
           py::arg("norm_const"), py::arg("tile") = 0);
+    m.def("gdn_prefill", &gdn_prefill, "chunked Gated DeltaNet forward (prefill), continuing state in place", py::arg("q"), py::arg("k"),
+          py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("state"), py::arg("o"), py::arg("scale"));
     m.def("nvfp4_gemm", &nvfp4_gemm, "CUTLASS SM120 NVFP4 x NVFP4 GEMM, bf16 out", py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
           py::arg("alpha"), py::arg("residual"), py::arg("out"), py::arg("tile") = 0);
     m.def("rmsnorm", &rmsnorm, "zero-centered RMSNorm (1 + w)");

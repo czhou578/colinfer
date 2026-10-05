@@ -690,6 +690,35 @@ projection's input scale, as `quant_nvfp4` does). Traffic per layer drops to ~16
 - Prefill: 2k 0.619 -> 0.596 s (3,434 tok/s), 8k 2.598 -> 2.503 s (3,273 tok/s), 3.7% faster.
 - Perplexity (prefill engine): WikiText 7.0707, code 1.8026 (7.0785 / 1.8027 before). `COLINFER_FUSED_SWIGLU=0`: old path.
 
+## 15. Gated DeltaNet chunked prefill in CUDA
+
+FLA's `chunk_gated_delta_rule` was 92 ms of a 2,048-token chunk (48 layers: cumsum, KK^T + triangular solve, w / u
+recompute, the state recurrence writing every chunk's state, the output pass; the recurrence pinned to 2 warps on
+Blackwell). `csrc/gdn_prefill.cu` does the same math in two kernels (per value head, 64-token chunks, in-chunk cumulative
+decay G; see the file header):
+
+- `k_wy`, all chunks in parallel: A = strictly-lower β_i (k_i·k_j) e^(G_i − G_j) from a tensor-core K K^T, then
+  T = (I + A)^-1 by 16 × 16 blocks (diagonal blocks by substitution, then three block rows of small products).
+- `k_chunk`, one block per (value head, 64-wide V slice), sequential over chunks with the state on chip (fp32 registers,
+  bf16 copy in shared memory): U = T diag(β) V, W = T diag(β e^G) K, V_new = U − W S, P = (Q K^T) ∘ decay mask,
+  O = scale (e^G ∘ Q S + P V_new), S ← e^(G_C) S + K^T (e^(G_C − G) ∘ V_new), all on mma.sync bf16; the next
+  chunk's K / V stream in with cp.async.
+
+Against FLA (`tests/test_gdn_prefill.py`): output and final state within 0.2-0.35% relative (bf16 rounding).
+Per layer at 2,048 tokens: FLA 1.93 ms, CUDA 0.95 ms (k_chunk 0.76, k_wy 0.19). A first k_wy solved column by column
+(64 threads, local-memory chains: 0.575 ms); the blocked inverse and sharing K's shared memory for T brought it to 0.19.
+
+| Prompt | FLA | CUDA |
+|---|---|---|
+| 2k | 0.593 s | **0.558 s** (3,672 tok/s) |
+| 8k | 2.485 s | **2.340 s** (3,501 tok/s) |
+| 32k | 11.64 s | **11.05 s** |
+| 126k (passkey TTFT) | 76.6 s | **65.9 s** |
+
+Perplexity (prefill engine, FP8 KV): WikiText 7.0807, code 1.8010, code ctx 8192 1.6073 (7.0707 / 1.8026 / 1.6085 with
+FLA: within the noise of different rounding). Passkey 6/6 at 31k and 126k; `tests/scheduler_check.py` passes.
+`COLINFER_GDN_CUDA=0` selects FLA.
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:
