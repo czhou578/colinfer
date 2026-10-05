@@ -22,7 +22,7 @@ Startup takes about 21 s with a warm page cache: 6 s to load weights, 10 s for t
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
 | `--k` | 7 | Longest MTP draft. Each cycle picks k=3 or 7 from measured acceptance (see below). |
 | `--drafter-weights` | `auto` | MTP head weights: `auto` uses `~/.cache/colinfer/drafter/mtp_ft.safetensors` (`tools/train_drafter.py`) when it exists; `none` the checkpoint's; or a path. Drafts change speed, never outputs. |
-| `--decode-weights` | `checkpoint` | `requant`: decode the attention / GDN projections from NVFP4 re-quantizations, about 18% faster, but code perplexity +1.5% (`docs/phase6_progress.md`). |
+| `--decode-weights` | `auto` | `auto`: `awq-attn` when `~/.cache/colinfer/requant/<snapshot>/attn_gdn_nvfp4_awq_attn.safetensors` exists (`tools/awq_nvfp4.py --groups self_attn`), else `checkpoint`. `awq-attn`: decode the 64 attention projections from AWQ NVFP4, ~3% faster, perplexity within 0.5%. `requant`: attention and GDN projections from NVFP4, about 18% faster, but code perplexity +1.5%. `checkpoint`: the FP8 originals (`docs/phase6_progress.md` section 3). |
 | `--checkpoints` | 32 | Prefix-checkpoint ring, 154 MB each, allocated at startup. |
 | `--no-prefix-caching` | off | Never reuse a prompt prefix (same as `--checkpoints 0`). For raw-prefill benchmarks, like vLLM's `--no-enable-prefix-caching`. |
 | `--mem-cap-gb` | 80 | Hard cap on the torch allocator. Exceeding it raises an error, and the process exits and restarts. |

@@ -112,32 +112,13 @@ def gptq(W, H, gs, blocksize=128, damp=0.01):
 
 
 @torch.inference_mode()
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--nvfp4", default="nvidia/Qwen3.8-27B-NVFP4")
-    ap.add_argument("--bf16", default="Qwen/Qwen3.8-27B")
-    ap.add_argument("--seqs", type=int, default=64, help="calibration sequences (half WikiText train, half code)")
-    ap.add_argument("--ctx", type=int, default=2048)
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--damp", type=float, default=0.01, help="Hessian damping, fraction of mean(diag H): larger -> closer to round-to-nearest")
-    ap.add_argument("--hessians", default=None, help="cache file for the calibration Hessians (computed once, reused)")
-    ap.add_argument("--check", type=int, default=0, help="only compare GPTQ with round-to-nearest on this many linears")
-    a = ap.parse_args()
-    p4, p16 = resolve(a.nvfp4), resolve(a.bf16)
-    out = a.out or default_out(p4).replace("attn_gdn_nvfp4", f"attn_gdn_nvfp4_gptq_d{a.damp:g}")
+def hessians(p4: str, seqs, cache: str | None = None):
+    """Calibration Hessians H = E[x^T x] of the inputs of the FP8 attention / GDN linears (q/k/v share one, as do
+    in_proj_qkv / in_proj_z), from the reference model over `seqs` (token id tensors). Returns (H by key on the GPU,
+    targets: linear name -> key). cache: a file to reuse / write."""
     t0 = time.time()
-    # ---- 1. calibration Hessians
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(p4)
-    rng = random.Random(0)
-    wiki, code = calib_texts(rng)
-    seqs = []
-    for text, n in ((wiki, a.seqs // 2), (code, a.seqs - a.seqs // 2)):
-        ids = tok(text, return_tensors="pt").input_ids[0]
-        starts = rng.sample(range(0, ids.numel() - a.ctx), n)
-        seqs += [ids[s:s + a.ctx] for s in starts]
     H, cnt = {}, {}
-    cached = a.hessians and os.path.exists(a.hessians)
+    cached = cache and os.path.exists(cache)
     model = load_model(p4) if not cached else None
 
     def hook(name):
@@ -165,35 +146,60 @@ def main():
     for i, layer in enumerate(model.layers if model is not None else []):
         p = f"layers.{i}."
         if layer.block_type == "full_attention":
-            at = layer.self_attn
-            at.q_proj.register_forward_pre_hook(hook(p + "attn_in"))
-            at.o_proj.register_forward_pre_hook(hook(p + "attn_out"))
-            for n in ("q_proj", "k_proj", "v_proj"):
-                targets[p + "self_attn." + n] = p + "attn_in"
-            targets[p + "self_attn.o_proj"] = p + "attn_out"
+            layer.self_attn.q_proj.register_forward_pre_hook(hook(p + "attn_in"))
+            layer.self_attn.o_proj.register_forward_pre_hook(hook(p + "attn_out"))
         else:
-            g = layer.linear_attn
-            g.in_proj_qkv.register_forward_pre_hook(hook(p + "gdn_in"))
-            g.out_proj.register_forward_pre_hook(hook(p + "gdn_out"))
-            targets[p + "linear_attn.in_proj_qkv"] = p + "gdn_in"
-            targets[p + "linear_attn.in_proj_z"] = p + "gdn_in"
-            targets[p + "linear_attn.out_proj"] = p + "gdn_out"
+            layer.linear_attn.in_proj_qkv.register_forward_pre_hook(hook(p + "gdn_in"))
+            layer.linear_attn.out_proj.register_forward_pre_hook(hook(p + "gdn_out"))
     for j, s in enumerate(seqs if model is not None else []):
-        state = model.new_state(1, a.ctx)
+        state = model.new_state(1, s.numel())
         model(s.view(1, -1).cuda(), state)
         if j % 8 == 7:
-            print(f"[gptq] calibration {j + 1}/{len(seqs)} sequences ({time.time() - t0:.0f}s)", flush=True)
+            print(f"[calib] {j + 1}/{len(seqs)} sequences ({time.time() - t0:.0f}s)", flush=True)
     if cached:
-        H = {k: v.cuda() for k, v in torch.load(a.hessians).items()}
-        print(f"[gptq] Hessians from {a.hessians}")
+        H = {k: v.cuda() for k, v in torch.load(cache).items()}
+        print(f"[calib] Hessians from {cache}")
     else:
         for k in H:
             H[k] /= cnt[k]
         del model
         torch.cuda.empty_cache()
-        if a.hessians:
-            torch.save({k: v.cpu() for k, v in H.items()}, a.hessians)
-            print(f"[gptq] Hessians saved to {a.hessians}")
+        if cache:
+            torch.save({k: v.cpu() for k, v in H.items()}, cache)
+            print(f"[calib] Hessians saved to {cache}")
+    return H, targets
+
+
+def calib_seqs(tok, n: int, ctx: int, rng: random.Random):
+    """n calibration sequences of ctx tokens: half WikiText-103 train, half transformers modeling code."""
+    wiki, code = calib_texts(rng)
+    seqs = []
+    for text, m in ((wiki, n // 2), (code, n - n // 2)):
+        ids = tok(text, return_tensors="pt").input_ids[0]
+        starts = rng.sample(range(0, ids.numel() - ctx), m)
+        seqs += [ids[s:s + ctx] for s in starts]
+    return seqs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--nvfp4", default="nvidia/Qwen3.8-27B-NVFP4")
+    ap.add_argument("--bf16", default="Qwen/Qwen3.8-27B")
+    ap.add_argument("--seqs", type=int, default=64, help="calibration sequences (half WikiText train, half code)")
+    ap.add_argument("--ctx", type=int, default=2048)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--damp", type=float, default=0.01, help="Hessian damping, fraction of mean(diag H): larger -> closer to round-to-nearest")
+    ap.add_argument("--hessians", default=None, help="cache file for the calibration Hessians (computed once, reused)")
+    ap.add_argument("--check", type=int, default=0, help="only compare GPTQ with round-to-nearest on this many linears")
+    a = ap.parse_args()
+    p4, p16 = resolve(a.nvfp4), resolve(a.bf16)
+    out = a.out or default_out(p4).replace("attn_gdn_nvfp4", f"attn_gdn_nvfp4_gptq_d{a.damp:g}")
+    t0 = time.time()
+    # ---- 1. calibration Hessians
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(p4)
+    rng = random.Random(0)
+    H, targets = hessians(p4, calib_seqs(tok, a.seqs, a.ctx, rng), a.hessians)
     # ---- 2. GPTQ per linear
     wm16 = json.load(open(os.path.join(p16, "model.safetensors.index.json")))["weight_map"]
 

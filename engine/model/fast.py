@@ -78,6 +78,13 @@ class Nvfp4Linear(nn.Module):
         return out.view(*shp[:-1], self.out_features)
 
 
+def _awq_in(x2, dec):
+    """Activations for an NVFP4 decode copy: x / s per input channel when it was quantized as W diag(s)
+    (tools/awq_nvfp4.py), else x."""
+    inv = getattr(dec, "awq_inv", None)
+    return x2 if inv is None else x2 * inv
+
+
 class Fp8Linear(nn.Module):
     """FP8 weights (the prefill path's W8A8 GEMM reads w directly). dec: optional NVFP4 copy of the same linear
     (attach_requant) that the decode path streams instead, ~half the bytes."""
@@ -95,7 +102,7 @@ class Fp8Linear(nn.Module):
         out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
         r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
         if self.dec is not None:
-            nvfp4_rows(x2, self.dec.w, self.dec.sf, self.dec.gscale, r2, out)
+            nvfp4_rows(_awq_in(x2, self.dec), self.dec.w, self.dec.sf, self.dec.gscale, r2, out)
         else:
             fp8_rows(x2, self.w, self.scale, r2, out)
         return out.view(*shp[:-1], self.out_features)
@@ -126,7 +133,7 @@ class StackedFp8Linear(nn.Module):
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], sum(self.sizes), device=x.device, dtype=torch.bfloat16)
         if self.dec is not None:
-            nvfp4_rows(x2, self.dec.w, self.dec.sf, self.dec.gscale, None, out)
+            nvfp4_rows(_awq_in(x2, self.dec), self.dec.w, self.dec.sf, self.dec.gscale, None, out)
         else:
             fp8_rows(x2, self.w, 1.0, None, out, self.rs)
         return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
@@ -453,10 +460,18 @@ def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False, kv_fp4: bool = False
     return model
 
 
-def requant_path(path_or_repo: str) -> str:
-    """NVFP4 copies of a checkpoint's FP8 linears: tools/gptq_nvfp4.py --damp 0.3 if present (WikiText perplexity
-    +0.37%, Python code +1.5%), else tools/requant_nvfp4.py round-to-nearest (+0.13%, +2.3%); docs/phase6_progress.md."""
+def requant_path(path_or_repo: str, kind: str = "requant") -> str:
+    """NVFP4 copies of a checkpoint's FP8 linears (docs/phase6_progress.md section 3).
+    kind "requant": all 208 (attention + GDN): tools/gptq_nvfp4.py --damp 0.3 if present (WikiText perplexity +0.37%,
+    Python code +1.5%), else tools/requant_nvfp4.py round-to-nearest (+0.13%, +2.3%). ~18% faster decode.
+    kind "awq-attn": the 64 attention linears only, tools/awq_nvfp4.py --groups self_attn (WikiText -0.05%, code
+    +0.43%). ~3% faster decode.
+    COLINFER_REQUANT_FILE overrides either."""
+    if os.environ.get("COLINFER_REQUANT_FILE"):  # an explicit file, e.g. a tools/awq_nvfp4.py output
+        return os.path.expanduser(os.environ["COLINFER_REQUANT_FILE"])
     d = os.path.join(os.path.expanduser("~/.cache/colinfer/requant"), os.path.basename(resolve(path_or_repo)))
+    if kind == "awq-attn":
+        return os.path.join(d, "attn_gdn_nvfp4_awq_attn.safetensors")
     gptq = os.path.join(d, "attn_gdn_nvfp4_gptq_d0.3.safetensors")
     return gptq if os.path.exists(gptq) else os.path.join(d, "attn_gdn_nvfp4.safetensors")
 
@@ -465,28 +480,39 @@ def attach_requant(model: FastQwen35, file: str) -> int:
     """Decode streams NVFP4 re-quantizations (tools/requant_nvfp4.py, from the BF16 originals) of the FP8 attention /
     GDN projections: 7.2 GB -> 4.1 GB per token, WikiText perplexity +0.13% (6.9789 vs 6.9698). Prefill keeps the
     FP8 weights (W8A8 GEMM). Stacked projections share a global scale in the file, so they stay one launch.
-    Call after to_fast (the stacking) and before capturing graphs. Returns the number of linears attached."""
+    Call after to_fast (the stacking) and before capturing graphs. Returns the number of linears attached.
+    AWQ files (tools/awq_nvfp4.py) carry per-input-channel scales s (W was quantized as W diag(s); decode feeds x / s)
+    and may leave groups out, which then keep decoding their FP8 weights."""
     from engine.weights.loader import PREFIX
     n = 0
     with safe_open(file, framework="pt", device=str(model.embed_tokens.weight.device)) as f:
+        keys = set(f.keys())
+
         def nv(names):
+            if any(PREFIX + m + ".weight" not in keys for m in names):
+                return None
             ws = [f.get_tensor(PREFIX + m + ".weight") for m in names]
             sfs = [f.get_tensor(PREFIX + m + ".weight_scale") for m in names]
             gs = {float(f.get_tensor(PREFIX + m + ".weight_scale_2")) for m in names}
             assert len(gs) == 1, names
-            return Nvfp4Linear(torch.cat(ws).contiguous(), torch.cat(sfs).contiguous(), gs.pop())
+            lin = Nvfp4Linear(torch.cat(ws).contiguous(), torch.cat(sfs).contiguous(), gs.pop())
+            if PREFIX + names[0] + ".input_scale_awq" in keys:
+                s = f.get_tensor(PREFIX + names[0] + ".input_scale_awq")
+                assert all(torch.equal(s, f.get_tensor(PREFIX + m + ".input_scale_awq")) for m in names[1:]), names
+                lin.register_buffer("awq_inv", (1.0 / s.float()).to(torch.bfloat16), persistent=False)
+            return lin
         for i, layer in enumerate(model.layers):
             p = f"layers.{i}."
             if layer.block_type == "full_attention":
                 a = layer.self_attn
                 a.qkv.dec = nv([p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"])
                 a.o_proj.dec = nv([p + "self_attn.o_proj"])
-                n += 4
+                n += 3 * (a.qkv.dec is not None) + (a.o_proj.dec is not None)
             else:
                 g = layer.linear_attn
                 g.qkvz.dec = nv([p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"])
                 g.out_proj.dec = nv([p + "linear_attn.out_proj"])
-                n += 3
+                n += 2 * (g.qkvz.dec is not None) + (g.out_proj.dec is not None)
     return n
 
 

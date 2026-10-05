@@ -183,16 +183,45 @@ likely reason for leaving them in FP8.
 
 **Status.**
 
-- It stays opt-in: `--decode-weights requant`, using the GPTQ damping-0.3 file when present.
-- The default decodes the checkpoint's FP8 projections.
-- Getting the 18% back without the quality cost would need a mixed format, for example FP8 for the most sensitive
-  rows or 6-bit weights. That is a kernel and format project of its own.
+- Full re-quantization stays opt-in: `--decode-weights requant`, using the GPTQ damping-0.3 file when present.
+
+**AWQ, and why only attention made it.** `tools/awq_nvfp4.py` scales each input channel j by s_j = E[x_j²]^(α/2)
+before quantizing (W diag(s)); decode divides the activations by s (`_awq_in` in `engine/model/fast.py`). α is
+searched per group of linears sharing an input, by the output error the calibration inputs see (128 sequences, half
+WikiText-103 train, half `transformers` code; the same Hessians as GPTQ). α = 0 is round-to-nearest, so calibration
+error can only drop; it does, by 17% (α ≈ 0.5 everywhere): attention qkv 0.052 → 0.035, GDN qkvz 0.059 → 0.044,
+o_proj / out_proj ~10%. Perplexity (reference engine, ctx 2048, 65,504 tokens; shipped weights 6.9698 / 1.7257):
+
+| NVFP4 for | WikiText | Python code |
+|---|---|---|
+| All 208, round-to-nearest | 6.9789 (+0.13%) | 1.7650 (+2.3%) |
+| All 208, AWQ | 7.0419 (+1.03%) | 1.7508 (+1.45%) |
+| AWQ, attention q/k/v only | 6.9719 (+0.03%) | |
+| AWQ, attention o_proj only | 6.9657 (-0.06%) | |
+| AWQ, GDN in_proj_qkv / z only | 7.0097 (+0.57%) | |
+| AWQ, GDN out_proj only | 7.0048 (+0.50%) | |
+| **AWQ, attention q/k/v/o (64 linears)** | **6.9663 (-0.05%)** | **1.7332 (+0.43%)** |
+
+- AWQ helps attention (round-to-nearest attention alone cost code +0.66%) and hurts Gated DeltaNet on WikiText,
+  although it lowers those linears' output error too. GDN projection errors pass through the recurrent state, where
+  a per-linear output-error objective does not predict their cost; GPTQ showed the same mismatch.
+- The scales stay within 0.2-5 (no channel is crushed), so this is not a range problem.
+- Attention-only AWQ passes the gate (≤ 0.5% on both corpora): **`--decode-weights auto`, the default, now decodes the
+  64 attention linears from `attn_gdn_nvfp4_awq_attn.safetensors` when it exists** (`tools/awq_nvfp4.py --groups
+  self_attn`). The GDN projections stay FP8.
+- Speed (`bench/decode_bench.py`, 8k): plain decode 81.4 → 79.0 ms, MTP cycles k=3 91.9 → 89.2 ms, k=7 104.5 → 102.2 ms,
+  width 3 k=3 101.8 → 99.4 ms: ~3%. The attention linears are 1.7B of the 7.2B FP8 parameters; the other 15%
+  is in GDN, which needs a better format than NVFP4 or a quantizer that models the recurrence.
+- `tests/scheduler_check.py --requant` with the AWQ file: every output identical with and without speculation.
+- Tool calling (85 tasks, 2048 tokens): 50 with AWQ attention, 51 with the FP8 projections; one schema task differs
+  (`schema_title_max_length_fail`). Full re-quantization lost three (48).
 
 **Tool calling.** On the 85-task suite at 2048 tokens the scores sit within the same 8 borderline tasks:
 
 | Configuration | Tasks passed |
 |---|---|
 | Re-quantized weights | 48 |
+| AWQ attention only (the default since) | 50 |
 | Skinny GEMM with the FP8 projections | 51 |
 | Phase 5 / vLLM | 53 / 53 |
 

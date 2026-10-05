@@ -92,6 +92,10 @@ def main():
                     if k.endswith(".weight") and (not args.override_filter or re.search(args.override_filter, k)):
                         base = k[: -len(".weight")]
                         w = dequant_nvfp4(f.get_tensor(k), f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2"))
+                        if base + ".input_scale_awq" in f.keys():  # tools/awq_nvfp4.py: W_eff = dequant(W diag(s)) / s
+                            w32 = dequant_nvfp4(f.get_tensor(k), f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2"),
+                                                torch.float32)
+                            w = (w32 / f.get_tensor(base + ".input_scale_awq")[None, :]).to(w.dtype)
                         model.get_submodule(base[len(PREFIX):]).weight.data.copy_(w)
                         n += 1
             print(f"[ppl] override: {n} linears from {ov}")
