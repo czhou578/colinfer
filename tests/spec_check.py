@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--mtp-bf16", action="store_true", help="draft with the BF16 MTP weights (default: FP8)")
     ap.add_argument("--draft-vocab", type=int, default=65536, help="0 = full vocabulary")
+    ap.add_argument("--drafter-weights", default=None, help="fine-tuned MTP weights (tools/train_drafter.py)")
     ap.add_argument("--temperature", type=float, default=0.0, help="> 0: sampled (no identity check; speed and acceptance only)")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
@@ -64,7 +65,7 @@ def main():
         spec = SpecGenerator(model, max_seq_len=8192, k=a.k)
     else:
         from engine.spec.mtp import MtpGenerator
-        spec = MtpGenerator(model, path, max_seq_len=8192, k=a.k, fp8=not a.mtp_bf16, draft_vocab=a.draft_vocab or None)
+        spec = MtpGenerator(model, path, max_seq_len=8192, k=a.k, fp8=not a.mtp_bf16, draft_vocab=a.draft_vocab or None, weights=a.drafter_weights)
     all_same, tot_tok, tot_t = True, 0, 0.0
     for name, text in PROMPTS.items():
         ids = chat(tok, text)

@@ -220,11 +220,15 @@ ATTN_SPLITS = 32
 
 class FastState(ModelState):
     """ModelState plus the device-side position (`pos_t`, int32 [B]) that graph replays advance.
-    kv_fp8: store the attention KV cache as e4m3 with unit scale (saturating), halving its traffic."""
+    kv_fp8: store the attention KV cache as e4m3 with unit scale (saturating), halving its traffic.
+    kv_fp4: 144-byte rows of e2m1 values + e4m3 block scales per 16 dims (csrc/attn_decode.cu KvFp4), 0.56x of fp8."""
 
-    def __init__(self, cfg, batch, max_seq_len, device, dtype=torch.bfloat16, kv_fp8: bool = False):
-        super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.float8_e4m3fn if kv_fp8 else None)
-        self.kv_fp8 = kv_fp8
+    def __init__(self, cfg, batch, max_seq_len, device, dtype=torch.bfloat16, kv_fp8: bool = False, kv_fp4: bool = False):
+        if kv_fp4:
+            super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.uint8, kv_row=cfg.head_dim // 2 + cfg.head_dim // 16)
+        else:
+            super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.float8_e4m3fn if kv_fp8 else None)
+        self.kv_fp8, self.kv_fp4 = kv_fp8, kv_fp4
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
         self.active = torch.ones(batch, dtype=torch.int32, device=device)  # decode updates only slots with active == 1
         self.arange = torch.arange(16, device=device)
@@ -236,7 +240,7 @@ class FastState(ModelState):
     def view(self, lo: int, hi: int) -> "FastState":
         """A FastState over slots [lo, hi) sharing this state's tensors (slices along the batch dim)."""
         v = FastState.__new__(FastState)
-        v.cfg, v.max_seq_len, v.kv_fp8, v.pos = self.cfg, self.max_seq_len, self.kv_fp8, self.pos
+        v.cfg, v.max_seq_len, v.kv_fp8, v.kv_fp4, v.pos = self.cfg, self.max_seq_len, self.kv_fp8, getattr(self, "kv_fp4", False), self.pos
         v.conv = {i: t[lo:hi] for i, t in self.conv.items()}
         v.rec = {i: t[lo:hi] for i, t in self.rec.items()}
         v.k = {i: t[lo:hi] for i, t in self.k.items()}
@@ -367,10 +371,11 @@ KernelGDN.commit = _gdn_commit
 
 class FastQwen35(Qwen35ForCausalLM):
     kv_fp8 = False
+    kv_fp4 = False
 
     def new_state(self, batch: int, max_seq_len: int) -> FastState:
         p = self.embed_tokens.weight
-        return FastState(self.cfg, batch, max_seq_len, p.device, p.dtype, kv_fp8=self.kv_fp8)
+        return FastState(self.cfg, batch, max_seq_len, p.device, p.dtype, kv_fp8=self.kv_fp8, kv_fp4=self.kv_fp4)
 
     def forward(self, input_ids: torch.Tensor, state: FastState, last_only: bool = False) -> torch.Tensor:
         B, T = input_ids.shape
@@ -417,10 +422,10 @@ FastQwen35.verify = _verify
 FastQwen35.commit = _commit
 
 
-def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False) -> FastQwen35:
+def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False, kv_fp4: bool = False) -> FastQwen35:
     """Switch a kernel-linear model (load_fast_model) onto the device-position decode path."""
     model.__class__ = FastQwen35
-    model.kv_fp8 = kv_fp8
+    model.kv_fp8, model.kv_fp4 = kv_fp8, kv_fp4
     for layer in model.layers:
         if layer.block_type == "full_attention":
             a = layer.self_attn

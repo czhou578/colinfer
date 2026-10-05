@@ -94,3 +94,59 @@ def test_kernel_attention_layer_matches_reference(kv_fp8, B, T, pos):
         got = ka(x, None, None, fs, 0, residual=res)
     rel = ((got.float() - want.float()).norm() / want.float().norm()).item()
     assert rel < (3e-2 if kv_fp8 else 1e-2), rel
+
+
+def rand_kv4(*shape):
+    """Random fp4 KV rows (uint8 [..., 144]): random e2m1 bytes, block scale codes for scales ~0.3-3 (stored x16)."""
+    data = torch.randint(0, 256, (*shape, 128), dtype=torch.uint8, device="cuda")
+    sc = ((torch.rand(*shape, 16, device="cuda") * 2.7 + 0.3) * 16).to(torch.float8_e4m3fn).view(torch.uint8)
+    return torch.cat([data, sc], -1).contiguous()
+
+
+def kv4_values(c):
+    from engine.kernels import ops
+    out = torch.empty(*c.shape[:-1], 256, device="cuda", dtype=torch.bfloat16)
+    ops().kv4_to_bf16(c, out)
+    return out
+
+
+@pytest.mark.parametrize("B,T,lens,splits", [(1, 1, [1000], 16), (3, 1, [5, 4096, 777], 24), (2, 4, [17, 2000], 16)])
+def test_attn_decode_kv4(B, T, lens, splits):
+    """fp4 cache: the kernel attends over exactly the values kv4_to_bf16 decodes."""
+    from engine.kernels import ops
+    torch.manual_seed(sum(lens) + T)
+    Hq, Hkv, D, Lmax = 24, 4, 256, 4224
+    q = torch.randn(B, Hq, T, D, device="cuda").bfloat16()
+    k, v = rand_kv4(B, Hkv, Lmax), rand_kv4(B, Hkv, Lmax)
+    sl = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    out = torch.empty_like(q)
+    ops().attn_decode(q, k, v, sl, out, splits, D ** -0.5)
+    r = ref(q, kv4_values(k), kv4_values(v), lens)
+    assert (out.float() - r.float()).abs().max().item() < 2e-2
+
+
+def test_kv4_prologue_quantizes_rows():
+    """The prologue's fp4 rows decode to the bf16 rows within NVFP4 rounding (block-16 e2m1, scale amax / 6)."""
+    from engine.kernels import ops
+    torch.manual_seed(5)
+    B, T, Hq, Hkv, L = 2, 3, 24, 4, 64
+    qp = torch.randn(B, T, Hq * 512, device="cuda").bfloat16()
+    kp = (torch.randn(B, T, Hkv * 256, device="cuda") * 3).bfloat16()
+    vp = (torch.randn(B, T, Hkv * 256, device="cuda") * torch.logspace(-1, 1.5, 256, device="cuda").repeat(Hkv)).bfloat16()
+    w = torch.zeros(256, device="cuda").bfloat16()
+    inv = torch.ones(32, device="cuda")
+    pos = torch.tensor([3, 10], dtype=torch.int32, device="cuda")
+    q16, q4 = torch.empty(B, Hq, T, 256, device="cuda").bfloat16(), torch.empty(B, Hq, T, 256, device="cuda").bfloat16()
+    k16, v16 = torch.zeros(B, Hkv, L, 256, device="cuda").bfloat16(), torch.zeros(B, Hkv, L, 256, device="cuda").bfloat16()
+    k4, v4 = torch.zeros(B, Hkv, L, 144, dtype=torch.uint8, device="cuda"), torch.zeros(B, Hkv, L, 144, dtype=torch.uint8, device="cuda")
+    ops().attn_prologue(qp, kp, vp, w, w, inv, pos, k16, v16, q16, 1e-6)
+    ops().attn_prologue(qp, kp, vp, w, w, inv, pos, k4, v4, q4, 1e-6)
+    assert torch.equal(q16, q4)
+    for c16, c4 in ((k16, k4), (v16, v4)):
+        for b in range(B):
+            rows = slice(int(pos[b]), int(pos[b]) + T)
+            a, d = c16[b, :, rows].float(), kv4_values(c4[b, :, rows].contiguous()).float()
+            blk = a.view(-1, 16).abs().amax(-1, keepdim=True)
+            # within half an e2m1 step: the largest step is 2 units (|v| in 4..6), a unit is amax / 6 rounded to e4m3 (<= 6.25% up)
+            assert ((d - a).view(-1, 16).abs() <= blk / 6 * 1.07 + 1e-6).all()
+            assert ((d - a).norm() / a.norm()).item() < 0.12

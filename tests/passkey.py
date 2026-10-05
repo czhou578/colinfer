@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--lens", type=int, nargs="+", default=[16384, 65536, 131072])
     ap.add_argument("--depths", type=float, nargs="+", default=[0.1, 0.5, 0.9])
     ap.add_argument("--kv-fp8", action="store_true")
+    ap.add_argument("--kv-fp4", action="store_true")
     ap.add_argument("--url", default=None, help="test a running server (engine/server) over HTTP instead of a local scheduler")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
@@ -66,8 +67,8 @@ def main():
                       f"(TTFT {r['timings']['ttft_s']:6.1f} s)", flush=True)
         print(f"PASSKEY {hits}/{len(a.lens) * len(a.depths)}")
         return
-    eng = Scheduler(to_fast(load_fast_model(path), kv_fp8=a.kv_fp8), n_slots=1, max_seq_len=max(a.lens) + 64, n_checkpoints=0)
-    print(f"KV {'fp8' if a.kv_fp8 else 'bf16'}")
+    eng = Scheduler(to_fast(load_fast_model(path), kv_fp8=a.kv_fp8, kv_fp4=a.kv_fp4), n_slots=1, max_seq_len=max(a.lens) + 64, n_checkpoints=0)
+    print(f"KV {'fp4' if a.kv_fp4 else 'fp8' if a.kv_fp8 else 'bf16'}")
     for L in a.lens:
         for d in a.depths:
             key = rng.randint(100000, 999999)

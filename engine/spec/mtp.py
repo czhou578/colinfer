@@ -96,7 +96,9 @@ class Mtp(nn.Module):
     draft_vocab: draft only among the N most frequent tokens (engine/spec/draft_vocab.npy): the drafting
     lm_head reads N rows instead of 248k. Neither affects correctness, only acceptance."""
 
-    def __init__(self, target: FastQwen35, path: str, fp8: bool = False, draft_vocab: int | None = None, prompt_slots: int = 4096):
+    def __init__(self, target: FastQwen35, path: str, fp8: bool = False, draft_vocab: int | None = None, prompt_slots: int = 4096,
+                 weights: str | None = None):
+        """weights: optional safetensors with mtp.* tensors replacing the checkpoint's (tools/train_drafter.py)."""
         super().__init__()
         cfg = target.cfg
         wm = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
@@ -104,6 +106,11 @@ class Mtp(nn.Module):
         for name, f in wm.items():
             if name.startswith("mtp."):
                 with safe_open(os.path.join(path, f), framework="pt", device="cuda") as sf:
+                    t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
+        if weights:
+            with safe_open(weights, framework="pt", device="cuda") as sf:
+                for name in sf.keys():
+                    assert name.startswith("mtp.") and name[4:] in t, name
                     t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
         P = "layers.0."
         self.fc = Bf16Linear(t["fc.weight"])
@@ -292,10 +299,11 @@ class MtpCycle:
 class MtpGenerator:
     """Generation with MTP speculation for one slot; greedy output identical to plain greedy decode."""
 
-    def __init__(self, model: FastQwen35, path: str, max_seq_len: int = 32768, k: int = 3, fp8: bool = True, draft_vocab: int | None = 65536):
+    def __init__(self, model: FastQwen35, path: str, max_seq_len: int = 32768, k: int = 3, fp8: bool = True, draft_vocab: int | None = 65536,
+                 weights: str | None = None):
         prepare_prefill(model)
         self.model, self.k = model, k
-        self.mtp = Mtp(model, path, fp8=fp8, draft_vocab=draft_vocab)
+        self.mtp = Mtp(model, path, fp8=fp8, draft_vocab=draft_vocab, weights=weights)
         self.state = model.new_state(1, max_seq_len)
         self.mst = MtpState(model.cfg, max_seq_len, "cuda", active=self.state.active)
         from engine.runtime.sampler import SamplerParams

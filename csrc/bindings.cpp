@@ -6,9 +6,12 @@ cudaError_t launch_nvfp4_gemv(const void*, const void*, const void*, float, cons
 cudaError_t launch_nvfp4_swiglu(const void*, const void*, const void*, float, const void*, const void*, float, void*, int, int, int, cudaStream_t);
 cudaError_t launch_fp8_gemv(const void*, const void*, float, const float*, const void*, void*, bool, int, int, int, cudaStream_t);
 cudaError_t launch_attn_decode(const void*, const void*, const void*, const int*, void*, float*, void*, int, int, int, int, int, int, int, float,
-                               bool, const void*, cudaStream_t);
+                               int, const void*, cudaStream_t);
 cudaError_t launch_attn_prologue(const void*, const void*, const void*, int, int, int, const void*, const void*, const float*, const int*, void*, void*, void*,
-                                 int, int, int, int, int, int, float, bool, const int*, cudaStream_t);
+                                 int, int, int, int, int, int, float, int, const int*, cudaStream_t);
+cudaError_t launch_kv4_to_bf16(const void*, void*, long, cudaStream_t);
+
+
 
 #define CHECK_CUDA_TENSOR(t, dt) \
     TORCH_CHECK((t).is_cuda() && (t).is_contiguous() && (t).scalar_type() == (dt), #t " must be a contiguous CUDA " #dt " tensor")
@@ -69,26 +72,43 @@ void fp8_gemv(torch::Tensor x, torch::Tensor w, double scale, c10::optional<torc
                                  x.size(0), N, K, at::cuda::getCurrentCUDAStream()));
 }
 
+// KV cache format: 0 bf16 [.., 256], 1 fp8 e4m3 [.., 256], 2 fp4 = uint8 [.., 144] (attn_decode.cu)
+static int kv_kind_of(const torch::Tensor& k, const torch::Tensor& v) {
+    TORCH_CHECK(k.is_cuda() && k.is_contiguous() && v.is_cuda() && v.is_contiguous() && k.sizes() == v.sizes() &&
+                k.scalar_type() == v.scalar_type(), "k / v caches: contiguous CUDA tensors of one shape and dtype");
+    if (k.scalar_type() == torch::kBFloat16 && k.size(-1) == 256) return 0;
+    if (k.scalar_type() == torch::kFloat8_e4m3fn && k.size(-1) == 256) return 1;
+    if (k.scalar_type() == torch::kUInt8 && k.size(-1) == 144) return 2;
+    TORCH_CHECK(false, "KV cache must be bf16 [.., 256], float8_e4m3fn [.., 256] or uint8 fp4 rows [.., 144]");
+    return -1;
+}
+
+// fp4 KV rows uint8 [.., 144] -> bf16 [.., 256]
+void kv4_to_bf16(torch::Tensor src, torch::Tensor dst) {
+    TORCH_CHECK(src.is_cuda() && src.is_contiguous() && src.scalar_type() == torch::kUInt8 && src.size(-1) == 144, "src: uint8 [.., 144]");
+    CHECK_CUDA_TENSOR(dst, torch::kBFloat16);
+    TORCH_CHECK(dst.size(-1) == 256 && dst.numel() / 256 == src.numel() / 144, "dst: bf16 [.., 256], same rows");
+    CHECK_LAUNCH(launch_kv4_to_bf16(src.data_ptr(), dst.data_ptr(), src.numel() / 144, at::cuda::getCurrentCUDAStream()));
+}
+
 // out[b, h, t] = softmax(q k^T * scale) v over the first seq_lens[b] - (T-1-t) cached positions.
 // q, out: bf16 [B, Hq, T, 256]; k_cache, v_cache: bf16 or float8_e4m3fn [B, Hkv, Lmax, 256]; seq_lens: int32 [B] (device).
 // gate (optional): the q_proj output [B, T, Hq, 2*256]; then out is [B, T, Hq*256] = attn * sigmoid(gate).
 void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor seq_lens, torch::Tensor out, int64_t splits,
                  double scale, c10::optional<torch::Tensor> gate) {
     CHECK_CUDA_TENSOR(q, torch::kBFloat16);
-    const bool kv_fp8 = k_cache.scalar_type() == torch::kFloat8_e4m3fn;
-    CHECK_CUDA_TENSOR(k_cache, kv_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16);
-    CHECK_CUDA_TENSOR(v_cache, k_cache.scalar_type());
+    const int kv_kind = kv_kind_of(k_cache, v_cache);
     CHECK_CUDA_TENSOR(seq_lens, torch::kInt32);
     CHECK_CUDA_TENSOR(out, torch::kBFloat16);
     TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes() && out.numel() == q.numel(), "bad shapes");
     const void* gp = nullptr;
     if (gate) { CHECK_CUDA_TENSOR(*gate, torch::kBFloat16); TORCH_CHECK(gate->numel() == 2 * q.numel()); gp = gate->data_ptr(); }
     const int64_t B = q.size(0), Hq = q.size(1), T = q.size(2), Dh = q.size(3), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
-    TORCH_CHECK(k_cache.size(0) == B && k_cache.size(3) == Dh && seq_lens.numel() == B && splits >= 1, "bad shapes");
+    TORCH_CHECK(k_cache.size(0) == B && Dh == 256 && seq_lens.numel() == B && splits >= 1, "bad shapes");
     auto part_acc = torch::empty({B * Hq * T * splits, Dh}, q.options().dtype(torch::kFloat32));
     auto part_ml = torch::empty({B * Hq * T * splits, 2}, q.options().dtype(torch::kFloat32));
     CHECK_LAUNCH(launch_attn_decode(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), seq_lens.data_ptr<int>(), out.data_ptr(),
-                                    part_acc.data_ptr<float>(), part_ml.data_ptr(), B, Hq, Hkv, T, Lmax, Dh, splits, (float)scale, kv_fp8,
+                                    part_acc.data_ptr<float>(), part_ml.data_ptr(), B, Hq, Hkv, T, Lmax, Dh, splits, (float)scale, kv_kind,
                                     gp, at::cuda::getCurrentCUDAStream()));
 }
 
@@ -103,16 +123,14 @@ void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::
     for (auto* t : {&qn_w, &kn_w, &q_out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     CHECK_CUDA_TENSOR(inv_freq, torch::kFloat32);
     CHECK_CUDA_TENSOR(pos_t, torch::kInt32);
-    const bool kv_fp8 = k_cache.scalar_type() == torch::kFloat8_e4m3fn;
-    CHECK_CUDA_TENSOR(k_cache, kv_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16);
-    CHECK_CUDA_TENSOR(v_cache, k_cache.scalar_type());
+    const int kv_kind = kv_kind_of(k_cache, v_cache);
     const int64_t B = q_out.size(0), Hq = q_out.size(1), T = q_out.size(2), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
     auto q2 = qp.reshape({-1, qp.size(-1)}), k2 = kp.reshape({-1, kp.size(-1)}), v2 = vp.reshape({-1, vp.size(-1)});
     TORCH_CHECK(q2.size(0) == B * T && k2.size(0) == B * T && v2.size(0) == B * T && q2.size(1) == Hq * 512 && k2.size(1) == Hkv * 256 &&
                 v2.size(1) == Hkv * 256 && q_out.size(3) == 256 && pos_t.numel() == B, "bad shapes / strides");
     CHECK_LAUNCH(launch_attn_prologue(q2.data_ptr(), k2.data_ptr(), v2.data_ptr(), (int)q2.stride(0), (int)k2.stride(0), (int)v2.stride(0), qn_w.data_ptr(), kn_w.data_ptr(), inv_freq.data_ptr<float>(),
                                       pos_t.data_ptr<int>(), k_cache.data_ptr(), v_cache.data_ptr(), q_out.data_ptr(), B, T, Hq, Hkv, Lmax,
-                                      2 * inv_freq.numel(), (float)eps, kv_fp8, active_ptr(active, B), at::cuda::getCurrentCUDAStream()));
+                                      2 * inv_freq.numel(), (float)eps, kv_kind, active_ptr(active, B), at::cuda::getCurrentCUDAStream()));
 }
 
 cudaError_t launch_gdn_conv(const void*, void*, const void*, void*, int, int, const int*, cudaStream_t);
@@ -418,6 +436,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("skinny_swiglu", &skinny_swiglu, "tensor-core silu(x Wg^T) * (x Wu^T), NVFP4, M<=16");
     m.def("skinny_fp8", &skinny_fp8, "tensor-core FP8 x bf16 skinny GEMM, M<=16", py::arg("x"), py::arg("w"), py::arg("scale"),
           py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
+    m.def("kv4_to_bf16", &kv4_to_bf16, "fp4 KV cache rows -> bf16");
     m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (speculative sampling)");
     m.def("gdn_conv_multi", &gdn_conv_multi, "spec verify: GDN conv over T tokens, state read-only");
     m.def("gdn_conv_commit", &gdn_conv_commit, "spec commit: advance the GDN conv state by n tokens");

@@ -119,7 +119,14 @@ def _attention(attn, q8, state: FastState, li: int):
     ops().attn_prologue(qp, kp, vp, attn.q_norm.weight, attn.k_norm.weight, attn.inv_freq, state.pos_t, kc, vc, q, attn.q_norm.eps)
     L = state.pos + T
     kk, vv = kc[0, :, :L], vc[0, :, :L]
-    if kk.dtype == torch.float8_e4m3fn:
+    if kk.dtype == torch.uint8:  # fp4 cache rows: dequantize the prefix per head into bf16 for FlashInfer
+        k16 = torch.empty(kk.shape[0], L, attn.head_dim, device=kk.device, dtype=torch.bfloat16)
+        v16 = torch.empty_like(k16)
+        for h in range(kk.shape[0]):
+            ops().kv4_to_bf16(kk[h], k16[h])
+            ops().kv4_to_bf16(vv[h], v16[h])
+        kk, vv = k16, v16
+    elif kk.dtype == torch.float8_e4m3fn:
         # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix
         # to a BF16 scratch first costs a few ms per layer at 128k and saves tens (exact: e4m3 -> bf16 is lossless)
         kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
@@ -198,6 +205,6 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
             ops().add_rmsnorm(x, None, model.norm.weight, model.norm.eps, q4=xq, sf4=xsf, in_scale4=model.p_lm["in_scale"])
             outs.append(_gemm_nvfp4(xq, xsf, model.p_lm))
     if all_logits:
-        return torch.cat(outs)
+        return (torch.cat(outs), torch.cat(hid)) if return_hidden else torch.cat(outs)
     logits = model.lm_head(model.norm(x_last)).float()
     return (logits, torch.cat(hid)) if return_hidden else logits

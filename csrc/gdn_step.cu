@@ -14,6 +14,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "pdl.cuh"
 
 namespace gdn {
 
@@ -25,6 +26,7 @@ __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); 
 // active (optional, int32 [B]): slots with active[b] == 0 keep their conv state (idle or mid-prefill slots)
 __global__ void k_conv(const __nv_bfloat16* __restrict__ mixed, __nv_bfloat16* __restrict__ conv_state, const __nv_bfloat16* __restrict__ w,
                        __nv_bfloat16* __restrict__ out, int C, const int* __restrict__ active) {
+    PDL_TRIGGER();
     const int b = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const bool upd = active == nullptr || active[b] != 0;
@@ -60,6 +62,7 @@ __global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restri
                                                     const __nv_bfloat16* __restrict__ A_log, const __nv_bfloat16* __restrict__ dt_bias,
                                                     const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ state,
                                                     __nv_bfloat16* __restrict__ out, int Hk, int Hv, float eps, const int* __restrict__ active) {
+    PDL_TRIGGER();
     const int b = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const bool upd = active == nullptr || active[b] != 0;  // inactive slots: compute, but leave the state untouched
     const int kh = h / (Hv / Hk), C = 2 * Hk * DK + Hv * DV;
@@ -129,6 +132,7 @@ __global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restri
 // ---------------------------------------------------------------------------------------------
 __global__ void k_conv_multi(const __nv_bfloat16* __restrict__ mixed, const __nv_bfloat16* __restrict__ conv_state,
                              const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out, int T, int C) {
+    PDL_TRIGGER();
     const int bt = blockIdx.y, b = bt / T, t = bt % T, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const __nv_bfloat16* cs = conv_state + ((size_t)b * C + c) * 3;
@@ -148,6 +152,7 @@ __global__ void k_conv_multi(const __nv_bfloat16* __restrict__ mixed, const __nv
 
 __global__ void k_conv_commit(const __nv_bfloat16* __restrict__ mixed, __nv_bfloat16* __restrict__ conv_state, const int* __restrict__ n_ptr,
                               int T, int C) {
+    PDL_TRIGGER();
     const int b = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int n = n_ptr[b];
@@ -164,6 +169,7 @@ __global__ void __launch_bounds__(THREADS) k_delta_multi(const __nv_bfloat16* __
                                                           const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ state,
                                                           __nv_bfloat16* __restrict__ out, int Hk, int Hv, float eps, int T,
                                                           const int* __restrict__ n_ptr) {
+    PDL_TRIGGER();
     const int b = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int kh = h / (Hv / Hk), C = 2 * Hk * DK + Hv * DV;
     const bool commit = n_ptr != nullptr;

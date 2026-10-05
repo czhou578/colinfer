@@ -12,10 +12,12 @@
 // heads that share the KV head (GQA: every K/V row is read once for all G heads). Lane l holds
 // head dims [8l, 8l+8). Warps are merged in shared memory, splits by a second small kernel.
 #include <cuda_bf16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdint.h>
+#include "pdl.cuh"
 
 namespace attn {
 
@@ -30,18 +32,28 @@ __device__ __forceinline__ void bf16x8_to_float(const uint4 v, float (&f)[8]) {
     }
 }
 
-// KV element types: bf16 (16-byte loads per lane) or fp8 e4m3 (8-byte loads per lane), 8 dims per lane.
+// KV cache formats. A cache row is one (token, head): ROW elements. Lane l of a warp handles head dims [8l, 8l+8).
+//   bf16:  256 x bf16 (16-byte loads per lane)
+//   fp8:   256 x e4m3, unit scale, saturating (8-byte loads per lane)
+//   fp4:   144 bytes: 128 bytes of e2m1 (dim 2i in the low nibble of byte i), then 16 e4m3 block scales (dims 16j..16j+15),
+//          each stored as 16 * amax / 6 so block maxima from ~0.006 to 168 stay in e4m3's normal range (K: 0.04-23,
+//          V: 0.17-108 measured on this model). 0.56x the bytes of fp8.
+// store_row(row, d, v): called by all 256 threads of a block, thread d holding dim d (fp4 needs the whole 16-dim block).
 struct KvBf16 {
     using Elem = __nv_bfloat16;
     using Vec = uint4;
-    static __device__ __forceinline__ void store(Elem* p, float v) { *p = __float2bfloat16(v); }
+    static constexpr int ROW = D;
+    static __device__ __forceinline__ Vec load(const Elem* row, int lane) { return __ldcs(reinterpret_cast<const Vec*>(row + lane * 8)); }
+    static __device__ __forceinline__ void store_row(Elem* row, int d, float v) { row[d] = __float2bfloat16(v); }
     static __device__ __forceinline__ void to_float(const Vec v, float (&f)[8]) { bf16x8_to_float(v, f); }
 };
 struct KvFp8 {
     using Elem = uint8_t;
     using Vec = uint2;
-    static __device__ __forceinline__ void store(Elem* p, float v) {
-        *p = (Elem)__nv_cvt_float_to_fp8(fminf(fmaxf(v, -448.f), 448.f), __NV_SATFINITE, __NV_E4M3);
+    static constexpr int ROW = D;
+    static __device__ __forceinline__ Vec load(const Elem* row, int lane) { return __ldcs(reinterpret_cast<const Vec*>(row + lane * 8)); }
+    static __device__ __forceinline__ void store_row(Elem* row, int d, float v) {
+        row[d] = (Elem)__nv_cvt_float_to_fp8(fminf(fmaxf(v, -448.f), 448.f), __NV_SATFINITE, __NV_E4M3);
     }
     static __device__ __forceinline__ void to_float(const Vec v, float (&f)[8]) {
         const uint32_t u[2] = {v.x, v.y};
@@ -57,11 +69,52 @@ struct KvFp8 {
     }
 };
 
+struct KvFp4 {
+    using Elem = uint8_t;
+    struct Vec { uint32_t d, s; };
+    static constexpr int ROW = D / 2 + D / 16;
+    static constexpr float SCALE_BIAS = 16.f;
+    static __device__ __forceinline__ Vec load(const Elem* row, int lane) {
+        Vec v;
+        v.d = __ldcs(reinterpret_cast<const uint32_t*>(row) + lane);
+        v.s = __ldcs(row + D / 2 + (lane >> 1));
+        return v;
+    }
+    static __device__ __forceinline__ float scale_of(uint32_t code) {
+        __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)code, __NV_E4M3);
+        return __half2float(*reinterpret_cast<__half*>(&h)) * (1.f / SCALE_BIAS);
+    }
+    static __device__ __forceinline__ void to_float(const Vec v, float (&f)[8]) {
+        const float sc = scale_of(v.s);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            __half2_raw h = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)((v.d >> (8 * i)) & 0xff), __NV_E2M1);
+            const float2 ff = __half22float2(*reinterpret_cast<__half2*>(&h));
+            f[2 * i] = ff.x * sc;
+            f[2 * i + 1] = ff.y * sc;
+        }
+    }
+    static __device__ __forceinline__ void store_row(Elem* row, int d, float v) {
+        float amax = fabsf(v);  // the 16 dims of a block are 16 consecutive lanes of one warp
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        // scale amax / 6: no clipping. (Choosing amax / 5 when it lowers the block's squared error, as for weights,
+        // made perplexity worse: clipping a block maximum hurts attention scores more than coarser steps.)
+        const __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(amax / 6.f * SCALE_BIAS, __NV_SATFINITE, __NV_E4M3);
+        const float sc = scale_of(code);
+        const uint32_t nib = sc > 0.f ? (uint32_t)__nv_cvt_float_to_fp4(v / sc, __NV_E2M1, cudaRoundNearest) & 0xf : 0u;
+        const uint32_t other = __shfl_xor_sync(0xffffffffu, nib, 1);
+        if (!(d & 1)) row[d >> 1] = (Elem)(nib | (other << 4));
+        if (!(d & 15)) row[D / 2 + (d >> 4)] = (Elem)code;
+    }
+};
+
 template <int G, typename KV>
 __global__ void __launch_bounds__(WARPS * 32) k_split(const __nv_bfloat16* __restrict__ q, const typename KV::Elem* __restrict__ kc,
                                                        const typename KV::Elem* __restrict__ vc, const int* __restrict__ seq_lens,
                                                        float* __restrict__ part_acc, float2* __restrict__ part_ml, int Hkv, int T,
                                                        int Lmax, int splits, float scale) {
+    PDL_TRIGGER();
     const int b = blockIdx.x / T, t = blockIdx.x % T, kvh = blockIdx.y, s = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, Hq = Hkv * G;
     const int len = seq_lens[b] - (T - 1 - t);
@@ -84,15 +137,15 @@ __global__ void __launch_bounds__(WARPS * 32) k_split(const __nv_bfloat16* __res
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[g][i] = 0.f;
     }
-    const size_t base = (size_t)(b * Hkv + kvh) * Lmax * D + lane * 8;
+    const size_t base = (size_t)(b * Hkv + kvh) * Lmax * KV::ROW;
     for (int j0 = start + warp; j0 < end; j0 += WARPS * UNROLL) {
         typename KV::Vec kr[UNROLL], vr[UNROLL];
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
             const int j = j0 + u * WARPS;
             if (j < end) {
-                kr[u] = __ldcs(reinterpret_cast<const typename KV::Vec*>(kc + base + (size_t)j * D));
-                vr[u] = __ldcs(reinterpret_cast<const typename KV::Vec*>(vc + base + (size_t)j * D));
+                kr[u] = KV::load(kc + base + (size_t)j * KV::ROW, lane);
+                vr[u] = KV::load(vc + base + (size_t)j * KV::ROW, lane);
             }
         }
 #pragma unroll
@@ -151,6 +204,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_split(const __nv_bfloat16* __res
 // gate in the second half of each head): out[b, t, h, :] = attn * sigmoid(gate), ready for o_proj.
 __global__ void k_combine(const float* __restrict__ part_acc, const float2* __restrict__ part_ml, __nv_bfloat16* __restrict__ out, int splits,
                           const __nv_bfloat16* __restrict__ gate, int Hq, int T) {
+    PDL_TRIGGER();
     const size_t row = blockIdx.x;  // (b, h, t)
     const int d = threadIdx.x;
     float M = -CUDART_INF_F;
@@ -185,6 +239,7 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
                            const __nv_bfloat16* __restrict__ qn_w, const __nv_bfloat16* __restrict__ kn_w, const float* __restrict__ inv_freq,
                            const int* __restrict__ pos_t, typename KV::Elem* __restrict__ kc, typename KV::Elem* __restrict__ vc,
                            __nv_bfloat16* __restrict__ q_out, int Hq, int Hkv, int T, int Lmax, int R, float eps, const int* __restrict__ active) {
+    PDL_TRIGGER();
     const int bt = blockIdx.x, b = bt / T, t = bt % T, hh = blockIdx.y, d = threadIdx.x;
     const bool upd = active == nullptr || active[b] != 0;  // inactive slots: no KV write
     const int pos = pos_t[b] + t;
@@ -197,7 +252,7 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
     else if (hh < Hq + Hkv) { x = __bfloat162float(kp[row * ldk + (size_t)(hh - Hq) * D + d]); w = kn_w; }
     else {
         const int h = hh - Hq - Hkv;
-        if (upd) KV::store(vc + (((size_t)b * Hkv + h) * Lmax + pos) * D + d, __bfloat162float(vp[row * ldv + (size_t)h * D + d]));
+        if (upd) KV::store_row(vc + (((size_t)b * Hkv + h) * Lmax + pos) * KV::ROW, d, __bfloat162float(vp[row * ldv + (size_t)h * D + d]));
         return;
     }
     float ss = x * x;
@@ -220,13 +275,30 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
         y = d < half ? xn * cs - xs[d + half] * sn : xn * cs + xs[d - half] * sn;
     }
     if (hh < Hq) q_out[(((size_t)b * Hq + hh) * T + t) * D + d] = __float2bfloat16(y);
-    else if (upd) KV::store(kc + (((size_t)b * Hkv + (hh - Hq)) * Lmax + pos) * D + d, __bfloat162float(__float2bfloat16(y)));
+    else if (upd) KV::store_row(kc + (((size_t)b * Hkv + (hh - Hq)) * Lmax + pos) * KV::ROW, d, __bfloat162float(__float2bfloat16(y)));
+}
+
+// fp4 cache rows -> bf16 rows (the prefill path hands FlashInfer a bf16 copy of the cached prefix)
+__global__ void k_kv4_to_bf16(const uint8_t* __restrict__ src, __nv_bfloat16* __restrict__ dst, long rows) {
+    const long r = blockIdx.x * (long)(blockDim.x / 32) + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    float f[8];
+    KvFp4::to_float(KvFp4::load(src + r * KvFp4::ROW, lane), f);
+    uint4 o;
+    uint32_t* ou = reinterpret_cast<uint32_t*>(&o);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_bfloat162 b2 = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+        ou[i] = *reinterpret_cast<const uint32_t*>(&b2);
+    }
+    *reinterpret_cast<uint4*>(dst + r * D + lane * 8) = o;
 }
 
 }  // namespace attn
 
 cudaError_t launch_attn_decode(const void* q, const void* kc, const void* vc, const int* seq_lens, void* out, float* part_acc,
-                               void* part_ml, int B, int Hq, int Hkv, int T, int Lmax, int Dh, int splits, float scale, bool kv_fp8,
+                               void* part_ml, int B, int Hq, int Hkv, int T, int Lmax, int Dh, int splits, float scale, int kv_kind,
                                const void* gate, cudaStream_t st) {
     if (Dh != attn::D || Hq % Hkv) return cudaErrorInvalidValue;
     const int G = Hq / Hkv;
@@ -235,9 +307,11 @@ cudaError_t launch_attn_decode(const void* q, const void* kc, const void* vc, co
 #define ATTN_LAUNCH(GG, KVT) \
     attn::k_split<GG, attn::KVT><<<grid, block, 0, st>>>(qb, (const attn::KVT::Elem*)kc, (const attn::KVT::Elem*)vc, seq_lens, part_acc, \
                                                          (float2*)part_ml, Hkv, T, Lmax, splits, scale)
-    if (G == 6 && kv_fp8) ATTN_LAUNCH(6, KvFp8);
+    if (G == 6 && kv_kind == 1) ATTN_LAUNCH(6, KvFp8);
+    else if (G == 6 && kv_kind == 2) ATTN_LAUNCH(6, KvFp4);
     else if (G == 6) ATTN_LAUNCH(6, KvBf16);
-    else if (G == 4 && kv_fp8) ATTN_LAUNCH(4, KvFp8);
+    else if (G == 4 && kv_kind == 1) ATTN_LAUNCH(4, KvFp8);
+    else if (G == 4 && kv_kind == 2) ATTN_LAUNCH(4, KvFp4);
     else if (G == 4) ATTN_LAUNCH(4, KvBf16);
     else return cudaErrorInvalidValue;
 #undef ATTN_LAUNCH
@@ -248,9 +322,13 @@ cudaError_t launch_attn_decode(const void* q, const void* kc, const void* vc, co
 
 cudaError_t launch_attn_prologue(const void* qp, const void* kp, const void* vp, int ldq, int ldk, int ldv, const void* qn_w, const void* kn_w, const float* inv_freq,
                                  const int* pos_t, void* kc, void* vc, void* q_out, int B, int T, int Hq, int Hkv, int Lmax, int R, float eps,
-                                 bool kv_fp8, const int* active, cudaStream_t st) {
+                                 int kv_kind, const int* active, cudaStream_t st) {
     dim3 grid(B * T, Hq + 2 * Hkv);
-    if (kv_fp8)
+    if (kv_kind == 2)
+        attn::k_prologue<attn::KvFp4><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp, ldq, ldk, ldv,
+                                                                (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
+                                                                (uint8_t*)kc, (uint8_t*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps, active);
+    else if (kv_kind == 1)
         attn::k_prologue<attn::KvFp8><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp, ldq, ldk, ldv,
                                                                 (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
                                                                 (uint8_t*)kc, (uint8_t*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps, active);
@@ -258,5 +336,10 @@ cudaError_t launch_attn_prologue(const void* qp, const void* kp, const void* vp,
         attn::k_prologue<attn::KvBf16><<<grid, attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp, ldq, ldk, ldv,
                                                                  (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq, pos_t,
                                                                  (__nv_bfloat16*)kc, (__nv_bfloat16*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R, eps, active);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_kv4_to_bf16(const void* src, void* dst, long rows, cudaStream_t st) {
+    attn::k_kv4_to_bf16<<<(rows + 7) / 8, 256, 0, st>>>((const uint8_t*)src, (__nv_bfloat16*)dst, rows);
     return cudaGetLastError();
 }

@@ -20,6 +20,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "pdl.cuh"
 
 namespace gemv {
 
@@ -110,6 +111,7 @@ template <int M, int UNROLL, typename OutT>
 __global__ void __launch_bounds__(WARPS * 32) k_nvfp4(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w,
                                                        const uint8_t* __restrict__ sf, float gscale, const __nv_bfloat16* residual,
                                                        OutT* __restrict__ out, int N, int K) {
+    PDL_TRIGGER();
     const int lane = threadIdx.x & 31, n = blockIdx.x * WARPS + (threadIdx.x >> 5);
     if (n >= N) return;
     float acc[M];
@@ -124,6 +126,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_nvfp4_swiglu(const __nv_bfloat16
                                                               const uint8_t* __restrict__ wg, const uint8_t* __restrict__ sg, float gg,
                                                               const uint8_t* __restrict__ wu, const uint8_t* __restrict__ su, float gu,
                                                               __nv_bfloat16* __restrict__ out, int N, int K) {
+    PDL_TRIGGER();
     const int lane = threadIdx.x & 31, n = blockIdx.x * WARPS + (threadIdx.x >> 5);
     if (n >= N) return;
     float ag[M], au[M];
@@ -162,6 +165,7 @@ template <int M, int UNROLL, typename OutT>
 __global__ void __launch_bounds__(WARPS * 32) k_fp8(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w, float scale,
                                                      const float* __restrict__ row_scale, const __nv_bfloat16* residual,
                                                      OutT* __restrict__ out, int N, int K) {
+    PDL_TRIGGER();
     const int lane = threadIdx.x & 31, n = blockIdx.x * WARPS + (threadIdx.x >> 5);
     if (n >= N) return;
     float acc[M];
@@ -185,6 +189,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_fp8(const __nv_bfloat16* __restr
 template <int M>
 __global__ void __launch_bounds__(WARPS * 32) k_bf16(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                                       __nv_bfloat16* __restrict__ out, int N, int K) {
+    PDL_TRIGGER();
     const int n = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     float acc[M];
 #pragma unroll

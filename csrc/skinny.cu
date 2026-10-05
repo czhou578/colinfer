@@ -29,6 +29,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <stdlib.h>
+
+#include "pdl.cuh"
 
 namespace skinny {
 
@@ -87,6 +90,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
                                                         const __nv_bfloat16* __restrict__ residual, OutT* __restrict__ out,
                                                         int S, float* __restrict__ ws, int* __restrict__ cnt) {
     using C = Cfg<F>;
+    PDL_TRIGGER();
     extern __shared__ __align__(16) uint8_t smem[];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
     constexpr int NT = 2;  // mma n-tiles per warp
@@ -132,6 +136,15 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
     for (int j = 0; j < 2; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
     load_w(cb);
     load_s(cb / C::SCH);
+    // Everything above reads only weights. Launched with programmatic serialization (PDL), this kernel runs while its
+    // predecessor finishes: also pull the next chunks into L2, then wait for the predecessor before reading activations
+    // or writing anything.
+#pragma unroll
+    for (int c = cb + 1; c < cb + 3; ++c)
+        if (c < ce)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) asm volatile("prefetch.global.L2 [%0];" ::"l"(wrow(2 * i + hr) + (size_t)c * 256 + seg * 16));
+    PDL_WAIT();
     for (int c = cb; c < ce; ++c) {
         // registers -> scratch (the previous chunk's readers finished at the trailing __syncwarp)
 #pragma unroll
@@ -287,10 +300,20 @@ cudaError_t launch(const void* x, int M, int N, int K, const void* w, const void
         if (cudaError_t e = cudaMemset(g_cnt, 0, CNT * sizeof(int))) return e;
     }
     if (tiles > CNT) return cudaErrorInvalidValue;
-    k_skinny<F, SWIGLU, OutT><<<(tiles * S + WARPS - 1) / WARPS, WARPS * 32, WARPS * C::SCRATCH, st>>>(
-        (const __nv_bfloat16*)x, M, N, K, (const uint8_t*)w, (const uint8_t*)sf, scale, row_scale, (const uint8_t*)w2, (const uint8_t*)sf2,
-        scale2, (const __nv_bfloat16*)residual, (OutT*)out, S, ws, g_cnt);
-    return cudaGetLastError();
+    static const bool pdl = !getenv("COLINFER_PDL") || getenv("COLINFER_PDL")[0] != '0';
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = dim3((tiles * S + WARPS - 1) / WARPS);
+    lc.blockDim = dim3(WARPS * 32);
+    lc.dynamicSmemBytes = WARPS * C::SCRATCH;
+    lc.stream = st;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = attr;
+    lc.numAttrs = pdl ? 1 : 0;
+    return cudaLaunchKernelEx(&lc, k_skinny<F, SWIGLU, OutT>, (const __nv_bfloat16*)x, M, N, K, (const uint8_t*)w, (const uint8_t*)sf, scale,
+                              row_scale, (const uint8_t*)w2, (const uint8_t*)sf2, scale2, (const __nv_bfloat16*)residual, (OutT*)out, S, ws,
+                              g_cnt);
 }
 
 }  // namespace skinny

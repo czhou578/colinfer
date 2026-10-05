@@ -69,7 +69,7 @@ class Worker(threading.Thread):
         ops()  # build / load the CUDA extension
         t1 = time.perf_counter()
         path = resolve(a.model)
-        model = to_fast(load_fast_model(path), kv_fp8=True)
+        model = to_fast(load_fast_model(path), kv_fp8=a.kv == "fp8", kv_fp4=a.kv == "fp4")
         rq = requant_path(path)
         if a.decode_weights == "requant":
             if os.path.exists(rq):
@@ -79,7 +79,7 @@ class Worker(threading.Thread):
         mtp = None
         if a.spec == "mtp":
             from engine.spec.mtp import Mtp
-            mtp = Mtp(model, path, fp8=True, draft_vocab=a.draft_vocab or None)
+            mtp = Mtp(model, path, fp8=True, draft_vocab=a.draft_vocab or None, weights=a.drafter_weights)
         t2 = time.perf_counter()
         sched = Scheduler(model, n_slots=a.slots, max_seq_len=a.max_seq_len, n_checkpoints=a.checkpoints, mtp=mtp, k=a.k,
                           selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False, boundary_token=a.boundary_token)
@@ -557,7 +557,11 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--slots", type=int, default=3)
     ap.add_argument("--max-seq-len", type=int, default=262144, help="tokens per slot (prompt + output)")
+    ap.add_argument("--kv", choices=("fp8", "fp4"), default="fp8",
+                    help="KV cache format: fp8 (32 KB / token) or fp4 (18 KB / token: e2m1 + block scales; perplexity +0.2-0.3%%, "
+                         "faster decode at long context)")
     ap.add_argument("--spec", choices=("mtp", "none"), default="mtp")
+    ap.add_argument("--drafter-weights", default=None, help="fine-tuned MTP head (tools/train_drafter.py output)")
     ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
     ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP drafts among this many frequent tokens (+ prompt tokens); 0 = full")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")

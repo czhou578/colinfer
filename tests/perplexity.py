@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--engine", choices=["reference", "prefill"], default="reference",
                     help="reference: Phase 1 PyTorch model; prefill: Phase 3 W4A4 / W8A8 kernel prefill path")
     ap.add_argument("--kv-fp8", action="store_true", help="prefill engine: fp8 KV cache")
+    ap.add_argument("--kv-fp4", action="store_true", help="prefill engine: fp4 KV cache (e2m1 + e4m3 block scales)")
     ap.add_argument("--override", help="reference engine: safetensors of NVFP4 weights replacing the checkpoint's "
                                        "(tools/requant_nvfp4.py output; 'requant' = its default path)")
     args = ap.parse_args()
@@ -72,7 +73,7 @@ def main():
     if args.engine == "prefill":
         from engine.model.fast import load_fast_model, to_fast
         from engine.model.prefill import prefill
-        model = to_fast(load_fast_model(path), kv_fp8=args.kv_fp8)
+        model = to_fast(load_fast_model(path), kv_fp8=args.kv_fp8, kv_fp4=args.kv_fp4)
     else:
         model = load_model(path, emulate=args.emulate)
         if args.override:
@@ -110,7 +111,7 @@ def main():
         if (w + 1) % 8 == 0 or w == n_win - 1:
             print(f"[ppl] {w + 1}/{n_win} windows  running ppl {math.exp(nll / count):.4f}  ({time.time() - t0:.0f}s)")
     ppl = math.exp(nll / count)
-    print(f"[ppl] RESULT text={args.text or 'wikitext'} ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} filter={args.override_filter} kv_fp8={args.kv_fp8} "
+    print(f"[ppl] RESULT text={args.text or 'wikitext'} ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} filter={args.override_filter} kv_fp8={args.kv_fp8} kv_fp4={args.kv_fp4} "
           f"ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
     if args.json:
         json.dump(dict(ckpt=args.ckpt, emulate=args.emulate, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)

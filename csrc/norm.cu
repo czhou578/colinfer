@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "pdl.cuh"
 
 namespace rmsn {
 
@@ -10,6 +11,7 @@ constexpr int THREADS = 256;
 
 __global__ void __launch_bounds__(THREADS) k_rmsnorm(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                                       __nv_bfloat16* __restrict__ out, int K, float eps) {
+    PDL_TRIGGER();
     const __nv_bfloat16* xr = x + (size_t)blockIdx.x * K;
     __nv_bfloat16* orow = out + (size_t)blockIdx.x * K;
     float ss = 0.f;
