@@ -398,42 +398,59 @@ void gated_rmsnorm(torch::Tensor o, torch::Tensor z, torch::Tensor w, double eps
                                       (float)eps, at::cuda::getCurrentCUDAStream()));
 }
 
-cudaError_t launch_gdn_conv_multi(const void*, const void*, const void*, void*, int, int, int, cudaStream_t);
-cudaError_t launch_gdn_conv_commit(const void*, void*, const int*, int, int, int, cudaStream_t);
+cudaError_t launch_gdn_conv_multi(const void*, const void*, const void*, void*, int, int, int, int, cudaStream_t);
+cudaError_t launch_gdn_conv_commit(const void*, void*, const int*, int, int, int, int, cudaStream_t);
 cudaError_t launch_gdn_delta_multi(const void*, const void*, const void*, const void*, const void*, const void*, const void*, float*, void*, int, int,
-                                   int, float, int, const int*, cudaStream_t);
+                                   int, float, int, const int*, int, int, cudaStream_t);
 
 // speculative verify: conv over T tokens per slot from the (unchanged) conv state. mixed, out: bf16 [B, T, C].
+// Row stride (elements) of a [..., n] bf16 view whose last dim is contiguous and whose rows are evenly spaced (a column
+// slice of a wider matrix, or a contiguous tensor).
+static int64_t row_stride(const torch::Tensor& t, int64_t n, const char* name) {
+    TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kBFloat16 && t.size(-1) == n && t.stride(-1) == 1, name, ": bf16 CUDA [..., ", n,
+                "] with a contiguous last dim");
+    const int64_t ld = t.dim() > 1 ? t.stride(-2) : n;
+    for (int64_t i = 0; i + 2 < t.dim(); ++i)
+        TORCH_CHECK(t.size(i) == 1 || t.stride(i) == t.stride(i + 1) * t.size(i + 1), name, ": rows must be evenly strided");
+    TORCH_CHECK(ld >= n, name, ": overlapping rows");
+    return ld;
+}
+
 void gdn_conv_multi(torch::Tensor mixed, torch::Tensor conv_state, torch::Tensor w, torch::Tensor out) {
-    for (auto* t : {&mixed, &conv_state, &w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
+    for (auto* t : {&conv_state, &w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     const int64_t B = conv_state.size(0), C = conv_state.size(1), T = mixed.numel() / (B * C);
+    const int64_t ldm = row_stride(mixed, C, "mixed");
     TORCH_CHECK(mixed.numel() == B * T * C && out.numel() == mixed.numel() && w.numel() == C * 4, "bad shapes");
-    CHECK_LAUNCH(launch_gdn_conv_multi(mixed.data_ptr(), conv_state.data_ptr(), w.data_ptr(), out.data_ptr(), B, T, C, at::cuda::getCurrentCUDAStream()));
+    CHECK_LAUNCH(launch_gdn_conv_multi(mixed.data_ptr(), conv_state.data_ptr(), w.data_ptr(), out.data_ptr(), B, T, C, ldm,
+                                       at::cuda::getCurrentCUDAStream()));
 }
 
 // speculative commit: conv state advanced by n[b] of the T verified tokens. n: int32 [B] on the device.
 void gdn_conv_commit(torch::Tensor mixed, torch::Tensor conv_state, torch::Tensor n) {
-    CHECK_CUDA_TENSOR(mixed, torch::kBFloat16);
     CHECK_CUDA_TENSOR(conv_state, torch::kBFloat16);
     CHECK_CUDA_TENSOR(n, torch::kInt32);
     const int64_t B = conv_state.size(0), C = conv_state.size(1), T = mixed.numel() / (B * C);
+    const int64_t ldm = row_stride(mixed, C, "mixed");
     TORCH_CHECK(n.numel() == B && mixed.numel() == B * T * C, "bad shapes");
-    CHECK_LAUNCH(launch_gdn_conv_commit(mixed.data_ptr(), conv_state.data_ptr(), n.data_ptr<int>(), B, T, C, at::cuda::getCurrentCUDAStream()));
+    CHECK_LAUNCH(launch_gdn_conv_commit(mixed.data_ptr(), conv_state.data_ptr(), n.data_ptr<int>(), B, T, C, ldm, at::cuda::getCurrentCUDAStream()));
 }
 
 // speculative verify (n = None: outputs for all T tokens, state untouched) or commit (n: int32 [B]: state
-// advanced by n[b] tokens and written, no outputs). qkv [B, T, C]; z [B, T, Hv*128]; b, a [B, T, Hv].
+// advanced by n[b] tokens and written, no outputs). qkv [B, T, C]; z [B, T, Hv*128]; b, a [B, T, Hv]. z, b and a may be
+// column slices of wider rows (b and a with the same row stride).
 void gdn_delta_multi(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tensor a, torch::Tensor A_log, torch::Tensor dt_bias,
                      torch::Tensor norm_w, torch::Tensor state, torch::Tensor out, int64_t Hk, double eps, c10::optional<torch::Tensor> n) {
-    for (auto* t : {&qkv, &z, &b, &a, &A_log, &dt_bias, &norm_w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
+    for (auto* t : {&qkv, &A_log, &dt_bias, &norm_w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     CHECK_CUDA_TENSOR(state, torch::kFloat32);
     const int64_t B = state.size(0), Hv = state.size(1), C = 2 * Hk * 128 + Hv * 128, T = qkv.numel() / (B * C);
+    const int64_t ldz = row_stride(z, Hv * 128, "z"), ldba = row_stride(b, Hv, "b");
+    TORCH_CHECK(row_stride(a, Hv, "a") == ldba, "b and a must share a row stride");
     TORCH_CHECK(qkv.numel() == B * T * C && z.numel() == B * T * Hv * 128 && b.numel() == B * T * Hv && a.numel() == b.numel() &&
                 out.numel() == z.numel(), "bad shapes");
     const int* np = nullptr;
     if (n) { CHECK_CUDA_TENSOR(*n, torch::kInt32); TORCH_CHECK(n->numel() == B); np = n->data_ptr<int>(); }
     CHECK_LAUNCH(launch_gdn_delta_multi(qkv.data_ptr(), z.data_ptr(), b.data_ptr(), a.data_ptr(), A_log.data_ptr(), dt_bias.data_ptr(),
-                                        norm_w.data_ptr(), state.data_ptr<float>(), out.data_ptr(), B, Hk, Hv, (float)eps, T, np,
+                                        norm_w.data_ptr(), state.data_ptr<float>(), out.data_ptr(), B, Hk, Hv, (float)eps, T, np, ldz, ldba,
                                         at::cuda::getCurrentCUDAStream()));
 }
 

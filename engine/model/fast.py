@@ -380,17 +380,23 @@ def _gdn_verify(self, x, state, layer_idx: int, residual=None):
     """Speculative verify of T tokens per slot: outputs for every token, GDN state untouched; the inputs
     are kept for the commit (engine/spec)."""
     B, T, _ = x.shape
-    mixed, z = self.qkvz(x)
-    mixed, z = mixed.reshape(B, T, -1).contiguous(), z.reshape(B, T, -1).contiguous()
+    # the tiny b/a GEMV on a parallel branch, beside the qkv/z weight stream; mixed, z, b and a stay views (the GDN
+    # kernels take row strides)
     ba = torch.empty(B * T, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
     x2 = x.reshape(B * T, -1)
-    for i in range(0, B * T, GEMV_M):
-        ops().bf16_gemv(x2[i:i + GEMV_M], self.w_ba, ba[i:i + GEMV_M])
+    main, side = torch.cuda.current_stream(), _side_stream(x.device)
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        for i in range(0, B * T, GEMV_M):
+            ops().bf16_gemv(x2[i:i + GEMV_M], self.w_ba, ba[i:i + GEMV_M])
+    mixed, z = self.qkvz(x)
+    main.wait_stream(side)
+    mixed, z = mixed.reshape(B, T, -1), z.reshape(B, T, -1)
     ba = ba.view(B, T, -1)
-    b, a = ba[..., : self.num_v_heads].contiguous(), ba[..., self.num_v_heads:].contiguous()
-    qkv = torch.empty_like(mixed)
+    b, a = ba[..., : self.num_v_heads], ba[..., self.num_v_heads:]
+    qkv = torch.empty(B, T, mixed.shape[-1], device=x.device, dtype=torch.bfloat16)
     ops().gdn_conv_multi(mixed, state.conv[layer_idx], self.conv1d.weight, qkv)
-    o = torch.empty_like(z)
+    o = torch.empty(B, T, z.shape[-1], device=x.device, dtype=torch.bfloat16)
     ops().gdn_delta_multi(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], o, self.num_k_heads, self.norm.eps)
     self._spec = (mixed, qkv, z, b, a, o)
     return self.out_proj(o.view(B, T, -1), residual)

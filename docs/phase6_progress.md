@@ -834,6 +834,10 @@ would therefore save ≈2 ms per cycle, more only with a tile-contiguous copy of
   (4-block clusters, 192 blocks) was no faster.
 - **Commit concurrent with drafting**: the cycle graph runs the GDN commit on a second branch, since drafting never
   reads the GDN state (`COLINFER_COMMIT_OVERLAP`). k=7 cycle 91.0 → 90.4 ms.
+- **GDN glue in verify**: the conv / delta-rule kernels take row strides, so `mixed`, `z`, `b` and `a` stay views of
+  the projection outputs (four copy kernels per layer gone), and the b / a GEMV runs on a parallel branch beside the
+  qkv / z weight stream (as plain decode already did). ≈15 → ≈3 µs of serial work per GDN layer; k=7 cycle 90.4 →
+  89.4 ms, k=3 81.3 → 81.1 ms.
 - **Draft early exit** (`COLINFER_DRAFT_STOP`, default 0.1): after each draft step the cycle keeps the product of the
   drafter's probabilities of its drafts so far (softmax over the draft vocabulary); once it is below the threshold
   for every active slot, a device flag makes the remaining steps' skinny GEMMs return at once with a zero output

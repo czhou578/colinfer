@@ -58,3 +58,34 @@ def test_verify_commit_bit_exact(B, T):
         ops().gdn_conv_commit(mixed, conv_c, one)
         ops().gdn_delta_multi(qkv, z, bb, aa, A_log, dtb, nw, rec_c, out, Hk, 1e-6, one)
         assert torch.equal(conv_c, conv1) and torch.equal(rec_c, rec1)
+
+
+def test_strided_views_bit_exact():
+    """mixed / z as column slices of one projection output and b / a of one [.., 2 Hv] output (no copies)."""
+    from engine.kernels import ops
+    torch.manual_seed(7)
+    B, T, Hk, Hv = 2, 5, 16, 48
+    C, Z = 2 * Hk * 128 + Hv * 128, Hv * 128
+    proj = torch.randn(B, T, C + Z, device="cuda").bfloat16()
+    ba = torch.randn(B, T, 2 * Hv, device="cuda").bfloat16()
+    mixed, z = proj[..., :C], proj[..., C:]
+    b, a = ba[..., :Hv], ba[..., Hv:]
+    A_log = (torch.randn(Hv, device="cuda") * 0.5).bfloat16()
+    dtb = torch.randn(Hv, device="cuda").bfloat16()
+    nw = (torch.randn(128, device="cuda") * 0.2 + 1).bfloat16()
+    w = (torch.randn(C, 1, 4, device="cuda") * 0.5).bfloat16()
+    conv0 = torch.randn(B, C, 3, device="cuda").bfloat16()
+    rec0 = torch.randn(B, Hv, 128, 128, device="cuda") * 0.1
+    n = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    res = []
+    for m_, z_, b_, a_ in ((mixed, z, b, a), (mixed.contiguous(), z.contiguous(), b.contiguous(), a.contiguous())):
+        conv, rec = conv0.clone(), rec0.clone()
+        qkv = torch.empty(B, T, C, device="cuda", dtype=torch.bfloat16)
+        ops().gdn_conv_multi(m_, conv, w, qkv)
+        out = torch.empty(B, T, Z, device="cuda", dtype=torch.bfloat16)
+        ops().gdn_delta_multi(qkv, z_, b_, a_, A_log, dtb, nw, rec, out, Hk, 1e-6)
+        ops().gdn_conv_commit(m_, conv, n)
+        ops().gdn_delta_multi(qkv, z_, b_, a_, A_log, dtb, nw, rec, out[:0].new_empty(out.shape), Hk, 1e-6, n)
+        res.append((out, conv, rec))
+    for x, y in zip(*res):
+        assert torch.equal(x, y)
