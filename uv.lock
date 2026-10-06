@@ -142,7 +142,6 @@ version = "0.0.1"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
-    { name = "flashinfer-cubin" },
     { name = "flashinfer-jit-cache" },
     { name = "flashinfer-jit-cache-sm121a" },
     { name = "flashinfer-python" },
@@ -166,7 +165,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.142.2" },
-    { name = "flashinfer-cubin", specifier = "==0.7.0.post1", index = "https://flashinfer.ai/whl" },
     { name = "flashinfer-jit-cache", specifier = "==0.7.0.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm121a", specifier = "==0.7.0.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-python", specifier = "==0.7.0.post1" },
@@ -341,14 +339,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/70/51/2bc9e529f154fad99b6cd0073e609291eb32fd23581b32362d33d164d316/filelock-4.0.9.tar.gz", hash = "sha256:635e7d67fa92654eed444e75e9ca18426d34e77ad9c469bf4373f75a932f7b22", size = 251200, upload-time = "2026-10-01T23:09:14.029Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/4f/83454fafd628e1e7e1726d74e44fb2332be5969d04c6182ca1fecb6c580e/filelock-4.0.9-py3-none-any.whl", hash = "sha256:9287fd61b99a806e5202be29a83034c0808a1b9830e820537c2f5773981f7eeb", size = 110368, upload-time = "2026-10-01T23:09:12.391Z" },
-]
-
-[[package]]
-name = "flashinfer-cubin"
-version = "0.7.0.post1"
-source = { registry = "https://flashinfer.ai/whl" }
-wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.0.post1/flashinfer_cubin-0.7.0.post1-py3-none-any.whl", hash = "sha256:f5b5fbf6e914b358219b845ed3ee586ffc1ae3c9768c8b135115ac14afbceed3" },
 ]
 
 [[package]]

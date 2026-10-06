@@ -9,9 +9,10 @@ dependencies = [
     # torch cu130 matches the nvcc 13.0 on the box so torch.utils.cpp_extension builds cleanly.
     "torch==2.14.1",
     "triton==3.8.0",
-    # FlashInfer: python package + precompiled cubins + the GB10-specific (sm121a) JIT cache.
+    # FlashInfer: python package + the GB10-specific (sm121a) JIT cache, which holds the kernels the engine calls (FA2
+    # prefill attention, top-k / top-p renormalization). flashinfer-cubin (6.3 GB of TRT-LLM / DeepGEMM cubins for other
+    # Blackwell parts) is not needed.
     "flashinfer-python==0.7.0.post1",
-    "flashinfer-cubin==0.7.0.post1",
     "flashinfer-jit-cache==0.7.0.post1",
     "flashinfer-jit-cache-sm121a==0.7.0.post1",
     # Model loading / tokenization.
@@ -56,13 +57,7 @@ name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
 explicit = true
 
-[[tool.uv.index]]
-name = "flashinfer"
-url = "https://flashinfer.ai/whl"
-explicit = true
-
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
-flashinfer-cubin = { index = "flashinfer" }
