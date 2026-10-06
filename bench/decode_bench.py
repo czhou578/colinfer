@@ -2,7 +2,8 @@
 """Decode step and speculative cycle times on the real model (PLAN.md 4.7 bench/decode_bench.py).
 
 Plain decode graph (T=1 per slot) at 1-3 slots, and the MTP cycle graph at widths 1-3 and draft lengths k,
-at a given context length. COLINFER_SKINNY=0 switches the decode linears to the CUDA-core GEMV.
+at a given context length. COLINFER_SKINNY=0 switches the decode linears to the CUDA-core GEMV. Cycles run every draft
+step (the drafter's early exit, COLINFER_DRAFT_STOP, is off unless set: the bench's dummy tokens would trigger it).
 
    uv run python bench/decode_bench.py [--ctx 8192] [--ks 1 3 5 7]
 """
@@ -14,6 +15,7 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("COLINFER_DRAFT_STOP", "0")
 from engine.model.fast import SKINNY, DecodeGraph, load_fast_model, to_fast  # noqa: E402
 from engine.weights.loader import resolve  # noqa: E402
 
@@ -36,13 +38,14 @@ def main():
     ap.add_argument("--widths", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--kv", choices=("fp8", "fp4"), default="fp8")
     ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP static draft vocabulary (the server's --draft-vocab)")
-    ap.add_argument("--requant", action="store_true", help="decode streams the NVFP4 re-quantized attention / GDN projections")
+    ap.add_argument("--requant", nargs="?", const="int", default=None, choices=("int", "awq-attn", "requant"),
+                    help="decode streams re-quantized attention / GDN projections (engine.model.fast.requant_path; default int)")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     model = to_fast(load_fast_model(path), kv_fp8=a.kv == "fp8", kv_fp4=a.kv == "fp4")
     if a.requant:
         from engine.model.fast import attach_requant, requant_path
-        print(f"requant: {attach_requant(model, requant_path(path))} linears decode from re-quantized copies")
+        print(f"requant: {attach_requant(model, requant_path(path, a.requant))} linears decode from re-quantized copies")
     from engine.model.prefill import prepare_prefill
     from engine.spec.mtp import Mtp, MtpCycle, MtpState
     prepare_prefill(model)

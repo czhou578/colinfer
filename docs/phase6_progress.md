@@ -810,6 +810,57 @@ What is left between a k=7 cycle (≈93 ms now) and its byte floor (≈70 ms at 
 ≈86% of peak (the long-K down projection and the small output projections are the weaker shapes; GDN recurrence,
 attention and norms are ≈4-5 ms of serial work per cycle), and the drafter still streams ≈0.44 GB per step.
 
+## 18. Decode cycle: the GDN recurrence, commit overlap, draft early exit
+
+Where a k=7 cycle's time goes now (`bench/traces/cycle_k7_8k_v2`, INT6 / INT5 weights, 8k), each kernel charged with
+the time it alone extends the timeline:
+
+| Part | Time |
+|---|---|
+| Verify weight GEMMs (15.5 GB) | 69.5 ms (≈223 GB/s) |
+| Verify GDN recurrence / attention / norms / small GEMVs | 1.45 / 1.36 / 0.34 / 0.44 ms (+0.5 ms elementwise) |
+| Drafting (catch-up row + 6 chained steps) and what the GDN commit adds | 16.0 ms (14.8 ms of GEMMs) |
+
+The weight GEMMs stream within 2-5% of what a pure-streaming kernel with the same access pattern reaches
+(229-236 GB/s, NVFP4 scale planes included; `cp.async.bulk` into a shared-memory ring: +1-3%, contiguous 4 KB tiles:
+236-241). Isolated, the GEMMs sum to within 1.7 ms of their time inside the cycle. A TMA rewrite of the skinny GEMM
+would therefore save ≈2 ms per cycle, more only with a tile-contiguous copy of the NVFP4 MLP weights (+9.6 GB).
+
+- **GDN verify / commit kernel** (`csrc/gdn_step.cu` `k_delta_multi`): q / k norms, β and the decay of all T tokens
+  are computed up front (warp t: token t, the same sums in the same order), the gated RMSNorm after the loop from
+  per-step column partials, so a step is the two passes over the state and one `__syncthreads` (two alternating
+  column-partial buffers). 8 tokens: verify 30.7 → 22.5 µs per layer, commit 42.7 → 36.4 µs. Both now sit near the
+  fp32 state's bytes: 17.5 µs fixed for verify (3 MB read; 13 µs at peak) + 0.5 µs per token; a column-split variant
+  (4-block clusters, 192 blocks) was no faster.
+- **Commit concurrent with drafting**: the cycle graph runs the GDN commit on a second branch, since drafting never
+  reads the GDN state (`COLINFER_COMMIT_OVERLAP`). k=7 cycle 91.0 → 90.4 ms.
+- **Draft early exit** (`COLINFER_DRAFT_STOP`, default 0.1): after each draft step the cycle keeps the product of the
+  drafter's probabilities of its drafts so far (softmax over the draft vocabulary); once it is below the threshold
+  for every active slot, a device flag makes the remaining steps' skinny GEMMs return at once with a zero output
+  (`ops().skinny_skip`: the flag pointer is baked into the launches captured while it is set). Verify rejects
+  the junk drafts, so outputs are unchanged (`tests/spec_check.py --drafter mtp --k 7`, `tests/scheduler_check.py`).
+  A skipped step costs ≈0.35 ms instead of ≈1.8 ms (k=7 cycle with every step skipped: 79.8 ms, full: 90.8 ms).
+  Simulated on 3,080 recorded k=7 cycles: 35.3 → 36.6 tok/s at 0.2 (a single step's probability as the criterion:
+  36.1; an oracle that stops right after the first rejected draft: 38.8).
+- Tried and dropped: an L2 prefetch (`cp.async.bulk.prefetch.L2`, on a parallel branch) of the GDN output
+  projection's first 4-12 MB during the layer's serial recurrence. In isolation 8 MB cut that GEMM by 27 µs; in the
+  cycle the k=7 time went up 0.5-1 ms, because the prefetch slows the delta kernel's state reads, which are on the
+  critical path.
+
+The 40 requests of section 16 (server defaults, tok/s):
+
+| | Code | Prose | Q&A | Structured | All |
+|---|---|---|---|---|---|
+| Section 17 | 53.9 | 31.3 | 36.3 | 36.5 | 36.8 |
+| GDN kernel + commit overlap | 54.5 | 31.7 | 36.6 | 36.8 | 37.2 |
+| + draft early exit at 0.1 (**default**) | 54.8 | 32.6 | 36.8 | 38.6 | **38.1** |
+| early exit at 0.15 / 0.2 / 0.3 | | | | | 38.1 / 37.9 / 37.1 |
+| k=7 every cycle (no k=3), early exit 0 / 0.1 | | | | | 37.3 / 38.3 |
+
+(Run-to-run noise is about ±0.4 tok/s. Always drafting 7 with early exit is as good as the adaptive k=3 / 7 choice
+at width 1; the adaptive choice stays, since it also covers three slots, where 3 × 8 rows would need two weight
+passes. `COLINFER_K_OPTIONS` overrides the draft lengths a cycle picks from.)
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:

@@ -163,6 +163,10 @@ __global__ void k_conv_commit(const __nv_bfloat16* __restrict__ mixed, __nv_bflo
     cs[0] = hist[n]; cs[1] = hist[n + 1]; cs[2] = hist[n + 2];
 }
 
+// Latency layout (the kernel is a chain of T dependent steps, its 64 KB of state per block are read once): the q / k
+// L2 norms, beta and the decay of all T tokens are computed up front (warp t: token t, the same sums in the same
+// order as k_delta's block_sum_128), the outputs' gated RMSNorm after the loop from per-step column partials, so a
+// step is the two state passes and one __syncthreads (the kv column partials alternate between two buffers).
 __global__ void __launch_bounds__(THREADS) k_delta_multi(const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ z,
                                                           const __nv_bfloat16* __restrict__ bvec, const __nv_bfloat16* __restrict__ avec,
                                                           const __nv_bfloat16* __restrict__ A_log, const __nv_bfloat16* __restrict__ dt_bias,
@@ -174,66 +178,100 @@ __global__ void __launch_bounds__(THREADS) k_delta_multi(const __nv_bfloat16* __
     const int kh = h / (Hv / Hk), C = 2 * Hk * DK + Hv * DV;
     const bool commit = n_ptr != nullptr;
     const int steps = commit ? n_ptr[b] : T;
-    __shared__ float qs[DK], ks[DK], vs[DV], red[4], colred[4][DV];
+    extern __shared__ float dsm[];
+    float* qs = dsm;                 // [T][DK] normalised q (times 1/sqrt(dk))
+    float* ks = qs + T * DK;         // [T][DK] normalised k
+    float* vs = ks + T * DK;         // [T][DV]
+    float* opart = vs + T * DV;      // [T][4][DV] column partials of o (verify)
+    float* colred = opart + (commit ? 0 : T * 4 * DV);  // [2][4][DV]
+    float* gb = colred + 2 * 4 * DV;  // [T][2]: beta, decay
     const int rg = warp >> 2, col = ((warp & 3) << 5) + lane;
     float* S = state + ((size_t)b * Hv + h) * DK * DV + (size_t)(rg * 32) * DV + col;
     float s[32];
 #pragma unroll
     for (int r = 0; r < 32; ++r) s[r] = S[(size_t)r * DV];
-    const float A = __expf(__bfloat162float(A_log[h])), dtb = __bfloat162float(dt_bias[h]);
-    for (int t = 0; t < steps; ++t) {
-        const __nv_bfloat16* src = qkv + ((size_t)b * T + t) * C;
-        __syncthreads();
-        if (tid < DK) {
-            qs[tid] = __bfloat162float(src[kh * DK + tid]);
-            ks[tid] = __bfloat162float(src[Hk * DK + kh * DK + tid]);
-            vs[tid] = __bfloat162float(src[2 * Hk * DK + h * DV + tid]);
-        }
-        __syncthreads();
-        const float qq = block_sum_128(tid < DK ? qs[tid] * qs[tid] : 0.f, red, tid);
-        const float kk = block_sum_128(tid < DK ? ks[tid] * ks[tid] : 0.f, red, tid);
-        if (tid < DK) {
-            qs[tid] = qs[tid] * rsqrtf(qq + 1e-6f) * rsqrtf((float)DK);
-            ks[tid] = ks[tid] * rsqrtf(kk + 1e-6f);
-        }
-        __syncthreads();
+    if (warp < steps) {
+        const int t = warp;
         const size_t bt = (size_t)b * T + t;
-        const float beta = bf(1.f / (1.f + __expf(-__bfloat162float(bvec[bt * Hv + h]))));
-        const float av = __bfloat162float(avec[bt * Hv + h]) + dtb;
-        const float softplus = av > 20.f ? av : log1pf(__expf(av));
-        const float decay = __expf(-A * softplus);
+        const __nv_bfloat16* src = qkv + bt * C;
+        float q[4], k[4], qq = 0.f, kk = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            q[j] = __bfloat162float(src[kh * DK + 32 * j + lane]);
+            k[j] = __bfloat162float(src[Hk * DK + kh * DK + 32 * j + lane]);
+            vs[t * DV + 32 * j + lane] = __bfloat162float(src[2 * Hk * DK + h * DV + 32 * j + lane]);
+            float a = q[j] * q[j], c = k[j] * k[j];
+            for (int o = 16; o > 0; o >>= 1) {
+                a += __shfl_xor_sync(0xffffffffu, a, o);
+                c += __shfl_xor_sync(0xffffffffu, c, o);
+            }
+            qq = j ? qq + a : a;
+            kk = j ? kk + c : c;
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            qs[t * DK + 32 * j + lane] = q[j] * rsqrtf(qq + 1e-6f) * rsqrtf((float)DK);
+            ks[t * DK + 32 * j + lane] = k[j] * rsqrtf(kk + 1e-6f);
+        }
+        if (lane == 0) {
+            const float beta = bf(1.f / (1.f + __expf(-__bfloat162float(bvec[bt * Hv + h]))));
+            const float av = __bfloat162float(avec[bt * Hv + h]) + __bfloat162float(dt_bias[h]);
+            const float softplus = av > 20.f ? av : log1pf(__expf(av));
+            gb[2 * t] = beta;
+            gb[2 * t + 1] = __expf(-__expf(__bfloat162float(A_log[h])) * softplus);
+        }
+    }
+    __syncthreads();
+    for (int t = 0; t < steps; ++t) {
+        const float* kt = ks + t * DK + rg * 32;
+        const float* qt = qs + t * DK + rg * 32;
+        float* cr = colred + (t & 1) * 4 * DV;
+        const float decay = gb[2 * t + 1];
 #pragma unroll
         for (int r = 0; r < 32; ++r) s[r] = s[r] * decay;
         float part = 0.f;
 #pragma unroll
-        for (int r = 0; r < 32; ++r) part = fmaf(s[r], ks[rg * 32 + r], part);
-        colred[rg][col] = part;
+        for (int r = 0; r < 32; ++r) part = fmaf(s[r], kt[r], part);
+        cr[rg * DV + col] = part;
         __syncthreads();
-        const float kv = colred[0][col] + colred[1][col] + colred[2][col] + colred[3][col];
-        const float delta = (vs[col] - kv) * beta;
-        __syncthreads();
+        const float kv = cr[col] + cr[DV + col] + cr[2 * DV + col] + cr[3 * DV + col];
+        const float delta = (vs[t * DV + col] - kv) * gb[2 * t];
         part = 0.f;
 #pragma unroll
         for (int r = 0; r < 32; ++r) {
-            s[r] = fmaf(ks[rg * 32 + r], delta, s[r]);
-            part = fmaf(s[r], qs[rg * 32 + r], part);
+            s[r] = fmaf(kt[r], delta, s[r]);
+            part = fmaf(s[r], qt[r], part);
         }
-        if (commit) continue;
-        colred[rg][col] = part;
-        __syncthreads();
-        float o = 0.f;
-        if (tid < DV) o = bf(colred[0][tid] + colred[1][tid] + colred[2][tid] + colred[3][tid]);
-        const float var = block_sum_128(tid < DV ? o * o : 0.f, red, tid) / DV;
-        if (tid < DV) {
-            const float xn = bf(o * rsqrtf(var + eps));
-            const float y = bf(__bfloat162float(norm_w[tid]) * xn);
-            const float g = __bfloat162float(z[bt * Hv * DV + h * DV + tid]);
-            out[bt * Hv * DV + h * DV + tid] = __float2bfloat16(y * silu(g));
-        }
+        if (!commit) opart[(t * 4 + rg) * DV + col] = part;
     }
     if (commit) {
 #pragma unroll
         for (int r = 0; r < 32; ++r) S[(size_t)r * DV] = s[r];
+        return;
+    }
+    __syncthreads();
+    if (warp < T) {  // warp t: gated RMSNorm of token t's 128 outputs
+        const int t = warp;
+        const size_t bt = (size_t)b * T + t;
+        const float* op = opart + t * 4 * DV;
+        float o[4], var = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = 32 * j + lane;
+            o[j] = bf(op[c] + op[DV + c] + op[2 * DV + c] + op[3 * DV + c]);
+            float a = o[j] * o[j];
+            for (int m = 16; m > 0; m >>= 1) a += __shfl_xor_sync(0xffffffffu, a, m);
+            var = j ? var + a : a;
+        }
+        var = var / DV;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = 32 * j + lane;
+            const float xn = bf(o[j] * rsqrtf(var + eps));
+            const float y = bf(__bfloat162float(norm_w[c]) * xn);
+            const float g = __bfloat162float(z[bt * Hv * DV + h * DV + c]);
+            out[bt * Hv * DV + h * DV + c] = __float2bfloat16(y * silu(g));
+        }
     }
 }
 
@@ -271,8 +309,16 @@ cudaError_t launch_gdn_conv_commit(const void* mixed, void* conv_state, const in
 cudaError_t launch_gdn_delta_multi(const void* qkv, const void* z, const void* b, const void* a, const void* A_log, const void* dt_bias,
                                    const void* norm_w, float* state, void* out, int B, int Hk, int Hv, float eps, int T, const int* n,
                                    cudaStream_t st) {
+    if (T < 1 || T > gdn::THREADS / 32) return cudaErrorInvalidValue;
     dim3 grid(Hv, B);
-    gdn::k_delta_multi<<<grid, gdn::THREADS, 0, st>>>((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)z, (const __nv_bfloat16*)b,
+    const int smem = (T * (3 * 128 + (n ? 0 : 4 * 128)) + 2 * 4 * 128 + 2 * T) * (int)sizeof(float);
+    static bool attr = false;
+    if (!attr) {
+        if (cudaError_t e = cudaFuncSetAttribute(gdn::k_delta_multi, cudaFuncAttributeMaxDynamicSharedMemorySize, 16 * (7 * 128 + 2) * 4 + 4096))
+            return e;
+        attr = true;
+    }
+    gdn::k_delta_multi<<<grid, gdn::THREADS, smem, st>>>((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)z, (const __nv_bfloat16*)b,
                                                       (const __nv_bfloat16*)a, (const __nv_bfloat16*)A_log, (const __nv_bfloat16*)dt_bias,
                                                       (const __nv_bfloat16*)norm_w, state, (__nv_bfloat16*)out, Hk, Hv, eps, T, n);
     return cudaGetLastError();

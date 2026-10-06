@@ -199,10 +199,15 @@ class Mtp(nn.Module):
         self.lm_draft.w[self.n_static:] = lm.w[ids]
         self.lm_draft.sf[self.n_static:] = lm.sf[ids]
 
-    def draft(self, g: torch.Tensor) -> torch.Tensor:
-        """Greedy draft token ids from MTP outputs g [..., H] -> [...]."""
-        idx = self.lm_draft(g).argmax(-1)
-        return idx if self.vocab_ids is None else self.vocab_ids[idx]
+    def draft(self, g: torch.Tensor, prob: bool = False):
+        """Greedy draft token ids from MTP outputs g [..., H] -> [...]; prob: also the drafter's probability of each
+        (softmax over the draft vocabulary)."""
+        lg = self.lm_draft(g)
+        idx = lg.argmax(-1)
+        ids = idx if self.vocab_ids is None else self.vocab_ids[idx]
+        if not prob:
+            return ids
+        return ids, torch.exp(lg.amax(-1) - torch.logsumexp(lg, -1))
 
     @staticmethod
     def _norm(w, cfg):
@@ -263,6 +268,15 @@ class Mtp(nn.Module):
         return torch.cat(d, 1)[0].tolist()
 
 
+# Draft early exit: once the product of the drafter's probabilities of a cycle's drafts so far is below this for every
+# active slot, the remaining draft steps skip their GEMMs (their drafts are junk that verify rejects; outputs are
+# unchanged). Simulated on the k = 7 cycle mix: 35.3 -> 36.6 tok/s at 0.2 (an oracle stop: 38.8). 0 disables.
+DRAFT_STOP = float(os.environ.get("COLINFER_DRAFT_STOP", "0.1"))
+
+# GDN commit concurrent with the MTP drafting (a second branch of the cycle graph); COLINFER_COMMIT_OVERLAP=0: serial
+COMMIT_OVERLAP = os.environ.get("COLINFER_COMMIT_OVERLAP", "1") != "0"
+
+
 class MtpCycle:
     """CUDA graph of one speculative cycle with the MTP drafter for B slots (k drafts each).
 
@@ -283,6 +297,8 @@ class MtpCycle:
         self.stop_ids = stop_ids if stop_ids is not None else torch.full((B, 1), -1, dtype=torch.long, device=dev)
         assert self.tok.shape == (B, k + 1) and self.stop_ids.shape[0] == B
         self.idx = torch.arange(k + 1, device=dev)
+        self._side = torch.cuda.Stream()
+        self.skip = torch.zeros(1, dtype=torch.int32, device=dev)
         state.reset()
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -317,7 +333,13 @@ class MtpCycle:
         n = torch.where(has, (first + 1).int(), n) * st.active
         bonus = torch.where(has, d.gather(1, first[:, None])[:, 0], bonus)
         p0 = st.pos_t.clone()
-        m.commit(st, n)
+        if COMMIT_OVERLAP:  # the drafting below never reads the GDN state: commit it on a parallel graph branch
+            side = self._side
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                m.commit(st, n)
+        else:
+            m.commit(st, n)
         nl = n.long()
         out_tok = torch.cat([d, bonus[:, None]], 1)                  # accepted drafts are d[:n-1]; the bonus is out_tok[n-1]
         out_tok = torch.where(self.idx[None] == nl[:, None] - 1, bonus[:, None], out_tok)
@@ -326,14 +348,32 @@ class MtpCycle:
         g = mtp(out_tok, H, self.mst)                                # [B, k+1, H]
         last = (nl - 1).clamp_min(0)
         gp = g.gather(1, last[:, None, None].expand(B, 1, g.shape[-1]))
-        dr = [mtp.draft(gp)]                                         # [B, 1]
+        stop = DRAFT_STOP > 0 and k > 1
+        d, cp = mtp.draft(gp, prob=True) if stop else (mtp.draft(gp), None)
+        dr = [d]                                                     # [B, 1]
         self.mst.pos_t.copy_(p0 + n)
+        if stop:
+            self.skip.zero_()
         for _ in range(k - 1):
-            gp = mtp(dr[-1], gp, self.mst)
-            dr.append(mtp.draft(gp))
+            if stop:  # every slot's chain is unlikely to survive this far: the remaining steps skip their GEMMs
+                self.skip.copy_(torch.maximum(self.skip, ((cp[:, 0] < DRAFT_STOP) | (st.active == 0)).all().int().view(1)))
+                ops().skinny_skip(self.skip)
+            try:
+                gp = mtp(dr[-1], gp, self.mst)
+                if stop:
+                    d, p = mtp.draft(gp, prob=True)
+                    cp = cp * p
+                else:
+                    d = mtp.draft(gp)
+            finally:
+                if stop:
+                    ops().skinny_skip(None)
+            dr.append(d)
             self.mst.pos_t += 1
         nxt = torch.cat([bonus[:, None]] + dr, 1)                    # [B, k+1] = [y', d1'..dk']
         self.tok.copy_(torch.where(st.active[:, None] > 0, nxt, tok))
+        if COMMIT_OVERLAP:
+            torch.cuda.current_stream().wait_stream(self._side)
         return out_tok, n, logits, H
 
 

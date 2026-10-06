@@ -92,6 +92,10 @@ Other endpoints:
   - A cycle verifies (k+1) rows per slot, and a weight-streaming pass handles 8 rows.
   - One or two decoding slots use k=3: 4 and 8 rows.
   - Three slots use k=1, which is 6 rows; with k=3 they would need 12 rows and a second pass over every weight.
+- **Drafting stops early when it is unlikely to pay.** Once the product of the drafter's probabilities of a cycle's
+  drafts falls below 0.1 for every decoding slot, the cycle's remaining draft steps skip their weight GEMMs (~0.35 ms
+  instead of ~1.8 ms a step); verify rejects their junk drafts, so outputs do not change. `COLINFER_DRAFT_STOP` sets
+  the threshold (0 turns it off; `docs/phase6_progress.md` section 18).
 - **Prefix checkpoints.** A request restores the longest checkpoint that is a prefix of its prompt. Checkpoints are taken:
   - at the end of each prompt and each reply;
   - at the end of the first message (a shared system prompt);

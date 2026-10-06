@@ -442,6 +442,7 @@ cudaError_t launch_skinny_swiglu(const void*, const void*, const void*, float, c
                                  cudaStream_t);
 cudaError_t launch_skinny_fp8(const void*, const void*, float, const float*, const void*, void*, bool, int, int, int, float*, cudaStream_t);
 int skinny_ws_floats(int, bool, int, int, int);
+void skinny_set_skip(const int*);
 cudaError_t launch_skinny_int(int, const void*, const void*, const void*, const void*, float, const void*, void*, bool, int, int, int, float*,
                               cudaStream_t);
 
@@ -466,6 +467,15 @@ static const void* residual_ptr(const c10::optional<torch::Tensor>& r, const tor
     CHECK_CUDA_TENSOR(*r, torch::kBFloat16);
     TORCH_CHECK(r->sizes() == out.sizes(), "residual must match out");
     return r->data_ptr();
+}
+
+// Skinny GEMMs launched (or captured) while a flag is set return at once when the int32 it points to is nonzero.
+void skinny_skip(c10::optional<torch::Tensor> flag) {
+    if (flag) {
+        CHECK_CUDA_TENSOR(*flag, torch::kInt32);
+        TORCH_CHECK(flag->numel() == 1, "flag: one int32");
+    }
+    skinny_set_skip(flag ? flag->data_ptr<int>() : nullptr);
 }
 
 // Tensor-core skinny GEMM (csrc/skinny.cu): same contract as nvfp4_gemv / nvfp4_swiglu / fp8_gemv, M <= 16 rows.
@@ -540,6 +550,7 @@ void philox_uniform(torch::Tensor seed, torch::Tensor offset, torch::Tensor out)
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("skinny_nvfp4", &skinny_nvfp4, "tensor-core NVFP4 x bf16 skinny GEMM, M<=16", py::arg("x"), py::arg("w"), py::arg("sf"),
           py::arg("gscale"), py::arg("residual"), py::arg("out"));
+    m.def("skinny_skip", &skinny_skip, "skinny GEMMs launched from now on return early while *flag != 0 (None: never)", py::arg("flag"));
     m.def("skinny_swiglu", &skinny_swiglu, "tensor-core silu(x Wg^T) * (x Wu^T), NVFP4, M<=16");
     m.def("skinny_int6", &skinny_int6, "tensor-core skinny GEMM, INT6 / INT5 block-16 weights, M<=16", py::arg("x"), py::arg("wlo"), py::arg("whi"),
           py::arg("sf"), py::arg("gscale"), py::arg("residual"), py::arg("out"));

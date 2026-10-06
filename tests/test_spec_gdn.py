@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 
-@pytest.mark.parametrize("B,T", [(1, 4), (2, 3), (1, 1)])
+@pytest.mark.parametrize("B,T", [(1, 4), (2, 3), (1, 1), (1, 8), (2, 16)])
 def test_verify_commit_bit_exact(B, T):
     from engine.kernels import ops
     torch.manual_seed(B * 10 + T)

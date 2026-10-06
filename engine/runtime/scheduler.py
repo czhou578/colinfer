@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import os
 import time
 from typing import Any
 
@@ -42,7 +43,7 @@ from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, sample
 
 MAX_STOP_IDS = 8  # stop token ids per slot visible to the GPU-side cut (more are still honored on the host)
-K_OPTIONS = (3, 7)  # draft lengths a cycle chooses between (capped by the scheduler's k)
+K_OPTIONS = tuple(int(v) for v in os.environ.get("COLINFER_K_OPTIONS", "3,7").split(","))  # draft lengths a cycle chooses between (capped by k)
 ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
 
 

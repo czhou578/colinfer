@@ -105,6 +105,11 @@ __device__ __forceinline__ __half2 e4m3_to_h2(uint32_t byte) {
     return __halves2half2(h, h);
 }
 
+template <typename T> __device__ __forceinline__ T zero_of() {
+    if constexpr (sizeof(T) == 4) return 0.f;
+    else return __float2bfloat16(0.f);
+}
+
 // out = (x W^T) * scale (+ residual); SWIGLU: out = silu((x W^T) * scale) * ((x W2^T) * scale2)
 //
 // Split-K: a warp's work item is (tile of 16 rows, K range s of S). S depends only on the matrix shape, never on M, so
@@ -117,7 +122,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
                                                         const float* __restrict__ row_scale,
                                                         const uint8_t* __restrict__ w2, const uint8_t* __restrict__ sf2, float scale2,
                                                         const __nv_bfloat16* __restrict__ residual, OutT* __restrict__ out,
-                                                        int S, float* __restrict__ ws, int* __restrict__ cnt) {
+                                                        int S, float* __restrict__ ws, int* __restrict__ cnt, const int* __restrict__ skip) {
     using C = Cfg<F>;
     PDL_TRIGGER();
     extern __shared__ __align__(16) uint8_t smem[];
@@ -126,6 +131,14 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
     const int item = blockIdx.x * WARPS + warp, tile = item / S, split = item % S;
     const int n0 = tile * (SWIGLU ? 8 : 16);
     if (n0 >= N) return;
+    if (skip && *skip) {  // a draft step after the drafter stopped (skinny_set_skip): no weight reads, zero output
+        constexpr int COLS = SWIGLU ? 8 : 16;
+        PDL_WAIT();  // out may be memory the predecessor still reads
+        if (split == 0)
+            for (int i = lane; i < M * COLS; i += 32)
+                if (n0 + i % COLS < N) out[(size_t)(i / COLS) * N + n0 + i % COLS] = zero_of<OutT>();
+        return;
+    }
     uint8_t* wsc = smem + warp * C::SCRATCH;  // [16 rows][ROWB]: one chunk in fragment-friendly layout
     uint8_t* ssc = wsc + 16 * C::ROWB;        // NVFP4 / INT6: [16 rows][128]: block scales of 4 chunks
     uint8_t* hsc = ssc + 16 * 128;            // INT6: [16 rows][ROWH]: high-bit plane of the chunk
@@ -334,6 +347,12 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
 static int* g_cnt = nullptr;
 constexpr int CNT = 1 << 17;
 
+// Skip flag baked into the launches made while it is set (skinny_set_skip): the speculative cycle's draft steps after
+// the first read a device int that the drafter sets once its chain is unlikely to be accepted (engine/spec/mtp.py).
+// It must be written by a kernel that completed before the GEMM's stream predecessor started (it is read before
+// griddepcontrol.wait).
+static const int* g_skip = nullptr;
+
 // Splits for a shape: enough work items (SKINNY_ITEMS) to keep every SM streaming to the end of the grid.
 inline int splits_for(int F, bool swiglu, int N, int K) {
     const int tiles = (N + (swiglu ? 8 : 16) - 1) / (swiglu ? 8 : 16);
@@ -370,10 +389,12 @@ cudaError_t launch(const void* x, int M, int N, int K, const void* w, const void
     return cudaLaunchKernelEx(&lc, k_skinny<F, SWIGLU, OutT>, (const __nv_bfloat16*)x, M, N, K, (const uint8_t*)w, (const uint8_t*)sf,
                               (const uint8_t*)wh, scale,
                               row_scale, (const uint8_t*)w2, (const uint8_t*)sf2, scale2, (const __nv_bfloat16*)residual, (OutT*)out, S, ws,
-                              g_cnt);
+                              g_cnt, g_skip);
 }
 
 }  // namespace skinny
+
+void skinny_set_skip(const int* p) { skinny::g_skip = p; }
 
 // workspace floats a call needs (0: no split); the caller passes a buffer of that size as ws
 int skinny_ws_floats(int fmt, bool swiglu, int M, int N, int K) {
