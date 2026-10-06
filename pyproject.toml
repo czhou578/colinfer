@@ -8,7 +8,6 @@ dependencies = [
     # Host-side toolchain: pinned exactly, these are sm_121-sensitive (see PLAN.md 1.x).
     # torch cu130 matches the nvcc 13.0 on the box so torch.utils.cpp_extension builds cleanly.
     "torch==2.14.1",
-    "triton==3.8.0",
     # FlashInfer: python package + the GB10-specific (sm121a) JIT cache, which holds the kernels the engine calls (FA2
     # prefill attention, top-k / top-p renormalization). flashinfer-cubin (6.3 GB of TRT-LLM / DeepGEMM cubins for other
     # Blackwell parts) is not needed.
@@ -23,7 +22,11 @@ dependencies = [
     # Build helper for torch.utils.cpp_extension / CMake.
     "ninja>=1.11",
     "fastapi>=0.142.2",
-    "uvicorn[standard]>=0.54.0",
+    # HTTP server: uvicorn picks up uvloop and httptools when they are installed (its [standard] extra also brings
+    # file watching, websockets and .env support, which the server does not use).
+    "uvicorn>=0.54.0",
+    "uvloop>=0.23.0",
+    "httptools>=0.8.0",
 ]
 
 [dependency-groups]
