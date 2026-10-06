@@ -17,7 +17,6 @@ build/
 *.nsys-rep
 *.ncu-rep
 *.sqlite
-bench/traces/*.sqlite
 
 # GPUDirect Storage log written by fastsafetensors/vLLM runs
 cufile.log
