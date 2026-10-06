@@ -410,21 +410,17 @@ cudaError_t launch_skinny_swiglu(const void* x, const void* wg, const void* sg, 
     return launch<NVFP4, true, __nv_bfloat16>(x, M, N, K, wg, sg, gg, nullptr, wu, su, gu, nullptr, out, ws, st);
 }
 
+// INT6 / INT5 and FP8 weights only feed bf16 activations (fp32 output: NVFP4 only, for logits)
 cudaError_t launch_skinny_int(int bits, const void* x, const void* wlo, const void* whi, const void* sf, float gscale, const void* residual,
-                              void* out, bool out_fp32, int M, int N, int K, float* ws, cudaStream_t st) {
+                              void* out, int M, int N, int K, float* ws, cudaStream_t st) {
     using namespace skinny;
-    if (bits == 6)
-        return out_fp32 ? launch<INT6, false, float>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi)
-                        : launch<INT6, false, __nv_bfloat16>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi);
-    if (bits == 5)
-        return out_fp32 ? launch<INT5, false, float>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi)
-                        : launch<INT5, false, __nv_bfloat16>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi);
+    if (bits == 6) return launch<INT6, false, __nv_bfloat16>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi);
+    if (bits == 5) return launch<INT5, false, __nv_bfloat16>(x, M, N, K, wlo, sf, gscale, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st, whi);
     return cudaErrorInvalidValue;
 }
 
-cudaError_t launch_skinny_fp8(const void* x, const void* w, float scale, const float* row_scale, const void* residual, void* out,
-                              bool out_fp32, int M, int N, int K, float* ws, cudaStream_t st) {
+cudaError_t launch_skinny_fp8(const void* x, const void* w, float scale, const float* row_scale, const void* residual, void* out, int M, int N,
+                              int K, float* ws, cudaStream_t st) {
     using namespace skinny;
-    return out_fp32 ? launch<FP8, false, float>(x, M, N, K, w, nullptr, scale, row_scale, nullptr, nullptr, 0.f, residual, out, ws, st)
-                    : launch<FP8, false, __nv_bfloat16>(x, M, N, K, w, nullptr, scale, row_scale, nullptr, nullptr, 0.f, residual, out, ws, st);
+    return launch<FP8, false, __nv_bfloat16>(x, M, N, K, w, nullptr, scale, row_scale, nullptr, nullptr, 0.f, residual, out, ws, st);
 }

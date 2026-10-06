@@ -55,10 +55,10 @@ def test_fp8_row_scales(M):
     w = (torch.randn(N, K, device="cuda") * 30).to(torch.float8_e4m3fn)
     rs = torch.rand(N, device="cuda") * 0.01 + 0.001
     x = torch.randn(M, K, device="cuda").bfloat16()
-    out = torch.empty(M, N, device="cuda", dtype=torch.float32)
+    out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
     ops().skinny_fp8(x, w, 1.0, None, out, rs)
-    assert rel(out, x.float() @ (w.float() * rs[:, None]).T) < 1e-5
-    out1 = torch.empty(1, N, device="cuda", dtype=torch.float32)
+    assert rel(out, x.float() @ (w.float() * rs[:, None]).T) < 3e-3
+    out1 = torch.empty(1, N, device="cuda", dtype=torch.bfloat16)
     ops().skinny_fp8(x[-1:].contiguous(), w, 1.0, None, out1, rs)
     assert torch.equal(out1, out[-1:])
 

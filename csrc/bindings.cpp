@@ -47,8 +47,8 @@ static int64_t row_stride(const torch::Tensor& t, int64_t n, const char* name) {
 cudaError_t launch_skinny_nvfp4(const void*, const void*, const void*, float, const void*, void*, bool, int, int, int, float*, cudaStream_t);
 cudaError_t launch_skinny_swiglu(const void*, const void*, const void*, float, const void*, const void*, float, void*, int, int, int, float*,
                                  cudaStream_t);
-cudaError_t launch_skinny_fp8(const void*, const void*, float, const float*, const void*, void*, bool, int, int, int, float*, cudaStream_t);
-cudaError_t launch_skinny_int(int, const void*, const void*, const void*, const void*, float, const void*, void*, bool, int, int, int, float*,
+cudaError_t launch_skinny_fp8(const void*, const void*, float, const float*, const void*, void*, int, int, int, float*, cudaStream_t);
+cudaError_t launch_skinny_int(int, const void*, const void*, const void*, const void*, float, const void*, void*, int, int, int, float*,
                               cudaStream_t);
 int skinny_ws_floats(int, bool, int, int, int);
 void skinny_set_skip(const int*);
@@ -110,7 +110,7 @@ void skinny_swiglu(torch::Tensor x, torch::Tensor wg, torch::Tensor sg, double g
 }
 
 // INT6 / INT5 weights (engine/weights/quantize.py): wlo uint8 [N, K/2] low nibbles, whi uint8 [N, K/4] (INT6: 2-bit fields)
-// or [N, K/8] (INT5: one bit per code), sf e4m3 [N, K/16]. The width of whi gives the format.
+// or [N, K/8] (INT5: one bit per code), sf e4m3 [N, K/16]. The width of whi gives the format. out: bf16.
 void skinny_int(torch::Tensor x, torch::Tensor wlo, torch::Tensor whi, torch::Tensor sf, double gscale, c10::optional<torch::Tensor> residual,
                 torch::Tensor out) {
     CHECK_CUDA_TENSOR(wlo, torch::kUInt8);
@@ -120,13 +120,14 @@ void skinny_int(torch::Tensor x, torch::Tensor wlo, torch::Tensor whi, torch::Te
     check_sf(sf, N, K);
     const int bits = whi.size(1) == K / 4 ? 6 : whi.size(1) == K / 8 ? 5 : 0;
     TORCH_CHECK(bits && whi.size(0) == N, "high-bit plane: [N, K/4] (INT6) or [N, K/8] (INT5)");
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "out must be bf16");
     torch::Tensor hold;
     float* ws = skinny_ws(2, false, x, N, K, hold);
     CHECK_LAUNCH(launch_skinny_int(bits, x.data_ptr(), wlo.data_ptr(), whi.data_ptr(), sf.data_ptr(), (float)gscale, residual_ptr(residual, out),
-                                   out.data_ptr(), out.scalar_type() == torch::kFloat32, x.size(0), N, K, ws, stream()));
+                                   out.data_ptr(), x.size(0), N, K, ws, stream()));
 }
 
-// FP8 W: e4m3 [N, K] with a per-tensor scale, or per-row scales row_scale fp32 [N] (stacked projections).
+// FP8 W: e4m3 [N, K] with a per-tensor scale, or per-row scales row_scale fp32 [N] (stacked projections). out: bf16.
 void skinny_fp8(torch::Tensor x, torch::Tensor w, double scale, c10::optional<torch::Tensor> residual, torch::Tensor out,
                 c10::optional<torch::Tensor> row_scale) {
     TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.element_size() == 1 && w.dim() == 2, "w must be 1-byte [N, K]");
@@ -138,10 +139,11 @@ void skinny_fp8(torch::Tensor x, torch::Tensor w, double scale, c10::optional<to
         TORCH_CHECK(row_scale->numel() == N, "row_scale: fp32 [N]");
         rs = row_scale->data_ptr<float>();
     }
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "out must be bf16");
     torch::Tensor hold;
     float* ws = skinny_ws(1, false, x, N, K, hold);
-    CHECK_LAUNCH(launch_skinny_fp8(x.data_ptr(), w.data_ptr(), (float)scale, rs, residual_ptr(residual, out), out.data_ptr(),
-                                   out.scalar_type() == torch::kFloat32, x.size(0), N, K, ws, stream()));
+    CHECK_LAUNCH(launch_skinny_fp8(x.data_ptr(), w.data_ptr(), (float)scale, rs, residual_ptr(residual, out), out.data_ptr(), x.size(0), N, K, ws,
+                                   stream()));
 }
 
 // Skinny GEMMs launched (or captured) while a flag is set return at once, writing zeros, whenever the int32 it points to
