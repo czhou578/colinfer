@@ -607,6 +607,18 @@ rounds once (q × s has up to 9 significant bits; ~0.2% relative). Rows stay bit
   changed reduction order (WikiText 7.0785, code 1.8027 vs 7.0909 / 1.8012). The recurrence kernel is pinned to 2 warps
   on Blackwell by FLA (a Triton race) and the rest is autotuned; more needs a CUDA port of the chunked delta rule
   (~7% if it halved those 92 ms), as does fusing SwiGLU + quantization into the GEMM epilogue (up to ~7%).
+- **Prefill chunk size** (`bench/prefill_bench.py --chunk`, after sections 14-15), seconds for 2k / 8k / 32k / 64k prompts:
+
+  | Chunk | 2k | 8k | 32k | 64k |
+  |---|---|---|---|---|
+  | 1,024 | 0.555 | 2.355 | 11.18 | |
+  | 1,536 | 0.562 | 2.282 | 10.80 | |
+  | **2,048 (default)** | **0.534** | **2.260** | **10.78** | **26.22** |
+  | 4,096 | 0.542 | 2.572 | 11.99 | 28.12 |
+  | 8,192 | 0.547 | 3.745 | 16.80 | 38.07 |
+
+  2,048 stays. Larger chunks lose in cuBLASLt's FP8 GEMMs (the attention / GDN projections): 478 ms for a 4,096-token
+  chunk against 162 ms per 2,048 tokens, 47% slower per token (its algorithm choice at M = 4,096 on sm_121).
 - **Dropping the FP8 copies of the re-quantized projections (5.2 GB) was not done.** Prefill's W8A8 GEMMs would have to
   rebuild FP8 weights from the INT copies every chunk: ~12 GB more traffic per 2,048-token chunk (~5-8% slower prefill)
   and a second rounding of the prefill weights, for memory that is not short (61 GB allocated, 80 GB cap).
