@@ -18,7 +18,7 @@ def ops():
             sources=[os.path.join(_ROOT, "csrc", f) for f in ("bindings.cpp", "gemv.cu", "attn_decode.cu", "attn_prefill.cu", "gdn_step.cu", "gdn_prefill.cu", "norm.cu", "gemm_nvfp4.cu", "prefill_ops.cu", "sampling.cu", "skinny.cu")],
             extra_cflags=["-O3"],
             extra_include_paths=[os.path.join(_ROOT, "csrc", "third_party", "cutlass", p) for p in ("include", "tools/util/include")],
-            extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "-lineinfo", "--expt-relaxed-constexpr", "--fmad=false",
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "--expt-relaxed-constexpr", "--fmad=false",
                                "-Xptxas=-v" if os.environ.get("COLINFER_PTXAS_VERBOSE") else "-DNOVERBOSE"],
             build_directory=build,
             verbose=bool(os.environ.get("COLINFER_BUILD_VERBOSE")),
