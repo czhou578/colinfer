@@ -55,7 +55,7 @@ Tests: `tests/test_gemv.py`, `test_attn_decode.py`, `test_gdn_step.py` (73 tests
 | Fused norms + residuals, FP8 KV | 16/30 | 4.4e-4 |
 | Final path: + fused attention prologue / gate, stacked projections (the 12.53 tok/s configuration) | 14/30 | 4.9e-4 |
 
-All are ~40x or more below the quantized-path gate (KL <= 1.7e-2, docs/phase1_results.md). The kernels apply
+All are ~40x or more below the quantized-path gate (KL <= 1.7e-2, docs/history/phase1_results.md). The kernels apply
 the NVFP4 global scale in fp32 rather than rounding dequantized weights to BF16, so they are
 slightly more accurate than the reference, not bit-identical to it.
 

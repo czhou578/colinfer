@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end speed on the 40-request mix (docs/phase6_progress.md sections 16-19): the tools/drafter_data.py prompts
+"""End-to-end speed on the 40-request mix (docs/history/phase6_progress.md sections 16-19): the tools/drafter_data.py prompts
 (seed 1: code, prose, Q&A, structured; half with thinking on), one request at a time, greedy, 256 tokens, prompts sent
 as token ids. Reports completion tokens per second of wall time (prefill included) per kind, against a running
 colinfer server or an SGLang server (whose replies also give accepted tokens per verify step).

@@ -25,9 +25,8 @@ def reference(q, k, v, pos):
     return (torch.softmax(s, -1) @ vv).transpose(0, 1)
 
 
-@pytest.mark.parametrize("bn", [32, 64])
 @pytest.mark.parametrize("T,pos", [(1, 0), (1, 700), (37, 0), (64, 64), (100, 200), (130, 5000), (2048, 0)])
-def test_prefill_fp8_matches_reference(T, pos, bn):
+def test_prefill_fp8_matches_reference(T, pos):
     from engine.kernels import ops
     torch.manual_seed(T + pos)
     Lmax = pos + T + 50
@@ -37,7 +36,7 @@ def test_prefill_fp8_matches_reference(T, pos, bn):
     k[0, :, pos + T:] = float("nan")  # past the context: must never be read into the result
     v[0, :, pos + T:] = float("nan")
     out = torch.empty(T, Hq * D, device="cuda", dtype=torch.bfloat16)
-    ops().attn_prefill_fp8(q, k, v, out, pos, D ** -0.5, bn)
+    ops().attn_prefill_fp8(q, k, v, out, pos, D ** -0.5)
     r = reference(q, k, v, pos)
     rel = ((out.view(T, Hq, D).float() - r).norm() / r.norm()).item()
     assert rel < 1e-2, rel

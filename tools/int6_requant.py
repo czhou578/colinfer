@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""INT6 (or INT5) re-quantization of the checkpoint's FP8 projections (docs/phase6_progress.md section 9).
+"""INT6 (or INT5) re-quantization of the checkpoint's FP8 projections (docs/history/phase6_progress.md section 9).
 
 NVFP4 for the Gated DeltaNet projections costs too much quality (Python-code perplexity +0.4-0.6% per projection type,
 round-to-nearest; AWQ and GPTQ do not fix it). A 6-bit integer with an e4m3 scale per 16 weights and an fp32 global

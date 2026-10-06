@@ -38,8 +38,8 @@ for the total (102 GB with these three).
 
 ## Notes
 
-- `nvidia/Qwen3.8-27B-NVFP4` is mixed precision; see `docs/baseline.md` section 3 and
-  `docs/nvfp4_inventory.txt` for exactly which modules are NVFP4 vs FP8 vs BF16.
+- `nvidia/Qwen3.8-27B-NVFP4` is mixed precision; see `docs/history/baseline.md` section 3 and
+  `docs/history/nvfp4_inventory.txt` for exactly which modules are NVFP4 vs FP8 vs BF16.
 - Inventory of any checkpoint: `uv run python tools/tensor_inventory.py <repo id or path>`.
 - Re-download or update: `uv run hf download <repo>`. Delete: `uv run hf cache delete` (interactive)
   or remove the `models--*` directory.

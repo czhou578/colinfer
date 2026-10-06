@@ -108,19 +108,3 @@ def pack5(codes: torch.Tensor):
     nib = (lo[:, 0::2] | (lo[:, 1::2] << 4)).to(torch.uint8)
     bits = sum(hi[:, j::8] << j for j in range(8)).to(torch.uint8)
     return nib.contiguous(), bits.contiguous()
-
-
-def unpack5(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
-    N = lo.shape[0]
-    lo, hi = lo.to(torch.int32), hi.to(torch.int32)
-    lo_codes = torch.stack([lo & 15, lo >> 4], -1).view(N, -1)
-    hi_bits = torch.stack([(hi >> j) & 1 for j in range(8)], -1).view(N, -1)
-    return (lo_codes | (hi_bits << 4)).to(torch.uint8)
-
-
-def unpack6(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
-    N = lo.shape[0]
-    lo, hi = lo.to(torch.int32), hi.to(torch.int32)
-    lo_codes = torch.stack([lo & 15, lo >> 4], -1).view(N, -1)
-    hi_bits = torch.stack([(hi >> (2 * j)) & 3 for j in range(4)], -1).view(N, -1)
-    return (lo_codes | (hi_bits << 4)).to(torch.uint8)

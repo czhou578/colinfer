@@ -77,7 +77,7 @@ class _LinearR(torch.nn.Linear):
 @pytest.mark.parametrize("B,T,pos", [(1, 1, 37), (2, 1, 500), (1, 3, 64)])
 def test_kernel_attention_layer_matches_reference(B, T, pos):
     """Fused prologue (q/k norm, RoPE, fp8 KV write) + multi-row attention + gated combine vs qwen35.Attention."""
-    from engine.model.fast import FastState, KernelAttention
+    from engine.model.fast import FastState, KernelAttention, LinearGroup
     from engine.model.qwen35 import Attention, ModelState, Qwen35Config
     torch.manual_seed(B * 100 + T + pos)
     cfg = Qwen35Config(layer_types=["full_attention"], num_hidden_layers=1)
@@ -114,6 +114,7 @@ def test_kernel_attention_layer_matches_reference(B, T, pos):
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             setattr(ka, name, getattr(ref, name))
         ka.__class__ = KernelAttention
+        ka.qkv = LinearGroup([ka.q_proj, ka.k_proj, ka.v_proj])
         ka.inv_freq = inv
         got = ka(x, None, None, fs, 0, residual=res)
     rel = ((got.float() - want.float()).norm() / want.float().norm()).item()

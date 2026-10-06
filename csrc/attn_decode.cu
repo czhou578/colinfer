@@ -427,8 +427,7 @@ cudaError_t launch_attn_decode_tc(const void* q, const void* kc, const void* vc,
         case 2: TC_LAUNCH(GG, 2); break;  \
         case 3: TC_LAUNCH(GG, 3); break;  \
     }
-    if (G == 6) TC_MT(6)        // the target: 24 query heads over 4 KV heads
-    else if (G == 4) TC_MT(4)   // tests with smaller head counts
+    if (G == 6) TC_MT(6)  // Qwen3.8-27B: 24 query heads over 4 KV heads (the target and the MTP layer)
 #undef TC_MT
 #undef TC_LAUNCH
     if (err != cudaSuccess) return err;

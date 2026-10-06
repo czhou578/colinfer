@@ -335,12 +335,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
     }
 }
 
-#ifndef SKINNY_ITEMS
-#define SKINNY_ITEMS 2048
-#endif
-#ifndef SKINNY_MIN_CHUNKS
-#define SKINNY_MIN_CHUNKS 1
-#endif
+constexpr int ITEMS = 2048;  // warp work items per launch that keep every SM streaming to the end of the grid
 
 // Per-tile split counters, zeroed once and reset by each tile's last item. Allocated on the first (eager) call,
 // before any CUDA graph capture.
@@ -353,13 +348,14 @@ constexpr int CNT = 1 << 17;
 // griddepcontrol.wait).
 static const int* g_skip = nullptr;
 
-// Splits for a shape: enough work items (SKINNY_ITEMS) to keep every SM streaming to the end of the grid.
+// Splits for a shape: enough work items (ITEMS) to keep every SM streaming to the end of the grid, at least one
+// scale unit (4 chunks; 1 for FP8) per split.
 inline int splits_for(int F, bool swiglu, int N, int K) {
     const int tiles = (N + (swiglu ? 8 : 16) - 1) / (swiglu ? 8 : 16);
     const int kc = F == FP8 ? 256 : 512, unit = F == FP8 ? 1 : 4;
     const int units = (K / kc + unit - 1) / unit;
-    const int maxs = units * unit / SKINNY_MIN_CHUNKS;  // each split streams at least SKINNY_MIN_CHUNKS chunks
-    const int S = (SKINNY_ITEMS + tiles - 1) / tiles;
+    const int maxs = units * unit;
+    const int S = (ITEMS + tiles - 1) / tiles;
     return S < 1 ? 1 : (S > maxs ? (maxs < 1 ? 1 : maxs) : S);
 }
 

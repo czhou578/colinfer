@@ -85,7 +85,7 @@ Other endpoints:
 
 - **Prefill past 16k tokens of context uses FP8 attention** (Q K^T on FP8 tensor cores, `csrc/attn_prefill.cu`): 6%
   faster at 64k, 11% at 128k, perplexity +0.25-0.3% for those chunks (`ATTN_FP8_MIN_CTX` in `engine/model/prefill.py`;
-  `docs/phase6_progress.md` section 8).
+  `docs/history/phase6_progress.md` section 8).
 - **Speculation is always on unless the server runs with `--spec none`.** Its output is token-identical to plain decode, greedy or sampled (with the same seed): `--spec none` returns exactly the same tokens, only slower.
 - **Draft length adapts.** A cycle verifies k+1 rows per slot in one weight pass of up to 16 rows, and picks k = 3 or 7
   per cycle for the most expected tokens per second given each request's acceptance (code and structured output
@@ -93,11 +93,11 @@ Other endpoints:
 - **Drafting stops early when it is unlikely to pay.** Once the product of the drafter's probabilities of a cycle's
   drafts falls below 0.1 for every decoding slot, the cycle's remaining draft steps skip their weight GEMMs (~0.35 ms
   instead of ~1.8 ms a step); verify rejects their junk drafts, so outputs do not change (`DRAFT_STOP` in
-  `engine/spec/mtp.py`; `docs/phase6_progress.md` section 18).
+  `engine/spec/mtp.py`; `docs/history/phase6_progress.md` section 18).
 - **Low-rank draft head.** With `~/.cache/colinfer/drafter/draft_head_pca.safetensors` (`tools/lowrank_draft_head.py`),
   each draft step scores a rank-1024 approximation of the draft lm head and rescores its top 256 candidates exactly:
   the same drafts as the full head for ~1/5 of its bytes (k=7 cycle 89.8 → 86.0 ms). Without the file the engine uses
-  the full draft head (`docs/phase6_progress.md` section 19).
+  the full draft head (`docs/history/phase6_progress.md` section 19).
 - **Prefix checkpoints.** A request restores the longest checkpoint that is a prefix of its prompt. Checkpoints are taken:
   - at the end of each prompt and each reply;
   - at the end of the first message (a shared system prompt);

@@ -1,7 +1,7 @@
 # Results: Phase 5, daily driver (2026-10-04)
 
 This page covers the engine as an OpenAI-compatible server for `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark (GB10). It compares the engine
-with the Phase 0 public-stack baselines (`docs/baseline.md`) under the same harnesses. Usage is in `docs/server.md`.
+with the Phase 0 public-stack baselines (`docs/history/baseline.md`) under the same harnesses. Usage is in `docs/server.md`.
 
 **Measurement setup:**
 
@@ -20,7 +20,7 @@ with the Phase 0 public-stack baselines (`docs/baseline.md`) under the same harn
   - Run directories are under `results/colinfer-Qwen3.8-27B-NVFP4*`. llama-benchy and full tool-calling outputs are under `results/phase5/`.
 - **No prefix reuse in benchmarks:** for every benchmark the engine ran with `--no-prefix-caching`, or llama-benchy's `--no-cache`. The baselines also ran without a prefix cache, so prefill numbers are raw.
 
-## Targets (PLAN.md 2.5 and docs/baseline.md section 5)
+## Targets (PLAN.md 2.5 and docs/history/baseline.md section 5)
 
 | Target | Result | |
 |---|---|---|
@@ -32,7 +32,7 @@ with the Phase 0 public-stack baselines (`docs/baseline.md`) under the same harn
 | Context 262k by Phase 5 | 3 slots × 262,144; passkey retrieved from a **260,649-token** prompt through the HTTP API (TTFT 272 s) | met |
 | 3 concurrent requests: per-request decode ≥ 0.8× single | Spec: 17.4 per request vs 35.8 alone (0.49×), but the aggregate is 48.8 tok/s. Plain decode: 10.5 vs 12.6 (0.83×) | not met with speculation (see "Not done") |
 | Tool-call quality within noise of vLLM on the same checkpoint | full 85-task suite: **44 vs 46** at the harness's 256-token limit; **53 vs 53** at 2048 tokens (6 tasks differ, 3 each way) | met |
-| Startup ≤ 60 s (≤ 30 s in docs/baseline.md) | **21 s** to serving with a warm page cache, **31 s** cold (checkpoint evicted from the page cache); vLLM: 140 s | met (cold: 1 s over the 30 s stretch) |
+| Startup ≤ 60 s (≤ 30 s in docs/history/baseline.md) | **21 s** to serving with a warm page cache, **31 s** cold (checkpoint evicted from the page cache); vLLM: 140 s | met (cold: 1 s over the 30 s stretch) |
 | Memory cap enforced | 57.4 GB allocated at startup, all of it preallocated; torch allocator capped at 80 GB (`--mem-cap-gb`) | met |
 
 ## Harness: engine vs Phase 0 baselines
@@ -48,7 +48,7 @@ with the Phase 0 public-stack baselines (`docs/baseline.md`) under the same harn
 | 32,768 | 13.72 / 2,391 | 18.03 / 1,802 |
 | 65,536 | 33.38 / 1,970 | 43.32 / 1,515 |
 
-The SGLang harness runs have no TTFT figures (its stream gives no first-token timing; `docs/baseline.md` section 4).
+The SGLang harness runs have no TTFT figures (its stream gives no first-token timing; `docs/history/baseline.md` section 4).
 
 ### Decode: average tok/s, single stream, the harness's prose prompt (thinking on, greedy)
 
@@ -98,7 +98,7 @@ At 256 tokens, 28 of the engine's 85 requests run out of tokens while still thin
 - On two schema tasks the engine's reasoning ran longer and hit the limit inside the tool call.
 - On one arithmetic task the engine answered directly instead of calling the calculator.
 
-Replayed with 2048 tokens, both schema tasks pass. The engine's numerics are the more accurate ones for this checkpoint: W4A16 perplexity is 1.75% lower than W4A4 (Phase 1, `docs/phase1_results.md`).
+Replayed with 2048 tokens, both schema tasks pass. The engine's numerics are the more accurate ones for this checkpoint: W4A16 perplexity is 1.75% lower than W4A4 (Phase 1, `docs/history/phase1_results.md`).
 
 One parser difference was found and fixed. vLLM's parser keeps a tool call cut off by the token limit, with its completed parameters, and our server now does the same. Unlike vLLM, the engine still reports `finish_reason: "length"` for it, so a client can see the call was truncated.
 

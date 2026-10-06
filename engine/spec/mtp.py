@@ -38,8 +38,8 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import DecodeGraph, FastQwen35, FastState, KernelAttention, KernelRMSNorm, Nvfp4Linear, fast_layer_forward
-from engine.model.prefill import ATTN_FP8_BN, ATTN_FP8_MIN_CTX, prefill, prepare_prefill
+from engine.model.fast import DecodeGraph, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear, fast_layer_forward
+from engine.model.prefill import ATTN_FP8_MIN_CTX, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm
 from engine.weights.loader import dequant_nvfp4
 from engine.weights.quantize import nvfp4_global_scale, quantize
@@ -144,6 +144,7 @@ class Mtp(nn.Module):
             a.q_norm.weight = nn.Parameter(t[P + "self_attn.q_norm.weight"], requires_grad=False)
             a.k_norm.weight = nn.Parameter(t[P + "self_attn.k_norm.weight"], requires_grad=False)
         a.__class__ = KernelAttention
+        a.qkv = LinearGroup([a.q_proj, a.k_proj, a.v_proj])  # the drafter keeps them separate (each its own NVFP4 global scale)
         d = cfg.rotary_dim
         a.inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device="cuda") / d))
         layer.mlp = DraftMLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
@@ -241,7 +242,7 @@ class Mtp(nn.Module):
             L = p0 + T
             if L > ATTN_FP8_MIN_CTX:
                 o = torch.empty(T, a.num_heads, a.head_dim, device=x.device, dtype=torch.bfloat16)
-                ops().attn_prefill_fp8(q, st.k[0][0:1], st.v[0][0:1], o.view(T, -1), p0, a.head_dim ** -0.5, ATTN_FP8_BN)
+                ops().attn_prefill_fp8(q, st.k[0][0:1], st.v[0][0:1], o.view(T, -1), p0, a.head_dim ** -0.5)
             else:  # FlashInfer over a bf16 copy of the cached prefix
                 kk, vv = st.k[0][0, :, :L].to(torch.bfloat16), st.v[0][0, :, :L].to(torch.bfloat16)
                 o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",

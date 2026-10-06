@@ -1,4 +1,4 @@
-"""Low-rank draft head pieces (engine/spec/mtp.py, docs/phase6_progress.md section 19)."""
+"""Low-rank draft head pieces (engine/spec/mtp.py, docs/history/phase6_progress.md section 19)."""
 import os
 import sys
 

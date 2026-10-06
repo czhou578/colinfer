@@ -1,5 +1,5 @@
 // attn_prefill.cu -- causal prefill attention over an FP8 KV cache, Q K^T on FP8 tensor cores (PLAN.md 4.4 item 3,
-// docs/phase6_progress.md section 8).
+// docs/history/phase6_progress.md section 8).
 //
 // FlashInfer's FA2 prefill (bf16) runs ~79 TFLOPS on this chip, 81% of the BF16 GEMM peak, and is a third of a chunk's
 // time at 32k context. Here S = Q K^T uses mma.sync.m16n8k32 e4m3 (twice the BF16 rate): K is the cache's own e4m3
@@ -29,6 +29,7 @@
 namespace apf {
 
 constexpr int D = 256, WARPS = 4, BM = 16 * WARPS, VS = D + 8;
+constexpr int BN = 32;  // keys per KV tile: 32 (two blocks per SM) beat 64 (102-106 vs 86-87 TFLOPS)
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
@@ -77,11 +78,9 @@ __device__ __forceinline__ void bf16x8_to_float(const uint4 v, float* f) {
     }
 }
 
-template <int BN>
-constexpr int smem_bytes() { return 4 * BN * D + BN * VS * 2; }  // K, V raw x 2 stages, V f16
+constexpr int SMEM = 4 * BN * D + BN * VS * 2;  // K, V raw x 2 stages, V f16
 
-template <int BN>
-__global__ void __launch_bounds__(WARPS * 32, BN == 32 ? 2 : 1)
+__global__ void __launch_bounds__(WARPS * 32, 2)
     k_prefill_fp8(const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
                   __nv_bfloat16* __restrict__ out, int T, int Hq, int Hkv, int Lmax, int pos, float scale_log2) {
     constexpr int NT = BN / 8;  // n8 tiles of keys per KV tile
@@ -246,24 +245,15 @@ __global__ void __launch_bounds__(WARPS * 32, BN == 32 ? 2 : 1)
 
 // FP8-QK causal prefill attention. bn: KV tile (32 or 64 keys).
 cudaError_t launch_attn_prefill_fp8(const void* q, const void* kc, const void* vc, void* out, int T, int Hq, int Hkv, int Lmax, int pos,
-                                    float scale, int bn, cudaStream_t st) {
+                                    float scale, cudaStream_t st) {
     if (Hq % Hkv || T < 1) return cudaErrorInvalidValue;
+    static bool init = false;
+    if (!init) {
+        if (cudaError_t e = cudaFuncSetAttribute(apf::k_prefill_fp8, cudaFuncAttributeMaxDynamicSharedMemorySize, apf::SMEM)) return e;
+        init = true;
+    }
     dim3 grid((T + apf::BM - 1) / apf::BM, Hq), block(apf::WARPS * 32);
-    const float sl2 = scale * 1.4426950408889634f;
-#define APF_LAUNCH(BN)                                                                                                         \
-    do {                                                                                                                       \
-        static bool init = false;                                                                                              \
-        if (!init) {                                                                                                           \
-            cudaFuncSetAttribute(apf::k_prefill_fp8<BN>, cudaFuncAttributeMaxDynamicSharedMemorySize, apf::smem_bytes<BN>()); \
-            init = true;                                                                                                       \
-        }                                                                                                                      \
-        apf::k_prefill_fp8<BN><<<grid, block, apf::smem_bytes<BN>(), st>>>((const __nv_bfloat16*)q, (const uint8_t*)kc,       \
-                                                                         (const uint8_t*)vc, (__nv_bfloat16*)out, T, Hq, Hkv,  \
-                                                                         Lmax, pos, sl2);                                      \
-    } while (0)
-    if (bn == 32) APF_LAUNCH(32);
-    else if (bn == 64) APF_LAUNCH(64);
-    else return cudaErrorInvalidValue;
-#undef APF_LAUNCH
+    apf::k_prefill_fp8<<<grid, block, apf::SMEM, st>>>((const __nv_bfloat16*)q, (const uint8_t*)kc, (const uint8_t*)vc, (__nv_bfloat16*)out, T, Hq,
+                                                       Hkv, Lmax, pos, scale * 1.4426950408889634f);
     return cudaGetLastError();
 }

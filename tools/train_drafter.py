@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fine-tune the checkpoint's MTP head as a multi-step drafter (docs/phase6_progress.md sections 7, 12, 13).
+"""Fine-tune the checkpoint's MTP head as a multi-step drafter (docs/history/phase6_progress.md sections 7, 12, 13).
 
 The MTP head ships trained for one step: (embedding of x_{i+1}, target hidden h_i) -> x_{i+2}. The engine chains it
 (engine/spec/mtp.py): step s feeds the head its own previous output instead of a target hidden state, so drafts 2..k

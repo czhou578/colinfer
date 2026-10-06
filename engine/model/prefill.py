@@ -24,9 +24,8 @@ import torch.nn.functional as F
 from engine.kernels import ops
 from engine.model.fast import FastQwen35, FastState, Nvfp4Linear, StackedFp8Linear
 
-CHUNK = 2048            # tokens per chunk: larger chunks make the FP8 GEMMs slower per token (docs/phase6_progress.md)
+CHUNK = 2048            # tokens per chunk: larger chunks make the FP8 GEMMs slower per token (docs/history/phase6_progress.md)
 ATTN_FP8_MIN_CTX = 16384  # context length above which prefill attention runs on csrc/attn_prefill.cu
-ATTN_FP8_BN = 32        # its KV tile: 32 keys (2 blocks per SM) beat 64
 
 
 def _nvfp4_operands(lin_list):
@@ -116,14 +115,14 @@ def _attention(attn, q8, state: FastState, li: int):
     """Mixer output (no residual) of a full-attention layer."""
     import flashinfer
     T = q8.shape[0]
-    qp, kp, vp = _split(_fp8_gemm(q8, attn.qkv), attn.qkv.sizes)  # strided column views, read in place
+    qp, kp, vp = _fp8_gemm(q8, attn.qkv).split(attn.qkv.sizes, dim=-1)  # strided column views, read in place
     kc, vc = state.k[li], state.v[li]
     q = torch.empty(1, attn.num_heads, T, attn.head_dim, device=q8.device, dtype=torch.bfloat16)
     ops().attn_prologue(qp, kp, vp, attn.q_norm.weight, attn.k_norm.weight, attn.inv_freq, state.pos_t, kc, vc, q, attn.q_norm.eps)
     L = state.pos + T
     if L > ATTN_FP8_MIN_CTX:  # FP8 Q K^T over the cache as stored
         o = torch.empty(T, attn.num_heads * attn.head_dim, device=q8.device, dtype=torch.bfloat16)
-        ops().attn_prefill_fp8(q, kc, vc, o, state.pos, attn.head_dim ** -0.5, ATTN_FP8_BN)
+        ops().attn_prefill_fp8(q, kc, vc, o, state.pos, attn.head_dim ** -0.5)
     else:
         # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix to a BF16
         # scratch first is cheaper (and exact: e4m3 -> bf16 is lossless)
@@ -138,7 +137,7 @@ def _attention(attn, q8, state: FastState, li: int):
 def _gdn(g, n, q8, state: FastState, li: int):
     """Mixer output (no residual) of a Gated DeltaNet layer. n: bf16 normed input (for the b/a projection)."""
     T = n.shape[0]
-    mixed, z = _split(_fp8_gemm(q8, g.qkvz), g.qkvz.sizes)
+    mixed, z = _fp8_gemm(q8, g.qkvz).split(g.qkvz.sizes, dim=-1)
     ba = n @ g.w_ba.t()
     b, a = ba[:, : g.num_v_heads], ba[:, g.num_v_heads:]
     K = g.conv_kernel_size
@@ -162,10 +161,6 @@ def _gdn(g, n, q8, state: FastState, li: int):
     o8 = torch.empty(T, g.value_dim, dtype=torch.float8_e4m3fn, device=dev)
     ops().fp8_quant(on.view(T, -1), g.out_proj.in_scale, o8)
     return _fp8_gemm(o8, g.out_proj)
-
-
-def _split(t, sizes):
-    return t.split(sizes, dim=-1)
 
 
 @torch.inference_mode()

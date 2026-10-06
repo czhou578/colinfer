@@ -38,7 +38,7 @@ must be in the local Hugging Face cache. Three optional files make decoding fast
 
 ## How it works
 
-`docs/architecture.md` is the technical description. In short:
+`docs/architecture.md` is the technical description; `docs/history/` holds the dated logs behind each design choice. In short:
 
 - **Decode** streams the quantized weights once per step with a tensor-core *skinny GEMM* (`csrc/skinny.cu`) that
   multiplies up to 16 rows for the price of one, so verifying 8 speculative tokens costs about what one token costs.
@@ -66,7 +66,7 @@ must be in the local Hugging Face cache. Three optional files make decoding fast
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`spec_check.py`, `scheduler_check.py`, `perplexity.py`, ...) |
 | `tools/` | offline artifacts (decode copies, drafter training, low-rank head) and checkpoint utilities |
 | `bench/` | decode / prefill / attention / GEMM / end-to-end benchmarks, nsys trace summaries |
-| `docs/` | `architecture.md` (current design), `server.md`; the `phase*` / `baseline*` / `results.md` files are the project's dated logs |
+| `docs/` | `architecture.md` (current design), `server.md` (running the server), `checkpoints.md` (the checkpoints on this machine); `history/`: the project's dated logs and measurements |
 | `PLAN.md` | the original plan and targets |
 
 ## Testing

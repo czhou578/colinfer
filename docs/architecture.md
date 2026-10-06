@@ -1,7 +1,7 @@
 # Architecture
 
 How colin-inference-engine runs `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark. This page describes the engine as it is;
-the dated logs (`docs/phase*_progress.md`, `docs/baseline.md`, `docs/results.md`) record how it got here, with the
+the dated logs in `docs/history/` (`phase*`, `baseline.md`, `results.md`) record how it got here, with the
 measurements behind each choice and the alternatives that were tried and dropped.
 
 ## 1. The machine and the model
@@ -200,4 +200,4 @@ departure from the checkpoint's own numerics (the INT copies, FP8 prefill attent
 A k = 7 cycle (86 ms at 8k): ≈69.5 ms of verify weight GEMMs at ≈223 GB/s (the 15.5 GB floor at 238 GB/s is 65 ms),
 ≈3 ms of GDN recurrence / attention / norms, ≈11.6 ms of drafting (≈280 MB of drafter weights per step). The remaining
 levers are mostly on the drafter (its own weights, a better stopping rule, better prose acceptance) and, for a few
-percent, a tile-contiguous weight copy that bulk copies could stream (docs/phase6_progress.md, sections 18-19).
+percent, a tile-contiguous weight copy that bulk copies could stream (docs/history/phase6_progress.md, sections 18-19).

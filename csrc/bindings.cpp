@@ -447,12 +447,12 @@ void gdn_prefill(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tenso
 }
 
 // ===================================================================================================== attn_prefill.cu
-cudaError_t launch_attn_prefill_fp8(const void*, const void*, const void*, void*, int, int, int, int, int, float, int, cudaStream_t);
+cudaError_t launch_attn_prefill_fp8(const void*, const void*, const void*, void*, int, int, int, int, int, float, cudaStream_t);
 
 // Causal prefill attention over one slot's e4m3 KV cache, Q K^T on FP8 tensor cores.
 // q: bf16 [1, Hq, T, 256] (rows at positions pos .. pos + T - 1); caches: e4m3 [1, Hkv, Lmax, 256] with the T new rows
-// written; out: bf16 [T, Hq * 256]. bn: KV tile, 32 or 64 keys.
-void attn_prefill_fp8(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor out, int64_t pos, double scale, int64_t bn) {
+// written; out: bf16 [T, Hq * 256].
+void attn_prefill_fp8(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor out, int64_t pos, double scale) {
     CHECK_CUDA_TENSOR(q, torch::kBFloat16);
     check_kv(k_cache, v_cache);
     CHECK_CUDA_TENSOR(out, torch::kBFloat16);
@@ -460,7 +460,7 @@ void attn_prefill_fp8(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_ca
     const int64_t Hq = q.size(1), T = q.size(2), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
     TORCH_CHECK(pos >= 0 && pos + T <= Lmax, "positions past the cache");
     CHECK_LAUNCH(launch_attn_prefill_fp8(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(), T, Hq, Hkv, Lmax, pos, (float)scale,
-                                         bn, stream()));
+                                         stream()));
 }
 
 // ===================================================================================================== sampling.cu
@@ -535,7 +535,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gdn_prefill", &gdn_prefill, "chunked Gated DeltaNet forward (prefill), continuing state in place", py::arg("q"), py::arg("k"),
           py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("state"), py::arg("o"), py::arg("scale"));
     m.def("attn_prefill_fp8", &attn_prefill_fp8, "causal prefill attention, FP8 Q K^T over an e4m3 KV cache", py::arg("q"),
-          py::arg("k_cache"), py::arg("v_cache"), py::arg("out"), py::arg("pos"), py::arg("scale"), py::arg("bn") = 32);
+          py::arg("k_cache"), py::arg("v_cache"), py::arg("out"), py::arg("pos"), py::arg("scale"));
     // sampling and drafting
     m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (position-keyed sampling)");
     m.def("rescore_nvfp4", &rescore_nvfp4, "exact logits of candidate rows of an NVFP4 matrix (low-rank draft head)");

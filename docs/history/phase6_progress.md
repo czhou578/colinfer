@@ -26,7 +26,7 @@ Single request, greedy, 200-token replies, `tests/scheduler_check.py`:
 | four requests at once (3 slots + 1 queued), aggregate | 42.4 | 59.3 | **68.7** |
 
 Plain decode without speculation, 8k context (`bench/decode_bench.py`): 12.8 → **15.1 tok/s** with the
-re-quantized weights. That would meet `docs/baseline.md`'s frozen target of ≥ 14.0 tok/s and its 14.5 stretch.
+re-quantized weights. That would meet `docs/history/baseline.md`'s frozen target of ≥ 14.0 tok/s and its 14.5 stretch.
 
 **The re-quantization fails its quality gate on code, so it is opt-in** (`--decode-weights requant`, section 3).
 With the default FP8 projections:

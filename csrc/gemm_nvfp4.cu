@@ -7,7 +7,7 @@
 //     offset(r, kb) = ((r / 128) * ceil(KB / 4) + kb / 4) * 512 + (r % 32) * 16 + ((r / 32) % 4) * 4 + kb % 4
 //   with rows padded to 128 and KB = K / 16 padded to 4 (padding zero-filled). See quant_nvfp4 below.
 //   alpha = input_scale * weight_scale_2 (the two NVFP4 global scales).
-// Tile configs from bench/gemm_sm120.cu (docs/baseline.md section 2). The persistent scheduler's raster
+// Tile configs from the phase-0 CUTLASS sweep (docs/history/baseline.md section 2). The persistent scheduler's raster
 // swizzle is set to 8: without it the 5120 x 17408 down projection loses 60% to L2 thrash at M = 4096.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>

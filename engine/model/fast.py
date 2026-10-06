@@ -143,6 +143,18 @@ class StackedFp8Linear(nn.Module):
         return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
 
 
+class LinearGroup(nn.Module):
+    """Separate linears on the same input, called as one (KernelAttention.qkv where the parts are not stacked: the MTP
+    drafter, whose parts keep their own NVFP4 global scales). forward returns one output per part."""
+
+    def __init__(self, parts: list):
+        super().__init__()
+        self.parts = nn.ModuleList(parts)
+
+    def forward(self, x):
+        return [p(x) for p in self.parts]
+
+
 class SwiGLUMLP(nn.Module):
     """silu(gate) * up in one fused weight pass (skinny_swiglu), then down with the residual added in its epilogue."""
 
@@ -249,7 +261,7 @@ class KernelAttention(Attention):
 
     def forward(self, x, cos, sin, state: FastState, layer_idx: int, residual=None):
         B, T, _ = x.shape
-        qp, kp, vp = self.qkv(x) if hasattr(self, "qkv") else (self.q_proj(x), self.k_proj(x), self.v_proj(x))  # MTP layer: unstacked
+        qp, kp, vp = self.qkv(x)
         kc, vc = state.k[layer_idx], state.v[layer_idx]
         qp = qp.reshape(B, T, -1)
         q = torch.empty(B, self.num_heads, T, self.head_dim, device=x.device, dtype=torch.bfloat16)

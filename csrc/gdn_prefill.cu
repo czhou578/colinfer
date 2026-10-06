@@ -1,5 +1,5 @@
 // gdn_prefill.cu -- chunked Gated DeltaNet forward for prefill (PLAN.md 4.4 item 4; replaces FLA's chunk_gated_delta_rule
-// in engine/model/prefill.py, docs/phase6_progress.md section 15).
+// in engine/model/prefill.py, docs/history/phase6_progress.md section 15).
 //
 // Per value head h (key head h / (Hv / Hk)), state S [K=128][V=128] fp32, chunks of C = 64 tokens, in-chunk cumulative
 // log-decay G_i = sum_{t <= i} g_t:

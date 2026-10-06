@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Low-rank draft head (docs/phase6_progress.md section 19): the PCA basis of the MTP drafter's normed outputs.
+"""Low-rank draft head (docs/history/phase6_progress.md section 19): the PCA basis of the MTP drafter's normed outputs.
 
 The draft lm head (64k static + 4k prompt rows, NVFP4, ~200 MB) is streamed once per draft step. Its argmax is
 nearly always among the top few candidates of the rank-r approximation  g U (W U)^T  with U the top-r principal

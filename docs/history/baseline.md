@@ -85,7 +85,7 @@ N x K = 17408 x 5120 (gate/up) and 5120 x 17408 (down). D = A * B^T, bf16 out, f
 20 timed iterations after 3 warmup, medians. Every number below passed a numerical check
 (CUTLASS: 65,536 sampled outputs against an independent dequantize-and-dot kernel; torch:
 against an fp32 matmul; FlashInfer: relative error against fp32). Full output with all 11
-CUTLASS configs: `docs/gemm_peak_2026-10-02.txt`.
+CUTLASS configs: `docs/history/gemm_peak_2026-10-02.txt`.
 
 ### Peak TFLOPS by format (best verified kernel per cell, CUTLASS scheduler swizzle 8)
 
@@ -170,7 +170,7 @@ above uses 8 everywhere; the true optimum is shape-dependent. FlashInfer's SM120
 ## 3. Checkpoint inventory: `nvidia/Qwen3.8-27B-NVFP4`
 
 Source: `tools/tensor_inventory.py nvidia/Qwen3.8-27B-NVFP4` (reads safetensors headers only).
-Full dump: `docs/nvfp4_inventory.txt`. Where the checkpoints live: `docs/checkpoints.md`.
+Full dump: `docs/history/nvfp4_inventory.txt`. Where the checkpoints live: `docs/checkpoints.md`.
 
 **The checkpoint is mixed precision, not NVFP4 throughout** (`hf_quant_config.json`:
 `quant_algo: MIXED_PRECISION`). What each module class is stored as:
@@ -211,13 +211,13 @@ Full dump: `docs/nvfp4_inventory.txt`. Where the checkpoints live: `docs/checkpo
 
 | Checkpoint | Scheme | Per-token bytes (backbone + lm_head) | Notes |
 |---|---|---|---|
-| `Qwen/Qwen3.8-27B-FP8` | FP8 e4m3 weights with **128x128 block-wise `weight_scale_inv` (BF16)**, dynamic per-token activation scales, no static input scales | **26.9 GB** (plan assumed 25.8; lm_head is BF16 here, 2.5 GB) | All linears incl. MTP are FP8; needs a block-scaled FP8 GEMM (CUTLASS `sm120_mma_tma_blockwise_scaling`), not the per-tensor path benchmarked in section 2. Ceiling 8.5 tok/s at 8k. Full dump `docs/fp8_inventory.txt`. |
-| `Qwen/Qwen3.8-27B` | BF16, nothing quantized | **51.2 GB** (plan assumed 51.25) | Parity reference only. Ceiling 4.5 tok/s at 8k. Full dump `docs/bf16_inventory.txt`. |
+| `Qwen/Qwen3.8-27B-FP8` | FP8 e4m3 weights with **128x128 block-wise `weight_scale_inv` (BF16)**, dynamic per-token activation scales, no static input scales | **26.9 GB** (plan assumed 25.8; lm_head is BF16 here, 2.5 GB) | All linears incl. MTP are FP8; needs a block-scaled FP8 GEMM (CUTLASS `sm120_mma_tma_blockwise_scaling`), not the per-tensor path benchmarked in section 2. Ceiling 8.5 tok/s at 8k. Full dump `docs/history/fp8_inventory.txt`. |
+| `Qwen/Qwen3.8-27B` | BF16, nothing quantized | **51.2 GB** (plan assumed 51.25) | Parity reference only. Ceiling 4.5 tok/s at 8k. Full dump `docs/history/bf16_inventory.txt`. |
 
 ## 4. Public-stack baselines on the NVFP4 checkpoint (2026-10-03)
 
 Harness: `~/Projects/model-benchmarks` (`core_runner.py`), YAMLs `models/qwen3.8_27b_nvidia_nvfp4*.yml`,
-raw summaries in `docs/baselines_2026-10-03.md`, run dirs under its `results/`. Settings chosen to
+raw summaries in `docs/history/baselines_2026-10-03.md`, run dirs under its `results/`. Settings chosen to
 match the engine's use case: prefix / radix cache **off** (so prefill is raw), max 4 running requests,
 128k context, fp8 KV cache, FlashInfer attention, thinking disabled in the harness prompts.
 
