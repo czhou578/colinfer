@@ -4,17 +4,29 @@
 // so this stream never coincides with FlashInfer's sampling stream, which uses seed[b] directly with the
 // row index as the subsequence.
 #include <cuda_runtime.h>
-#include <curand_kernel.h>
 #include <stdint.h>
+
+// Philox4x32-10 (Salmon et al. 2011), bit-identical to cuRAND's curand_init(key, 0, n) + curand_uniform: counter
+// (n / 4, 0), output word n % 4, mapped to (0, 1] as u32 * 2^-32 + 2^-33.
+__device__ __forceinline__ uint32_t philox_u32(uint64_t key, uint64_t n) {
+    uint4 c = make_uint4((uint32_t)(n >> 2), (uint32_t)(n >> 34), 0u, 0u);
+    uint2 k = make_uint2((uint32_t)key, (uint32_t)(key >> 32));
+#pragma unroll
+    for (int r = 0; r < 10; ++r) {
+        if (r) { k.x += 0x9E3779B9u; k.y += 0xBB67AE85u; }
+        const uint32_t lo0 = 0xD2511F53u * c.x, hi0 = __umulhi(0xD2511F53u, c.x);
+        const uint32_t lo1 = 0xCD9E8D57u * c.z, hi1 = __umulhi(0xCD9E8D57u, c.z);
+        c = make_uint4(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
+    }
+    const uint32_t w[4] = {c.x, c.y, c.z, c.w};
+    return w[n & 3];
+}
 
 __global__ void k_philox_uniform(const int64_t* __restrict__ seed, const int64_t* __restrict__ offset, float* __restrict__ out, int n) {
     const int b = blockIdx.x;
     const uint64_t key = (uint64_t)seed[b] * 6364136223846793005ULL + 1442695040888963407ULL;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        curandStatePhilox4_32_10_t st;
-        curand_init(key, 0, (uint64_t)offset[b] + i, &st);
-        out[(size_t)b * n + i] = curand_uniform(&st);  // (0, 1]
-    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        out[(size_t)b * n + i] = philox_u32(key, (uint64_t)offset[b] + i) * 2.3283064e-10f + 2.3283064e-10f / 2.0f;  // (0, 1]
 }
 
 cudaError_t launch_philox_uniform(const int64_t* seed, const int64_t* offset, float* out, int B, int n, cudaStream_t st) {
