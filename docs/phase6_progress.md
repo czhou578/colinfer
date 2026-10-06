@@ -891,7 +891,7 @@ argmax almost always:
   2.76 / 3.39; **with 256: 2.77 / 3.41**.
 - Cycle (`bench/decode_bench.py`, 8k): k=7 89.8 → **86.0 ms**, k=3 81.4 → 79.1 ms (width 2: 97.3 → 93.7, 85.6 → 83.9).
 
-The 40 requests of section 16 (server defaults, tok/s):
+The 40 requests of section 16 (server defaults, tok/s; `bench/request_mix_bench.py`):
 
 | | Code | Prose | Q&A | Structured | All |
 |---|---|---|---|---|---|
@@ -913,10 +913,16 @@ checkpoint layout. Not pursued.
 
 ## Next
 
-- A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:
-  features, two chains and a second layer do not help; more data is what is left.
-- Tensor-core multi-row decode attention: done (section 6).
-- FP8 (Q K^T) prefill attention for long prompts: done (section 8), 6% at 64k, 11% at 128k.
-- GDN projections below 8 bits: done (section 9), INT5 GDN + INT6 attention, decode 9.5% faster than FP8.
-- A scheme that keeps Q's precision in layers 23-51 (their outputs move 2-4% under e4m3 Q) would remove most of its
-  +0.25-0.3% perplexity.
+Where a k=7 cycle's 85 ms go now (`bench/traces/cycle_k7_8k_v3`): verify 73.5 ms (69.5 ms weight GEMMs at ≈223 GB/s,
+≈3 ms GDN recurrence / attention / norms), drafting 11.6 ms (≈1.66 ms a step, ≈280 MB of weights a step).
+
+- The drafter's own weights (MTP layer, NVFP4, ≈240 MB a step; its MLP is 150 MB of that). Fewer bits or a smaller
+  MLP only cost acceptance, never correctness, but need retraining (`tools/train_drafter.py`) to hold acceptance.
+- A better early-exit rule: the probability product reaches 36.6 of an oracle's 38.8 tok/s in the k=7 simulation
+  (section 18); a small learned predictor over a few drafter features may close part of that.
+- A better drafter for prose: acceptance there is about 0.45-0.50 per token (sections 7, 12, 13: features, two chains
+  and a second layer do not help; more data is what is left).
+- A tile-contiguous copy of the decode weights for bulk-copy streaming: ≤3% of the weight GEMMs (section 19).
+- The fused draft-selection reductions (topk, logsumexp: ≈0.35 ms a cycle).
+- A scheme that keeps Q's precision in layers 23-51 (their outputs move 2-4% under e4m3 Q) would remove most of the FP8
+  prefill attention's +0.25-0.3% perplexity.
