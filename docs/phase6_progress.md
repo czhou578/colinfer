@@ -773,6 +773,43 @@ SGLang's `srt/models/dflash.py`) and replays greedy cycles with our target's hid
 The engine is ~20% faster than SGLang + DFlash2 on identical requests. Prose stays near 30 tok/s with either drafter:
 ~0.45 acceptance per drafted token is what both learn on this model's prose.
 
+## 17. Where a speculative cycle's time goes, and an NVFP4 drafter
+
+A trace of a k=7 cycle at 8k on the INT6 / INT5 weights (`bench/traces/cycle_k7_8k_int`, 98.6 ms):
+
+| Part | Time |
+|---|---|
+| GDN commit of the accepted rows + MTP drafting (catch-up row + 6 chained steps) | 22.9 ms (20.3 ms of weight GEMMs) |
+| Target verify, 8 rows: 64 layers + lm_head | 75.7 ms (≈15.4 GB: ≈204 GB/s against ≈238 peak) |
+
+Each draft step re-streams the MTP head (FP8 projections + MLP: 423 MB) and the draft lm_head (NVFP4, 69,632 rows: ≈200
+MB). `Bf16Linear.to_lowbit` (`engine/spec/mtp.py`) now gives the head INT6 / INT5 / NVFP4 decode copies (round-to-nearest
+from BF16, block-16 e4m3 scales) on the existing skinny GEMM paths; `COLINFER_MTP_FORMAT` selects one.
+
+| Drafter weights | k=3 cycle | k=7 cycle | Tokens per cycle k=3 / k=7 (`tools/eval_drafter.py`) |
+|---|---|---|---|
+| FP8 (before) | 91.6 ms | 103.8 ms | 2.78 / 3.45 |
+| INT6 | 90.6 ms | 101.5 ms | 2.77 / 3.44 |
+| INT5 | | | 2.77 / 3.43 |
+| **NVFP4 (default)** | **89.1 ms** | **98.4 ms** | **2.77 / 3.41** |
+| NVFP4, draft vocabulary 32k | 88.1 ms | 95.8 ms | 2.70 / 3.30 |
+| NVFP4, draft vocabulary 16k | 87.8 ms | 94.3 ms | 2.60 / 3.12 |
+
+(Cycle times with the FP8 target projections; the draft vocabulary stays 64k: a smaller one loses as much acceptance
+as it saves time.) Drafts change speed, never outputs: `tests/spec_check.py` and `tests/scheduler_check.py` pass.
+
+The 40-request comparison of section 16, rerun (server defaults; tok/s):
+
+| | Code | Prose | Q&A | Structured | All |
+|---|---|---|---|---|---|
+| FP8 drafter | 50.7 | 30.0 | 33.7 | 34.5 | 34.8 |
+| **NVFP4 drafter** | **53.9** | **31.3** | **36.3** | **36.5** | **36.8** |
+| SGLang + DFlash2 | 41.2 | 25.2 | 28.3 | 28.4 | 29.0 |
+
+What is left between a k=7 cycle (≈93 ms now) and its byte floor (≈70 ms at 238 GB/s): the verify pass streams at
+≈86% of peak (the long-K down projection and the small output projections are the weaker shapes; GDN recurrence,
+attention and norms are ≈4-5 ms of serial work per cycle), and the drafter still streams ≈0.44 GB per step.
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:

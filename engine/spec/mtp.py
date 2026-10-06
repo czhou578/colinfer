@@ -47,12 +47,35 @@ class Bf16Linear(nn.Module):
         self.rs = rs.contiguous()
         return self
 
+    def to_lowbit(self, fmt: str):
+        """Decode copy in INT6 / INT5 / NVFP4 (block-16 e4m3 scales, round-to-nearest from the BF16 weights) for the
+        tensor-core skinny GEMM: the drafter re-reads its weights every draft step, so its bytes are cycle time."""
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools"))
+        from engine.model.fast import Int6Linear, Nvfp4Linear
+        w = self.w.float()
+        if fmt == "nvfp4":
+            from requant_nvfp4 import quantize
+            gs = float(w.abs().max()) / (448.0 * 6.0)
+            packed, sf = quantize(w, gs)
+            self.low = Nvfp4Linear(packed, sf, gs)
+        else:
+            from int6_requant import pack5, pack6, quantize_int
+            bits = {"int6": 6, "int5": 5}[fmt]
+            gs = float(w.abs().max()) / (448.0 * (2 ** (bits - 1) - 1))
+            codes, sf = quantize_int(w, gs, bits)
+            lo, hi = (pack6 if bits == 6 else pack5)(codes)
+            self.low = Int6Linear(lo, hi, sf, gs)
+        return self
+
     def forward(self, x, residual=None):
         shp = x.shape
         x2 = x.reshape(-1, self.in_features).contiguous()
         if x2.shape[0] <= 16:
             out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
-            if self.w8 is not None:
+            if getattr(self, "low", None) is not None:
+                self.low.rows(x2, None, out)
+            elif self.w8 is not None:
                 fp8_rows(x2, self.w8, 1.0, None, out, self.rs)
             else:
                 for i in range(0, x2.shape[0], GEMV_M):
@@ -144,8 +167,11 @@ class Mtp(nn.Module):
         self.embed, self.lm_head, self.cfg = target.embed_tokens, target.lm_head, cfg
         self.nbytes = sum(v.numel() * 2 for v in t.values())
         if fp8:
+            # the draft steps' weight stream: nvfp4 (default; k=7 cycle 103.8 -> 98.4 ms, acceptance 3.45 -> 3.41 tokens per
+            # cycle, docs/phase6_progress.md section 17) | int6 | int5 | fp8 (per-row scales)
+            fmt = os.environ.get("COLINFER_MTP_FORMAT", "nvfp4")
             for mod in [self.fc, a.q_proj, a.k_proj, a.v_proj, a.o_proj, layer.mlp.gate, layer.mlp.up, layer.mlp.down]:
-                mod.to_fp8()
+                mod.to_fp8() if fmt == "fp8" else mod.to_lowbit(fmt)
         self.vocab_ids = None
         self.lm_draft = target.lm_head
         if draft_vocab:

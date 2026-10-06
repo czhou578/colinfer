@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--k", type=int, nargs="+", default=[3, 7])
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--no-baseline", action="store_true", help="skip the checkpoint's MTP head")
+    ap.add_argument("--draft-vocab", type=int, default=65536, help="static draft vocabulary size (the engine's --draft-vocab)")
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
@@ -42,7 +43,7 @@ def main():
     eos = (248046, 248044)
     for w in ([] if a.no_baseline else [None]) + a.weights:
         for k in a.k:
-            gen = MtpGenerator(model, path, max_seq_len=4096, k=k, weights=w)
+            gen = MtpGenerator(model, path, max_seq_len=4096, k=k, weights=w, draft_vocab=a.draft_vocab)
             per = collections.defaultdict(lambda: [0, 0, 0, 0])  # drafted, accepted, tokens, cycles
             for x, kind in ids:
                 s0 = dict(gen.stats)

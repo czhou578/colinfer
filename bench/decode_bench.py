@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--ks", type=int, nargs="+", default=[1, 3, 5, 7])
     ap.add_argument("--widths", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--kv", choices=("fp8", "fp4"), default="fp8")
+    ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP static draft vocabulary (the server's --draft-vocab)")
     ap.add_argument("--requant", action="store_true", help="decode streams the NVFP4 re-quantized attention / GDN projections")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
@@ -60,7 +61,7 @@ def main():
             v.pos_t.fill_(a.ctx)
         dt = timed(step)
         print(f"plain decode  width {B}: {dt * 1e3:6.1f} ms/step  -> {B / dt:5.1f} tok/s aggregate")
-    mtp = Mtp(model, path, fp8=True, draft_vocab=65536)
+    mtp = Mtp(model, path, fp8=True, draft_vocab=a.draft_vocab)
     mst = MtpState(model.cfg, a.ctx + 64, "cuda", batch=3, active=st.active)
     for B in a.widths:
         for k in a.ks:
