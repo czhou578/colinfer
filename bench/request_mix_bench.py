@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end speed on the 40-request mix (docs/history/phase6_progress.md sections 16-19): the tools/drafter_data.py prompts
-(seed 1: code, prose, Q&A, structured; half with thinking on), one request at a time, greedy, 256 tokens, prompts sent
-as token ids. Reports completion tokens per second of wall time (prefill included) per kind, against a running
+(seed 1: code, prose, Q&A, structured; half with thinking on) frozen as token ids in tests/golden/prompts.json, one request
+at a time, greedy, 256 tokens. Reports completion tokens per second of wall time (prefill included) per kind, against a running
 colinfer server or an SGLang server (whose replies also give accepted tokens per verify step).
 
    uv run python bench/request_mix_bench.py --port 8002                  # colinfer (python -m engine.server ...)
@@ -10,14 +10,12 @@ colinfer server or an SGLang server (whose replies also give accepted tokens per
 import argparse
 import collections
 import os
-import random
 import sys
 import time
 
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
 
 def main():
@@ -27,15 +25,10 @@ def main():
     ap.add_argument("--n", type=int, default=40)
     ap.add_argument("--max-tokens", type=int, default=256)
     a = ap.parse_args()
-    from transformers import AutoTokenizer
-
-    from drafter_data import build_prompts
-    from engine.weights.loader import resolve
-    tok = AutoTokenizer.from_pretrained(resolve("nvidia/Qwen3.8-27B-NVFP4"))
+    from tests.golden import load_prompts
     res = collections.defaultdict(lambda: [0, 0, 0.0])  # completion tokens, verify steps (SGLang), seconds
-    for prompt, kind, think in build_prompts(a.n, random.Random(1)):
-        x = tok.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, enable_thinking=think, tokenize=True)
-        x = list(x["input_ids"] if hasattr(x, "keys") else x)[-3000:]
+    for m in load_prompts()["mix"][:a.n]:
+        x, kind = m["ids"], m["kind"]
         t0 = time.time()
         if a.engine == "colinfer":
             r = requests.post(f"http://127.0.0.1:{a.port}/v1/completions", json={"prompt": x, "temperature": 0, "max_tokens": a.max_tokens},

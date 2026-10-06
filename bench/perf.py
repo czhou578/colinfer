@@ -3,7 +3,7 @@
 checkpoints, INT6 / INT5 decode copies and the drafter files when present), in-process, no HTTP.
 
   prefill   random-token prompts of 2k / 8k / 32k tokens, one token out: TTFT (submit -> first token) and prefill tok/s
-  decode    12 chat prompts of the tools/drafter_data.py mix (3 per kind), one at a time, 256 tokens greedy, MTP:
+  decode    12 chat prompts of the frozen 40-prompt mix (3 per kind), one at a time, 256 tokens greedy, MTP:
             per-request decode tok/s = (tokens - 1) / (last token - first token), and their TTFT
   plain     4 of those prompts, 128 tokens, without speculation (a 1-slot scheduler built after the first is freed)
 
@@ -22,7 +22,6 @@ import argparse
 import gc
 import json
 import os
-import random
 import statistics
 import subprocess
 import sys
@@ -34,8 +33,7 @@ import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-from tests.golden import EOS, build_engine  # noqa: E402
+from tests.golden import EOS, build_engine, load_prompts  # noqa: E402
 
 
 def meminfo_kb(key: str) -> int:
@@ -80,16 +78,12 @@ def stats(xs):
     return dict(mean=statistics.mean(xs), std=statistics.stdev(xs) if len(xs) > 1 else 0.0, min=min(xs), max=max(xs), n=len(xs))
 
 
-def chat_prompts(path, n_per_kind: int):
-    from transformers import AutoTokenizer
-
-    from drafter_data import build_prompts
-    tok = AutoTokenizer.from_pretrained(path)
+def chat_prompts(n_per_kind: int):
+    """The first n_per_kind prompts of each kind of the frozen 40-prompt mix (tests/golden/prompts.json)."""
     by_kind = {}
-    for p, kind, think in build_prompts(40, random.Random(1)):
-        if len(by_kind.setdefault(kind, [])) < n_per_kind:
-            x = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=think, tokenize=True)
-            by_kind[kind].append(list(x["input_ids"] if hasattr(x, "keys") else x)[-3000:])
+    for m in load_prompts()["mix"]:
+        if len(by_kind.setdefault(m["kind"], [])) < n_per_kind:
+            by_kind[m["kind"]].append(m["ids"])
     return [(k, x) for k, xs in sorted(by_kind.items()) for x in xs]
 
 
@@ -144,7 +138,7 @@ def main():
         t0 = time.perf_counter()
         path, sched = build_engine(spec=True, slots=3, max_seq_len=262144, checkpoints=32)
         res["startup_s"] = time.perf_counter() - t0
-        prompts = chat_prompts(path, 3)
+        prompts = chat_prompts(3)
         rounds = []
         for i in range(a.warmup + a.runs):
             rounds.append(prefill_round(sched, a.lens, seed=i))
