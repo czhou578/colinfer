@@ -5,11 +5,16 @@ served through an OpenAI-compatible HTTP API. It is built for one person making 
 the speed this chip can physically deliver: decode is bound by LPDDR5x bandwidth (~238 GB/s), so everything above the
 ~14 tok/s weight-streaming floor comes from speculative decoding.
 
-| | colinfer | SGLang 0.5.21 + DFlash2 |
-|---|---|---|
-| 40-request mix, greedy, 256 tokens, wall tok/s (`bench/request_mix_bench.py`) | **39.4** (code 57.7, prose 33.3, Q&A 38.5, structured 39.6) | 29.0 |
-| Plain decode, 8k context | 74 ms / token (13.5 tok/s) | |
-| Prefill, 2k / 8k / 32k prompt | 0.54 s / 2.29 s / 10.9 s | |
+| | colinfer | SGLang 0.5.21 | vLLM 0.25.1 |
+|---|---|---|---|
+| 40-request mix, greedy, 256 tokens, wall tok/s (`bench/request_mix_bench.py`) | **39.4** (code 57.7, prose 33.3, Q&A 38.5, structured 39.6) | 29.0 (with DFlash2) | not measured |
+| Plain decode, no speculation | **13.5 tok/s** (74 ms / token at 8k context) | 12.3 tok/s | 12.3 tok/s |
+| Prefill, 2k / 8k / 32k prompt | **0.54 s / 2.29 s / 10.9 s** (3.8k / 3.6k / 3.0k tok/s) | ≈1.3 s / ≈4.9 s / not measured (≈1.5k / ≈1.7k tok/s) | 0.81 s / 3.9 s / 18.0 s |
+
+The SGLang and vLLM decode and prefill figures are the phase-0 baselines on the same checkpoint and machine
+(`docs/history/baseline.md` section 4: FP8 KV, prefix cache off; decode on a short prose prompt; SGLang's prefill from its
+own per-batch log). The SGLang mix figure is SGLang with the DFlash2 drafter on the identical 40 requests
+(`docs/history/phase6_progress.md` section 16).
 
 Outputs are **token-identical with speculation on or off**, greedy or seeded-sampled, at any batch width
 (`tests/spec_check.py`, `tests/scheduler_check.py`). Every quantization choice beyond the checkpoint's own passes a
