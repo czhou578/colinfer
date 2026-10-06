@@ -96,6 +96,10 @@ Other endpoints:
   drafts falls below 0.1 for every decoding slot, the cycle's remaining draft steps skip their weight GEMMs (~0.35 ms
   instead of ~1.8 ms a step); verify rejects their junk drafts, so outputs do not change. `COLINFER_DRAFT_STOP` sets
   the threshold (0 turns it off; `docs/phase6_progress.md` section 18).
+- **Low-rank draft head.** With `~/.cache/colinfer/drafter/draft_head_pca.safetensors` (`tools/lowrank_draft_head.py`),
+  each draft step scores a rank-1024 approximation of the draft lm head and rescores its top 256 candidates exactly:
+  the same drafts as the full head for ~1/5 of its bytes (k=7 cycle 89.8 → 86.0 ms). `COLINFER_DRAFT_LOWRANK=0` turns
+  it off (`docs/phase6_progress.md` section 19).
 - **Prefix checkpoints.** A request restores the longest checkpoint that is a prefix of its prompt. Checkpoints are taken:
   - at the end of each prompt and each reply;
   - at the end of the first message (a shared system prompt);

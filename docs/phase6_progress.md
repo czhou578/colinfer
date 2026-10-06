@@ -865,6 +865,52 @@ The 40 requests of section 16 (server defaults, tok/s):
 at width 1; the adaptive choice stays, since it also covers three slots, where 3 × 8 rows would need two weight
 passes. `COLINFER_K_OPTIONS` overrides the draft lengths a cycle picks from.)
 
+## 19. Low-rank draft head, and what a TMA weight stream would give
+
+**Draft head.** Each draft step streamed the draft lm head (64k static + 4k prompt rows of the target's NVFP4 lm_head,
+≈200 MB, ≈0.86 ms), about half of the step. The head's weights are not low-rank (rank 1024 holds 42% of their energy,
+and the full head's argmax is in a rank-1024 SVD approximation's top 64 only 75% of the time), but the drafter's
+outputs g are: their top 1024 principal directions U hold 89% of the energy. Scoring  (g U)(W U)^T  instead of  g W^T
+(two NVFP4 skinny GEMMs: U^T 1024 x 5120 and W U 69,632 x 1024, ≈43 MB) and rescoring the approximation's top
+candidates exactly against the real NVFP4 rows (`ops().rescore_nvfp4`, `csrc/sampling.cu`) gives the full head's
+argmax almost always:
+
+| Rank | Full head's argmax in the top 16 / 64 / 256 (held-out drafter outputs, fine-tuned head) |
+|---|---|
+| 512 | 0.899 / 0.971 / 0.992 |
+| **1024** | 0.968 / 0.994 / **0.9996** |
+| 2048 | 0.995 / 0.9999 / 1.000 |
+
+- `tools/lowrank_draft_head.py` collects the drafter's outputs from real k=7 cycles (40 prompts of the
+  `tools/drafter_data.py` mix with a seed the evals do not use), fits U and saves it to
+  `~/.cache/colinfer/drafter/draft_head_pca.safetensors`; the engine uses it when present (`COLINFER_DRAFT_LOWRANK`:
+  `auto` | `0` | a path; `COLINFER_DRAFT_CANDS`, default 256). W U is kept for the whole target vocabulary (143 MB), so
+  a request's prompt rows are a gather, as for the draft head itself. Server startup +1 s.
+- The early exit's probability uses the exact logit of the chosen draft over the approximation's logsumexp.
+- Acceptance (`tools/eval_drafter.py`, tokens per cycle k=3 / k=7): full head 2.77 / 3.41; low-rank with 64 candidates
+  2.76 / 3.39; **with 256: 2.77 / 3.41**.
+- Cycle (`bench/decode_bench.py`, 8k): k=7 89.8 → **86.0 ms**, k=3 81.4 → 79.1 ms (width 2: 97.3 → 93.7, 85.6 → 83.9).
+
+The 40 requests of section 16 (server defaults, tok/s):
+
+| | Code | Prose | Q&A | Structured | All |
+|---|---|---|---|---|---|
+| Section 17 (before this round) | 53.9 | 31.3 | 36.3 | 36.5 | 36.8 |
+| Section 18 (GDN kernel, commit overlap, early exit) | 54.8 | 32.6 | 36.8 | 38.6 | 38.1 |
+| **Low-rank draft head (default)** | **57.6** | **33.3** | **38.4** | **39.6** | **39.3** |
+| (early exit at 0.15 instead of 0.1) | 57.5 | 33.5 | 38.5 | 39.8 | 39.5 |
+| SGLang + DFlash2 (section 16) | 41.2 | 25.2 | 28.3 | 28.4 | 29.0 |
+
+**TMA weight streaming, measured.** A `cp.async.bulk` variant of the skinny GEMM (a 2-3 stage shared-memory ring per
+warp, lane r copying weight row r's 256 bytes and its 32 scale bytes, one mbarrier per stage; bit-identical outputs)
+streamed at half the rate of the register version (65-130 GB/s): the copy engine is limited by request count, and
+256-byte row pieces cap at ≈192 GB/s even without the scales (≈115 with them). 2D tensor-map loads (two 128-byte x
+16-row boxes per chunk, 128B swizzle, plus a 32 x 16 scale box) match the register path without scales (222-235
+GB/s) and lose with them (212-224 vs 229-236). Only a tile-contiguous layout (a 16-row x 512-k chunk with its scales as
+one 4.6 KB block) streams faster through bulk copies, 232-241 GB/s, i.e. ≤3% of the weight GEMMs: ≈2 ms per cycle,
+and for the MLP (60% of the bytes) it needs a second copy of the weights (+9.6 GB) since CUTLASS prefill reads the
+checkpoint layout. Not pursued.
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:

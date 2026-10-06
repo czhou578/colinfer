@@ -553,6 +553,21 @@ void skinny_fp8(torch::Tensor x, torch::Tensor w, double scale, c10::optional<to
 }
 
 cudaError_t launch_philox_uniform(const int64_t*, const int64_t*, float*, int, int, cudaStream_t);
+cudaError_t launch_rescore_nvfp4(const void*, const void*, const void*, float, const int64_t*, float*, int, int, int, cudaStream_t);
+
+// exact logits of candidate rows of an NVFP4 matrix: x bf16 [B, K], w u8 [V, K/2], sf e4m3 [V, K/16], cand int64 [B, NC] -> [B, NC] fp32
+torch::Tensor rescore_nvfp4(torch::Tensor x, torch::Tensor w, torch::Tensor sf, double gs, torch::Tensor cand) {
+    CHECK_CUDA_TENSOR(x, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(w, torch::kUInt8);
+    CHECK_CUDA_TENSOR(cand, torch::kInt64);
+    TORCH_CHECK(sf.is_cuda() && sf.is_contiguous() && sf.element_size() == 1, "sf: 1-byte contiguous CUDA");
+    const int64_t K = x.size(-1), B = x.numel() / K, NC = cand.size(-1);
+    TORCH_CHECK(w.size(1) * 2 == K && sf.size(0) == w.size(0) && sf.size(1) == K / 16 && cand.numel() == B * NC, "shapes");
+    auto out = torch::empty({B, NC}, x.options().dtype(torch::kFloat32));
+    CHECK_LAUNCH(launch_rescore_nvfp4(x.data_ptr(), w.data_ptr(), sf.data_ptr(), (float)gs, cand.data_ptr<int64_t>(), out.data_ptr<float>(),
+                                      (int)B, (int)K, (int)NC, at::cuda::getCurrentCUDAStream()));
+    return out;
+}
 
 // out fp32 [B, n] = per-slot seeded uniforms in (0, 1] at counters offset[b] + i (seed, offset: int64 [B], device).
 void philox_uniform(torch::Tensor seed, torch::Tensor offset, torch::Tensor out) {
@@ -574,6 +589,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("skinny_fp8", &skinny_fp8, "tensor-core FP8 x bf16 skinny GEMM, M<=16", py::arg("x"), py::arg("w"), py::arg("scale"),
           py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
     m.def("kv4_to_bf16", &kv4_to_bf16, "fp4 KV cache rows -> bf16");
+    m.def("rescore_nvfp4", &rescore_nvfp4, "exact logits of candidate rows of an NVFP4 matrix");
     m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (speculative sampling)");
     m.def("gdn_conv_multi", &gdn_conv_multi, "spec verify: GDN conv over T tokens, state read-only");
     m.def("gdn_conv_commit", &gdn_conv_commit, "spec commit: advance the GDN conv state by n tokens");

@@ -185,6 +185,40 @@ class Mtp(nn.Module):
             self.vocab_ids = torch.tensor(allids.astype(np.int64), device="cuda")
             lm = target.lm_head
             self.lm_draft = Nvfp4Linear(lm.w[self.vocab_ids].contiguous(), lm.sf[self.vocab_ids].contiguous(), lm.gscale, out_fp32=True)
+            self._init_lowrank()
+
+    def _init_lowrank(self):
+        """Low-rank draft head (tools/lowrank_draft_head.py, docs/phase6_progress.md section 19): with U [H, r] the top-r
+        principal directions of the drafter's outputs, the draft logits are approximated by (g U)(W U)^T (two NVFP4
+        GEMMs streaming ~1/5 of the draft head's bytes) and the top LOWRANK_CANDS candidates are rescored exactly
+        against the real NVFP4 rows. W U is kept for the whole vocabulary so per-request prompt rows are a gather."""
+        self.lr_A = self.lr_B = None
+        src = os.environ.get("COLINFER_DRAFT_LOWRANK", "auto")
+        if src == "0":
+            return
+        f = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca.safetensors") if src == "auto" else os.path.expanduser(src)
+        if not os.path.exists(f):
+            return
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools"))
+        from requant_nvfp4 import quantize
+        from engine.model.fast import Nvfp4Linear
+        from engine.weights.loader import dequant_nvfp4
+        with safe_open(f, framework="pt", device="cuda") as sf:
+            U = sf.get_tensor("U").float()                                        # [H, r]
+        lm = self.lm_head
+        gs = torch.tensor(lm.gscale)
+        WU = torch.empty(lm.w.shape[0], U.shape[1], device="cuda")
+        for i in range(0, lm.w.shape[0], 16384):
+            WU[i:i + 16384] = dequant_nvfp4(lm.w[i:i + 16384], lm.sf[i:i + 16384], gs, out_dtype=torch.float32) @ U
+        gb = float(WU.abs().max()) / (448.0 * 6.0)
+        wb, sb = quantize(WU, gb)
+        del WU
+        ga = float(U.abs().max()) / (448.0 * 6.0)
+        wa, sa = quantize(U.T.contiguous(), ga)
+        self.lr_A = Nvfp4Linear(wa, sa, ga)
+        self.lr_full = (wb, sb)                                                   # [V_target, r]: prompt rows gather from it
+        self.lr_B = Nvfp4Linear(wb[self.vocab_ids].contiguous(), sb[self.vocab_ids].contiguous(), gb, out_fp32=True)
 
     def set_prompt_vocab(self, prompt: list[int]):
         """Fill the per-request draft-vocab rows with prompt tokens missing from the static set."""
@@ -198,10 +232,24 @@ class Mtp(nn.Module):
         lm = self.lm_head
         self.lm_draft.w[self.n_static:] = lm.w[ids]
         self.lm_draft.sf[self.n_static:] = lm.sf[ids]
+        if self.lr_B is not None:
+            self.lr_B.w[self.n_static:] = self.lr_full[0][ids]
+            self.lr_B.sf[self.n_static:] = self.lr_full[1][ids]
 
     def draft(self, g: torch.Tensor, prob: bool = False):
         """Greedy draft token ids from MTP outputs g [..., H] -> [...]; prob: also the drafter's probability of each
         (softmax over the draft vocabulary)."""
+        if getattr(self, "lr_B", None) is not None:  # low-rank scores, the top candidates rescored exactly
+            g2 = g.reshape(-1, g.shape[-1]).contiguous()
+            ap = self.lr_B(self.lr_A(g2))                                           # [N, V] fp32
+            cand = ap.topk(LOWRANK_CANDS, -1).indices                               # [N, C]
+            ex = ops().rescore_nvfp4(g2, self.lm_draft.w, self.lm_draft.sf, self.lm_draft.gscale, cand)
+            best = ex.argmax(-1, keepdim=True)
+            ids = self.vocab_ids[cand.gather(-1, best)].view(g.shape[:-1])
+            if not prob:
+                return ids
+            p = torch.exp(ex.gather(-1, best) - torch.logsumexp(ap, -1, keepdim=True)).clamp_max(1.0)
+            return ids, p.view(g.shape[:-1])
         lg = self.lm_draft(g)
         idx = lg.argmax(-1)
         ids = idx if self.vocab_ids is None else self.vocab_ids[idx]
@@ -272,6 +320,9 @@ class Mtp(nn.Module):
 # active slot, the remaining draft steps skip their GEMMs (their drafts are junk that verify rejects; outputs are
 # unchanged). Simulated on the k = 7 cycle mix: 35.3 -> 36.6 tok/s at 0.2 (an oracle stop: 38.8). 0 disables.
 DRAFT_STOP = float(os.environ.get("COLINFER_DRAFT_STOP", "0.1"))
+
+# Low-rank draft head: candidates rescored exactly per draft (COLINFER_DRAFT_CANDS)
+LOWRANK_CANDS = int(os.environ.get("COLINFER_DRAFT_CANDS", "256"))
 
 # GDN commit concurrent with the MTP drafting (a second branch of the cycle graph); COLINFER_COMMIT_OVERLAP=0: serial
 COMMIT_OVERLAP = os.environ.get("COLINFER_COMMIT_OVERLAP", "1") != "0"
