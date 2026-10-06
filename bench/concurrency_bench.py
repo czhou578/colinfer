@@ -36,8 +36,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.0)
     a = ap.parse_args()
-    print(f"| streams | per-request decode tok/s (each) | mean | aggregate tok/s |")
-    print(f"|---|---|---|---|")
+    print("| streams | per-request decode tok/s (each) | mean | aggregate tok/s |")
+    print("|---|---|---|---|")
     for n in a.levels:
         t0 = time.time()
         with cf.ThreadPoolExecutor(n) as ex:

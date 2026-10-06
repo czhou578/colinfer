@@ -16,7 +16,6 @@ import json
 import os
 import re
 import struct
-import sys
 
 
 def resolve(path_or_repo):

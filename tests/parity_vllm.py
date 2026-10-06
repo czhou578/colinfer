@@ -9,7 +9,6 @@ top 20 is reported alongside; when it is small the truncated KL is a close lower
   uv run python tests/parity_vllm.py tests/parity_out/vllm_nvfp4.json tests/parity_out/ours_nvfp4.pt
 """
 import json
-import math
 import sys
 
 import torch

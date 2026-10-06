@@ -13,7 +13,6 @@ import os
 import random
 import re
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from transformers import AutoTokenizer  # noqa: E402
@@ -70,7 +69,6 @@ def main():
         for d in a.depths:
             key = rng.randint(100000, 999999)
             ids = build(tok, L, d, key)
-            t0 = time.perf_counter()
             r = eng.run([Request(ids, max_new_tokens=12, eos_ids=(248046, 248044))])[0]
             ans = tok.decode(r.output, skip_special_tokens=True).strip()
             ok = str(key) in re.sub(r"[^0-9]", "", ans) or str(key) in ans
