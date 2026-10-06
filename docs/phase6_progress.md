@@ -739,6 +739,40 @@ Perplexity (prefill engine, FP8 KV): WikiText 7.0807, code 1.8010, code ctx 8192
 with FLA (differences of both signs, the size other rounding-only changes produce). Passkey 6/6 at 31k and 126k;
 `tests/scheduler_check.py` passes. `COLINFER_GDN_CUDA=0` selects FLA.
 
+## 16. DFlash2 (block-diffusion drafter) vs the MTP head
+
+SGLang + DFlash2 (`z-lab/Qwen3.8-27B-DFlash2`: 1.9B parameters, 5 non-causal layers over the target's residual stream
+after layers 5 / 19 / 33 / 47 / 61, an 8-token block per forward, a top-16 candidate selector) is reported at 40-50 tok/s
+on one DGX Spark (MT-Bench acceptance 4.10 per verify, HumanEval 4.39). `tools/dflash_sim.py` ports its forward (from
+SGLang's `srt/models/dflash.py`) and replays greedy cycles with our target's hidden states.
+
+**Acceptance (tokens per verify step) on the engine's greedy replies to the 40 eval prompts** (half with thinking on):
+
+| | MTP k=7, fine-tuned head (ours) | DFlash2, our port | DFlash2 in SGLang 0.5.21 | best of MTP and DFlash2 per cycle |
+|---|---|---|---|---|
+| Code | 5.64 | 5.27 | 4.85 | 5.33 |
+| Prose | 2.79 | 2.83 | 2.91 | 2.95 |
+| Q&A | 3.35 | 3.29 | 3.29 | 3.42 |
+| Structured | 3.56 | 3.54 | 3.30 | 3.68 |
+| All | 3.45 | 3.42 | 3.37 | 3.54 |
+
+- The port agrees with SGLang's own DFlash2 (3.42 vs 3.37 overall), so the comparison is fair: on these prompts DFlash2
+  drafts no better than the fine-tuned MTP head. The published 4.1-4.4 come from easier benchmarks.
+- Two chains, one from each drafter, would add < 5% tokens per cycle for twice the verify rows: not worth it.
+
+**End to end, the same 40 requests** (greedy, 256 tokens, token-id prompts, wall time including prefill):
+
+| tok/s | SGLang + DFlash2 | colinfer (defaults) |
+|---|---|---|
+| Code | 41.2 | **50.7** |
+| Prose | 25.2 | **30.0** |
+| Q&A | 28.3 | **33.7** |
+| Structured | 28.4 | **34.5** |
+| All | 29.0 | **34.8** |
+
+The engine is ~20% faster than SGLang + DFlash2 on identical requests. Prose stays near 30 tok/s with either drafter:
+~0.45 acceptance per drafted token is what both learn on this model's prose.
+
 ## Next
 
 - A better drafter for prose. Acceptance there is about 0.45-0.50, so speculation adds about 1.15×. Sections 7, 12, 13:
