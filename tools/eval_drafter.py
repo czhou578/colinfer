@@ -24,7 +24,7 @@ def main():
     ap.add_argument("--k", type=int, nargs="+", default=[3, 7])
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--no-baseline", action="store_true", help="skip the checkpoint's MTP head")
-    ap.add_argument("--draft-vocab", type=int, default=65536, help="static draft vocabulary size (the engine's --draft-vocab)")
+    ap.add_argument("--full-head", action="store_true", help="score drafts with the full draft head, not the low-rank one")
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
@@ -34,7 +34,7 @@ def main():
     from engine.weights.loader import resolve
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
-    model = to_fast(load_fast_model(path), kv_fp8=True)
+    model = to_fast(load_fast_model(path))
     prompts = build_prompts(a.n, random.Random(1))
     ids = []
     for p, kind, think in prompts:
@@ -43,7 +43,7 @@ def main():
     eos = (248046, 248044)
     for w in ([] if a.no_baseline else [None]) + a.weights:
         for k in a.k:
-            gen = MtpGenerator(model, path, max_seq_len=4096, k=k, weights=w, draft_vocab=a.draft_vocab)
+            gen = MtpGenerator(model, path, max_seq_len=4096, k=k, weights=w, **({"lowrank": None} if a.full_head else {}))
             per = collections.defaultdict(lambda: [0, 0, 0, 0])  # drafted, accepted, tokens, cycles
             for x, kind in ids:
                 s0 = dict(gen.stats)

@@ -47,10 +47,8 @@ def main():
     ap.add_argument("--emulate", help="quant emulation effects: act_nvfp4,act_fp8,fp8_requant or all")
     ap.add_argument("--engine", choices=["reference", "prefill"], default="reference",
                     help="reference: Phase 1 PyTorch model; prefill: Phase 3 W4A4 / W8A8 kernel prefill path")
-    ap.add_argument("--kv-fp8", action="store_true", help="prefill engine: fp8 KV cache")
-    ap.add_argument("--kv-fp4", action="store_true", help="prefill engine: fp4 KV cache (e2m1 + e4m3 block scales)")
-    ap.add_argument("--override", help="reference engine: safetensors of NVFP4 weights replacing the checkpoint's "
-                                       "(tools/requant_nvfp4.py output; 'requant' = its default path)")
+    ap.add_argument("--override", help="reference engine: safetensors replacing the checkpoint's weights, comma-separated: "
+                                       "tools/int6_requant.py --simulate outputs (.weight_deq) or NVFP4 tensors")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -73,20 +71,15 @@ def main():
     if args.engine == "prefill":
         from engine.model.fast import load_fast_model, to_fast
         from engine.model.prefill import prefill
-        model = to_fast(load_fast_model(path), kv_fp8=args.kv_fp8, kv_fp4=args.kv_fp4)
+        model = to_fast(load_fast_model(path))
     else:
         model = load_model(path, emulate=args.emulate)
         if args.override:
             from safetensors import safe_open
 
             from engine.weights.loader import PREFIX, dequant_nvfp4
-            ov = args.override
-            if ov == "requant":
-                sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
-                from requant_nvfp4 import default_out
-                ov = default_out(path)
             n = 0
-            for ov in ov.split(","):  # several files: e.g. AWQ attention + INT6 GDN
+            for ov in args.override.split(","):  # several files: e.g. INT6 attention + INT5 GDN
               with safe_open(ov, "pt", device="cuda") as f:
                 import re
                 for k in f.keys():
@@ -98,10 +91,6 @@ def main():
                     if k.endswith(".weight") and (not args.override_filter or re.search(args.override_filter, k)):
                         base = k[: -len(".weight")]
                         w = dequant_nvfp4(f.get_tensor(k), f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2"))
-                        if base + ".input_scale_awq" in f.keys():  # tools/awq_nvfp4.py: W_eff = dequant(W diag(s)) / s
-                            w32 = dequant_nvfp4(f.get_tensor(k), f.get_tensor(base + ".weight_scale"), f.get_tensor(base + ".weight_scale_2"),
-                                                torch.float32)
-                            w = (w32 / f.get_tensor(base + ".input_scale_awq")[None, :]).to(w.dtype)
                         model.get_submodule(base[len(PREFIX):]).weight.data.copy_(w)
                         n += 1
             print(f"[ppl] override: {n} linears from {ov}")
@@ -121,7 +110,7 @@ def main():
         if (w + 1) % 8 == 0 or w == n_win - 1:
             print(f"[ppl] {w + 1}/{n_win} windows  running ppl {math.exp(nll / count):.4f}  ({time.time() - t0:.0f}s)")
     ppl = math.exp(nll / count)
-    print(f"[ppl] RESULT text={args.text or 'wikitext'} ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} filter={args.override_filter} kv_fp8={args.kv_fp8} kv_fp4={args.kv_fp4} "
+    print(f"[ppl] RESULT text={args.text or 'wikitext'} ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} filter={args.override_filter} "
           f"ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
     if args.json:
         json.dump(dict(ckpt=args.ckpt, emulate=args.emulate, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)

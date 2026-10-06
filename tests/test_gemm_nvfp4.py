@@ -78,8 +78,8 @@ def test_startup_selftest_passes():
 
 @pytest.mark.parametrize("M", [1, 37, 256, 2048])
 def test_gemm_swiglu_fused(M):
-    """Up GEMM with silu(gate) * acc and NVFP4 quantization in the epilogue == the unfused silu_mul_quant path (up to
-    rounding ties: the fused path does not round u and the product to bf16 first)."""
+    """Up GEMM with silu(gate) * acc and NVFP4 quantization in the epilogue == NVFP4 of silu(gate) * up computed from the
+    two plain GEMMs (up to rounding ties: the fused path does not round up and the product to bf16 first)."""
     from engine.kernels import ops
     torch.manual_seed(M)
     K, I = 1024, 2048
@@ -98,10 +98,11 @@ def test_gemm_swiglu_fused(M):
     gate, up = (torch.empty(M, I, device="cuda", dtype=torch.bfloat16) for _ in range(2))
     ops().nvfp4_gemm(xq, xsf, gq, gsf, sx * sw, None, gate, tile)
     ops().nvfp4_gemm(xq, xsf, uq, usf, sx * sw, None, up, tile)
-    hq_ref = torch.empty(M, I // 2, dtype=torch.uint8, device="cuda")
-    hsf_ref = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device="cuda")
-    ops().silu_mul_quant(torch.cat([gate, up], 1).contiguous(), sh, hq_ref, hsf_ref)
-    hq, hsf = torch.empty_like(hq_ref), torch.empty_like(hsf_ref)
+    hq = torch.empty(M, I // 2, dtype=torch.uint8, device="cuda")
+    hsf = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device="cuda")
     ops().nvfp4_gemm_swiglu(xq, xsf, uq, usf, sx * sw, gate, hq, hsf, torch.tensor([1.0 / sh], device="cuda"), tile)
-    assert (hq == hq_ref).float().mean().item() > 0.97
-    assert (hsf == hsf_ref).float().mean().item() > 0.97
+    lut = E2M1_LUT.cuda()
+    got = torch.stack([lut[(hq & 15).long()], lut[(hq >> 4).long()]], -1).reshape(M, I)
+    got = got * unswizzle(hsf, M, I).view(torch.float8_e4m3fn).float().repeat_interleave(16, 1)
+    want = fake_quant_nvfp4_unscaled((torch.nn.functional.silu(gate.float()) * up.float()).bfloat16(), sh).float()
+    assert (got == want).float().mean().item() > 0.97

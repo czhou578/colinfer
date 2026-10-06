@@ -1,5 +1,6 @@
-"""Chunked Gated DeltaNet forward (csrc/gdn_prefill.cu) against FLA's chunk_gated_delta_rule: output and the continued
-state, GVA (16 key heads, 48 value heads), lengths that end mid-chunk. Run: uv run pytest tests/test_gdn_prefill.py -q"""
+"""Chunked Gated DeltaNet forward (csrc/gdn_prefill.cu) against the reference chunk_gated_delta_rule (engine/model/
+qwen35.py, fp32): output and the continued state, GVA (16 key heads, 48 value heads), lengths that end mid-chunk.
+Run: uv run pytest tests/test_gdn_prefill.py -q"""
 import os
 import sys
 
@@ -11,10 +12,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the
 
 
 @pytest.mark.parametrize("T", [1, 5, 63, 64, 65, 200, 1000])
-def test_gdn_prefill_matches_fla(T):
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-
+def test_gdn_prefill_matches_reference(T):
     from engine.kernels import ops
+    from engine.model.qwen35 import chunk_gated_delta_rule
     torch.manual_seed(T)
     Hk, Hv, D = 16, 48, 128
     q = torch.nn.functional.normalize(torch.randn(T, Hk, D, device="cuda"), dim=-1).bfloat16()
@@ -23,8 +23,8 @@ def test_gdn_prefill_matches_fla(T):
     g = -torch.rand(T, Hv, device="cuda") * 0.5 - 0.01
     beta = torch.rand(T, Hv, device="cuda").bfloat16()
     s0 = torch.randn(1, Hv, D, D, device="cuda") * 0.1
-    o_ref, s_ref = chunk_gated_delta_rule(q[None], k[None], v[None], g=g[None], beta=beta[None], initial_state=s0.clone(),
-                                          output_final_state=True, use_qk_l2norm_in_kernel=False)
+    rep = lambda x: x.repeat_interleave(Hv // Hk, dim=1)[None]  # noqa: E731  (GVA: each key head serves 3 value heads)
+    o_ref, s_ref = chunk_gated_delta_rule(rep(q), rep(k), v[None], g[None], beta[None], s0.clone())
     st = s0[0].clone()
     o = torch.empty(T, Hv, D, device="cuda", dtype=torch.bfloat16)
     ops().gdn_prefill(q, k, v, g, beta, st, o, D ** -0.5)

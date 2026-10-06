@@ -47,15 +47,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--k", type=int, default=7)
     ap.add_argument("--only-alone", action="store_true", help="just the single-request speeds")
-    ap.add_argument("--requant", action="store_true", help="decode from the NVFP4 re-quantized attention / GDN projections")
+    ap.add_argument("--checkpoint-weights", action="store_true", help="decode the FP8 projections instead of the INT6 / INT5 copies")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
-    model = to_fast(load_fast_model(path), kv_fp8=True)
-    if a.requant:
-        from engine.model.fast import attach_requant, requant_path
-        print(f"requant: {attach_requant(model, requant_path(path))} linears")
-    mtp = Mtp(model, path, fp8=True, draft_vocab=65536)
+    model = to_fast(load_fast_model(path))
+    if not a.checkpoint_weights:
+        from engine.model.fast import attach_decode_copies, decode_copies_paths
+        print(f"INT6 / INT5 decode copies: {attach_decode_copies(model, decode_copies_paths(path))} linears")
+    mtp = Mtp(model, path)
     t0 = time.perf_counter()
     ref = Scheduler(model, n_slots=1, max_seq_len=8192, n_checkpoints=0, selftest=True)
     spec = Scheduler(model, n_slots=3, max_seq_len=32768, n_checkpoints=32, mtp=mtp, k=a.k, selftest=False, boundary_token=IM_START)

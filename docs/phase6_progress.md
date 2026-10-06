@@ -1,5 +1,10 @@
 # Phase 6: pushing past the public numbers (progress, 2026-10-04)
 
+> Dated log. The alternatives it measured and the switches it names (`COLINFER_*` environment variables, the CUDA-core
+> GEMV, bf16 / fp4 KV caches, NVFP4 / AWQ / GPTQ decode copies, FLA, the n-gram drafter, FP8 / INT drafter formats, ...)
+> were removed from the code on 2026-10-06, keeping only what each measurement chose. `docs/architecture.md` describes
+> the current engine.
+
 Three changes so far. All of them keep greedy and seeded-sampled output token-identical across batch widths, draft
 lengths and speculation on/off (`tests/scheduler_check.py`, `tests/spec_check.py`).
 

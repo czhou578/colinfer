@@ -1,4 +1,6 @@
-"""Split-KV decode attention (csrc/attn_decode.cu) against torch SDPA. Run: uv run pytest tests/test_attn_decode.py -q"""
+"""Decode attention (csrc/attn_decode.cu) over an fp8 KV cache: accuracy against torch SDPA, every row bit-identical to a
+one-row launch at that row's length (what makes speculation output-invariant), and the full KernelAttention layer
+(prologue + attention + gate) against the reference qwen35.Attention. Run: uv run pytest tests/test_attn_decode.py -q"""
 import os
 import sys
 
@@ -21,26 +23,49 @@ def ref(q, k, v, seq_lens):
     return out
 
 
-@pytest.mark.parametrize("B,T,lens,splits", [
-    (1, 1, [1], 1), (1, 1, [7], 4), (1, 1, [1000], 16), (1, 1, [8192], 32), (1, 1, [33], 64),  # more splits than keys
-    (3, 1, [5, 4096, 777], 24), (1, 2, [300], 8), (2, 4, [17, 2000], 16),
-])
-@pytest.mark.parametrize("kv_fp8", [False, True])
-def test_attn_decode(B, T, lens, splits, kv_fp8):
+Hq, Hkv, D = 24, 4, 256
+
+
+def cache(B, Lmax):
+    k = (torch.randn(B, Hkv, Lmax, D, device="cuda") * 2).to(torch.float8_e4m3fn)
+    v = torch.randn(B, Hkv, Lmax, D, device="cuda").to(torch.float8_e4m3fn)
+    return k, v, k.bfloat16(), v.bfloat16()  # the reference sees exactly the values the kernel reads
+
+
+@pytest.mark.parametrize("B,T,lens", [(1, 1, [1]), (1, 1, [31]), (1, 1, [1000]), (1, 1, [8192]), (3, 1, [5, 4096, 777]),
+                                      (1, 4, [300]), (2, 8, [17, 2000]), (1, 3, [33]), (2, 10, [600, 64]), (1, 16, [1500])])
+def test_attn_decode_matches_sdpa(B, T, lens):
     from engine.kernels import ops
     torch.manual_seed(sum(lens) + T)
-    Hq, Hkv, D, Lmax = 24, 4, 256, 8448
+    Lmax = 8448
+    k, v, kr, vr = cache(B, Lmax)
     q = torch.randn(B, Hq, T, D, device="cuda").bfloat16()
-    k = torch.randn(B, Hkv, Lmax, D, device="cuda").bfloat16()
-    v = torch.randn(B, Hkv, Lmax, D, device="cuda").bfloat16()
-    if kv_fp8:  # the reference sees exactly the values the kernel reads
-        k, v = k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn)
     sl = torch.tensor(lens, dtype=torch.int32, device="cuda")
     out = torch.empty_like(q)
-    ops().attn_decode(q, k, v, sl, out, splits, D ** -0.5)
-    r = ref(q, k.bfloat16(), v.bfloat16(), lens)
+    ops().attn_decode(q, k, v, sl, out, D ** -0.5)
+    r = ref(q, kr, vr, lens)
     err = (out.float() - r.float()).abs().max().item()
-    assert err < 2e-2, err
+    assert err <= 1e-2 * max(1.0, r.float().abs().max().item()), err  # P is rounded to f16 (~5e-4 relative), plus a bf16 ulp
+
+
+@pytest.mark.parametrize("T,L", [(4, 37), (8, 4000), (8, 33), (2, 70), (12, 900), (8, 64 * 16 * 3 + 5)])
+def test_rows_bit_identical_to_single_row(T, L):
+    """Row t of a T-row launch at seq_len L == the one-row launch at seq_len L - (T-1-t), including the gated layout."""
+    from engine.kernels import ops
+    torch.manual_seed(T * 1000 + L)
+    B, Lmax = 2, 4096 + 64 * 16 * 3
+    k, v, _, _ = cache(B, Lmax)
+    q = torch.randn(B, Hq, T, D, device="cuda").bfloat16()
+    gate = torch.randn(B, T, Hq, 2 * D, device="cuda").bfloat16()
+    sl = torch.tensor([L, L + 3], dtype=torch.int32, device="cuda")
+    out = torch.empty(B, T, Hq * D, device="cuda", dtype=torch.bfloat16)
+    ops().attn_decode(q, k, v, sl, out, D ** -0.5, gate)
+    for t in range(T):
+        q1 = q[:, :, t:t + 1].contiguous()
+        g1 = gate[:, t:t + 1].contiguous()
+        o1 = torch.empty(B, 1, Hq * D, device="cuda", dtype=torch.bfloat16)
+        ops().attn_decode(q1, k, v, sl - (T - 1 - t), o1, D ** -0.5, g1)
+        assert torch.equal(o1[:, 0], out[:, t]), (t, (o1[:, 0].float() - out[:, t].float()).abs().max().item())
 
 
 class _LinearR(torch.nn.Linear):
@@ -49,10 +74,9 @@ class _LinearR(torch.nn.Linear):
         return y if residual is None else y + residual
 
 
-@pytest.mark.parametrize("kv_fp8", [False, True])
 @pytest.mark.parametrize("B,T,pos", [(1, 1, 37), (2, 1, 500), (1, 3, 64)])
-def test_kernel_attention_layer_matches_reference(kv_fp8, B, T, pos):
-    """Fused prologue (q/k norm, RoPE, KV write) + split-KV attention + gated combine vs qwen35.Attention."""
+def test_kernel_attention_layer_matches_reference(B, T, pos):
+    """Fused prologue (q/k norm, RoPE, fp8 KV write) + multi-row attention + gated combine vs qwen35.Attention."""
     from engine.model.fast import FastState, KernelAttention
     from engine.model.qwen35 import Attention, ModelState, Qwen35Config
     torch.manual_seed(B * 100 + T + pos)
@@ -66,11 +90,11 @@ def test_kernel_attention_layer_matches_reference(kv_fp8, B, T, pos):
         for n, p in ref.named_parameters():
             p.copy_(torch.randn_like(p) * (0.02 if "proj" in n else 0.3))
     rs = ModelState(cfg, B, 1024, "cuda")
-    fs = FastState(cfg, B, 1024, "cuda", kv_fp8=kv_fp8)
+    fs = FastState(cfg, B, 1024, "cuda")
     hist_k = torch.randn_like(rs.k[0][:, :, :pos]) * 2
     hist_v = torch.randn_like(rs.v[0][:, :, :pos])
-    if kv_fp8:  # both sides see the same (fp8-representable) history
-        hist_k, hist_v = hist_k.to(torch.float8_e4m3fn).bfloat16(), hist_v.to(torch.float8_e4m3fn).bfloat16()
+    # both sides see the same (fp8-representable) history
+    hist_k, hist_v = hist_k.to(torch.float8_e4m3fn).bfloat16(), hist_v.to(torch.float8_e4m3fn).bfloat16()
     rs.k[0][:, :, :pos], rs.v[0][:, :, :pos] = hist_k, hist_v
     fs.k[0][:, :, :pos] = hist_k.to(fs.k[0].dtype)
     fs.v[0][:, :, :pos] = hist_v.to(fs.v[0].dtype)
@@ -93,60 +117,4 @@ def test_kernel_attention_layer_matches_reference(kv_fp8, B, T, pos):
         ka.inv_freq = inv
         got = ka(x, None, None, fs, 0, residual=res)
     rel = ((got.float() - want.float()).norm() / want.float().norm()).item()
-    assert rel < (3e-2 if kv_fp8 else 1e-2), rel
-
-
-def rand_kv4(*shape):
-    """Random fp4 KV rows (uint8 [..., 144]): random e2m1 bytes, block scale codes for scales ~0.3-3 (stored x16)."""
-    data = torch.randint(0, 256, (*shape, 128), dtype=torch.uint8, device="cuda")
-    sc = ((torch.rand(*shape, 16, device="cuda") * 2.7 + 0.3) * 16).to(torch.float8_e4m3fn).view(torch.uint8)
-    return torch.cat([data, sc], -1).contiguous()
-
-
-def kv4_values(c):
-    from engine.kernels import ops
-    out = torch.empty(*c.shape[:-1], 256, device="cuda", dtype=torch.bfloat16)
-    ops().kv4_to_bf16(c, out)
-    return out
-
-
-@pytest.mark.parametrize("B,T,lens,splits", [(1, 1, [1000], 16), (3, 1, [5, 4096, 777], 24), (2, 4, [17, 2000], 16)])
-def test_attn_decode_kv4(B, T, lens, splits):
-    """fp4 cache: the kernel attends over exactly the values kv4_to_bf16 decodes."""
-    from engine.kernels import ops
-    torch.manual_seed(sum(lens) + T)
-    Hq, Hkv, D, Lmax = 24, 4, 256, 4224
-    q = torch.randn(B, Hq, T, D, device="cuda").bfloat16()
-    k, v = rand_kv4(B, Hkv, Lmax), rand_kv4(B, Hkv, Lmax)
-    sl = torch.tensor(lens, dtype=torch.int32, device="cuda")
-    out = torch.empty_like(q)
-    ops().attn_decode(q, k, v, sl, out, splits, D ** -0.5)
-    r = ref(q, kv4_values(k), kv4_values(v), lens)
-    assert (out.float() - r.float()).abs().max().item() < 2e-2
-
-
-def test_kv4_prologue_quantizes_rows():
-    """The prologue's fp4 rows decode to the bf16 rows within NVFP4 rounding (block-16 e2m1, scale amax / 6)."""
-    from engine.kernels import ops
-    torch.manual_seed(5)
-    B, T, Hq, Hkv, L = 2, 3, 24, 4, 64
-    qp = torch.randn(B, T, Hq * 512, device="cuda").bfloat16()
-    kp = (torch.randn(B, T, Hkv * 256, device="cuda") * 3).bfloat16()
-    vp = (torch.randn(B, T, Hkv * 256, device="cuda") * torch.logspace(-1, 1.5, 256, device="cuda").repeat(Hkv)).bfloat16()
-    w = torch.zeros(256, device="cuda").bfloat16()
-    inv = torch.ones(32, device="cuda")
-    pos = torch.tensor([3, 10], dtype=torch.int32, device="cuda")
-    q16, q4 = torch.empty(B, Hq, T, 256, device="cuda").bfloat16(), torch.empty(B, Hq, T, 256, device="cuda").bfloat16()
-    k16, v16 = torch.zeros(B, Hkv, L, 256, device="cuda").bfloat16(), torch.zeros(B, Hkv, L, 256, device="cuda").bfloat16()
-    k4, v4 = torch.zeros(B, Hkv, L, 144, dtype=torch.uint8, device="cuda"), torch.zeros(B, Hkv, L, 144, dtype=torch.uint8, device="cuda")
-    ops().attn_prologue(qp, kp, vp, w, w, inv, pos, k16, v16, q16, 1e-6)
-    ops().attn_prologue(qp, kp, vp, w, w, inv, pos, k4, v4, q4, 1e-6)
-    assert torch.equal(q16, q4)
-    for c16, c4 in ((k16, k4), (v16, v4)):
-        for b in range(B):
-            rows = slice(int(pos[b]), int(pos[b]) + T)
-            a, d = c16[b, :, rows].float(), kv4_values(c4[b, :, rows].contiguous()).float()
-            blk = a.view(-1, 16).abs().amax(-1, keepdim=True)
-            # within half an e2m1 step: the largest step is 2 units (|v| in 4..6), a unit is amax / 6 rounded to e4m3 (<= 6.25% up)
-            assert ((d - a).view(-1, 16).abs() <= blk / 6 * 1.07 + 1e-6).all()
-            assert ((d - a).norm() / a.norm()).item() < 0.12
+    assert rel < 3e-2, rel  # the new rows' K / V are rounded to e4m3 on one side only

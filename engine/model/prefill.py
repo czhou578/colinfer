@@ -1,22 +1,22 @@
-"""Prefill path (PLAN.md Phase 3): whole chunks of up to CHUNK tokens per layer on tensor cores.
+"""Prefill path: a prompt in chunks of up to CHUNK tokens, each layer on tensor-core GEMMs over the whole chunk.
 
-  MLP        W4A4: activations quantized to NVFP4 (static checkpoint input scale), CUTLASS SM120
-             NVFP4 x NVFP4 GEMM (csrc/gemm_nvfp4.cu); gate and up are one stacked GEMM; the down
-             GEMM adds the residual in its epilogue.
-  FP8 linears W8A8: activations quantized to e4m3 with the static input scale, cuBLASLt via
-             torch._scaled_mm (row-wise weight scales, so stacked q/k/v and qkv/z keep their own scales).
-  attention  fused q/k norm + RoPE + KV write (csrc/attn_decode.cu prologue, T rows), FlashInfer FA2
-             causal prefill over the slot's cache, output gate, o_proj.
-  GDN        causal conv over the chunk continuing the conv state, FLA chunk_gated_delta_rule continuing
-             the recurrent state, gated RMSNorm, out_proj.
+  MLP          W4A4: activations quantized to NVFP4 (static checkpoint input scale) inside the fused add + RMSNorm,
+               CUTLASS SM120 NVFP4 x NVFP4 GEMMs (csrc/gemm_nvfp4.cu): the gate GEMM, then the up GEMM computes
+               silu(gate) * up and quantizes it to NVFP4 in its epilogue; the down GEMM adds the residual.
+  FP8 linears  W8A8: activations quantized to e4m3 with the static input scale, cuBLASLt via torch._scaled_mm (row-wise
+               weight scales, so the stacked q/k/v and qkv/z keep their own scales).
+  attention    the decode prologue on T rows (q/k norm + RoPE + fp8 KV write), then causal attention over the slot's
+               cache: FlashInfer FA2 over a bf16 copy of the cached prefix, or past ATTN_FP8_MIN_CTX tokens of context
+               csrc/attn_prefill.cu (Q K^T on FP8 tensor cores over the cache as stored: 6% faster prefill at 64k,
+               11% at 128k; perplexity +0.25-0.3% from rounding Q to e4m3); output gate fused with the FP8 quantization.
+  GDN          causal conv + SiLU + q/k L2 norm (csrc/prefill_ops.cu) continuing the conv window, the chunked gated
+               delta rule (csrc/gdn_prefill.cu) continuing the recurrent state, gated RMSNorm, out_proj.
 
-Works on the same FastQwen35 model / FastState as the decode graph; after prefill the state is
-exactly what decode expects (KV written, conv / recurrent state advanced, pos and pos_t moved).
-Only the logits of the last token are computed.
+Works on the same FastQwen35 model / FastState as the decode graph; afterwards the state is exactly what decode expects
+(KV written, conv / recurrent state advanced, pos and pos_t moved). Only the last token's logits are computed, unless
+all_logits (perplexity).
 """
 from __future__ import annotations
-
-import os
 
 import torch
 import torch.nn.functional as F
@@ -24,25 +24,14 @@ import torch.nn.functional as F
 from engine.kernels import ops
 from engine.model.fast import FastQwen35, FastState, Nvfp4Linear, StackedFp8Linear
 
-CHUNK = 2048
-# The MLP's SwiGLU + NVFP4 quantization in the up GEMM's epilogue (csrc/gemm_nvfp4.cu SwigluNvfp4) instead of a bf16
-# [gate | up] round trip through k_silu_mul_quant: ~0.5 ms per layer at 2,048 tokens. COLINFER_FUSED_SWIGLU=0: the old path.
-FUSED_SWIGLU = os.environ.get("COLINFER_FUSED_SWIGLU", "1") != "0"
-# Gated DeltaNet chunked forward: csrc/gdn_prefill.cu (2x FLA's chunk_gated_delta_rule per layer). COLINFER_GDN_CUDA=0: FLA.
-GDN_CUDA = os.environ.get("COLINFER_GDN_CUDA", "1") != "0"
-_EMU_Q_FP8 = os.environ.get("COLINFER_EMU_Q_FP8") == "1"  # FlashInfer path only: Q rounded as the FP8 kernel rounds it
-# Attention over an fp8 cache, for chunks whose context passes ATTN_FP8_MIN_CTX: csrc/attn_prefill.cu (Q K^T in e4m3,
-# ~1.25x FlashInfer's rate; prefill 4% faster at 32k, 6% at 64k; perplexity +0.25-0.3%, from rounding Q to e4m3).
-# Shorter contexts keep FlashInfer FA2 over a bf16 copy of the cached prefix (attention is a small share there).
-# COLINFER_ATTN_FP8_PREFILL=0 turns it off; COLINFER_ATTN_FP8_MIN_CTX moves the threshold.
-ATTN_FP8 = os.environ.get("COLINFER_ATTN_FP8_PREFILL", "1") != "0"
-ATTN_FP8_MIN_CTX = int(os.environ.get("COLINFER_ATTN_FP8_MIN_CTX", "16384"))
-ATTN_FP8_BN = 32  # KV tile: 32 keys (2 blocks per SM) beat 64 (102-106 vs 86-87 TFLOPS)
+CHUNK = 2048            # tokens per chunk: larger chunks make the FP8 GEMMs slower per token (docs/phase6_progress.md)
+ATTN_FP8_MIN_CTX = 16384  # context length above which prefill attention runs on csrc/attn_prefill.cu
+ATTN_FP8_BN = 32        # its KV tile: 32 keys (2 blocks per SM) beat 64
 
 
 def _nvfp4_operands(lin_list):
     """Stack NVFP4 linears row-wise (shared K, input scale, weight global scale) into one GEMM operand
-    with CUTLASS-swizzled scales; the originals become views so the decode GEMV keeps working."""
+    with CUTLASS-swizzled scales; the originals become views so the decode GEMMs keep working."""
     w = torch.cat([l.w for l in lin_list]).contiguous()
     sf = torch.cat([l.sf for l in lin_list]).contiguous()
     gs, ins = {l.gscale for l in lin_list}, {l.in_scale for l in lin_list}
@@ -73,18 +62,10 @@ def prepare_prefill(model: FastQwen35):
         mlp.p_g = dict(mlp.p_gu, w=mlp.p_gu["w"][:I], sf=mlp.p_gu["sf"][:sfh], N=I)
         mlp.p_u = dict(mlp.p_gu, w=mlp.p_gu["w"][I:], sf=mlp.p_gu["sf"][sfh:], N=I)
         mlp.p_down["nc"] = torch.tensor([1.0 / mlp.p_down["in_scale"]], dtype=torch.float32, device=mlp.p_gu["w"].device)
-    if isinstance(model.lm_head, Nvfp4Linear):  # for all-token logits (perplexity); decode uses the GEMV
+    if isinstance(model.lm_head, Nvfp4Linear):  # for all-token logits (perplexity); decode uses the skinny GEMM
         model.p_lm = _nvfp4_operands([model.lm_head])
     torch.cuda.empty_cache()
     model._prefill_ready = True
-
-
-def _quant_nvfp4(x2, in_scale):
-    M, K = x2.shape
-    q = torch.empty(M, K // 2, dtype=torch.uint8, device=x2.device)
-    sf = torch.empty(ops().nvfp4_sf_size(M, K), dtype=torch.uint8, device=x2.device)
-    ops().nvfp4_quant(x2, in_scale, q, sf)
-    return q, sf
 
 
 def _gemm_nvfp4(xq, xsf, op, residual=None):
@@ -125,13 +106,9 @@ def _mlp(layer, x, y):
     I = mlp.p_gu["N"] // 2
     hq = torch.empty(M, I // 2, dtype=torch.uint8, device=x.device)
     hsf = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device=x.device)
-    if FUSED_SWIGLU:  # gate GEMM, then the up GEMM computes silu(gate) * up and quantizes it in its epilogue
-        g = _gemm_nvfp4(xq, xsf, mlp.p_g)
-        u = mlp.p_u
-        ops().nvfp4_gemm_swiglu(xq, xsf, u["w"], u["sf"], u["alpha"], g, hq, hsf, mlp.p_down["nc"], 0 if M >= 1536 else 1)
-    else:
-        gu = _gemm_nvfp4(xq, xsf, mlp.p_gu)
-        ops().silu_mul_quant(gu, mlp.p_down["in_scale"], hq, hsf)
+    g = _gemm_nvfp4(xq, xsf, mlp.p_g)  # the gate GEMM, then the up GEMM computes silu(gate) * up and quantizes it
+    u = mlp.p_u
+    ops().nvfp4_gemm_swiglu(xq, xsf, u["w"], u["sf"], u["alpha"], g, hq, hsf, mlp.p_down["nc"], 0 if M >= 1536 else 1)
     return _gemm_nvfp4(hq, hsf, mlp.p_down, x_new)
 
 
@@ -144,38 +121,22 @@ def _attention(attn, q8, state: FastState, li: int):
     q = torch.empty(1, attn.num_heads, T, attn.head_dim, device=q8.device, dtype=torch.bfloat16)
     ops().attn_prologue(qp, kp, vp, attn.q_norm.weight, attn.k_norm.weight, attn.inv_freq, state.pos_t, kc, vc, q, attn.q_norm.eps)
     L = state.pos + T
-    if ATTN_FP8 and kc.dtype == torch.float8_e4m3fn and L > ATTN_FP8_MIN_CTX:  # FP8 Q K^T over the cache as stored
+    if L > ATTN_FP8_MIN_CTX:  # FP8 Q K^T over the cache as stored
         o = torch.empty(T, attn.num_heads * attn.head_dim, device=q8.device, dtype=torch.bfloat16)
         ops().attn_prefill_fp8(q, kc, vc, o, state.pos, attn.head_dim ** -0.5, ATTN_FP8_BN)
-        o8 = torch.empty(T, attn.num_heads * attn.head_dim, dtype=torch.float8_e4m3fn, device=q8.device)
-        ops().gate_fp8(o, qp, attn.head_dim, attn.o_proj.in_scale, o8)
-        return _fp8_gemm(o8, attn.o_proj)
-    kk, vv = kc[0, :, :L], vc[0, :, :L]
-    if kk.dtype == torch.uint8:  # fp4 cache rows: dequantize the prefix per head into bf16 for FlashInfer
-        k16 = torch.empty(kk.shape[0], L, attn.head_dim, device=kk.device, dtype=torch.bfloat16)
-        v16 = torch.empty_like(k16)
-        for h in range(kk.shape[0]):
-            ops().kv4_to_bf16(kk[h], k16[h])
-            ops().kv4_to_bf16(vv[h], v16[h])
-        kk, vv = k16, v16
-    elif kk.dtype == torch.float8_e4m3fn:
-        # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix
-        # to a BF16 scratch first costs a few ms per layer at 128k and saves tens (exact: e4m3 -> bf16 is lossless)
-        kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
-    qq = q[0].transpose(0, 1)
-    if _EMU_Q_FP8:  # experiment: Q rounded to e4m3 with a per-(token, head) scale, as an FP8 QK^T kernel would see it
-        sc = qq.float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448.0
-        qq = ((qq.float() / sc).to(torch.float8_e4m3fn).float() * sc).to(torch.bfloat16)
-    o = flashinfer.single_prefill_with_kv_cache(qq, kk, vv, causal=True, kv_layout="HND",
-                                                sm_scale=attn.head_dim ** -0.5)
+    else:
+        # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix to a BF16
+        # scratch first is cheaper (and exact: e4m3 -> bf16 is lossless)
+        kk, vv = kc[0, :, :L].to(torch.bfloat16), vc[0, :, :L].to(torch.bfloat16)
+        o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
+                                                    sm_scale=attn.head_dim ** -0.5).reshape(T, -1)
     o8 = torch.empty(T, attn.num_heads * attn.head_dim, dtype=torch.float8_e4m3fn, device=q8.device)
-    ops().gate_fp8(o.reshape(T, -1), qp, attn.head_dim, attn.o_proj.in_scale, o8)
+    ops().gate_fp8(o, qp, attn.head_dim, attn.o_proj.in_scale, o8)
     return _fp8_gemm(o8, attn.o_proj)
 
 
 def _gdn(g, n, q8, state: FastState, li: int):
     """Mixer output (no residual) of a Gated DeltaNet layer. n: bf16 normed input (for the b/a projection)."""
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     T = n.shape[0]
     mixed, z = _split(_fp8_gemm(q8, g.qkvz), g.qkvz.sizes)
     ba = n @ g.w_ba.t()
@@ -186,22 +147,16 @@ def _gdn(g, n, q8, state: FastState, li: int):
     k = torch.empty(T, g.key_dim, device=dev, dtype=torch.bfloat16)
     v = torch.empty(T, g.value_dim, device=dev, dtype=torch.bfloat16)
     cs = state.conv[li][0]  # [C, K-1]
-    ops().causal_conv_silu(mixed, cs, g.conv1d.weight, [q, k, v], 1e-6)  # q, k come out L2-normalized per head (FLA's eps)
+    ops().causal_conv_silu(mixed, cs, g.conv1d.weight, [q, k, v], 1e-6)  # q, k come out L2-normalized per head
     if T >= K - 1:
         cs.copy_(mixed[-(K - 1):].t())
     else:
         cs.copy_(torch.cat([cs, mixed.t()], dim=-1)[:, -(K - 1):])
-    beta = b.sigmoid()[None]
-    gg = (-g.A_log.float().exp() * F.softplus(a.float() + g.dt_bias))[None]
-    if GDN_CUDA:  # csrc/gdn_prefill.cu: continues state.rec in place
-        o = torch.empty(1, T, g.num_v_heads, g.head_v_dim, device=dev, dtype=torch.bfloat16)
-        ops().gdn_prefill(q.view(T, -1, g.head_k_dim), k.view(T, -1, g.head_k_dim), v.view(T, -1, g.head_v_dim), gg[0].contiguous(),
-                          beta[0].contiguous(), state.rec[li][0], o[0], g.head_k_dim ** -0.5)
-    else:
-        o, s = chunk_gated_delta_rule(q.view(1, T, -1, g.head_k_dim), k.view(1, T, -1, g.head_k_dim), v.view(1, T, -1, g.head_v_dim), g=gg,
-                                      beta=beta, initial_state=state.rec[li], output_final_state=True,
-                                      use_qk_l2norm_in_kernel=False)  # GVA: 16 key heads, 48 value heads
-        state.rec[li].copy_(s)
+    beta = b.sigmoid().contiguous()
+    gg = (-g.A_log.float().exp() * F.softplus(a.float() + g.dt_bias)).contiguous()  # log decay
+    o = torch.empty(T, g.num_v_heads, g.head_v_dim, device=dev, dtype=torch.bfloat16)  # continues state.rec in place
+    ops().gdn_prefill(q.view(T, -1, g.head_k_dim), k.view(T, -1, g.head_k_dim), v.view(T, -1, g.head_v_dim), gg, beta, state.rec[li][0], o,
+                      g.head_k_dim ** -0.5)
     on = torch.empty(T * g.num_v_heads, g.head_v_dim, device=dev, dtype=torch.bfloat16)
     ops().gated_rmsnorm(o.reshape(-1, g.head_v_dim), z, g.norm.weight, g.norm.eps, on)
     o8 = torch.empty(T, g.value_dim, dtype=torch.float8_e4m3fn, device=dev)
@@ -215,18 +170,16 @@ def _split(t, sizes):
 
 @torch.inference_mode()
 def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk: int = CHUNK, all_logits: bool = False,
-            return_hidden: bool = False, return_layers: tuple = ()):
-    """input_ids [1, T]. Runs the prompt through the model in chunks, advancing `state`; returns the
-    fp32 logits of the last token [1, vocab], or with all_logits the bf16 logits of every token
-    [T, vocab] (lm_head as a W4A4 GEMM; for perplexity). return_hidden: also return the post-final-norm
-    hidden state of every prompt position [T, H] (the MTP drafter's input). return_layers: also return the residual stream
-    after each of these layers, [T, len(return_layers), H] (EAGLE-3-style drafter features; return_hidden required)."""
+            return_hidden: bool = False):
+    """input_ids [1, T] from position state.pos of a single-slot state. Returns the fp32 logits of the last token
+    [1, vocab], or with all_logits the bf16 logits of every token [T, vocab] (lm_head as a W4A4 GEMM; for perplexity).
+    return_hidden: also the post-final-norm hidden state of every prompt position [T, H] (the MTP drafter's input)."""
     assert input_ids.shape[0] == 1, "one slot at a time"
     prepare_prefill(model)
     T_all = input_ids.shape[1]
     if state.pos + T_all > state.max_seq_len:
         raise ValueError("prompt exceeds the slot's max_seq_len")
-    x_last, outs, hid, lay = None, [], [], []
+    x_last, outs, hid = None, [], []
     for c0 in range(0, T_all, chunk):
         ids = input_ids[0, c0:c0 + chunk]
         T = ids.numel()
@@ -236,8 +189,6 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
             n, q8 = _norm_in(layer, x, need_bf16=gdn)
             y = _gdn(layer.linear_attn, n, q8, state, li) if gdn else _attention(layer.self_attn, q8, state, li)
             x = _mlp(layer, x, y)
-            if li in return_layers:
-                lay.append((li, x.clone()))
         state.pos += T
         state.pos_t += T
         x_last = x[-1:]
@@ -248,15 +199,5 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
             xsf = torch.empty(ops().nvfp4_sf_size(T, x.shape[1]), dtype=torch.uint8, device=x.device)
             ops().add_rmsnorm(x, None, model.norm.weight, model.norm.eps, q4=xq, sf4=xsf, in_scale4=model.p_lm["in_scale"])
             outs.append(_gemm_nvfp4(xq, xsf, model.p_lm))
-    if return_layers:  # chunk-major list -> [T, n_layers, H] in return_layers order
-        per = {li: torch.cat([t for l, t in lay if l == li]) for li in return_layers}
-        hid = [torch.cat(hid)]
-        L = torch.stack([per[li] for li in return_layers], 1)
-    if all_logits:
-        if return_layers:
-            return torch.cat(outs), hid[0], L
-        return (torch.cat(outs), torch.cat(hid)) if return_hidden else torch.cat(outs)
-    logits = model.lm_head(model.norm(x_last)).float()
-    if return_layers:
-        return logits, hid[0], L
-    return (logits, torch.cat(hid)) if return_hidden else logits
+    out = torch.cat(outs) if all_logits else model.lm_head(model.norm(x_last)).float()
+    return (out, torch.cat(hid)) if return_hidden else out

@@ -1,5 +1,6 @@
-"""Fused GDN decode step (csrc/gdn_step.cu) against the Phase 1 PyTorch GatedDeltaNet (T = 1, existing
-state), at Qwen3.8-27B dimensions. Run: uv run pytest tests/test_gdn_step.py -q"""
+"""The GDN decode step (csrc/gdn_step.cu: gdn_conv + gdn_conv_commit + gdn_delta, T = 1) against the reference PyTorch
+GatedDeltaNet (engine/model/qwen35.py) on an existing state, at Qwen3.8-27B dimensions; inactive slots keep their state.
+Run: uv run pytest tests/test_gdn_step.py -q"""
 import os
 import sys
 
@@ -37,10 +38,21 @@ def test_gdn_step_matches_reference(B):
         a = layer.in_proj_a(x)[:, 0].contiguous()
         qkv = torch.empty_like(mixed)
         ops().gdn_conv(mixed, conv, layer.conv1d.weight.contiguous(), qkv)
+        active = torch.ones(B, dtype=torch.int32, device="cuda")
+        ops().gdn_conv_commit(mixed, conv, active)
         o = torch.empty_like(z)
-        ops().gdn_delta(qkv, z, b, a, layer.A_log.data, layer.dt_bias.data, layer.norm.weight.data, rec, o, cfg.linear_num_key_heads, cfg.rms_norm_eps)
+        ops().gdn_delta(qkv, z, b, a, layer.A_log.data, layer.dt_bias.data, layer.norm.weight.data, rec, o, cfg.linear_num_key_heads, cfg.rms_norm_eps,
+                        active)
         out = layer.out_proj(o)[:, None]
+        # an inactive slot: same outputs, state untouched
+        conv_i, rec_i = conv0.clone(), rec0.clone()
+        idle = torch.zeros(B, dtype=torch.int32, device="cuda")
+        ops().gdn_conv_commit(mixed, conv_i, idle)
+        o_i = torch.empty_like(z)
+        ops().gdn_delta(qkv, z, b, a, layer.A_log.data, layer.dt_bias.data, layer.norm.weight.data, rec_i, o_i, cfg.linear_num_key_heads,
+                        cfg.rms_norm_eps, idle)
     assert torch.equal(conv, ref_conv)
     torch.testing.assert_close(rec, ref_rec, rtol=1e-4, atol=1e-4)
     rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel < 1e-2, rel
+    assert torch.equal(o_i, o) and torch.equal(conv_i, conv0) and torch.equal(rec_i, rec0)

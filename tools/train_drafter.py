@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fine-tune the checkpoint's MTP head as a multi-step drafter (PLAN.md 4.5 item 4 / Phase 6: better drafters).
+"""Fine-tune the checkpoint's MTP head as a multi-step drafter (docs/phase6_progress.md sections 7, 12, 13).
 
 The MTP head ships trained for one step: (embedding of x_{i+1}, target hidden h_i) -> x_{i+2}. The engine chains it
 (engine/spec/mtp.py): step s feeds the head its own previous output instead of a target hidden state, so drafts 2..k
@@ -17,7 +17,7 @@ Rows are scored only where x_{i+2} lies in the reply. The embedding and lm_head 
 
    uv run python tools/train_drafter.py --extract      # target hidden states + top-k distributions (once per --data file)
    uv run python tools/train_drafter.py --train        # fine-tune; writes ~/.cache/colinfer/drafter/mtp_ft.safetensors
-   uv run python tools/train_drafter.py --eval         # per-depth agreement with the target on held-out replies
+                                                       # (prints held-out per-depth agreement with the target before / after)
 """
 import argparse
 import glob
@@ -56,12 +56,11 @@ def extract(a):
     from engine.model.fast import load_fast_model, to_fast
     from engine.model.prefill import prefill
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    model = to_fast(load_fast_model(path), kv_fp8=True)
+    model = to_fast(load_fast_model(path))
     src = os.path.expanduser(a.data)
     rows = [json.loads(l) for l in open(src)]
     stem = os.path.splitext(os.path.basename(src))[0]
     prefix = "" if stem == "data" else stem + "_"  # data.jsonl -> shard_*.pt, data2.jsonl -> data2_shard_*.pt
-    layers = tuple(int(x) for x in a.layers.split(",")) if a.layers else ()
     feat = os.path.join(DIR, a.feat)
     os.makedirs(feat, exist_ok=True)
     t0 = time.time()
@@ -70,15 +69,10 @@ def extract(a):
         ids = (r["prompt"] + r["output"])[-MAXLEN:]
         P = max(0, len(ids) - len(r["output"]))  # reply starts here
         st = model.new_state(1, len(ids))
-        if layers:
-            logits, H, Lh = prefill(model, torch.tensor([ids], device="cuda"), st, all_logits=True, return_hidden=True, return_layers=layers)
-        else:
-            logits, H = prefill(model, torch.tensor([ids], device="cuda"), st, all_logits=True, return_hidden=True)
+        logits, H = prefill(model, torch.tensor([ids], device="cuda"), st, all_logits=True, return_hidden=True)
         lp = torch.log_softmax(logits.float(), -1)
         tv, ti = lp.topk(TOPK, -1)
         item = dict(ids=torch.tensor(ids, dtype=torch.int32), P=P, H=H.cpu(), tv=tv.half().cpu(), ti=ti.int().cpu(), kind=r["kind"])
-        if layers:
-            item["L"], item["layers"] = Lh.cpu(), layers
         shard.append(item)
         if len(shard) == 100 or j == len(rows) - 1:
             torch.save(shard, os.path.join(feat, f"{prefix}shard_{n:03d}.pt"))
@@ -88,11 +82,8 @@ def extract(a):
 
 # ------------------------------------------------------------------------------------------------ 2. the head
 class Head(torch.nn.Module):
-    """layers: target layers whose residual streams feed an EAGLE-3-style fusion with the final hidden h_i:
-    h0 = h_i + B A [rms(l_1), .., rms(l_n)] (rank-r A, B) replaces h_i as the depth-1 hidden input. B starts at zero,
-    i.e. exactly the plain head. (A full-rank fusion [0 .. 0 I] + learned, 105M parameters, drifted from the identity
-    faster than 3.8k replies could train it: held-out agreement -2 points after one epoch.)"""
-    def __init__(self, t, cfg, layers=(), rank=256, extra_layers=0):
+    """The MTP head in fp32 with a training-time-test unroll (one decoder layer, as the engine runs it)."""
+    def __init__(self, t, cfg):
         super().__init__()
         P = lambda n: torch.nn.Parameter(t["mtp." + n].float())  # noqa: E731
         self.fc = P("fc.weight")
@@ -103,40 +94,8 @@ class Head(torch.nn.Module):
         self.qn, self.kn = P(L + "self_attn.q_norm.weight"), P(L + "self_attn.k_norm.weight")
         self.gate, self.up, self.down = (P(L + f"mlp.{n}_proj.weight") for n in ("gate", "up", "down"))
         self.eps, self.H, self.Hq, self.Hkv, self.D = cfg.rms_norm_eps, cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
-        self.layers = tuple(layers)
-        if self.layers:
-            n, Hd = len(self.layers), cfg.hidden_size
-            if "mtp.eagle_a.weight" in t:
-                self.fa, self.fb, self.lnorm = P("eagle_a.weight"), P("eagle_b.weight"), P("eagle_norm.weight")
-            else:
-                g = torch.Generator(device=self.fc.device).manual_seed(0)
-                self.fa = torch.nn.Parameter(torch.randn(rank, n * Hd, device=self.fc.device, generator=g) / math.sqrt(n * Hd))
-                self.fb = torch.nn.Parameter(torch.zeros(Hd, rank, device=self.fc.device))
-                self.lnorm = torch.nn.Parameter(torch.zeros(n, Hd, device=self.fc.device))
-        # extra decoder layers (--extra-layers): from the file if it has them, else copies of layer 0 whose output
-        # projections (o, down) start at zero, so the head starts exactly as it was
-        self.extra = torch.nn.ModuleList()
-        names = dict(in_ln="input_layernorm", post_ln="post_attention_layernorm", q="self_attn.q_proj", k="self_attn.k_proj",
-                     v="self_attn.v_proj", o="self_attn.o_proj", qn="self_attn.q_norm", kn="self_attn.k_norm", gate="mlp.gate_proj",
-                     up="mlp.up_proj", down="mlp.down_proj")
-        self.lnames = names
-        for li in range(1, 1 + extra_layers):
-            pre = f"mtp.layers.{li}."
-            if pre + "input_layernorm.weight" in t:
-                prm = {key: torch.nn.Parameter(t[pre + n + ".weight"].float()) for key, n in names.items()}
-            else:
-                prm = {key: torch.nn.Parameter(getattr(self, key).detach().clone() * (0.0 if key in ("o", "down") else 1.0))
-                       for key in names}
-            self.extra.append(torch.nn.ParameterDict(prm))
         d = cfg.rotary_dim
         self.register_buffer("inv_freq", 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d)), persistent=False)
-
-    def features(self, H, L):
-        """H [T, Hd] final hidden, L [T, n, Hd] residual streams -> the depth-1 hidden input [T, Hd]."""
-        if not self.layers:
-            return H
-        x = torch.cat([self.rms(L[:, i], self.lnorm[i]) for i in range(len(self.layers))], -1)
-        return H + (x @ self.fa.t().to(x.dtype)) @ self.fb.t().to(x.dtype)
 
     def rms(self, x, w):
         xf = x.float()
@@ -150,14 +109,10 @@ class Head(torch.nn.Module):
         rot = torch.cat([-xr[..., R // 2:], xr[..., :R // 2]], -1)
         return torch.cat([xr * cos + rot * sin, xp], -1)
 
-    def layer_params(self):
-        """Decoder layers: the checkpoint's (layer 0), then any added ones (--extra-layers)."""
-        base = dict(in_ln=self.in_ln, post_ln=self.post_ln, q=self.q, k=self.k, v=self.v, o=self.o, qn=self.qn, kn=self.kn,
-                    gate=self.gate, up=self.up, down=self.down)
-        return [base] + [dict(p) for p in self.extra]
-
-    def _layer(self, x, prm, kv, s, pos, T, G, scale):
-        """One decoder layer at draft depth s; kv: this layer's (keys, values) lists, one entry per depth so far."""
+    def _layer(self, x, kv, s, pos, T, G, scale):
+        """The decoder layer at draft depth s; kv: (keys, values) lists, one entry per depth so far."""
+        prm = dict(in_ln=self.in_ln, post_ln=self.post_ln, q=self.q, k=self.k, v=self.v, o=self.o, qn=self.qn, kn=self.kn,
+                   gate=self.gate, up=self.up, down=self.down)
         ks, vs = kv
         h1 = self.rms(x, prm["in_ln"])
         qg = (h1 @ prm["q"].t().to(h1.dtype)).view(T, self.Hq, 2 * self.D)
@@ -198,7 +153,7 @@ class Head(torch.nn.Module):
         T = e.shape[0]
         pos = torch.arange(T, device=e.device)
         outs = []
-        kvs = [([], []) for _ in self.layer_params()]  # per decoder layer: keys / values per depth
+        kv = ([], [])  # keys / values per depth
         hid = h0
         scale = self.D ** -0.5
         G = self.Hq // self.Hkv
@@ -206,8 +161,7 @@ class Head(torch.nn.Module):
             if s > 1:  # row i takes the previous depth's output at row i - 1
                 hid = torch.cat([torch.zeros_like(outs[-1][:1]), outs[-1][:-1]])
             x = torch.cat([self.rms(e, self.pre_e), self.rms(hid, self.pre_h)], -1) @ self.fc.t().to(e.dtype)
-            for li, prm in enumerate(self.layer_params()):
-                x = self._layer(x, prm, kvs[li], s, pos, T, G, scale)
+            x = self._layer(x, kv, s, pos, T, G, scale)
             outs.append(self.rms(x, self.norm))
         return outs
 
@@ -220,16 +174,7 @@ class Head(torch.nn.Module):
             t[L + f"self_attn.{n}_proj.weight"] = p
         for n, p in zip(("gate", "up", "down"), (self.gate, self.up, self.down)):
             t[L + f"mlp.{n}_proj.weight"] = p
-        for li, prm in enumerate(self.extra, start=1):
-            for key, n in self.lnames.items():
-                t[f"mtp.layers.{li}.{n}.weight"] = prm[key]
-        out = {k: v.detach().to(torch.bfloat16).contiguous().cpu() for k, v in t.items()}
-        if self.layers:
-            out["mtp.eagle_a.weight"] = self.fa.detach().to(torch.bfloat16).contiguous().cpu()
-            out["mtp.eagle_b.weight"] = self.fb.detach().to(torch.bfloat16).contiguous().cpu()
-            out["mtp.eagle_norm.weight"] = self.lnorm.detach().to(torch.bfloat16).contiguous().cpu()
-            out["mtp.eagle_layers"] = torch.tensor(self.layers, dtype=torch.int32)
-        return out
+        return {k: v.detach().to(torch.bfloat16).contiguous().cpu() for k, v in t.items()}
 
 
 def shards(feat="feat"):
@@ -265,8 +210,6 @@ def seq_loss(head, item, embed, lm_draft, remap, depth, train=True):
     ids = item["ids"].long().cuda()
     T, P = ids.numel(), item["P"]
     H = item["H"].cuda()
-    if head.layers:
-        H = head.features(H, item["L"].cuda())
     e = embed[torch.cat([ids[1:], ids[-1:]])]  # row i consumes x_{i+1} (the last row is never scored)
     outs = head.unroll(e, H, depth)
     rows = torch.arange(max(P - 2, 0), T - 2, device="cuda")  # x_{i+2} in the reply
@@ -294,10 +237,8 @@ def train(a):
     if a.init:  # start from an earlier fine-tune (e.g. mtp_ft.safetensors)
         with safe_open(os.path.expanduser(a.init), framework="pt", device="cuda") as f:
             for n in f.keys():
-                if n != "mtp.eagle_layers":
-                    t[n] = f.get_tensor(n).to(torch.bfloat16)
-    layers = tuple(int(x) for x in a.layers.split(",")) if a.layers else ()
-    head = Head(t, cfg, layers, a.rank, a.extra_layers).cuda()
+                t[n] = f.get_tensor(n).to(torch.bfloat16)
+    head = Head(t, cfg).cuda()
     files = shards(a.feat)
     first = [f for f in files if os.path.basename(f).startswith("shard_")]  # data.jsonl: the held-out split comes from here only,
     sizes = {f: len(torch.load(f, mmap=True)) for f in files}               # so it stays the same as more data files are added
@@ -313,14 +254,8 @@ def train(a):
     order = {r: k for k, r in enumerate(refs[:nval])}
     val = [it for _, _, it in sorted(val, key=lambda x: order[(x[0], x[1])])]
     ntr = sum(sizes.values()) - nval
-    print(f"[train] {ntr} train / {len(val)} held-out replies, depth {a.depth}, layers {layers or 'none'}")
-    main_p = [p for n, p in head.named_parameters() if n not in ("fa", "fb", "lnorm") and not n.startswith("extra.")]
-    groups = [dict(params=main_p, lr=a.lr)]
-    if layers:
-        groups.append(dict(params=[head.fa, head.fb, head.lnorm], lr=a.fuse_lr))
-    if a.extra_layers:
-        groups.append(dict(params=list(head.extra.parameters()), lr=a.extra_lr))
-    opt = torch.optim.AdamW(groups, weight_decay=0.0, betas=(0.9, 0.95))
+    print(f"[train] {ntr} train / {len(val)} held-out replies, depth {a.depth}")
+    opt = torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=0.0, betas=(0.9, 0.95))
     total = a.epochs * ntr // a.accum
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, (st + 1) / 20) * 0.5 * (1 + math.cos(math.pi * min(st, total) / total)))
 
@@ -381,12 +316,6 @@ def main():
     ap.add_argument("--data", default=os.path.join(DIR, "data.jsonl"), help="--extract: replies (tools/drafter_data.py output)")
     ap.add_argument("--decay", type=float, default=0.9, help="loss weight decay per depth")
     ap.add_argument("--feat", default="feat", help="feature directory under ~/.cache/colinfer/drafter")
-    ap.add_argument("--layers", default="", help="EAGLE-3-style fused features: target layers (e.g. 3,23,43); --extract stores "
-                    "their residual streams, --train fuses them with the final hidden state")
-    ap.add_argument("--fuse-lr", type=float, default=1e-4, help="learning rate of the fusion weights")
-    ap.add_argument("--rank", type=int, default=256, help="rank of the layer fusion")
-    ap.add_argument("--extra-layers", type=int, default=0, help="decoder layers added to the head (start as identity)")
-    ap.add_argument("--extra-lr", type=float, default=1e-4, help="learning rate of the added layers")
     ap.add_argument("--init", default="", help="--train: start from these mtp.* weights instead of the checkpoint's")
     a = ap.parse_args()
     if a.extract:

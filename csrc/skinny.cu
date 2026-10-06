@@ -1,4 +1,4 @@
-// skinny.cu -- weight-streaming skinny GEMM on tensor cores (PLAN.md 4.3 item 2 / Phase 4 week 12 / Phase 6).
+// skinny.cu -- weight-streaming skinny GEMM on tensor cores: every decode-time linear.
 //
 //   out[m, n] = sum_k x[m, k] * W[n, k]   (* scale, + residual),  M <= 16 rows of bf16 activations.
 //
@@ -6,8 +6,8 @@
 // scale; FP8: e4m3 [N, K] + per-tensor or per-row fp32 scale), the same tensors the CUTLASS prefill GEMM reads.
 // Dequantization is exact into bf16 (e2m1 x e4m3 has <= 5 significant bits) and the product runs on
 // mma.sync.m16n8k16 bf16 x bf16 -> fp32, so 16 activation rows cost about what 1 row costs: the kernel is bound by
-// streaming the weights, not by math. (The CUDA-core GEMV in gemv.cu does M FMAs per weight and is compute-bound
-// beyond ~4 rows.)
+// streaming the weights, not by math. Every decode linear runs here: plain decode (1-3 rows), speculative verify (up to
+// 16 rows) and the MTP drafter.
 //
 // Memory pattern. A warp owns 16 weight rows (two mma n-tiles: rows n0..n0+15, or the gate and up rows n0..n0+7 for
 // SwiGLU) and walks K in chunks of 256 bytes per row. Weights are prefetched into registers one chunk ahead with
@@ -375,7 +375,6 @@ cudaError_t launch(const void* x, int M, int N, int K, const void* w, const void
         if (cudaError_t e = cudaMemset(g_cnt, 0, CNT * sizeof(int))) return e;
     }
     if (tiles > CNT) return cudaErrorInvalidValue;
-    static const bool pdl = !getenv("COLINFER_PDL") || getenv("COLINFER_PDL")[0] != '0';
     cudaLaunchConfig_t lc = {};
     lc.gridDim = dim3((tiles * S + WARPS - 1) / WARPS);
     lc.blockDim = dim3(WARPS * 32);
@@ -385,7 +384,7 @@ cudaError_t launch(const void* x, int M, int N, int K, const void* w, const void
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     lc.attrs = attr;
-    lc.numAttrs = pdl ? 1 : 0;
+    lc.numAttrs = 1;
     return cudaLaunchKernelEx(&lc, k_skinny<F, SWIGLU, OutT>, (const __nv_bfloat16*)x, M, N, K, (const uint8_t*)w, (const uint8_t*)sf,
                               (const uint8_t*)wh, scale,
                               row_scale, (const uint8_t*)w2, (const uint8_t*)sf2, scale2, (const __nv_bfloat16*)residual, (OutT*)out, S, ws,

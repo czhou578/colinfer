@@ -1,4 +1,4 @@
-"""Request scheduler (PLAN.md 3 and 4.6, Phase 5): up to `n_slots` concurrent requests, one engine thread.
+"""Request scheduler: up to `n_slots` concurrent requests, driven by one engine thread (engine/server/api.py).
 
 * One batched FastState holds every slot (KV cache, GDN conv / recurrent state, positions); with speculation
   also a batched MtpState (the drafter's own KV cache).
@@ -7,8 +7,9 @@
   Without MTP, one plain decode graph per range. A step uses the smallest range covering the decoding slots; idle
   and prefilling slots inside it are masked off (state.active), so a step never touches them. Each cycle picks k
   (3 or 7, when the verify rows fit one weight pass) for the most expected tokens per second given each slot's
-  running acceptance rate and the cycle times measured at startup: code and structured output draft 7, prose 3. Greedy output does not depend on what the other slots are doing: every kernel computes a
-  slot's rows the same way at any batch width.
+  running acceptance rate and the cycle times measured at startup: code and structured output draft 7, prose 3.
+  Greedy output does not depend on what the other slots are doing: every kernel computes a slot's rows the same way at
+  any batch width.
 * Prefill: at most one chunk per engine step on a single-slot view (engine/model/prefill.py), then one decode
   step for the decoding slots, so a long prompt stalls the others for one chunk at a time. With MTP the
   drafter's KV rows for the chunk are written right after it.
@@ -30,20 +31,18 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-import os
 import time
 from typing import Any
 
 import torch
 
-from engine.model import fast as fast_model
-from engine.model.fast import DecodeGraph, FastQwen35
+from engine.model.fast import MAX_ROWS, DecodeGraph, FastQwen35
 from engine.model.prefill import CHUNK, prefill, prepare_prefill
 from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, sample
 
 MAX_STOP_IDS = 8  # stop token ids per slot visible to the GPU-side cut (more are still honored on the host)
-K_OPTIONS = tuple(int(v) for v in os.environ.get("COLINFER_K_OPTIONS", "3,7").split(","))  # draft lengths a cycle chooses between (capped by k)
+K_OPTIONS = (3, 7)  # draft lengths a cycle chooses between (capped by k)
 ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
 
 
@@ -166,11 +165,11 @@ class Scheduler:
 
     def k_options(self, width: int) -> list[int]:
         """Draft lengths with a graph at this batch width: those of K_OPTIONS (capped by k) whose verify rows
-        (width * (k+1)) fit one weight pass (fast_model.MAX_M rows: 16 with the skinny GEMM, 8 with the GEMV), since a
-        second pass streams every weight again. A slot's pending drafts are a chain, so a shorter k uses a prefix."""
+        (width * (k+1)) fit one weight pass of the skinny GEMM (MAX_ROWS = 16), since a second pass streams every weight
+        again. A slot's pending drafts are a chain, so a shorter k uses a prefix."""
         opts = sorted({min(kk, self.k) for kk in K_OPTIONS + (self.k,)})
-        fit = [kk for kk in opts if width * (kk + 1) <= fast_model.MAX_M]
-        return fit or [max(1, fast_model.MAX_M // width - 1)]
+        fit = [kk for kk in opts if width * (kk + 1) <= MAX_ROWS]
+        return fit or [max(1, MAX_ROWS // width - 1)]
 
     def _pick_k(self, width: int, dec) -> int:
         """The draft length with the most expected tokens per second: sum over slots of (1 - a^(k+1)) / (1 - a), a = the
@@ -410,7 +409,6 @@ class Scheduler:
             toks = torch.zeros(hi - lo, dtype=torch.long)
             for s in dec:
                 toks[s.idx - lo] = s.y
-            g.state.pos = 0  # per-slot limits are enforced here; the graph's own counter is not meaningful
             nxt = g.step(toks.to(self.dev))
             self._evt.record()
             self._evt.synchronize()

@@ -4,7 +4,7 @@
 TTFT = prefill of the whole prompt + sampling the first token (the decode graph is already captured,
 as in a running server). Prompts are random token ids (cost does not depend on content).
 
-  uv run python bench/prefill_bench.py [--lens 512 2048 8192 32768] [--chunk 2048] [--kv-fp8] [--profile]
+  uv run python bench/prefill_bench.py [--lens 512 2048 8192 32768] [--chunk 2048] [--profile]
 Targets (docs/baseline.md section 5 / PLAN.md Phase 3): >= 3,500 tok/s at 2k-8k (plan exit 2,500),
 TTFT(2k) <= 0.6 s (plan 0.8 s), 32k prompt <= 12 s (plan 16 s).
 """
@@ -25,15 +25,14 @@ def main():
     ap.add_argument("--ckpt", default="nvidia/Qwen3.8-27B-NVFP4")
     ap.add_argument("--lens", type=int, nargs="+", default=[512, 2048, 8192, 32768])
     ap.add_argument("--chunk", type=int, default=2048)
-    ap.add_argument("--kv-fp8", action="store_true")
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--profile", action="store_true", help="per-kernel breakdown of one 2048-token prefill")
     ap.add_argument("--profile-at", type=int, default=0, help="--profile: the chunk that follows this many prompt tokens")
     a = ap.parse_args()
-    m = to_fast(load_fast_model(a.ckpt), kv_fp8=a.kv_fp8)
+    m = to_fast(load_fast_model(a.ckpt))
     prepare_prefill(m)
     st = m.new_state(1, max(a.lens + [a.profile_at + a.chunk]) + 16)
-    print(f"KV {'fp8' if a.kv_fp8 else 'bf16'}, chunk {a.chunk}")
+    print(f"chunk {a.chunk}")
     print(f"{'prompt':>7s} {'TTFT s':>8s} {'tok/s':>8s}")
     for L in a.lens:
         ids = torch.randint(0, 200000, (1, L), device="cuda")

@@ -21,7 +21,6 @@ dependencies = [
     "numpy>=2.3",
     # Build helper for torch.utils.cpp_extension / CMake.
     "ninja>=1.11",
-    "flash-linear-attention>=0.5.2",
     "fastapi>=0.142.2",
     "uvicorn[standard]>=0.54.0",
 ]

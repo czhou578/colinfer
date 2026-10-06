@@ -1,4 +1,4 @@
-"""OpenAI-compatible HTTP server (PLAN.md 4.6, Phase 5).
+"""OpenAI-compatible HTTP server.
 
     uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 262144] [--spec mtp|none]
 
@@ -61,36 +61,30 @@ class Worker(threading.Thread):
     def _build(self):
         a, t0 = self.args, time.perf_counter()
         from engine.kernels import ops
-        from engine.model.fast import attach_requant, load_fast_model, requant_path, set_linear_kernel, to_fast
-        # speculation verifies many rows per weight pass: tensor-core skinny GEMM; plain decode (1-3 rows): GEMV
-        set_linear_kernel("skinny" if a.spec == "mtp" else "gemv")
+        from engine.model.fast import attach_decode_copies, decode_copies_paths, load_fast_model, to_fast
         from engine.runtime.scheduler import Scheduler
         from engine.weights.loader import resolve
         ops()  # build / load the CUDA extension
         t1 = time.perf_counter()
         path = resolve(a.model)
-        model = to_fast(load_fast_model(path), kv_fp8=a.kv == "fp8", kv_fp4=a.kv == "fp4")
-        dw = a.decode_weights
-        have = lambda kind: all(os.path.exists(f) for f in requant_path(path, kind).split(","))  # noqa: E731
-        if dw == "auto":  # the best quality-gated decode copies that have been made
-            dw = "int" if have("int") else "awq-attn" if have("awq-attn") else "checkpoint"
-        if dw != "checkpoint":
-            rq = requant_path(path, dw)
-            if have(dw):
-                log(f"[engine] decode streams re-quantized projections ({dw}): {attach_requant(model, rq)} linears ({rq})")
+        model = to_fast(load_fast_model(path))
+        if a.decode_weights == "int":
+            files = decode_copies_paths(path)
+            if all(os.path.exists(f) for f in files):
+                log(f"[engine] decode streams the INT6 / INT5 projection copies: {attach_decode_copies(model, files)} linears")
             else:
-                log(f"[engine] no re-quantized weights at {rq} (tools/int6_requant.py / awq_nvfp4.py / requant_nvfp4.py): decoding the checkpoint's FP8 projections")
+                log(f"[engine] no INT6 / INT5 decode copies at {files} (tools/int6_requant.py): decoding the checkpoint's FP8 projections")
         mtp = None
         if a.spec == "mtp":
-            from engine.spec.mtp import Mtp
+            from engine.spec.mtp import DRAFT_DIR, Mtp
             dw = a.drafter_weights
             if dw == "auto":
-                dw = os.path.expanduser("~/.cache/colinfer/drafter/mtp_ft.safetensors")
+                dw = os.path.join(DRAFT_DIR, "mtp_ft.safetensors")
                 dw = dw if os.path.exists(dw) else None
             elif dw == "none":
                 dw = None
-            mtp = Mtp(model, path, fp8=True, draft_vocab=a.draft_vocab or None, weights=dw)
-            log(f"[engine] MTP drafter: {dw or 'checkpoint weights'}")
+            mtp = Mtp(model, path, weights=dw)
+            log(f"[engine] MTP drafter: {dw or 'checkpoint weights'}; low-rank draft head: {'on' if mtp.lr_B is not None else 'off'}")
         t2 = time.perf_counter()
         sched = Scheduler(model, n_slots=a.slots, max_seq_len=a.max_seq_len, n_checkpoints=a.checkpoints, mtp=mtp, k=a.k,
                           selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False, boundary_token=a.boundary_token)
@@ -568,22 +562,15 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--slots", type=int, default=3)
     ap.add_argument("--max-seq-len", type=int, default=262144, help="tokens per slot (prompt + output)")
-    ap.add_argument("--kv", choices=("fp8", "fp4"), default="fp8",
-                    help="KV cache format: fp8 (32 KB / token) or fp4 (18 KB / token: e2m1 + block scales; perplexity +0.2-0.3%%, "
-                         "faster decode at long context)")
     ap.add_argument("--spec", choices=("mtp", "none"), default="mtp")
     ap.add_argument("--drafter-weights", default="auto",
                     help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors (tools/train_drafter.py) when it "
                          "exists, none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
     ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
-    ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP drafts among this many frequent tokens (+ prompt tokens); 0 = full")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
-    ap.add_argument("--decode-weights", choices=("auto", "int", "awq-attn", "requant", "checkpoint"), default="auto",
-                    help="checkpoint: decode the attention / GDN projections from their FP8 originals; int: INT6 attention + INT5 GDN "
-                         "(tools/int6_requant.py; ~9.5%% faster, perplexity within 0.25%%); awq-attn: the attention "
-                         "projections from AWQ NVFP4 (tools/awq_nvfp4.py --groups self_attn; ~3%% faster, perplexity within 0.5%%); "
-                         "requant: attention and GDN from NVFP4 (tools/gptq_nvfp4.py --damp 0.3, else tools/requant_nvfp4.py): ~18%% "
-                         "faster, but Python-code perplexity +1.5%% (docs/phase6_progress.md); auto: int if its files exist, else awq-attn, else checkpoint")
+    ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default="int",
+                    help="int: decode the attention / GDN projections from INT6 / INT5 copies (tools/int6_requant.py; ~9.5%% faster, "
+                         "perplexity within 0.25%%) when their files exist; checkpoint: from the FP8 weights")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto", help="default enable_thinking (auto: the template's default, on)")

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Decode step and speculative cycle times on the real model (PLAN.md 4.7 bench/decode_bench.py).
+"""Decode step and speculative cycle times on the real model.
 
 Plain decode graph (T=1 per slot) at 1-3 slots, and the MTP cycle graph at widths 1-3 and draft lengths k,
-at a given context length. COLINFER_SKINNY=0 switches the decode linears to the CUDA-core GEMV. Cycles run every draft
-step (the drafter's early exit, COLINFER_DRAFT_STOP, is off unless set: the bench's dummy tokens would trigger it).
+at a given context length, on the default decode weights (INT6 / INT5 copies when present; --checkpoint-weights: the
+FP8 projections). Cycles run every draft step (--early-exit: with the drafter's early exit, which the bench's dummy
+tokens would trigger on almost every step).
 
    uv run python bench/decode_bench.py [--ctx 8192] [--ks 1 3 5 7]
 """
@@ -15,8 +16,7 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("COLINFER_DRAFT_STOP", "0")
-from engine.model.fast import SKINNY, DecodeGraph, load_fast_model, to_fast  # noqa: E402
+from engine.model.fast import DecodeGraph, attach_decode_copies, decode_copies_paths, load_fast_model, to_fast  # noqa: E402
 from engine.weights.loader import resolve  # noqa: E402
 
 
@@ -36,21 +36,21 @@ def main():
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--ks", type=int, nargs="+", default=[1, 3, 5, 7])
     ap.add_argument("--widths", type=int, nargs="+", default=[1, 2, 3])
-    ap.add_argument("--kv", choices=("fp8", "fp4"), default="fp8")
-    ap.add_argument("--draft-vocab", type=int, default=65536, help="MTP static draft vocabulary (the server's --draft-vocab)")
-    ap.add_argument("--requant", nargs="?", const="int", default=None, choices=("int", "awq-attn", "requant"),
-                    help="decode streams re-quantized attention / GDN projections (engine.model.fast.requant_path; default int)")
+    ap.add_argument("--checkpoint-weights", action="store_true", help="decode the FP8 projections instead of the INT6 / INT5 copies")
+    ap.add_argument("--early-exit", action="store_true", help="keep the drafter's early exit (engine/spec/mtp.py DRAFT_STOP)")
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    model = to_fast(load_fast_model(path), kv_fp8=a.kv == "fp8", kv_fp4=a.kv == "fp4")
-    if a.requant:
-        from engine.model.fast import attach_requant, requant_path
-        print(f"requant: {attach_requant(model, requant_path(path, a.requant))} linears decode from re-quantized copies")
+    model = to_fast(load_fast_model(path))
+    if not a.checkpoint_weights:
+        files = [f for f in decode_copies_paths(path) if os.path.exists(f)]
+        print(f"INT6 / INT5 decode copies: {attach_decode_copies(model, files)} linears")
     from engine.model.prefill import prepare_prefill
+    from engine.spec import mtp as mtp_mod
     from engine.spec.mtp import Mtp, MtpCycle, MtpState
+    if not a.early_exit:
+        mtp_mod.DRAFT_STOP = 0.0
     prepare_prefill(model)
-    print(f"linears: {'tensor-core skinny GEMM' if SKINNY else 'CUDA-core GEMV'}; context {a.ctx}; KV {a.kv}; "
-          f"PDL {os.environ.get('COLINFER_PDL', '1')}")
+    print(f"context {a.ctx}")
     st = model.new_state(3, a.ctx + 64)
     for B in a.widths:
         v = st.view(0, B)
@@ -59,12 +59,11 @@ def main():
         tok = torch.zeros(B, dtype=torch.long, device="cuda")
 
         def step():
-            g.state.pos = 0
             g.step(tok)
             v.pos_t.fill_(a.ctx)
         dt = timed(step)
         print(f"plain decode  width {B}: {dt * 1e3:6.1f} ms/step  -> {B / dt:5.1f} tok/s aggregate")
-    mtp = Mtp(model, path, fp8=True, draft_vocab=a.draft_vocab)
+    mtp = Mtp(model, path)
     mst = MtpState(model.cfg, a.ctx + 64, "cuda", batch=3, active=st.active)
     for B in a.widths:
         for k in a.ks:

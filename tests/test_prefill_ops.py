@@ -27,21 +27,6 @@ def test_fp8_quant():
     assert torch.equal(out.float(), (x.float() / 0.02).clamp(-448, 448).to(torch.float8_e4m3fn).float())
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2, 3])
-def test_silu_mul_quant(seed):
-    torch.manual_seed(seed)
-    M, I = 257, 17408
-    gu = (torch.randn(M, 2 * I, device="cuda") * 2).bfloat16()
-    h = F.silu(gu[:, :I]) * gu[:, I:]
-    s = float(h.float().abs().max()) / (6 * 448) * 0.7
-    q = torch.empty(M, I // 2, dtype=torch.uint8, device="cuda")
-    sf = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device="cuda")
-    ops().silu_mul_quant(gu, s, q, sf)
-    lut = E2M1_LUT.cuda()
-    got = torch.stack([lut[(q & 15).long()], lut[(q >> 4).long()]], -1).reshape(M, I) * unswizzle(sf, M, I).view(torch.float8_e4m3fn).float().repeat_interleave(16, 1)
-    assert torch.equal(got, fake_quant_nvfp4_unscaled(h, s).float())
-
-
 @pytest.mark.parametrize("T", [1, 2, 3, 100])
 def test_causal_conv_silu(T):
     C = 10240
@@ -117,9 +102,7 @@ def test_gate_fp8():
 
 @pytest.mark.parametrize("T", [1, 5, 300])
 def test_causal_conv_silu_l2norm(T):
-    """The fused per-head L2 norm of q and k matches FLA's l2norm applied to the plain conv outputs."""
-    from fla.modules.l2norm import l2norm_fwd
-
+    """The fused per-head L2 norm of q and k matches x / sqrt(sum x^2 + eps) applied to the plain conv outputs."""
     from engine.kernels import ops
     torch.manual_seed(T)
     c1, c2, C = 256, 512, 896
@@ -131,6 +114,7 @@ def test_causal_conv_silu_l2norm(T):
     ops().causal_conv_silu(x, st, w, plain)
     ops().causal_conv_silu(x, st, w, fused, 1e-6)
     for p, f in zip(plain[:2], fused[:2]):
-        ref = l2norm_fwd(p.view(T, -1, 128), eps=1e-6)[0].view(T, -1).float()
+        h = p.view(T, -1, 128).float()
+        ref = (h / torch.sqrt((h * h).sum(-1, keepdim=True) + 1e-6)).view(T, -1)
         assert (f.float() - ref).abs().max().item() < 1e-2 * ref.abs().max().item()
     assert torch.equal(plain[2], fused[2])

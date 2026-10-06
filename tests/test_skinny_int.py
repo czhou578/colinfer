@@ -7,7 +7,6 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 
@@ -16,7 +15,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the
 @pytest.mark.parametrize("M", [1, 3, 16])
 def test_skinny_int(bits, N, K, M):
     from engine.kernels import ops
-    from int6_requant import pack5, pack6, quantize_int
+    from engine.weights.quantize import pack5, pack6, quantize_int
     torch.manual_seed(bits * 1000 + N + M)
     W = torch.randn(N, K, device="cuda") * 0.02
     gs = float(W.abs().max()) / (448 * (2 ** (bits - 1) - 1))
@@ -27,9 +26,9 @@ def test_skinny_int(bits, N, K, M):
     x = torch.randn(M, K, device="cuda").bfloat16()
     res = torch.randn(M, N, device="cuda").bfloat16()
     out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    ops().skinny_int6(x, lo, hi, sf, gs, res, out)
+    ops().skinny_int(x, lo, hi, sf, gs, res, out)
     ref = (x.float() @ wq.t()) * gs + res.float()
     assert ((out.float() - ref).norm() / ref.norm()).item() < 5e-3
     o1 = torch.empty(1, N, device="cuda", dtype=torch.bfloat16)
-    ops().skinny_int6(x[:1].contiguous(), lo, hi, sf, gs, res[:1].contiguous(), o1)
+    ops().skinny_int(x[:1].contiguous(), lo, hi, sf, gs, res[:1].contiguous(), o1)
     assert torch.equal(o1[0], out[0])

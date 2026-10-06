@@ -35,15 +35,16 @@ def collect(n: int, seed: int, weights, k: int = 7, max_new: int = 256) -> torch
     calls = [0]
     orig = M.Mtp.draft
 
-    def draft(self, g, prob=False):  # captured into the cycle graph: draft step j copies its input into gbuf[j]
+    def draft(self, g):  # captured into the cycle graph: draft step j copies its input into gbuf[j]
         gbuf[calls[0] % k].copy_(g.reshape(-1, g.shape[-1])[0])
         calls[0] += 1
-        return orig(self, g, prob)
+        return orig(self, g)
     M.Mtp.draft = draft
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
-    model = to_fast(load_fast_model(path), kv_fp8=True)
-    gen = M.MtpGenerator(model, path, max_seq_len=4096, k=k, weights=weights)
+    model = to_fast(load_fast_model(path))
+    M.DRAFT_STOP = 0.0  # every draft step runs: all drafter outputs are real
+    gen = M.MtpGenerator(model, path, max_seq_len=4096, k=k, weights=weights, lowrank=None)  # collect with the full head
     G = []
     for p, kind, think in build_prompts(n, random.Random(seed)):
         x = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=think, tokenize=True)
@@ -79,8 +80,6 @@ def main():
     if w == "auto":
         w = os.path.expanduser("~/.cache/colinfer/drafter/mtp_ft.safetensors")
         w = w if os.path.exists(w) else None
-    os.environ.setdefault("COLINFER_DRAFT_STOP", "0")
-    os.environ["COLINFER_DRAFT_LOWRANK"] = "0"  # collect with the full head
     g, W = collect(a.n, a.seed, w)
     n = g.shape[0]
     tr, te = g[: n * 2 // 3], g[n * 2 // 3:]

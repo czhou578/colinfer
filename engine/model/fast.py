@@ -1,11 +1,24 @@
-"""Decode-path model (PLAN.md Phase 2): the Phase 1 architecture with every NVFP4 / FP8 linear
-running on the weight-streaming GEMV kernels (csrc/gemv.cu, W4A16 / W8A16, activations bf16).
-Weights stay quantized on the GPU (~22 GB). Everything that is not a quantized linear (norms,
-GDN conv / delta rule, attention, rotary) is still the Phase 1 PyTorch code and is replaced
-kernel by kernel in later steps.
+"""Decode-path model: the reference architecture (engine/model/qwen35.py) with every op on the engine's CUDA kernels and
+the positions on the device, so a decode step or a whole speculative cycle is one CUDA graph.
 
-Linears take any number of rows and stream the weights once per MAX_M rows, so prefill works (slowly)
-on this path too; Phase 3's prefill path (engine/model/prefill.py) is the real one.
+Weights (nvidia/Qwen3.8-27B-NVFP4, kept quantized on the GPU, ~20 GB):
+  MLP + lm_head        NVFP4 (Nvfp4Linear): streamed by the tensor-core skinny GEMM (csrc/skinny.cu) at decode, read by
+                       the CUTLASS NVFP4 GEMM at prefill (engine/model/prefill.py).
+  attention / GDN      FP8 (Fp8Linear, StackedFp8Linear): prefill multiplies the FP8 weights (W8A8). Decode streams an
+  projections          INT6 (attention) / INT5 (GDN) copy when its files exist (attach_decode_copies, tools/int6_requant.py:
+                       ~9.5% faster decode, perplexity within 0.25% of the checkpoint), else the FP8 weights themselves.
+  everything else      BF16 (embeddings, norms, the GDN conv and b / a gates).
+
+Bit identity. Every decode linear runs on the skinny GEMM, whose rows are bit-identical whatever the number of rows
+(1..16) in the launch; attention and the GDN recurrence likewise compute a row the same way at any width (csrc/
+attn_decode.cu, csrc/gdn_step.cu). So plain decode, the speculative verify of k+1 rows and any batch of slots produce the
+same bits for the same token, and speculation can never change an output.
+
+The KV cache is fp8 (e4m3, unit scale, saturating): half of bf16's bytes, and decode attention reads it directly.
+
+Entry points: load_fast_model(path) -> to_fast(model) -> [attach_decode_copies(model, path)] -> DecodeGraph / MtpCycle
+(engine/spec/mtp.py) / prefill(). FastQwen35.forward is one decode step (T = 1 per slot); verify / commit are the
+speculative halves (T = k + 1 rows, then the accepted prefix).
 """
 from __future__ import annotations
 
@@ -18,57 +31,47 @@ import torch.nn as nn
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
+from engine.model.qwen35 import Attention, GatedDeltaNet, ModelState, Qwen35Config, Qwen35ForCausalLM
 from engine.weights.loader import PREFIX, SCALE_SUFFIXES, SKIP_PREFIXES, resolve
+from engine.weights.quantize import REQUANT_DIR
 
-# Decode linears run on the tensor-core skinny GEMM (csrc/skinny.cu, M <= 16) or, with COLINFER_SKINNY=0, on the
-# CUDA-core GEMV (csrc/gemv.cu, M <= 8). Either way a row's result is bit-identical for every M, and every decode
-# path (plain steps, speculative verify, the MTP drafter) uses the same kernel, so speculation never changes outputs.
-SKINNY = os.environ.get("COLINFER_SKINNY", "1") != "0"
-GEMV_M = 8                       # rows per CUDA-core GEMV launch
-MAX_M = 16 if SKINNY else GEMV_M  # rows per weight pass
+MAX_ROWS = 16  # rows per weight pass of the skinny GEMM: a verify of width * (k + 1) rows must fit
+GEMV_ROWS = 8  # rows per bf16 GEMV launch (the GDN b / a gates)
 
 
-def set_linear_kernel(name: str):
-    """'skinny' (tensor cores: any row count up to 16 costs about one weight pass; the speculative path) or 'gemv'
-    (CUDA cores: ~4% faster at 1-3 rows, compute-bound beyond ~4; plain decode). Set before capturing graphs: the
-    choice is baked into them, and all decode paths of a process must use the same kernel to stay bit-identical."""
-    global SKINNY, MAX_M
-    SKINNY = name == "skinny"
-    MAX_M = 16 if SKINNY else GEMV_M
+# ------------------------------------------------------------------------------------------------------------ linears
+def _rows(fn, x2, r2, out):
+    """Run a skinny GEMM over any number of rows, MAX_ROWS at a time."""
+    for i in range(0, x2.shape[0], MAX_ROWS):
+        fn(x2[i:i + MAX_ROWS], None if r2 is None else r2[i:i + MAX_ROWS], out[i:i + MAX_ROWS])
 
 
-def _skinny_ok(K: int, fp4: bool) -> bool:
-    return SKINNY and K % (512 if fp4 else 256) == 0
+class Nvfp4Linear(nn.Module):
+    """NVFP4 weights: packed e2m1 w [N, K/2], e4m3 block scales sf [N, K/16], fp32 global scale; in_scale: the static
+    activation scale prefill quantizes with. out_fp32: logits."""
+
+    def __init__(self, w: torch.Tensor, sf: torch.Tensor, gscale: float, out_fp32: bool = False, in_scale: float = 1.0):
+        super().__init__()
+        self.register_buffer("w", w, persistent=False)
+        self.register_buffer("sf", sf, persistent=False)
+        self.gscale, self.out_fp32, self.in_scale = float(gscale), out_fp32, float(in_scale)
+        self.out_features, self.in_features = w.shape[0], w.shape[1] * 2
+
+    def rows(self, x2, r2, out):
+        _rows(lambda x, r, o: ops().skinny_nvfp4(x, self.w, self.sf, self.gscale, r, o), x2, r2, out)
+
+    def forward(self, x, residual=None):
+        shp = x.shape
+        x2 = x.reshape(-1, self.in_features).contiguous()
+        out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.float32 if self.out_fp32 else torch.bfloat16)
+        r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
+        self.rows(x2, r2, out)
+        return out.view(*shp[:-1], self.out_features)
 
 
-def nvfp4_rows(x2, w, sf, gscale, r2, out):
-    """out = x2 @ dequant(w)^T * gscale (+ r2), any number of rows, in passes of MAX_M rows."""
-    if _skinny_ok(x2.shape[1], True):
-        for i in range(0, x2.shape[0], 16):
-            ops().skinny_nvfp4(x2[i:i + 16], w, sf, gscale, None if r2 is None else r2[i:i + 16], out[i:i + 16])
-    else:
-        for i in range(0, x2.shape[0], GEMV_M):
-            ops().nvfp4_gemv(x2[i:i + GEMV_M], w, sf, gscale, None if r2 is None else r2[i:i + GEMV_M], out[i:i + GEMV_M])
-
-
-def fp8_rows(x2, w, scale, r2, out, row_scale=None):
-    if _skinny_ok(x2.shape[1], False):
-        for i in range(0, x2.shape[0], 16):
-            ops().skinny_fp8(x2[i:i + 16], w, scale, None if r2 is None else r2[i:i + 16], out[i:i + 16], row_scale)
-    else:
-        for i in range(0, x2.shape[0], GEMV_M):
-            ops().fp8_gemv(x2[i:i + GEMV_M], w, scale, None if r2 is None else r2[i:i + GEMV_M], out[i:i + GEMV_M], row_scale)
-
-
-def int6_rows(x2, wlo, whi, sf, gscale, r2, out):
-    """out = x2 @ dequant_int6(w)^T * gscale (+ r2), in passes of 16 rows (tensor-core skinny GEMM only)."""
-    for i in range(0, x2.shape[0], 16):
-        ops().skinny_int6(x2[i:i + 16], wlo, whi, sf, gscale, None if r2 is None else r2[i:i + 16], out[i:i + 16])
-
-
-class Int6Linear(nn.Module):
-    """Decode copy of an FP8 linear in INT6 (tools/int6_requant.py): two code planes + e4m3 block scales + global scale."""
+class IntLinear(nn.Module):
+    """INT6 / INT5 decode copy of an FP8 linear (engine/weights/quantize.py): low-nibble plane wlo [N, K/2], high-bit plane
+    whi [N, K/4] (INT6) or [N, K/8] (INT5), e4m3 block scales sf [N, K/16], fp32 global scale."""
 
     def __init__(self, wlo: torch.Tensor, whi: torch.Tensor, sf: torch.Tensor, gscale: float):
         super().__init__()
@@ -79,39 +82,12 @@ class Int6Linear(nn.Module):
         self.out_features, self.in_features = wlo.shape[0], wlo.shape[1] * 2
 
     def rows(self, x2, r2, out):
-        int6_rows(x2, self.wlo, self.whi, self.sf, self.gscale, r2, out)
-
-
-class Nvfp4Linear(nn.Module):
-    def rows(self, x2, r2, out):
-        nvfp4_rows(x2, self.w, self.sf, self.gscale, r2, out)
-
-    def __init__(self, w: torch.Tensor, sf: torch.Tensor, gscale: float, out_fp32: bool = False, in_scale: float = 1.0):
-        super().__init__()
-        self.register_buffer("w", w, persistent=False)
-        self.register_buffer("sf", sf, persistent=False)
-        self.gscale, self.out_fp32, self.in_scale = float(gscale), out_fp32, float(in_scale)
-        self.out_features, self.in_features = w.shape[0], w.shape[1] * 2
-
-    def forward(self, x, residual=None):
-        shp = x.shape
-        x2 = x.reshape(-1, self.in_features).contiguous()
-        out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.float32 if self.out_fp32 else torch.bfloat16)
-        r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
-        nvfp4_rows(x2, self.w, self.sf, self.gscale, r2, out)
-        return out.view(*shp[:-1], self.out_features)
-
-
-def _awq_in(x2, dec):
-    """Activations for an NVFP4 decode copy: x / s per input channel when it was quantized as W diag(s)
-    (tools/awq_nvfp4.py), else x."""
-    inv = getattr(dec, "awq_inv", None)
-    return x2 if inv is None else x2 * inv
+        _rows(lambda x, r, o: ops().skinny_int(x, self.wlo, self.whi, self.sf, self.gscale, r, o), x2, r2, out)
 
 
 class Fp8Linear(nn.Module):
-    """FP8 weights (the prefill path's W8A8 GEMM reads w directly). dec: optional NVFP4 copy of the same linear
-    (attach_requant) that the decode path streams instead, ~half the bytes."""
+    """FP8 weights w [N, K] with a per-tensor scale (prefill's W8A8 GEMM reads them). dec: an optional IntLinear copy
+    that decode streams instead (attach_decode_copies)."""
 
     def __init__(self, w: torch.Tensor, scale: float, in_scale: float = 1.0):
         super().__init__()
@@ -120,21 +96,25 @@ class Fp8Linear(nn.Module):
         self.out_features, self.in_features = w.shape
         self.dec = None
 
+    def rows(self, x2, r2, out):
+        if self.dec is not None:
+            self.dec.rows(x2, r2, out)
+        else:
+            _rows(lambda x, r, o: ops().skinny_fp8(x, self.w, self.scale, r, o), x2, r2, out)
+
     def forward(self, x, residual=None):
         shp = x.shape
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
         r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
-        if self.dec is not None:
-            self.dec.rows(_awq_in(x2, self.dec), r2, out)
-        else:
-            fp8_rows(x2, self.w, self.scale, r2, out)
+        self.rows(x2, r2, out)
         return out.view(*shp[:-1], self.out_features)
 
 
 class StackedFp8Linear(nn.Module):
-    """Several FP8 linears that read the same input, stacked into one GEMV launch with per-row
-    scales (each keeps its own checkpoint scale exactly). forward returns one output per part."""
+    """FP8 linears that read the same input (attention q / k / v; GDN in_proj_qkv / in_proj_z) stacked into one weight
+    pass, with per-row scales so each part keeps its checkpoint scale exactly. forward returns one output per part
+    (column views of one [rows, sum(sizes)] tensor). The parts stay usable (prefill) as views of the stacked weight."""
 
     def __init__(self, parts: list):
         super().__init__()
@@ -146,9 +126,9 @@ class StackedFp8Linear(nn.Module):
         if len({p.in_scale for p in parts}) != 1:
             raise ValueError("stacked FP8 parts must share the input scale")
         self.in_scale = parts[0].in_scale
-        self.dec = None  # optional stacked NVFP4 copy for decode (attach_requant)
+        self.dec = None
         off = 0
-        for p in parts:  # the parts keep working (prefill path) as views into the stacked weight
+        for p in parts:
             p.w = self.w[off:off + p.out_features]
             off += p.out_features
 
@@ -157,14 +137,14 @@ class StackedFp8Linear(nn.Module):
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], sum(self.sizes), device=x.device, dtype=torch.bfloat16)
         if self.dec is not None:
-            self.dec.rows(_awq_in(x2, self.dec), None, out)
+            self.dec.rows(x2, None, out)
         else:
-            fp8_rows(x2, self.w, 1.0, None, out, self.rs)
+            _rows(lambda x_, r, o: ops().skinny_fp8(x_, self.w, 1.0, r, o, self.rs), x2, None, out)
         return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
 
 
 class SwiGLUMLP(nn.Module):
-    """silu(gate) * up in one fused GEMV launch, then down."""
+    """silu(gate) * up in one fused weight pass (skinny_swiglu), then down with the residual added in its epilogue."""
 
     def __init__(self, gate: Nvfp4Linear, up: Nvfp4Linear, down: Nvfp4Linear):
         super().__init__()
@@ -175,16 +155,13 @@ class SwiGLUMLP(nn.Module):
         x2 = x.reshape(-1, self.gate.in_features).contiguous()
         h = torch.empty(x2.shape[0], self.gate.out_features, device=x.device, dtype=torch.bfloat16)
         g, u = self.gate, self.up
-        if _skinny_ok(x2.shape[1], True):
-            for i in range(0, x2.shape[0], 16):
-                ops().skinny_swiglu(x2[i:i + 16], g.w, g.sf, g.gscale, u.w, u.sf, u.gscale, h[i:i + 16])
-        else:
-            for i in range(0, x2.shape[0], GEMV_M):
-                ops().nvfp4_swiglu(x2[i:i + GEMV_M], g.w, g.sf, g.gscale, u.w, u.sf, u.gscale, h[i:i + GEMV_M])
+        _rows(lambda x_, r, o: ops().skinny_swiglu(x_, g.w, g.sf, g.gscale, u.w, u.sf, u.gscale, o), x2, None, h)
         return self.down(h.view(*shp[:-1], -1), residual)
 
 
 def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35ForCausalLM:
+    """The reference module tree with the checkpoint's NVFP4 / FP8 linears swapped for kernel modules (weights stay
+    quantized). Call to_fast() on the result."""
     path = resolve(path_or_repo)
     cfg = Qwen35Config.from_checkpoint(path)
     t0 = time.time()
@@ -205,18 +182,16 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
         local = name[len(PREFIX):] if name.startswith(PREFIX) else name
         base = name[: -len(".weight")]
         mod = local[: -len(".weight")] if local.endswith(".weight") else None
+        insc = float(raw[base + ".input_scale"].float()) if base + ".input_scale" in raw else 1.0
         if t.dtype == torch.uint8 and base + ".weight_scale" in raw:
-            insc = float(raw[base + ".input_scale"].float()) if base + ".input_scale" in raw else 1.0
             quant[mod] = Nvfp4Linear(t, raw[base + ".weight_scale"], float(raw[base + ".weight_scale_2"].float()), out_fp32=(mod == "lm_head"),
                                      in_scale=insc)
         elif t.dtype == torch.float8_e4m3fn and base + ".weight_scale" in raw:
-            insc = float(raw[base + ".input_scale"].float()) if base + ".input_scale" in raw else 1.0
             quant[mod] = Fp8Linear(t, float(raw[base + ".weight_scale"].float()), in_scale=insc)
         elif t.dtype == torch.float8_e4m3fn:
-            raise NotImplementedError(f"{name}: block-scaled FP8 is not supported on the decode path yet")
+            raise NotImplementedError(f"{name}: block-scaled FP8 checkpoints are not supported")
         else:
             plain[local] = t.to(torch.bfloat16) if t.is_floating_point() else t
-    # load the non-quantized parameters, then swap the quantized linears in
     missing = set(model.state_dict()) - set(plain) - {m + ".weight" for m in quant}
     if missing:
         raise RuntimeError(f"missing tensors: {sorted(missing)[:5]}")
@@ -225,8 +200,7 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
         parent, _, child = mod.rpartition(".")
         setattr(model.get_submodule(parent) if parent else model, child, q)
     for layer in model.layers:
-        if isinstance(layer.mlp.gate_proj, Nvfp4Linear):
-            layer.mlp = SwiGLUMLP(layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj)
+        layer.mlp = SwiGLUMLP(layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj)
     leftover = [n for n, p in model.named_parameters() if p.is_meta] + [n for n, b in model.named_buffers() if b.is_meta]
     if leftover:
         raise RuntimeError(f"tensors left on meta: {leftover[:5]}")
@@ -241,67 +215,48 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
     return model
 
 
-# ----------------------------------------------------------------------------------------------
-# Graph-capturable decode path: positions live on the device, attention reads seq_len on the GPU.
-# ----------------------------------------------------------------------------------------------
-from engine.model.qwen35 import Attention, GatedDeltaNet, ModelState, apply_rotary  # noqa: E402
-
-ATTN_SPLITS = 32
-# fp8 / fp4 caches decode on the tensor-core multi-row kernel (csrc/attn_decode.cu, namespace tc): one KV pass for all
-# verify rows of a slot. COLINFER_ATTN_TC=0 selects the split-KV CUDA-core kernel (one KV pass per row).
-ATTN_TC = os.environ.get("COLINFER_ATTN_TC", "1") != "0"
-
-
+# ------------------------------------------------------------------------------------------------------------ state
 class FastState(ModelState):
-    """ModelState plus the device-side position (`pos_t`, int32 [B]) that graph replays advance.
-    kv_fp8: store the attention KV cache as e4m3 with unit scale (saturating), halving its traffic.
-    kv_fp4: 144-byte rows of e2m1 values + e4m3 block scales per 16 dims (csrc/attn_decode.cu KvFp4), 0.56x of fp8."""
+    """ModelState with an fp8 KV cache and the device-side per-slot positions `pos_t` (int32 [B]) that graph replays
+    advance. active (int32 [B]): decode updates only slots with active == 1 (idle or prefilling slots inside a batched
+    step are masked off). view(lo, hi) shares the tensors of slots [lo, hi)."""
 
-    def __init__(self, cfg, batch, max_seq_len, device, dtype=torch.bfloat16, kv_fp8: bool = False, kv_fp4: bool = False):
-        if kv_fp4:
-            super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.uint8, kv_row=cfg.head_dim // 2 + cfg.head_dim // 16)
-        else:
-            super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.float8_e4m3fn if kv_fp8 else None)
-        self.kv_fp8, self.kv_fp4 = kv_fp8, kv_fp4
+    def __init__(self, cfg, batch, max_seq_len, device, dtype=torch.bfloat16):
+        super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.float8_e4m3fn)
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
-        self.active = torch.ones(batch, dtype=torch.int32, device=device)  # decode updates only slots with active == 1
-        self.arange = torch.arange(16, device=device)
+        self.active = torch.ones(batch, dtype=torch.int32, device=device)
 
     def reset(self):
         super().reset()
         self.pos_t.zero_()
 
     def view(self, lo: int, hi: int) -> "FastState":
-        """A FastState over slots [lo, hi) sharing this state's tensors (slices along the batch dim)."""
         v = FastState.__new__(FastState)
-        v.cfg, v.max_seq_len, v.kv_fp8, v.kv_fp4, v.pos = self.cfg, self.max_seq_len, self.kv_fp8, getattr(self, "kv_fp4", False), self.pos
+        v.cfg, v.max_seq_len, v.pos = self.cfg, self.max_seq_len, self.pos
         v.conv = {i: t[lo:hi] for i, t in self.conv.items()}
         v.rec = {i: t[lo:hi] for i, t in self.rec.items()}
         v.k = {i: t[lo:hi] for i, t in self.k.items()}
         v.v = {i: t[lo:hi] for i, t in self.v.items()}
-        v.pos_t, v.active, v.arange = self.pos_t[lo:hi], self.active[lo:hi], self.arange
+        v.pos_t, v.active = self.pos_t[lo:hi], self.active[lo:hi]
         return v
 
 
+# ------------------------------------------------------------------------------------------------------------ layers
 class KernelAttention(Attention):
-    """Gated GQA attention: KV written at device positions, split-KV decode kernel (any T <= 16)."""
+    """Gated GQA attention on T new rows per slot (1 for decode, k + 1 for verify): one stacked q / k / v pass, the fused
+    prologue (q / k norm, partial RoPE, fp8 KV write at the device positions), multi-row tensor-core attention with the
+    output gate fused, o_proj with the residual."""
 
     def forward(self, x, cos, sin, state: FastState, layer_idx: int, residual=None):
         B, T, _ = x.shape
-        if hasattr(self, "qkv"):
-            qp, kp, vp = self.qkv(x)
-        else:
-            qp, kp, vp = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        qp, kp, vp = self.qkv(x) if hasattr(self, "qkv") else (self.q_proj(x), self.k_proj(x), self.v_proj(x))  # MTP layer: unstacked
         kc, vc = state.k[layer_idx], state.v[layer_idx]
         qp = qp.reshape(B, T, -1)
         q = torch.empty(B, self.num_heads, T, self.head_dim, device=x.device, dtype=torch.bfloat16)
-        ops().attn_prologue(qp, kp, vp, self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t,
-                            kc, vc, q, self.q_norm.eps, state.active)
+        ops().attn_prologue(qp, kp, vp, self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t, kc, vc, q, self.q_norm.eps,
+                            state.active)
         attn = torch.empty(B, T, self.num_heads * self.head_dim, device=x.device, dtype=torch.bfloat16)
-        if ATTN_TC and kc.dtype != torch.bfloat16:
-            ops().attn_decode_tc(q, kc, vc, state.pos_t + T, attn, self.head_dim ** -0.5, qp.contiguous())
-        else:
-            ops().attn_decode(q, kc, vc, state.pos_t + T, attn, ATTN_SPLITS, self.head_dim ** -0.5, qp.contiguous())
+        ops().attn_decode(q, kc, vc, state.pos_t + T, attn, self.head_dim ** -0.5, qp.contiguous())
         return self.o_proj(attn, residual)
 
 
@@ -319,55 +274,61 @@ class KernelRMSNorm(nn.Module):
         return out.view(x.shape)
 
 
-_SIDE = {}
+_SIDE: dict = {}
 
 
-def _side_stream(device):
+def side_stream(device) -> torch.cuda.Stream:
+    """A second stream for work that can overlap the main one (a parallel branch when captured into a graph)."""
     if device not in _SIDE:
         _SIDE[device] = torch.cuda.Stream(device)
     return _SIDE[device]
 
 
 class KernelGDN(GatedDeltaNet):
-    """Single-token steps use the fused conv + delta-rule kernels (csrc/gdn_step.cu); multi-token
-    prefill chunks fall back to the Phase 1 chunked PyTorch path."""
+    """Gated DeltaNet on T new tokens per slot (csrc/gdn_step.cu).
 
-    def forward(self, x, state, layer_idx: int, residual=None):
+    Plain decode (T = 1): the conv and delta rule run on the slot's state and advance it (slots with active == 0 keep
+    theirs). Speculative verify (state.spec): outputs for all T tokens, state untouched, the inputs kept for commit(),
+    which advances the state by the accepted count. The mixed / z / b / a tensors stay column views of the projection
+    outputs (the kernels take row strides), and the tiny b / a GEMV runs on a side stream beside the qkv / z weight
+    pass."""
+
+    def forward(self, x, state: FastState, layer_idx: int, residual=None):
         B, T, _ = x.shape
-        if T > 1 and getattr(state, "spec", False):
-            return self._verify(x, state, layer_idx, residual)
-        if T != 1 or state is None:
-            out = super().forward(x, state, layer_idx)
-            return out if residual is None else residual + out
-        if not hasattr(self, "w_ba"):  # in_proj_b and in_proj_a stacked: one tiny GEMV launch
-            self.w_ba = torch.cat([self.in_proj_b.weight, self.in_proj_a.weight]).contiguous()
-        # the tiny b/a GEMV runs on a side stream, overlapped with the big qkv/z weight stream
-        x2 = x.view(B, -1)
-        ba = torch.empty(B, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
-        main = torch.cuda.current_stream()
-        side = _side_stream(x.device)
+        ba = torch.empty(B * T, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
+        x2 = x.reshape(B * T, -1)
+        main, side = torch.cuda.current_stream(), side_stream(x.device)
         side.wait_stream(main)
         with torch.cuda.stream(side):
-            ops().bf16_gemv(x2, self.w_ba, ba)
-        if hasattr(self, "qkvz"):
-            mixed, z = self.qkvz(x)
-            mixed, z = mixed.reshape(B, -1).contiguous(), z.reshape(B, -1).contiguous()
-        else:
-            mixed = self.in_proj_qkv(x).view(B, -1)
-            z = self.in_proj_z(x).view(B, -1)
+            for i in range(0, B * T, GEMV_ROWS):
+                ops().bf16_gemv(x2[i:i + GEMV_ROWS], self.w_ba, ba[i:i + GEMV_ROWS])
+        mixed, z = self.qkvz(x)
         main.wait_stream(side)
-        b, a = ba[:, : self.num_v_heads].contiguous(), ba[:, self.num_v_heads:].contiguous()
-        qkv = torch.empty_like(mixed)
-        active = getattr(state, "active", None)
-        ops().gdn_conv(mixed, state.conv[layer_idx], self.conv1d.weight, qkv, active)
-        o = torch.empty_like(z)
-        ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], o,
-                        self.num_k_heads, self.norm.eps, active)
-        return self.out_proj(o.view(B, 1, -1), residual)
+        mixed, z = mixed.reshape(B, T, -1), z.reshape(B, T, -1)
+        ba = ba.view(B, T, -1)
+        b, a = ba[..., : self.num_v_heads], ba[..., self.num_v_heads:]
+        conv, rec = state.conv[layer_idx], state.rec[layer_idx]
+        qkv = torch.empty(B, T, mixed.shape[-1], device=x.device, dtype=torch.bfloat16)
+        ops().gdn_conv(mixed, conv, self.conv1d.weight, qkv)
+        o = torch.empty(B, T, z.shape[-1], device=x.device, dtype=torch.bfloat16)
+        if getattr(state, "spec", False):
+            ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, rec, o, self.num_k_heads, self.norm.eps)
+            self._spec = (mixed, qkv, z, b, a)
+        else:
+            assert T == 1, "multi-token prompts go through engine/model/prefill.py"
+            ops().gdn_conv_commit(mixed, conv, state.active)
+            ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, rec, o, self.num_k_heads, self.norm.eps, state.active)
+        return self.out_proj(o.view(B, T, -1), residual)
+
+    def commit(self, state: FastState, layer_idx: int, n: torch.Tensor):
+        """Advance the conv / recurrent state by the first n[b] tokens of the last verify."""
+        mixed, qkv, z, b, a = self._spec
+        ops().gdn_conv_commit(mixed, state.conv[layer_idx], n)
+        ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], None, self.num_k_heads, self.norm.eps, n)
 
 
 def fast_layer_forward(self, x, cos, sin, state):
-    """DecoderLayer.forward with kernel norms and the residual adds fused into the output GEMVs."""
+    """DecoderLayer.forward with kernel norms and the residual adds fused into the output GEMMs."""
     h = self.input_layernorm(x)
     if self.block_type == "linear_attention":
         x = self.linear_attn(h, state, self.layer_idx, residual=x)
@@ -376,113 +337,58 @@ def fast_layer_forward(self, x, cos, sin, state):
     return self.mlp(self.post_attention_layernorm(x), residual=x)
 
 
-def _gdn_verify(self, x, state, layer_idx: int, residual=None):
-    """Speculative verify of T tokens per slot: outputs for every token, GDN state untouched; the inputs
-    are kept for the commit (engine/spec)."""
-    B, T, _ = x.shape
-    # the tiny b/a GEMV on a parallel branch, beside the qkv/z weight stream; mixed, z, b and a stay views (the GDN
-    # kernels take row strides)
-    ba = torch.empty(B * T, self.w_ba.shape[0], device=x.device, dtype=torch.bfloat16)
-    x2 = x.reshape(B * T, -1)
-    main, side = torch.cuda.current_stream(), _side_stream(x.device)
-    side.wait_stream(main)
-    with torch.cuda.stream(side):
-        for i in range(0, B * T, GEMV_M):
-            ops().bf16_gemv(x2[i:i + GEMV_M], self.w_ba, ba[i:i + GEMV_M])
-    mixed, z = self.qkvz(x)
-    main.wait_stream(side)
-    mixed, z = mixed.reshape(B, T, -1), z.reshape(B, T, -1)
-    ba = ba.view(B, T, -1)
-    b, a = ba[..., : self.num_v_heads], ba[..., self.num_v_heads:]
-    qkv = torch.empty(B, T, mixed.shape[-1], device=x.device, dtype=torch.bfloat16)
-    ops().gdn_conv_multi(mixed, state.conv[layer_idx], self.conv1d.weight, qkv)
-    o = torch.empty(B, T, z.shape[-1], device=x.device, dtype=torch.bfloat16)
-    ops().gdn_delta_multi(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], o, self.num_k_heads, self.norm.eps)
-    self._spec = (mixed, qkv, z, b, a, o)
-    return self.out_proj(o.view(B, T, -1), residual)
-
-
-def _gdn_commit(self, state, layer_idx: int, n: torch.Tensor):
-    mixed, qkv, z, b, a, o = self._spec
-    ops().gdn_conv_commit(mixed, state.conv[layer_idx], n)
-    ops().gdn_delta_multi(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], o, self.num_k_heads, self.norm.eps, n)
-
-
-KernelGDN._verify = _gdn_verify
-KernelGDN.commit = _gdn_commit
-
-
+# ------------------------------------------------------------------------------------------------------------ model
 class FastQwen35(Qwen35ForCausalLM):
-    kv_fp8 = False
-    kv_fp4 = False
-
     def new_state(self, batch: int, max_seq_len: int) -> FastState:
-        p = self.embed_tokens.weight
-        return FastState(self.cfg, batch, max_seq_len, p.device, p.dtype, kv_fp8=self.kv_fp8, kv_fp4=self.kv_fp4)
+        return FastState(self.cfg, batch, max_seq_len, self.embed_tokens.weight.device)
 
-    def forward(self, input_ids: torch.Tensor, state: FastState, last_only: bool = False) -> torch.Tensor:
-        B, T = input_ids.shape
-        if state.pos + T > state.max_seq_len:
-            raise ValueError(f"sequence length {state.pos + T} exceeds state max_seq_len {state.max_seq_len}")
-        x = self.embed_tokens(input_ids)
-        cos = sin = None  # RoPE is applied inside the fused attention prologue
-        for layer in self.layers:
-            x = layer(x, cos, sin, state)
-        x = self.norm(x)
-        if last_only:
-            x = x[:, -1:]
-        logits = self.lm_head(x).float()
-        state.pos_t += T * state.active
-        state.pos += T
-        return logits
-
-
-def _verify(self, input_ids: torch.Tensor, state: FastState, return_hidden: bool = False):
-    """Speculative verify: logits for all T rows per slot [B, T, V] (and the post-norm hidden [B, T, H]);
-    KV is written for all T, GDN state and positions are left for commit()."""
-    B, T = input_ids.shape
-    state.spec = True
-    try:
+    def forward(self, input_ids: torch.Tensor, state: FastState) -> torch.Tensor:
+        """One decode step: input_ids [B, 1] at positions state.pos_t -> fp32 logits [B, vocab]; pos_t += active."""
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
             x = layer(x, None, None, state)
-        h = self.norm(x)
-        logits = self.lm_head(h).float()
-    finally:
-        state.spec = False
-    return (logits, h) if return_hidden else logits
+        logits = self.lm_head(self.norm(x)).float()[:, -1]
+        state.pos_t += state.active
+        return logits
+
+    def verify(self, input_ids: torch.Tensor, state: FastState):
+        """Speculative verify of T rows per slot [y, d1..dk]: (fp32 logits [B, T, V], post-norm hidden [B, T, H]). KV is
+        written for all T rows; the GDN state and the positions are left for commit()."""
+        state.spec = True
+        try:
+            x = self.embed_tokens(input_ids)
+            for layer in self.layers:
+                x = layer(x, None, None, state)
+            h = self.norm(x)
+            logits = self.lm_head(h).float()
+        finally:
+            state.spec = False
+        return logits, h
+
+    def commit(self, state: FastState, n: torch.Tensor):
+        """Accept the first n[b] (int32, device) of the T verified rows per slot: GDN state forward, positions += n."""
+        for i, layer in enumerate(self.layers):
+            if layer.block_type == "linear_attention":
+                layer.linear_attn.commit(state, i, n)
+        state.pos_t += n
 
 
-def _commit(self, state: FastState, n: torch.Tensor):
-    """Accept n[b] (int32, device) of the T verified tokens per slot: GDN state forward, positions += n."""
-    for i, layer in enumerate(self.layers):
-        if layer.block_type == "linear_attention":
-            layer.linear_attn.commit(state, i, n)
-    state.pos_t += n
-
-
-FastQwen35.verify = _verify
-FastQwen35.commit = _commit
-
-
-def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False, kv_fp4: bool = False) -> FastQwen35:
-    """Switch a kernel-linear model (load_fast_model) onto the device-position decode path."""
+def to_fast(model: Qwen35ForCausalLM) -> FastQwen35:
+    """Switch a load_fast_model() model onto the kernel decode path: kernel attention / GDN / norms, stacked projections."""
     model.__class__ = FastQwen35
-    model.kv_fp8, model.kv_fp4 = kv_fp8, kv_fp4
+    d = model.cfg.rotary_dim
+    inv_freq = 1.0 / (model.cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=model.embed_tokens.weight.device) / d))
     for layer in model.layers:
         if layer.block_type == "full_attention":
             a = layer.self_attn
             a.__class__ = KernelAttention
-            d = model.cfg.rotary_dim
-            a.inv_freq = 1.0 / (model.cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=model.embed_tokens.weight.device) / d))
-            if isinstance(a.q_proj, Fp8Linear):  # one launch for q, k, v (the parts are dropped, memory reused)
-                a.qkv = StackedFp8Linear([a.q_proj, a.k_proj, a.v_proj])
+            a.inv_freq = inv_freq
+            a.qkv = StackedFp8Linear([a.q_proj, a.k_proj, a.v_proj])  # one weight pass for q, k, v
         else:
             g = layer.linear_attn
             g.__class__ = KernelGDN
-            if isinstance(g.in_proj_qkv, Fp8Linear):
-                g.qkvz = StackedFp8Linear([g.in_proj_qkv, g.in_proj_z])
-                g.w_ba = torch.cat([g.in_proj_b.weight, g.in_proj_a.weight]).contiguous()
+            g.qkvz = StackedFp8Linear([g.in_proj_qkv, g.in_proj_z])
+            g.w_ba = torch.cat([g.in_proj_b.weight, g.in_proj_a.weight]).contiguous()
         layer.input_layernorm = KernelRMSNorm(layer.input_layernorm)
         layer.post_attention_layernorm = KernelRMSNorm(layer.post_attention_layernorm)
         layer.forward = fast_layer_forward.__get__(layer)
@@ -490,81 +396,53 @@ def to_fast(model: Qwen35ForCausalLM, kv_fp8: bool = False, kv_fp4: bool = False
     return model
 
 
-def requant_path(path_or_repo: str, kind: str = "requant") -> str:
-    """NVFP4 copies of a checkpoint's FP8 linears (docs/phase6_progress.md section 3).
-    kind "requant": all 208 (attention + GDN): tools/gptq_nvfp4.py --damp 0.3 if present (WikiText perplexity +0.37%,
-    Python code +1.5%), else tools/requant_nvfp4.py round-to-nearest (+0.13%, +2.3%). ~18% faster decode.
-    kind "awq-attn": the 64 attention linears only, tools/awq_nvfp4.py --groups self_attn (WikiText -0.05%, code
-    +0.43%). ~3% faster decode.
-    kind "int": INT6 attention + INT5 GDN (tools/int6_requant.py --bits 6 --filter self_attn; --bits 5 --filter
-    linear_attn), a comma-separated pair (WikiText -0.21%, code +0.23%). ~9.5% faster decode.
-    COLINFER_REQUANT_FILE overrides any of them."""
-    if os.environ.get("COLINFER_REQUANT_FILE"):  # an explicit file, e.g. a tools/awq_nvfp4.py output
-        return os.path.expanduser(os.environ["COLINFER_REQUANT_FILE"])
-    d = os.path.join(os.path.expanduser("~/.cache/colinfer/requant"), os.path.basename(resolve(path_or_repo)))
-    if kind == "awq-attn":
-        return os.path.join(d, "attn_gdn_nvfp4_awq_attn.safetensors")
-    if kind == "int":
-        return ",".join(os.path.join(d, f) for f in ("attn_gdn_int6_self_attn.safetensors", "attn_gdn_int5_linear_attn.safetensors"))
-    gptq = os.path.join(d, "attn_gdn_nvfp4_gptq_d0.3.safetensors")
-    return gptq if os.path.exists(gptq) else os.path.join(d, "attn_gdn_nvfp4.safetensors")
+# ------------------------------------------------------------------------------------------------------------ decode copies
+def decode_copies_paths(path_or_repo: str) -> list[str]:
+    """INT6 attention + INT5 GDN decode copies of the checkpoint's FP8 projections (tools/int6_requant.py --bits 6 --filter
+    self_attn; --bits 5 --filter linear_attn). WikiText perplexity -0.21%, Python code +0.23% against the FP8 weights."""
+    d = os.path.join(REQUANT_DIR, os.path.basename(resolve(path_or_repo)))
+    return [os.path.join(d, f) for f in ("attn_gdn_int6_self_attn.safetensors", "attn_gdn_int5_linear_attn.safetensors")]
 
 
-def attach_requant(model: FastQwen35, file: str) -> int:
-    """Decode streams NVFP4 re-quantizations (tools/requant_nvfp4.py, from the BF16 originals) of the FP8 attention /
-    GDN projections: 7.2 GB -> 4.1 GB per token, WikiText perplexity +0.13% (6.9789 vs 6.9698). Prefill keeps the
-    FP8 weights (W8A8 GEMM). Stacked projections share a global scale in the file, so they stay one launch.
-    Call after to_fast (the stacking) and before capturing graphs. Returns the number of linears attached.
-    AWQ files (tools/awq_nvfp4.py) carry per-input-channel scales s (W was quantized as W diag(s); decode feeds x / s)
-    and may leave groups out, which then keep what they had (FP8, or an earlier file's copy). INT6 files
-    (tools/int6_requant.py) attach Int6Linear copies. `file` may list several, comma-separated, applied in order."""
-    if "," in file:
-        return sum(attach_requant(model, one) for one in file.split(","))
-    from engine.weights.loader import PREFIX
+def attach_decode_copies(model: FastQwen35, files) -> int:
+    """Point the decode path of the FP8 attention / GDN projections at INT6 / INT5 copies (prefill keeps the FP8 weights).
+    files: paths of tools/int6_requant.py outputs (each may cover some of the projections). Stacked projections share a
+    global scale in the file, so they stay one launch. Call after to_fast and before capturing graphs. Returns the number
+    of linears attached."""
     n = 0
-    with safe_open(file, framework="pt", device=str(model.embed_tokens.weight.device)) as f:
-        keys = set(f.keys())
+    for file in files:
+        with safe_open(file, framework="pt", device=str(model.embed_tokens.weight.device)) as f:
+            keys = set(f.keys())
 
-        def nv(names):
-            if all(PREFIX + m + ".qweight_lo" in keys for m in names):  # INT6 (tools/int6_requant.py)
+            def copy_of(names):
+                if not all(PREFIX + m + ".qweight_lo" in keys for m in names):
+                    return None
                 gs = {float(f.get_tensor(PREFIX + m + ".weight_scale_2")) for m in names}
                 assert len(gs) == 1, names
                 cat = lambda suffix: torch.cat([f.get_tensor(PREFIX + m + suffix) for m in names]).contiguous()  # noqa: E731
-                return Int6Linear(cat(".qweight_lo"), cat(".qweight_hi"), cat(".weight_scale"), gs.pop())
-            if any(PREFIX + m + ".weight" not in keys for m in names):
-                return None
-            ws = [f.get_tensor(PREFIX + m + ".weight") for m in names]
-            sfs = [f.get_tensor(PREFIX + m + ".weight_scale") for m in names]
-            gs = {float(f.get_tensor(PREFIX + m + ".weight_scale_2")) for m in names}
-            assert len(gs) == 1, names
-            lin = Nvfp4Linear(torch.cat(ws).contiguous(), torch.cat(sfs).contiguous(), gs.pop())
-            if PREFIX + names[0] + ".input_scale_awq" in keys:
-                s = f.get_tensor(PREFIX + names[0] + ".input_scale_awq")
-                assert all(torch.equal(s, f.get_tensor(PREFIX + m + ".input_scale_awq")) for m in names[1:]), names
-                lin.register_buffer("awq_inv", (1.0 / s.float()).to(torch.bfloat16), persistent=False)
-            return lin
-        for i, layer in enumerate(model.layers):
-            p = f"layers.{i}."
-            if layer.block_type == "full_attention":
-                a = layer.self_attn
-                parts = ((a.qkv, [p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"]), (a.o_proj, [p + "self_attn.o_proj"]))
-            else:
-                g = layer.linear_attn
-                parts = ((g.qkvz, [p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"]), (g.out_proj, [p + "linear_attn.out_proj"]))
-            for mod, names in parts:
-                d = nv(names)
-                if d is not None:
-                    mod.dec = d
-                    n += len(names)
+                return IntLinear(cat(".qweight_lo"), cat(".qweight_hi"), cat(".weight_scale"), gs.pop())
+            for i, layer in enumerate(model.layers):
+                p = f"layers.{i}."
+                if layer.block_type == "full_attention":
+                    a = layer.self_attn
+                    parts = ((a.qkv, [p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"]), (a.o_proj, [p + "self_attn.o_proj"]))
+                else:
+                    g = layer.linear_attn
+                    parts = ((g.qkvz, [p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"]), (g.out_proj, [p + "linear_attn.out_proj"]))
+                for mod, names in parts:
+                    d = copy_of(names)
+                    if d is not None:
+                        mod.dec = d
+                        n += len(names)
     return n
 
 
+# ------------------------------------------------------------------------------------------------------------ graph
 class DecodeGraph:
-    """One CUDA graph for a full decode step (T=1 per slot): embed -> 64 layers -> lm_head -> sampler.
+    """One CUDA graph for a plain decode step (T = 1 per slot): embed -> 64 layers -> lm_head -> sampler.
 
-    Capture runs on a fresh state and resets it afterwards (warm-up executes the step for real).
-    Per step the host writes the input tokens into a static buffer, replays, and reads back the
-    argmax ids (and optionally the logits)."""
+    Capture runs on a fresh state and resets it afterwards (warm-up executes the step for real). Per step the host writes
+    the input tokens into a static buffer, replays, and reads back the sampled ids (logits in self.logits)."""
 
     def __init__(self, model: FastQwen35, state: FastState, params=None):
         """params: optional SamplerParams (B slots) shared with other graphs; default: a private one."""
@@ -576,26 +454,20 @@ class DecodeGraph:
         self.params = params if params is not None else SamplerParams(B, model.cfg.vocab_size, state.pos_t.device)
         self.tok = torch.zeros(B, 1, dtype=torch.long, device=state.pos_t.device)
         state.reset()
-        state.pos = 1  # record the decode (has-previous-state) branches
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s), torch.inference_mode():
             for _ in range(2):
-                sample(model(self.tok, state, last_only=True)[:, -1], self.params, state.pos_t)
-                state.pos = 1
+                sample(model(self.tok, state), self.params, state.pos_t)
         torch.cuda.current_stream().wait_stream(s)
         self.graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(self.graph):
-            self.logits = model(self.tok, state, last_only=True)[:, -1]
+            self.logits = model(self.tok, state)
             self.next = sample(self.logits, self.params, state.pos_t)  # pos_t now holds the predicted token's position
         state.reset()
 
     def step(self, tokens: torch.Tensor) -> torch.Tensor:
-        """tokens: [B] long on the device. Returns sampled ids [B] (device; greedy for slots with
-        temperature 0, see self.params); logits in self.logits."""
-        if self.state.pos + 1 > self.state.max_seq_len:
-            raise ValueError("state full")
+        """tokens: [B] long on the device. Returns sampled ids [B] (device; greedy for slots with temperature 0)."""
         self.tok.copy_(tokens.view(-1, 1))
         self.graph.replay()
-        self.state.pos += 1
         return self.next

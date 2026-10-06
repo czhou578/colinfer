@@ -9,7 +9,7 @@ amax/31 * {1, .95, .9, .85, .8} by squared error. Stacked projections (q/k/v; in
 global scale.
 
   --simulate: write dequantized BF16 weights (<module>.weight_deq) for tests/perplexity.py --override
-  default:    the decode format (attach_requant in engine/model/fast.py, csrc/skinny.cu INT6), codes c = q + 32:
+  default:    the decode format (attach_decode_copies in engine/model/fast.py, csrc/skinny.cu), codes c = q + 32:
               <module>.qweight_lo uint8 [N, K/2]: low 4 bits, code 2i in the low nibble of byte i (NVFP4's layout)
               <module>.qweight_hi uint8 [N, K/4]: high 2 bits, code 4i + j in bits 2j .. 2j+1 of byte i
                                   (INT5: [N, K/8], the high bit of code 8i + j in bit j of byte i)
@@ -29,75 +29,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine.weights.loader import resolve  # noqa: E402
-from requant_nvfp4 import default_out  # noqa: E402
-
-DIVISORS = (1.0, 0.95, 0.9, 0.85, 0.8)
-
-
-def quantize_int(w: torch.Tensor, gs: float, bits: int = 6, rows: int = 2048):
-    """w [N, K] fp32 cuda -> (codes uint8 [N, K] = q + 2^(bits-1), block scales e4m3 [N, K/16])."""
-    qmax = 2 ** (bits - 1) - 1
-    N, K = w.shape
-    codes = torch.empty(N, K, dtype=torch.uint8, device=w.device)
-    scales = torch.empty(N, K // 16, dtype=torch.float8_e4m3fn, device=w.device)
-    for r0 in range(0, N, rows):
-        b = w[r0:r0 + rows].view(-1, K // 16, 16) / gs
-        amax = b.abs().amax(-1, keepdim=True)
-        best = None
-        for d in DIVISORS:
-            s = (amax * d / qmax).clamp(max=448.0).to(torch.float8_e4m3fn).float()
-            s = torch.where(s == 0, torch.ones_like(s), s)
-            q = torch.round(b / s).clamp(-qmax, qmax)
-            err = ((q * s - b) ** 2).sum(-1, keepdim=True)
-            if best is None:
-                best = [err, s, q]
-            else:
-                m = err < best[0]
-                best = [torch.where(m, err, best[0]), torch.where(m, s, best[1]), torch.where(m, q, best[2])]
-        codes[r0:r0 + rows] = (best[2] + 2 ** (bits - 1)).to(torch.uint8).view(-1, K)
-        scales[r0:r0 + rows] = best[1].view(-1, K // 16).to(torch.float8_e4m3fn)
-    return codes, scales
-
-
-def dequant_int(codes: torch.Tensor, scales: torch.Tensor, gs: float, bits: int = 6) -> torch.Tensor:
-    q = codes.float() - 2 ** (bits - 1)
-    return (q.view(q.shape[0], -1, 16) * scales.float()[..., None] * gs).view(q.shape)
-
-
-def pack6(codes: torch.Tensor):
-    """codes uint8 [N, K] (6-bit) -> (lo [N, K/2] nibbles, hi [N, K/4] 2-bit fields)."""
-    c = codes.to(torch.int32)
-    lo, hi = c & 15, c >> 4
-    nib = (lo[:, 0::2] | (lo[:, 1::2] << 4)).to(torch.uint8)
-    two = (hi[:, 0::4] | (hi[:, 1::4] << 2) | (hi[:, 2::4] << 4) | (hi[:, 3::4] << 6)).to(torch.uint8)
-    return nib.contiguous(), two.contiguous()
-
-
-def pack5(codes: torch.Tensor):
-    """codes uint8 [N, K] (5-bit) -> (lo [N, K/2] nibbles, hi [N, K/8]: code 8i + j in bit j of byte i)."""
-    c = codes.to(torch.int32)
-    lo, hi = c & 15, c >> 4
-    nib = (lo[:, 0::2] | (lo[:, 1::2] << 4)).to(torch.uint8)
-    bits = sum(hi[:, j::8] << j for j in range(8)).to(torch.uint8)
-    return nib.contiguous(), bits.contiguous()
-
-
-def unpack5(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
-    N = lo.shape[0]
-    lo, hi = lo.to(torch.int32), hi.to(torch.int32)
-    l = torch.stack([lo & 15, lo >> 4], -1).view(N, -1)
-    h = torch.stack([(hi >> j) & 1 for j in range(8)], -1).view(N, -1)
-    return (l | (h << 4)).to(torch.uint8)
-
-
-def unpack6(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
-    N = lo.shape[0]
-    lo, hi = lo.to(torch.int32), hi.to(torch.int32)
-    l = torch.stack([lo & 15, lo >> 4], -1).view(N, -1)
-    h = torch.stack([(hi >> (2 * j)) & 3 for j in range(4)], -1).view(N, -1)
-    return (l | (h << 4)).to(torch.uint8)
+from engine.weights.quantize import REQUANT_DIR, dequant_int, pack5, pack6, quantize_int  # noqa: E402
 
 
 def main():
@@ -111,7 +44,7 @@ def main():
     a = ap.parse_args()
     p4, p16 = resolve(a.nvfp4), resolve(a.bf16)
     tag = f"int{a.bits}" + ("_sim" if a.simulate else "") + (f"_{re.sub(r'[^a-z_]', '', a.filter)}" if a.filter else "")
-    out = a.out or default_out(p4).replace("attn_gdn_nvfp4", f"attn_gdn_{tag}")
+    out = a.out or os.path.join(REQUANT_DIR, os.path.basename(p4), f"attn_gdn_{tag}.safetensors")
     wm4 = json.load(open(os.path.join(p4, "model.safetensors.index.json")))["weight_map"]
     wm16 = json.load(open(os.path.join(p16, "model.safetensors.index.json")))["weight_map"]
     fp8 = []

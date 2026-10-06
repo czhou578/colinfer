@@ -1,118 +1,104 @@
-"""MTP drafter (PLAN.md 4.5 item 2): the checkpoint's multi-token-prediction block (one gated full-attention
-decoder layer + fc, BF16, excluded from quantization) run k times per step, with its own KV cache.
+"""MTP drafter: the checkpoint's multi-token-prediction block (one gated full-attention decoder layer + fc, BF16 in the
+checkpoint) run once per draft, with its own fp8 KV cache. Optionally fine-tuned weights replace it
+(tools/train_drafter.py; the server's --drafter-weights auto picks ~/.cache/colinfer/drafter/mtp_ft.safetensors).
 
-Row semantics (as vLLM's Qwen3_5MTP / EAGLE proposer): MTP row at position i takes (embed(x_{i+1}),
-h_i) where h_i is the target's post-final-norm hidden state at position i, and predicts x_{i+2}:
-    x = fc([pre_fc_norm_embedding(embed(x_{i+1})), pre_fc_norm_hidden(h_i)]) -> decoder layer -> mtp.norm
-    -> shared lm_head.  Chained steps feed the MTP's own normed output as the next hidden.
+Row semantics (as vLLM's Qwen3_5MTP / EAGLE proposer): the MTP row at position i takes (embed(x_{i+1}), h_i), where h_i is
+the target's post-final-norm hidden state at position i, and predicts x_{i+2}:
+    x = fc([pre_fc_norm_embedding(embed(x_{i+1})), pre_fc_norm_hidden(h_i)]) -> decoder layer -> mtp.norm -> draft head.
+Chained steps feed the MTP's own normed output as the next hidden.
 
-MtpCycle captures one CUDA graph per decode cycle for B slots (k drafts each):
-  1. verify [y, d1..dk] of every slot on the target (hidden states kept); acceptance (drafts that equal the
-     target's argmax, or its position-keyed sample for slots with temperature > 0, so the output is exactly what
-     plain decoding would emit); the accepted length is cut after the first accepted stop token
-     so the state never runs past the end of a reply; commit n[b] tokens per slot (0 for inactive slots);
-  2. MTP catch-up: rows for the n newly committed positions with the true target hidden states (rows past
-     n are padding, overwritten later); the last valid row yields the next d1;
-  3. k-1 chained MTP steps yield d2..dk; the next cycle's input [y', d1'..dk'] is written in place.
+Cost per draft step (the drafter is re-streamed every step, so its bytes are cycle time):
+  * its linears run on NVFP4 copies (round-to-nearest from BF16) on the skinny GEMM;
+  * the draft head scores DRAFT_VOCAB frequent tokens (engine/spec/draft_vocab.npy) plus up to PROMPT_SLOTS tokens of the
+    current prompts, not the 248k vocabulary;
+  * with ~/.cache/colinfer/drafter/draft_head_pca.safetensors (tools/lowrank_draft_head.py) the head is a rank-1024
+    approximation whose top LOWRANK_CANDS candidates are rescored exactly: the same drafts for ~1/5 of the bytes.
+None of this affects outputs, only how many drafts are accepted.
+
+MtpCycle captures one CUDA graph per speculative cycle for B slots (k drafts each):
+  1. verify [y, d1..dk] of every slot on the target (hidden states kept); accept the leading drafts that equal the
+     target's argmax, or its position-keyed sample for slots with temperature > 0 (engine/spec/accept.py), so the output
+     is exactly what plain decoding would emit; the accepted length is cut after the first accepted stop token, so the
+     state never runs past the end of a reply; commit n[b] tokens per slot (0 for inactive slots) on a parallel branch;
+  2. MTP catch-up: rows for the newly committed positions with the true target hidden states; the last valid row yields
+     the next d1;
+  3. k-1 chained MTP steps yield d2..dk, stopping early (DRAFT_STOP) once the drafts are unlikely to be accepted; the
+     next cycle's input [y', d1'..dk'] is written in place.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import GEMV_M, DecodeGraph, fp8_rows, FastQwen35, FastState, KernelAttention, KernelRMSNorm, fast_layer_forward
-from engine.model.prefill import ATTN_FP8, ATTN_FP8_BN, ATTN_FP8_MIN_CTX, prefill, prepare_prefill
+from engine.model.fast import DecodeGraph, FastQwen35, FastState, KernelAttention, KernelRMSNorm, Nvfp4Linear, fast_layer_forward
+from engine.model.prefill import ATTN_FP8_BN, ATTN_FP8_MIN_CTX, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm
+from engine.weights.loader import dequant_nvfp4
+from engine.weights.quantize import nvfp4_global_scale, quantize
+
+DRAFT_DIR = os.path.expanduser("~/.cache/colinfer/drafter")
+DRAFT_VOCAB = 65536   # static draft vocabulary (a smaller one loses as much acceptance as it saves time)
+PROMPT_SLOTS = 4096   # draft-head rows rewritten per request with prompt tokens outside the static vocabulary
+LOWRANK_CANDS = 256   # low-rank head: candidates rescored exactly (64: 0.6% of drafts change, 256: none measured)
+# Draft early exit: once the product of the drafter's probabilities of a cycle's drafts so far is below this for every
+# active slot, the remaining draft steps skip their GEMMs (a skipped step costs ~0.35 ms instead of ~1.8 ms; its junk
+# drafts are rejected by verify, outputs are unchanged). 40-request mix: 37.2 -> 38.1 tok/s.
+DRAFT_STOP = 0.1
 
 
-class Bf16Linear(nn.Module):
-    """BF16 weights; decode-sized inputs go through a GEMV (BF16, or FP8 with per-row scales after
-    to_fp8(), halving the weight stream), long inputs (the prompt pass) through cuBLAS BF16."""
+class DraftLinear(nn.Module):
+    """A drafter linear: BF16 weights for the prompt pass (cuBLAS, many rows) and an NVFP4 copy that the draft steps
+    stream (skinny GEMM, <= 16 rows)."""
 
     def __init__(self, w: torch.Tensor):
         super().__init__()
         self.register_buffer("w", w.contiguous(), persistent=False)
         self.out_features, self.in_features = w.shape
-        self.w8 = self.rs = None
-
-    def to_fp8(self):
-        rs = (self.w.float().abs().amax(1) / 448.0).clamp_min(1e-12)
-        self.w8 = (self.w.float() / rs[:, None]).to(torch.float8_e4m3fn).contiguous()
-        self.rs = rs.contiguous()
-        return self
-
-    def to_lowbit(self, fmt: str):
-        """Decode copy in INT6 / INT5 / NVFP4 (block-16 e4m3 scales, round-to-nearest from the BF16 weights) for the
-        tensor-core skinny GEMM: the drafter re-reads its weights every draft step, so its bytes are cycle time."""
-        import sys
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools"))
-        from engine.model.fast import Int6Linear, Nvfp4Linear
-        w = self.w.float()
-        if fmt == "nvfp4":
-            from requant_nvfp4 import quantize
-            gs = float(w.abs().max()) / (448.0 * 6.0)
-            packed, sf = quantize(w, gs)
-            self.low = Nvfp4Linear(packed, sf, gs)
-        else:
-            from int6_requant import pack5, pack6, quantize_int
-            bits = {"int6": 6, "int5": 5}[fmt]
-            gs = float(w.abs().max()) / (448.0 * (2 ** (bits - 1) - 1))
-            codes, sf = quantize_int(w, gs, bits)
-            lo, hi = (pack6 if bits == 6 else pack5)(codes)
-            self.low = Int6Linear(lo, hi, sf, gs)
-        return self
+        wf = w.float()
+        gs = nvfp4_global_scale(wf)
+        packed, sf = quantize(wf, gs)
+        self.low = Nvfp4Linear(packed, sf, gs)
 
     def forward(self, x, residual=None):
         shp = x.shape
         x2 = x.reshape(-1, self.in_features).contiguous()
         if x2.shape[0] <= 16:
             out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
-            if getattr(self, "low", None) is not None:
-                self.low.rows(x2, None, out)
-            elif self.w8 is not None:
-                fp8_rows(x2, self.w8, 1.0, None, out, self.rs)
-            else:
-                for i in range(0, x2.shape[0], GEMV_M):
-                    ops().bf16_gemv(x2[i:i + GEMV_M], self.w, out[i:i + GEMV_M])
+            self.low.rows(x2, None, out)
         else:
             out = F.linear(x2, self.w)
         out = out.view(*shp[:-1], self.out_features)
         return out if residual is None else out + residual
 
 
-class Bf16MLP(nn.Module):
+class DraftMLP(nn.Module):
     def __init__(self, g, u, d):
         super().__init__()
-        self.gate, self.up, self.down = Bf16Linear(g), Bf16Linear(u), Bf16Linear(d)
+        self.gate, self.up, self.down = DraftLinear(g), DraftLinear(u), DraftLinear(d)
 
     def forward(self, x, residual=None):
         return self.down(F.silu(self.gate(x)) * self.up(x), residual)
 
 
 class MtpState(FastState):
-    """KV cache of the single MTP attention layer (index 0) for `batch` slots plus their device positions.
-    active: share the target state's mask so a graph step never writes the MTP cache of an inactive slot.
-    kv_fp8: e4m3 cache like the target's (default; COLINFER_MTP_KV_FP8=0 for bf16). Each of the k draft steps of a cycle
-    reads the drafter's whole cache (512 MB per step per slot at 128k in bf16), so fp8 makes long-context cycles ~10%
-    faster (126 vs 140 ms, k=7 at 128k) at unchanged acceptance (tools/eval_drafter.py). Drafts change speed, never outputs."""
+    """The fp8 KV cache of the single MTP attention layer (index 0) for `batch` slots plus their device positions.
+    active: shares the target state's mask, so a graph step never writes the MTP cache of an inactive slot."""
 
-    def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None, kv_fp8: bool | None = None):
-        if kv_fp8 is None:
-            kv_fp8 = os.environ.get("COLINFER_MTP_KV_FP8", "1") != "0"
-        self.cfg, self.max_seq_len, self.kv_fp8, self.kv_fp4, self.pos = cfg, max_seq_len, kv_fp8, False, 0
+    def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None):
+        self.cfg, self.max_seq_len, self.pos = cfg, max_seq_len, 0
         self.conv, self.rec = {}, {}
-        self.k = {0: torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device,
-                                 dtype=torch.float8_e4m3fn if kv_fp8 else torch.bfloat16)}
+        self.k = {0: torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=torch.float8_e4m3fn)}
         self.v = {0: torch.zeros_like(self.k[0])}
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
         self.active = active if active is not None else torch.ones(batch, dtype=torch.int32, device=device)
-        self.arange = torch.arange(16, device=device)
 
     def slot(self, b: int) -> FastState:
         """Single-slot view with its own all-ones mask, for eager (non-graph) MTP work on one slot."""
@@ -120,14 +106,14 @@ class MtpState(FastState):
         v.active = torch.ones(1, dtype=torch.int32, device=self.pos_t.device)
         return v
 
-class Mtp(nn.Module):
-    """fp8: MTP linears stream FP8 (per-row scales) instead of BF16 when drafting.
-    draft_vocab: draft only among the N most frequent tokens (engine/spec/draft_vocab.npy): the drafting
-    lm_head reads N rows instead of 248k. Neither affects correctness, only acceptance."""
 
-    def __init__(self, target: FastQwen35, path: str, fp8: bool = False, draft_vocab: int | None = None, prompt_slots: int = 4096,
-                 weights: str | None = None):
-        """weights: optional safetensors with mtp.* tensors replacing the checkpoint's (tools/train_drafter.py)."""
+class Mtp(nn.Module):
+    """The MTP drafter for `target` (checkpoint at `path`). weights: optional safetensors with mtp.* tensors replacing the
+    checkpoint's (tools/train_drafter.py). lowrank: the PCA basis of the low-rank draft head (tools/lowrank_draft_head.py),
+    used when the file exists."""
+
+    def __init__(self, target: FastQwen35, path: str, weights: str | None = None,
+                 lowrank: str | None = os.path.join(DRAFT_DIR, "draft_head_pca.safetensors")):
         super().__init__()
         cfg = target.cfg
         wm = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
@@ -142,17 +128,16 @@ class Mtp(nn.Module):
                     assert name.startswith("mtp.") and name[4:] in t, name
                     t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
         P = "layers.0."
-        self.fc = Bf16Linear(t["fc.weight"])
+        self.fc = DraftLinear(t["fc.weight"])
         self.pre_e = self._norm(t["pre_fc_norm_embedding.weight"], cfg)
         self.pre_h = self._norm(t["pre_fc_norm_hidden.weight"], cfg)
         self.norm = self._norm(t["norm.weight"], cfg)
-        import dataclasses
         with torch.device("meta"):
             layer = DecoderLayer(dataclasses.replace(cfg, layer_types=["full_attention"], num_hidden_layers=1), 0)
         layer.input_layernorm = self._norm(t[P + "input_layernorm.weight"], cfg)
         layer.post_attention_layernorm = self._norm(t[P + "post_attention_layernorm.weight"], cfg)
         a = layer.self_attn
-        a.q_proj, a.k_proj, a.v_proj, a.o_proj = (Bf16Linear(t[P + f"self_attn.{n}_proj.weight"]) for n in "qkvo")
+        a.q_proj, a.k_proj, a.v_proj, a.o_proj = (DraftLinear(t[P + f"self_attn.{n}_proj.weight"]) for n in "qkvo")
         a.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to("cuda")
         a.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to("cuda")
         with torch.no_grad():
@@ -161,101 +146,70 @@ class Mtp(nn.Module):
         a.__class__ = KernelAttention
         d = cfg.rotary_dim
         a.inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device="cuda") / d))
-        layer.mlp = Bf16MLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
+        layer.mlp = DraftMLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
         layer.forward = fast_layer_forward.__get__(layer)
         self.layer = layer
         self.embed, self.lm_head, self.cfg = target.embed_tokens, target.lm_head, cfg
-        self.nbytes = sum(v.numel() * 2 for v in t.values())
-        if fp8:
-            # the draft steps' weight stream: nvfp4 (default; k=7 cycle 103.8 -> 98.4 ms, acceptance 3.45 -> 3.41 tokens per
-            # cycle, docs/phase6_progress.md section 17) | int6 | int5 | fp8 (per-row scales)
-            fmt = os.environ.get("COLINFER_MTP_FORMAT", "nvfp4")
-            for mod in [self.fc, a.q_proj, a.k_proj, a.v_proj, a.o_proj, layer.mlp.gate, layer.mlp.up, layer.mlp.down]:
-                mod.to_fp8() if fmt == "fp8" else mod.to_lowbit(fmt)
-        self.vocab_ids = None
-        self.lm_draft = target.lm_head
-        if draft_vocab:
-            import numpy as np
-            from engine.model.fast import Nvfp4Linear
-            ids = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "draft_vocab.npy"))[:draft_vocab]
-            # static frequent tokens + `prompt_slots` rows rewritten per request with the prompt's other tokens
-            self.n_static = len(ids)
-            self.static_set = set(int(i) for i in ids)
-            allids = np.concatenate([ids, np.full(prompt_slots, ids[0], dtype=ids.dtype)])
-            self.vocab_ids = torch.tensor(allids.astype(np.int64), device="cuda")
-            lm = target.lm_head
-            self.lm_draft = Nvfp4Linear(lm.w[self.vocab_ids].contiguous(), lm.sf[self.vocab_ids].contiguous(), lm.gscale, out_fp32=True)
-            self._init_lowrank()
-
-    def _init_lowrank(self):
-        """Low-rank draft head (tools/lowrank_draft_head.py, docs/phase6_progress.md section 19): with U [H, r] the top-r
-        principal directions of the drafter's outputs, the draft logits are approximated by (g U)(W U)^T (two NVFP4
-        GEMMs streaming ~1/5 of the draft head's bytes) and the top LOWRANK_CANDS candidates are rescored exactly
-        against the real NVFP4 rows. W U is kept for the whole vocabulary so per-request prompt rows are a gather."""
+        # draft head: the static frequent tokens, then PROMPT_SLOTS rows rewritten per request (set_prompt_vocab)
+        ids = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "draft_vocab.npy"))[:DRAFT_VOCAB]
+        self.n_static = len(ids)
+        self.static_set = set(int(i) for i in ids)
+        allids = np.concatenate([ids, np.full(PROMPT_SLOTS, ids[0], dtype=ids.dtype)]).astype(np.int64)
+        self.vocab_ids = torch.tensor(allids, device="cuda")
+        lm = target.lm_head
+        self.lm_draft = Nvfp4Linear(lm.w[self.vocab_ids].contiguous(), lm.sf[self.vocab_ids].contiguous(), lm.gscale, out_fp32=True)
         self.lr_A = self.lr_B = None
-        src = os.environ.get("COLINFER_DRAFT_LOWRANK", "auto")
-        if src == "0":
-            return
-        f = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca.safetensors") if src == "auto" else os.path.expanduser(src)
-        if not os.path.exists(f):
-            return
-        import sys
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools"))
-        from requant_nvfp4 import quantize
-        from engine.model.fast import Nvfp4Linear
-        from engine.weights.loader import dequant_nvfp4
-        with safe_open(f, framework="pt", device="cuda") as sf:
+        if lowrank and os.path.exists(lowrank):
+            self._init_lowrank(lowrank)
+
+    def _init_lowrank(self, file: str):
+        """Low-rank draft head: with U [H, r] the top-r principal directions of the drafter's outputs, the draft logits are
+        approximated by (g U)(W U)^T (two NVFP4 GEMMs streaming ~1/5 of the head's bytes) and the top LOWRANK_CANDS
+        candidates are rescored exactly against the real NVFP4 rows. W U is kept for the whole target vocabulary (143 MB),
+        so a request's prompt rows are a gather."""
+        with safe_open(file, framework="pt", device="cuda") as sf:
             U = sf.get_tensor("U").float()                                        # [H, r]
         lm = self.lm_head
         gs = torch.tensor(lm.gscale)
         WU = torch.empty(lm.w.shape[0], U.shape[1], device="cuda")
         for i in range(0, lm.w.shape[0], 16384):
             WU[i:i + 16384] = dequant_nvfp4(lm.w[i:i + 16384], lm.sf[i:i + 16384], gs, out_dtype=torch.float32) @ U
-        gb = float(WU.abs().max()) / (448.0 * 6.0)
+        gb = nvfp4_global_scale(WU)
         wb, sb = quantize(WU, gb)
         del WU
-        ga = float(U.abs().max()) / (448.0 * 6.0)
+        ga = nvfp4_global_scale(U)
         wa, sa = quantize(U.T.contiguous(), ga)
         self.lr_A = Nvfp4Linear(wa, sa, ga)
-        self.lr_full = (wb, sb)                                                   # [V_target, r]: prompt rows gather from it
+        self.lr_full = (wb, sb)                                                   # [V_target, r]
         self.lr_B = Nvfp4Linear(wb[self.vocab_ids].contiguous(), sb[self.vocab_ids].contiguous(), gb, out_fp32=True)
 
     def set_prompt_vocab(self, prompt: list[int]):
-        """Fill the per-request draft-vocab rows with prompt tokens missing from the static set."""
-        if self.vocab_ids is None:
-            return
+        """Fill the per-request draft-head rows with prompt tokens missing from the static set."""
         slots = self.vocab_ids.numel() - self.n_static
         extra = [t for t in dict.fromkeys(prompt) if t not in self.static_set][:slots]
         extra += [int(self.vocab_ids[0])] * (slots - len(extra))
         ids = torch.tensor(extra, dtype=torch.long, device="cuda")
         self.vocab_ids[self.n_static:] = ids
-        lm = self.lm_head
-        self.lm_draft.w[self.n_static:] = lm.w[ids]
-        self.lm_draft.sf[self.n_static:] = lm.sf[ids]
+        self.lm_draft.w[self.n_static:] = self.lm_head.w[ids]
+        self.lm_draft.sf[self.n_static:] = self.lm_head.sf[ids]
         if self.lr_B is not None:
             self.lr_B.w[self.n_static:] = self.lr_full[0][ids]
             self.lr_B.sf[self.n_static:] = self.lr_full[1][ids]
 
-    def draft(self, g: torch.Tensor, prob: bool = False):
-        """Greedy draft token ids from MTP outputs g [..., H] -> [...]; prob: also the drafter's probability of each
-        (softmax over the draft vocabulary)."""
-        if getattr(self, "lr_B", None) is not None:  # low-rank scores, the top candidates rescored exactly
+    def draft(self, g: torch.Tensor):
+        """Greedy drafts from MTP outputs g [..., H] -> (token ids [...], the drafter's probability of each: softmax over
+        the draft vocabulary; with the low-rank head, the exact logit over the approximation's logsumexp)."""
+        if self.lr_B is not None:  # low-rank scores, the top candidates rescored exactly
             g2 = g.reshape(-1, g.shape[-1]).contiguous()
             ap = self.lr_B(self.lr_A(g2))                                           # [N, V] fp32
             cand = ap.topk(LOWRANK_CANDS, -1).indices                               # [N, C]
             ex = ops().rescore_nvfp4(g2, self.lm_draft.w, self.lm_draft.sf, self.lm_draft.gscale, cand)
             best = ex.argmax(-1, keepdim=True)
             ids = self.vocab_ids[cand.gather(-1, best)].view(g.shape[:-1])
-            if not prob:
-                return ids
             p = torch.exp(ex.gather(-1, best) - torch.logsumexp(ap, -1, keepdim=True)).clamp_max(1.0)
             return ids, p.view(g.shape[:-1])
         lg = self.lm_draft(g)
-        idx = lg.argmax(-1)
-        ids = idx if self.vocab_ids is None else self.vocab_ids[idx]
-        if not prob:
-            return ids
-        return ids, torch.exp(lg.amax(-1) - torch.logsumexp(lg, -1))
+        return self.vocab_ids[lg.argmax(-1)], torch.exp(lg.amax(-1) - torch.logsumexp(lg, -1))
 
     @staticmethod
     def _norm(w, cfg):
@@ -270,12 +224,12 @@ class Mtp(nn.Module):
 
     @torch.inference_mode()
     def prefill(self, tokens: torch.Tensor, hidden: torch.Tensor, st: MtpState, chunk: int = 2048) -> torch.Tensor:
-        """Long-T MTP pass from position st.pos_t (prompt rows); returns the normed output of the last row [1, H]."""
+        """MTP rows for a prompt (tokens [T], hidden [T, H]) from position st.pos_t of a single-slot view, writing the
+        drafter's KV; returns the normed output of the last row [1, H]. Attention as in the target's prefill."""
         import flashinfer
         a, layer = self.layer.self_attn, self.layer
-        T_all = tokens.shape[0]
         g = None
-        for c0 in range(0, T_all, chunk):
+        for c0 in range(0, tokens.shape[0], chunk):
             tk, hd = tokens[c0:c0 + chunk], hidden[c0:c0 + chunk]
             T = tk.shape[0]
             x = self.fc(torch.cat([self.pre_e(self.embed(tk)), self.pre_h(hd)], -1))
@@ -285,14 +239,11 @@ class Mtp(nn.Module):
             ops().attn_prologue(qp, kp, vp, a.q_norm.weight, a.k_norm.weight, a.inv_freq, st.pos_t, st.k[0], st.v[0], q, a.q_norm.eps)
             p0 = int(st.pos_t)
             L = p0 + T
-            kk, vv = st.k[0][0:1], st.v[0][0:1]
-            if kk.dtype == torch.float8_e4m3fn and ATTN_FP8 and L > ATTN_FP8_MIN_CTX:  # as the target's prefill
+            if L > ATTN_FP8_MIN_CTX:
                 o = torch.empty(T, a.num_heads, a.head_dim, device=x.device, dtype=torch.bfloat16)
-                ops().attn_prefill_fp8(q, kk, vv, o.view(T, -1), p0, a.head_dim ** -0.5, ATTN_FP8_BN)
-            else:
-                kk, vv = kk[0, :, :L], vv[0, :, :L]
-                if kk.dtype == torch.float8_e4m3fn:  # FlashInfer reads a bf16 copy
-                    kk, vv = kk.to(torch.bfloat16), vv.to(torch.bfloat16)
+                ops().attn_prefill_fp8(q, st.k[0][0:1], st.v[0][0:1], o.view(T, -1), p0, a.head_dim ** -0.5, ATTN_FP8_BN)
+            else:  # FlashInfer over a bf16 copy of the cached prefix
+                kk, vv = st.k[0][0, :, :L].to(torch.bfloat16), st.v[0][0, :, :L].to(torch.bfloat16)
                 o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
                                                             sm_scale=a.head_dim ** -0.5)
             gate = qp.view(T, a.num_heads, 2 * a.head_dim)[:, :, a.head_dim:]
@@ -307,37 +258,25 @@ class Mtp(nn.Module):
         """MTP rows for (tokens[i], hidden[i]) from position st.pos_t (eager, one slot), then k-1 chained steps:
         the k drafts that follow the last token. st: a single-slot view with an all-ones mask (MtpState.slot)."""
         g = self.prefill(tokens, hidden, st)
-        d = [self.draft(g).view(1, 1)]
+        d = [self.draft(g)[0].view(1, 1)]
         gp = g.view(1, 1, -1)
         for _ in range(k - 1):
             gp = self(d[-1], gp, st)
-            d.append(self.draft(gp).view(1, 1))
+            d.append(self.draft(gp)[0].view(1, 1))
             st.pos_t += 1
         return torch.cat(d, 1)[0].tolist()
-
-
-# Draft early exit: once the product of the drafter's probabilities of a cycle's drafts so far is below this for every
-# active slot, the remaining draft steps skip their GEMMs (their drafts are junk that verify rejects; outputs are
-# unchanged). Simulated on the k = 7 cycle mix: 35.3 -> 36.6 tok/s at 0.2 (an oracle stop: 38.8). 0 disables.
-DRAFT_STOP = float(os.environ.get("COLINFER_DRAFT_STOP", "0.1"))
-
-# Low-rank draft head: candidates rescored exactly per draft (COLINFER_DRAFT_CANDS)
-LOWRANK_CANDS = int(os.environ.get("COLINFER_DRAFT_CANDS", "256"))
-
-# GDN commit concurrent with the MTP drafting (a second branch of the cycle graph); COLINFER_COMMIT_OVERLAP=0: serial
-COMMIT_OVERLAP = os.environ.get("COLINFER_COMMIT_OVERLAP", "1") != "0"
 
 
 class MtpCycle:
     """CUDA graph of one speculative cycle with the MTP drafter for B slots (k drafts each).
 
-    tok [B, k+1] (the next cycle's input [y, d1..dk] per slot), stop_ids [B, S] (int64, -1 = unused) and
-    params may be views into buffers shared by the graphs of every batch width, so a slot keeps its pending
-    input when the width changes. params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts
-    that equal the target's position-keyed sample, so the output is exactly plain sampling; greedy for the rest;
-    engine/spec/accept.py); None -> greedy cycle.
-    After replay: out_tok [B, k+1] (first n[b] valid), n [B] int32, logits [B, k+1, V] fp32 (verify rows,
-    raw), H [B, k+1, hidden] (target post-norm hidden of the verify rows)."""
+    tok [B, k+1] (the next cycle's input [y, d1..dk] per slot), stop_ids [B, S] (int64, -1 = unused) and params may be
+    views into buffers shared by the graphs of every batch width, so a slot keeps its pending input when the width
+    changes. params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts that equal the target's
+    position-keyed sample, so the output is exactly plain sampling; greedy for the rest; engine/spec/accept.py);
+    None -> greedy cycle.
+    After replay: out_tok [B, k+1] (first n[b] valid), n [B] int32, logits [B, k+1, V] fp32 (verify rows, raw),
+    H [B, k+1, hidden] (target post-norm hidden of the verify rows)."""
 
     def __init__(self, model: FastQwen35, mtp: Mtp, state: FastState, mst: MtpState, k: int = 3, params=None,
                  tok: torch.Tensor | None = None, stop_ids: torch.Tensor | None = None):
@@ -348,8 +287,8 @@ class MtpCycle:
         self.stop_ids = stop_ids if stop_ids is not None else torch.full((B, 1), -1, dtype=torch.long, device=dev)
         assert self.tok.shape == (B, k + 1) and self.stop_ids.shape[0] == B
         self.idx = torch.arange(k + 1, device=dev)
-        self._side = torch.cuda.Stream()
-        self.skip = torch.zeros(1, dtype=torch.int32, device=dev)
+        self._side = torch.cuda.Stream()  # the GDN commit's branch
+        self.skip = torch.zeros(1, dtype=torch.int32, device=dev)  # draft early exit flag (skinny_skip)
         state.reset()
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -367,7 +306,7 @@ class MtpCycle:
         k, m, mtp, st = self.k, self.model, self.mtp, self.state
         tok = self.tok
         B = tok.shape[0]
-        logits, H = m.verify(tok, st, return_hidden=True)            # [B, k+1, V], [B, k+1, H]
+        logits, H = m.verify(tok, st)                                # [B, k+1, V], [B, k+1, H]
         if self.params is None:
             pred = logits.argmax(-1)                                 # [B, k+1]
         else:  # the target's own sample at every row, keyed by position (engine/spec/accept.py): output = plain sampling
@@ -384,12 +323,9 @@ class MtpCycle:
         n = torch.where(has, (first + 1).int(), n) * st.active
         bonus = torch.where(has, d.gather(1, first[:, None])[:, 0], bonus)
         p0 = st.pos_t.clone()
-        if COMMIT_OVERLAP:  # the drafting below never reads the GDN state: commit it on a parallel graph branch
-            side = self._side
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                m.commit(st, n)
-        else:
+        # the drafting below never reads the GDN state: commit it on a parallel graph branch
+        self._side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._side):
             m.commit(st, n)
         nl = n.long()
         out_tok = torch.cat([d, bonus[:, None]], 1)                  # accepted drafts are d[:n-1]; the bonus is out_tok[n-1]
@@ -399,43 +335,37 @@ class MtpCycle:
         g = mtp(out_tok, H, self.mst)                                # [B, k+1, H]
         last = (nl - 1).clamp_min(0)
         gp = g.gather(1, last[:, None, None].expand(B, 1, g.shape[-1]))
-        stop = DRAFT_STOP > 0 and k > 1
-        d, cp = mtp.draft(gp, prob=True) if stop else (mtp.draft(gp), None)
-        dr = [d]                                                     # [B, 1]
+        d, cp = mtp.draft(gp)                                        # [B, 1], cp: running product of draft probabilities
+        dr = [d]
         self.mst.pos_t.copy_(p0 + n)
-        if stop:
-            self.skip.zero_()
+        self.skip.zero_()
         for _ in range(k - 1):
-            if stop:  # every slot's chain is unlikely to survive this far: the remaining steps skip their GEMMs
-                self.skip.copy_(torch.maximum(self.skip, ((cp[:, 0] < DRAFT_STOP) | (st.active == 0)).all().int().view(1)))
-                ops().skinny_skip(self.skip)
+            # every slot's chain is unlikely to survive this far: the remaining steps skip their GEMMs (zero outputs)
+            self.skip.copy_(torch.maximum(self.skip, ((cp[:, 0] < DRAFT_STOP) | (st.active == 0)).all().int().view(1)))
+            ops().skinny_skip(self.skip)
             try:
                 gp = mtp(dr[-1], gp, self.mst)
-                if stop:
-                    d, p = mtp.draft(gp, prob=True)
-                    cp = cp * p
-                else:
-                    d = mtp.draft(gp)
+                d, p = mtp.draft(gp)
             finally:
-                if stop:
-                    ops().skinny_skip(None)
+                ops().skinny_skip(None)
+            cp = cp * p
             dr.append(d)
             self.mst.pos_t += 1
         nxt = torch.cat([bonus[:, None]] + dr, 1)                    # [B, k+1] = [y', d1'..dk']
         self.tok.copy_(torch.where(st.active[:, None] > 0, nxt, tok))
-        if COMMIT_OVERLAP:
-            torch.cuda.current_stream().wait_stream(self._side)
+        torch.cuda.current_stream().wait_stream(self._side)
         return out_tok, n, logits, H
 
 
 class MtpGenerator:
-    """Generation with MTP speculation for one slot; greedy output identical to plain greedy decode."""
+    """Single-slot generation with MTP speculation (the tools' and tests/spec_check.py's driver; serving uses
+    engine/runtime/scheduler.py). Greedy and seeded-sampled outputs are identical to plain decoding (use_spec=False)."""
 
-    def __init__(self, model: FastQwen35, path: str, max_seq_len: int = 32768, k: int = 3, fp8: bool = True, draft_vocab: int | None = 65536,
-                 weights: str | None = None):
+    def __init__(self, model: FastQwen35, path: str, max_seq_len: int = 32768, k: int = 3, weights: str | None = None, **mtp_kw):
+        """mtp_kw: further Mtp options (lowrank=None: the full draft head)."""
         prepare_prefill(model)
         self.model, self.k = model, k
-        self.mtp = Mtp(model, path, fp8=fp8, draft_vocab=draft_vocab, weights=weights)
+        self.mtp = Mtp(model, path, weights=weights, **mtp_kw)
         self.state = model.new_state(1, max_seq_len)
         self.mst = MtpState(model.cfg, max_seq_len, "cuda", active=self.state.active)
         from engine.runtime.sampler import SamplerParams
@@ -443,7 +373,7 @@ class MtpGenerator:
         self.params = SamplerParams(1, model.cfg.vocab_size, "cuda")
         self.cycle = MtpCycle(model, self.mtp, self.state, self.mst, k)
         self.cycle_s = MtpCycle(model, self.mtp, self.state, self.mst, k, params=self.params, tok=self.cycle.tok)
-        self.stats = dict(steps=0, spec_steps=0, tokens=0, drafted=0, accepted=0)
+        self.stats = dict(steps=0, tokens=0, drafted=0, accepted=0)
 
     @torch.inference_mode()
     def generate(self, input_ids: list[int], max_new_tokens: int, eos_ids=(), use_spec: bool = True, temperature: float = 0.0,
@@ -453,7 +383,8 @@ class MtpGenerator:
         self.params.set(0, temperature, top_k, top_p, min_p, seed)
         self.plain.params.set(0, temperature, top_k, top_p, min_p, seed)
         cyc = self.cycle_s if temperature > 0 else self.cycle
-        st.reset(); st.pos = 0
+        st.reset()
+        st.pos = 0
         mst.pos_t.zero_()
         self.mtp.set_prompt_vocab(list(input_ids))
         logits, H = prefill(self.model, torch.tensor([input_ids], device="cuda"), st, return_hidden=True)
@@ -471,10 +402,10 @@ class MtpGenerator:
         while len(out) < max_new_tokens and y not in eos:
             cyc.graph.replay()
             n = int(cyc.n)
-            new = cyc.out_tok[0, :n].tolist()
-            self.stats["steps"] += 1; self.stats["spec_steps"] += 1
-            self.stats["drafted"] += k; self.stats["accepted"] += n - 1
-            for t in new:
+            self.stats["steps"] += 1
+            self.stats["drafted"] += k
+            self.stats["accepted"] += n - 1
+            for t in cyc.out_tok[0, :n].tolist():
                 out.append(t)
                 if t in eos or len(out) >= max_new_tokens:
                     break

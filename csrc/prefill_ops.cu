@@ -1,9 +1,10 @@
-// prefill_ops.cu -- bandwidth-bound glue of the prefill path, fused (PLAN.md 4.4).
-//   k_fp8_quant         bf16 [M, K] -> e4m3 [M, K] = sat(x / in_scale)            (W8A8 inputs)
-//   k_silu_mul_quant    gu bf16 [M, 2I] (gate | up) -> h = bf16(bf16(silu(g)) * u) quantized to NVFP4:
-//                       packed e2m1 [M, I/2] + CUTLASS-swizzled e4m3 scales     (down_proj input)
-//   k_causal_conv_silu  mixed bf16 [T, C] (token-major), state bf16 [C, 3] -> bf16(silu(bf16(conv))) (_l2: + q / k L2 norm)
-//   k_gated_rmsnorm     o, z bf16 [N, 128] -> bf16(bf16(w * bf16(rmsnorm(o))) * silu(z))
+// prefill_ops.cu -- the bandwidth-bound glue of the prefill path (engine/model/prefill.py), fused.
+//   k_fp8_quant            bf16 [M, K] -> e4m3 [M, K] = sat(x / in_scale)                        (W8A8 GEMM inputs)
+//   k_causal_conv_silu_l2  GDN: mixed bf16 [T, C] (token-major), conv window [C, 3] -> bf16(silu(bf16(conv))), with the q / k
+//                          heads L2-normalized (the chunked delta rule's input)
+//   k_gated_rmsnorm        GDN output: o, z bf16 [N, 128] -> bf16(bf16(w * bf16(rmsnorm(o))) * silu(z))
+//   k_add_rmsnorm          residual add + RMSNorm + the next GEMM's activation quantization (NVFP4 and / or e4m3)
+//   k_gate_fp8             attention output gate + e4m3 quantization for o_proj
 // Rounding points follow the PyTorch reference (engine/model/qwen35.py).
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -36,71 +37,9 @@ __global__ void k_fp8_quant(const __nv_bfloat16* __restrict__ x, uint8_t* __rest
     reinterpret_cast<uint2*>(out)[i] = make_uint2(o[0], o[1]);
 }
 
-// one thread per 16-element block of h
-__global__ void k_silu_mul_quant(const __nv_bfloat16* __restrict__ gu, uint8_t* __restrict__ q, uint8_t* __restrict__ sf, int M, int I,
-                                 float inv_in_scale, float in_scale) {
-    const int KB = I / 16, kb4 = (KB + 3) / 4;
-    const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (idx >= (size_t)M * KB) return;
-    const int r = idx / KB, kb = idx % KB;
-    const uint4* gp = reinterpret_cast<const uint4*>(gu + (size_t)r * 2 * I + kb * 16);
-    const uint4* up = reinterpret_cast<const uint4*>(gu + (size_t)r * 2 * I + I + kb * 16);
-    const uint4 g0 = gp[0], g1 = gp[1], u0 = up[0], u1 = up[1];
-    const uint32_t gw[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w}, uw[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
-    float h[16], amax = 0.f;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const float ga = __uint_as_float(gw[i] << 16), gb = __uint_as_float(gw[i] & 0xffff0000u);
-        const float ua = __uint_as_float(uw[i] << 16), ub = __uint_as_float(uw[i] & 0xffff0000u);
-        h[2 * i] = bf(bf(silu(ga)) * ua);
-        h[2 * i + 1] = bf(bf(silu(gb)) * ub);
-        amax = fmaxf(amax, fmaxf(fabsf(h[2 * i]), fabsf(h[2 * i + 1])));
-    }
-    const __nv_fp8_storage_t sfb = __nv_cvt_float_to_fp8(amax / 6.f * inv_in_scale, __NV_SATFINITE, __NV_E4M3);
-    __half_raw hr = __nv_cvt_fp8_to_halfraw(sfb, __NV_E4M3);
-    const float sfv = __half2float(*reinterpret_cast<__half*>(&hr));
-    const float os = sfv != 0.f ? 1.f / (sfv * in_scale) : 0.f;
-    uint32_t packed[2] = {0, 0};
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const float s = h[i] * os;
-        packed[i >> 3] |= (e2m1_code(fabsf(s)) | (s < 0.f ? 8u : 0u)) << (4 * (i & 7));
-    }
-    *reinterpret_cast<uint2*>(q + (size_t)r * (I / 2) + kb * 8) = make_uint2(packed[0], packed[1]);
-    sf[sf_offset(r, kb, kb4)] = sfb;
-}
-
-// one thread per (t, channel pair)
-// output channels [0, c1) -> o0 [T, c1], [c1, c2) -> o1 [T, c2 - c1], [c2, C) -> o2 [T, C - c2] (all contiguous)
-__global__ void k_causal_conv_silu(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ state,
-                                   const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ o0, __nv_bfloat16* __restrict__ o1,
-                                   __nv_bfloat16* __restrict__ o2, int c1, int c2, int T, int C) {
-    const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    const int C2 = C / 2;
-    if (idx >= (size_t)T * C2) return;
-    const int t = idx / C2, c = (idx % C2) * 2;
-    float acc0 = 0.f, acc1 = 0.f;
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        const int tt = t - 3 + k;
-        float x0, x1;
-        if (tt >= 0) {
-            const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(x + (size_t)tt * ldx + c);
-            x0 = __low2float(v); x1 = __high2float(v);
-        } else {
-            x0 = __bfloat162float(state[(size_t)c * 3 + (3 + tt)]);
-            x1 = __bfloat162float(state[(size_t)(c + 1) * 3 + (3 + tt)]);
-        }
-        acc0 = fmaf(__bfloat162float(w[(size_t)c * 4 + k]), x0, acc0);
-        acc1 = fmaf(__bfloat162float(w[(size_t)(c + 1) * 4 + k]), x1, acc1);
-    }
-    __nv_bfloat16* dst = c < c1 ? o0 + (size_t)t * c1 + c : c < c2 ? o1 + (size_t)t * (c2 - c1) + (c - c1) : o2 + (size_t)t * (C - c2) + (c - c2);
-    *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(silu(bf(acc0)), silu(bf(acc1)));
-}
-
-// One warp per (t, 128-channel head): lane l owns channels 4l .. 4l+3. l2_eps >= 0: the q and k outputs (channels < c2) are
-// also L2-normalized per head, as FLA's l2norm would (x / sqrt(sum x^2 + eps) on the bf16 values), so
-// chunk_gated_delta_rule runs with use_qk_l2norm_in_kernel=False and its separate l2norm pass goes away.
+// One warp per (t, 128-channel head): lane l owns channels 4l .. 4l+3. Output channels [0, c1) -> o0 [T, c1], [c1, c2) -> o1,
+// [c2, C) -> o2 (all contiguous). l2_eps >= 0: the q and k outputs (channels < c2) are also L2-normalized per head,
+// x / sqrt(sum x^2 + eps) on the bf16 values (the reference's l2norm, eps 1e-6), the chunked delta rule's input.
 __global__ void k_causal_conv_silu_l2(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ state,
                                       const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ o0, __nv_bfloat16* __restrict__ o1,
                                       __nv_bfloat16* __restrict__ o2, int c1, int c2, int T, int C, float l2_eps) {
@@ -297,27 +236,14 @@ cudaError_t launch_fp8_quant(const void* x, void* out, size_t n, float scale, cu
 }
 
 size_t nvfp4_sf_bytes(int R, int K);
-cudaError_t launch_silu_mul_quant(const void* gu, void* q, void* sf, int M, int I, float in_scale, cudaStream_t st) {
-    if (I % 16) return cudaErrorInvalidValue;
-    cudaMemsetAsync(sf, 0, nvfp4_sf_bytes(M, I), st);
-    const size_t n = (size_t)M * (I / 16);
-    pf::k_silu_mul_quant<<<(n + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)gu, (uint8_t*)q, (uint8_t*)sf, M, I, 1.f / in_scale, in_scale);
-    return cudaGetLastError();
-}
 
 cudaError_t launch_causal_conv_silu(const void* x, int ldx, const void* state, const void* w, void* o0, void* o1, void* o2, int c1, int c2, int T,
                                     int C, float l2_eps, cudaStream_t st) {
-    if (C % 128 == 0 && c1 % 128 == 0 && c2 % 128 == 0 && ldx % 4 == 0) {
-        const size_t threads = (size_t)T * (C / 128) * 32;
-        pf::k_causal_conv_silu_l2<<<(threads + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, ldx, (const __nv_bfloat16*)state,
-                                                                         (const __nv_bfloat16*)w, (__nv_bfloat16*)o0, (__nv_bfloat16*)o1,
-                                                                         (__nv_bfloat16*)o2, c1, c2, T, C, l2_eps);
-        return cudaGetLastError();
-    }
-    if (l2_eps >= 0.f || C % 2 || ldx % 2 || c1 % 2 || c2 % 2) return cudaErrorInvalidValue;
-    const size_t n = (size_t)T * (C / 2);
-    pf::k_causal_conv_silu<<<(n + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, ldx, (const __nv_bfloat16*)state, (const __nv_bfloat16*)w,
-                                                            (__nv_bfloat16*)o0, (__nv_bfloat16*)o1, (__nv_bfloat16*)o2, c1, c2, T, C);
+    if (C % 128 || c1 % 128 || c2 % 128 || ldx % 4) return cudaErrorInvalidValue;  // whole heads, 8-byte loads
+    const size_t threads = (size_t)T * (C / 128) * 32;
+    pf::k_causal_conv_silu_l2<<<(threads + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, ldx, (const __nv_bfloat16*)state,
+                                                                     (const __nv_bfloat16*)w, (__nv_bfloat16*)o0, (__nv_bfloat16*)o1,
+                                                                     (__nv_bfloat16*)o2, c1, c2, T, C, l2_eps);
     return cudaGetLastError();
 }
 
