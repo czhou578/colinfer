@@ -30,11 +30,27 @@ from engine.runtime.scheduler import Request, Scheduler  # noqa: E402
 from engine.spec.mtp import Mtp  # noqa: E402
 from engine.weights.loader import resolve  # noqa: E402
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from spec_check import PROMPTS  # noqa: E402
-
 EOS = (248046, 248044)
 IM_START = 248045
+CODE = '''def parse_config(path):
+    with open(path) as f:
+        data = json.load(f)
+    config = Config()
+    config.name = data["name"]
+    config.version = data["version"]
+    config.author = data["author"]
+    config.license = data["license"]
+    config.description = data["description"]
+    return config
+'''
+PROMPTS = {
+    "code-edit": "Rewrite this function so every field access uses data.get(key, default) with a sensible default, "
+                 "and add type hints. Return only the code.\n\n" + CODE,
+    "json": "Convert this list to a JSON array of objects with keys name, role and team: Alice engineer platform; "
+            "Bob designer web; Carol manager platform; Dave engineer infra; Erin analyst data; Frank engineer web.",
+    "code-gen": "Write a Python class LRUCache with get and put methods, O(1) each, using an OrderedDict. Include docstrings.",
+    "prose": "Write a short story about a lighthouse keeper who finds a message in a bottle.",
+}
 
 
 def chat_ids(tok, msgs):

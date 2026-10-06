@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import DecodeGraph, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear, fast_layer_forward
+from engine.model.fast import FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear, fast_layer_forward
 from engine.model.prefill import ATTN_FP8_MIN_CTX, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm
 from engine.weights.loader import dequant_nvfp4
@@ -359,8 +359,9 @@ class MtpCycle:
 
 
 class MtpGenerator:
-    """Single-slot generation with MTP speculation (the tools' and tests/spec_check.py's driver; serving uses
-    engine/runtime/scheduler.py). Greedy and seeded-sampled outputs are identical to plain decoding (use_spec=False)."""
+    """Single-slot greedy generation with MTP speculation at a fixed draft length k: the drafter tools' driver
+    (tools/eval_drafter.py, tools/lowrank_draft_head.py). Serving uses engine/runtime/scheduler.py, whose outputs with and
+    without speculation tests/golden.py checks."""
 
     def __init__(self, model: FastQwen35, path: str, max_seq_len: int = 32768, k: int = 3, weights: str | None = None, **mtp_kw):
         """mtp_kw: further Mtp options (lowrank=None: the full draft head)."""
@@ -369,34 +370,20 @@ class MtpGenerator:
         self.mtp = Mtp(model, path, weights=weights, **mtp_kw)
         self.state = model.new_state(1, max_seq_len)
         self.mst = MtpState(model.cfg, max_seq_len, "cuda", active=self.state.active)
-        from engine.runtime.sampler import SamplerParams
-        self.plain = DecodeGraph(model, self.state)
-        self.params = SamplerParams(1, model.cfg.vocab_size, "cuda")
         self.cycle = MtpCycle(model, self.mtp, self.state, self.mst, k)
-        self.cycle_s = MtpCycle(model, self.mtp, self.state, self.mst, k, params=self.params, tok=self.cycle.tok)
         self.stats = dict(steps=0, tokens=0, drafted=0, accepted=0)
 
     @torch.inference_mode()
-    def generate(self, input_ids: list[int], max_new_tokens: int, eos_ids=(), use_spec: bool = True, temperature: float = 0.0,
-                 top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0, seed: int = 0):
-        from engine.runtime.sampler import sample
-        st, mst, k = self.state, self.mst, self.k
-        self.params.set(0, temperature, top_k, top_p, min_p, seed)
-        self.plain.params.set(0, temperature, top_k, top_p, min_p, seed)
-        cyc = self.cycle_s if temperature > 0 else self.cycle
+    def generate(self, input_ids: list[int], max_new_tokens: int, eos_ids=()):
+        st, mst, k, cyc = self.state, self.mst, self.k, self.cycle
         st.reset()
         st.pos = 0
         mst.pos_t.zero_()
         self.mtp.set_prompt_vocab(list(input_ids))
         logits, H = prefill(self.model, torch.tensor([input_ids], device="cuda"), st, return_hidden=True)
-        y = int(sample(logits, self.params, st.pos_t)) if temperature > 0 else int(logits.argmax(-1))
+        y = int(logits.argmax(-1))
         out = [y]
         eos = set(eos_ids)
-        if not use_spec:
-            while len(out) < max_new_tokens and y not in eos:
-                y = int(self.plain.step(torch.tensor([y], device="cuda")))
-                out.append(y)
-            return out
         # MTP over the prompt: rows (x_{i+1}, h_i), i = 0..T-1, with x_T = y; the last row drafts d1
         toks = torch.tensor(list(input_ids[1:]) + [y], device="cuda")
         cyc.tok.copy_(torch.tensor([[y] + self.mtp.first_drafts(toks, H, mst, k)], device="cuda"))

@@ -17,7 +17,7 @@ own per-batch log). The SGLang mix figure is SGLang with the DFlash2 drafter on 
 (`docs/history/phase6_progress.md` section 16).
 
 Outputs are **token-identical with speculation on or off**, greedy or seeded-sampled, at any batch width
-(`tests/spec_check.py`, `tests/scheduler_check.py`). Every quantization choice beyond the checkpoint's own passes a
+(`tests/golden.py`, `tests/scheduler_check.py`). Every quantization choice beyond the checkpoint's own passes a
 perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
 
 ## Quick start
@@ -68,7 +68,7 @@ must be in the local Hugging Face cache. Three optional files make decoding fast
 | `engine/server/` | the OpenAI-compatible server (`api.py`), chat template and output parsing (`chat.py`) |
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), numerics emulation |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`); CUTLASS is a submodule in `csrc/third_party` |
-| `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`spec_check.py`, `scheduler_check.py`, `perplexity.py`, ...) |
+| `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |
 | `tools/` | offline artifacts (decode copies, drafter training, low-rank head) and checkpoint utilities |
 | `bench/` | decode / prefill / attention / GEMM / end-to-end benchmarks, nsys trace summaries |
 | `docs/` | `architecture.md` (current design), `server.md` (running the server), `checkpoints.md` (the checkpoints on this machine); `history/`: the project's dated logs and measurements |
@@ -78,7 +78,8 @@ must be in the local Hugging Face cache. Three optional files make decoding fast
 
 ```bash
 uv run pytest tests/ -q                                  # kernels against PyTorch references, bit-identity properties (~1 min)
-uv run python tests/spec_check.py --k 7                  # speculation on vs off, token-identical
+uv run python tests/golden.py check                      # recorded tokens and logprobs, bit for bit (MTP)
+uv run python tests/golden.py check --plain              # the same, without speculation
 uv run python tests/scheduler_check.py                   # batching, sampling, prefix reuse: outputs unchanged
 uv run python tests/perplexity.py --engine prefill --ckpt nvidia/Qwen3.8-27B-NVFP4   # quality
 ```

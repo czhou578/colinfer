@@ -187,13 +187,15 @@ departure from the checkpoint's own numerics (the INT copies, FP8 prefill attent
 - `pytest tests/` (≈1 min): each kernel against the PyTorch reference or a dequantized fp32 product; row-invariance and
   verify = sequential-decode bit identity; prefill ops; sampler and acceptance statistics; chat parsing; the drafter
   trainer's unroll.
-- `tests/spec_check.py`: outputs with and without speculation, greedy and seeded-sampled, must be identical.
+- `tests/golden.py`: 21 recorded requests (greedy, seeded-sampled, a 20k-token prompt), all at once, must reproduce
+  their tokens and per-token logprobs bit for bit, with speculation and without (`check --plain`).
 - `tests/scheduler_check.py`: the scheduler's outputs for single, concurrent, mixed (greedy next to sampled and a long
   prefill), multi-turn and shared-prefix requests must equal the uncached single-request outputs.
 - `tests/perplexity.py`, `tests/passkey.py` (long-context retrieval), `tests/parity_hf.py` (the reference vs
   transformers), `tests/server_check.py` (the HTTP API).
-- Benchmarks: `bench/decode_bench.py`, `bench/prefill_bench.py`, `bench/request_mix_bench.py` (end to end),
-  `bench/skinny_bench.py`, `bench/attn_bench.py`, `bench/trace_summary.py` (nsys).
+- Benchmarks: `bench/perf.py` (the repeatable baseline: prefill, TTFT, decode, memory), `bench/decode_bench.py`,
+  `bench/prefill_bench.py`, `bench/request_mix_bench.py` (end to end), `bench/skinny_bench.py`, `bench/attn_bench.py`,
+  `bench/trace_summary.py` (nsys).
 
 ## 9. Where the time goes, and what is left
 

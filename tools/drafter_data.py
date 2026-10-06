@@ -5,7 +5,7 @@ prompts, generated through a running server (engine/server), saved as token ids.
 Prompts are built offline from local data: WikiText-103 train (article titles and paragraphs), TinyStories (story
 openings), Python sources of the installed packages (functions to explain / document / refactor), and templates for
 questions and structured output. Mix: ~45% prose, 15% Q&A, 25% code, 15% structured; thinking on for half; sampled
-(T=0.7, top-p 0.95, top-k 20) so replies vary. Evaluation prompts (tests/spec_check.py) are not used.
+(T=0.7, top-p 0.95, top-k 20) so replies vary. Evaluation prompts (tests/scheduler_check.py) are not used.
 
    uv run python -m engine.server --port 8002 &
    uv run python tools/drafter_data.py --url http://127.0.0.1:8002 --n 1500 --out ~/.cache/colinfer/drafter/data.jsonl
