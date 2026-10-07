@@ -1,8 +1,10 @@
 [project]
 name = "colin-inference-engine"
 version = "0.0.1"
-description = "Single-user inference engine for DGX Spark (GB10, sm_121)"
+description = "Single-user inference engine for Qwen3.8-27B on one DGX Spark (GB10, sm_121)"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # Host-side toolchain: pinned exactly, these are sm_121-sensitive (see PLAN.md 1.x).
@@ -28,6 +30,9 @@ dependencies = [
     "uvloop>=0.23.0",
     "httptools>=0.8.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/czhou578/colinfer"
 
 [dependency-groups]
 dev = [
