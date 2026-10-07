@@ -1,16 +1,18 @@
-// gdn_prefill.cu -- chunked Gated DeltaNet forward for prefill (PLAN.md 4.4 item 4; replaces FLA's chunk_gated_delta_rule
-// in engine/model/prefill.py, docs/history/phase6_progress.md section 15).
+// gdn_prefill.cu -- chunked Gated DeltaNet forward for prefill (PLAN.md 4.4 item 4). It replaces the
+// chunk_gated_delta_rule of FLA in engine/model/prefill.py (docs/history/phase6_progress.md section 15).
 //
-// Per value head h (key head h / (Hv / Hk)), state S [K=128][V=128] fp32, chunks of C = 64 tokens, in-chunk cumulative
+// Per value head h (key head h / (Hv / Hk)): state S [K=128][V=128] fp32, chunks of C = 64 tokens, in-chunk cumulative
 // log-decay G_i = sum_{t <= i} g_t:
 //   A_ij = beta_i (k_i . k_j) e^(G_i - G_j)  (j < i),   T = (I + A)^-1                      k_wy (all chunks in parallel)
 //   W = T diag(beta e^G) K,   U = T diag(beta) V,   V_new = U - W S
 //   O = scale (diag(e^G) Q S + (Q K^T o M) V_new),   M_ij = e^(G_i - G_j) for j <= i, else 0
 //   S <- e^(G_C) S + K^T diag(e^(G_C - G)) V_new                                            k_chunk (sequential over chunks)
-// FLA runs this as cumsum, kkt/solve, w/u recompute, state recurrence (writing every chunk's state) and output kernels; here
-// the recurrence keeps S on chip and computes W, U, V_new, O and the update per chunk with mma.sync bf16 (fp32 accumulate),
-// one block per (value head, 64-wide V slice). Inputs are token-major: q, k [T, Hk, 128] (L2-normalized), v [T, Hv, 128]
-// bf16, g [T, Hv] fp32 (log decay), beta [T, Hv] bf16; o [T, Hv, 128] bf16; state [Hv, 128, 128] fp32, read and written.
+// FLA runs this as cumsum, kkt/solve, w/u recompute, the state recurrence (which writes the state of each chunk) and
+// output kernels. Here the recurrence keeps S on chip. It computes W, U, V_new, O and the update per chunk with mma.sync
+// bf16 (fp32 accumulate), one block per (value head, 64-wide V slice).
+//
+// The inputs are token-major: q, k [T, Hk, 128] (L2-normalized), v [T, Hv, 128] bf16, g [T, Hv] fp32 (log decay) and
+// beta [T, Hv] bf16. The output is o [T, Hv, 128] bf16. The kernels read and write state [Hv, 128, 128] fp32.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -165,9 +167,12 @@ __global__ void __launch_bounds__(WARPS * 32) k_wy(const __nv_bfloat16* __restri
 }
 
 // ---- k_chunk: the recurrence, one block per (value head, V slice), sequential over chunks ----
-// Shared: K (double buffered: read until the state update), V / T / Q (single, refilled as soon as the chunk is done with
-// them: T after V_new, V and Q after the state update; V's buffer meanwhile holds V_new decayed to the chunk end, rounded
-// once from fp32 as FLA does), S (bf16, for the mma), V_new, and each chunk's G / beta (from k_wy).
+// Shared memory:
+//   - K, double buffered: the kernel reads it until the state update.
+//   - V / T / Q, single buffers: the kernel fills each one again as soon as the chunk no longer needs it. (T after
+//     V_new, V and Q after the state update.) Meanwhile, the buffer of V holds V_new decayed to the chunk end, rounded once
+//     from fp32 as FLA does.
+//   - S (bf16, for the mma), V_new, and the G / beta of each chunk (from k_wy).
 __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __restrict__ qg, const __nv_bfloat16* __restrict__ k,
                                                          const __nv_bfloat16* __restrict__ v, const float* __restrict__ Gin,
                                                          const float* __restrict__ Bin, const __nv_bfloat16* __restrict__ Tm,

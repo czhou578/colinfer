@@ -1,34 +1,40 @@
-// skinny.cu -- weight-streaming skinny GEMM on tensor cores: every decode-time linear.
+// skinny.cu -- weight-streaming skinny GEMM on tensor cores, for each decode-time linear.
 //
 //   out[m, n] = sum_k x[m, k] * W[n, k]   (* scale, + residual),  M <= 16 rows of bf16 activations.
 //
-// Weights stay in the checkpoint's layout (NVFP4: packed e2m1 [N, K/2] + e4m3 block scales [N, K/16] + fp32 global
-// scale; FP8: e4m3 [N, K] + per-tensor or per-row fp32 scale), the same tensors the CUTLASS prefill GEMM reads.
-// Dequantization is exact into bf16 (e2m1 x e4m3 has <= 5 significant bits) and the product runs on
-// mma.sync.m16n8k16 bf16 x bf16 -> fp32, so 16 activation rows cost about what 1 row costs: the kernel is bound by
-// streaming the weights, not by math. Every decode linear runs here: plain decode (1-3 rows), speculative verify (up to
+// The weights stay in the layout of the checkpoint, the same tensors that the CUTLASS prefill GEMM reads:
+//   NVFP4  packed e2m1 [N, K/2] + e4m3 block scales [N, K/16] + fp32 global scale
+//   FP8    e4m3 [N, K] + per-tensor or per-row fp32 scale
+// The dequantization into bf16 is exact (e2m1 x e4m3 has <= 5 significant bits), and the product runs on
+// mma.sync.m16n8k16 bf16 x bf16 -> fp32. Thus 16 activation rows cost about the same as 1 row: the weight stream, not the
+// math, sets the speed of the kernel. All decode linears run here: plain decode (1-3 rows), the speculative verify (up to
 // 16 rows) and the MTP drafter.
 //
 // Memory pattern. A warp owns 16 weight rows (two mma n-tiles: rows n0..n0+15, or the gate and up rows n0..n0+7 for
-// SwiGLU) and walks K in chunks of 256 bytes per row. Weights are prefetched into registers one chunk ahead with
-// 16-byte loads that each cover 256 contiguous bytes of 2 rows: on this LPDDR5x, runs of >= 256 B stream at 235-238
-// GB/s, 128 B at ~225 and 64 B at 190-210 GB/s on a 600 MB tensor (which is what loading mma fragments straight from
-// global memory gives: each lane needs its own row). The chunk is then transposed into fragment order through a
-// small per-warp shared-memory scratch (__syncwarp only: warps stream independently, and L1 stays free for the
-// activations). NVFP4 block scales (1/8 of the bytes) come 4 chunks at a time, 128 B per row.
+// SwiGLU). It walks K in chunks of 256 bytes per row. It prefetches the weights into registers one chunk ahead, with
+// 16-byte loads that each cover 256 contiguous bytes of 2 rows.
 //
-// Fragment order: within each 64-wide group S of a chunk, lane t (g = t/4: the weight row / output column it serves,
-// q = t%4) takes 16 consecutive k at 64S + 16q, four per mma k-step j: physical k = 64S + 16q + 4j + e for fragment
-// element e. That is a fixed permutation of the mma's k order inside the step, applied to A and B alike, so a lane's
-// B fragments are 8 (FP4) or 16 (FP8) contiguous scratch bytes per group and its A fragments 32 contiguous bytes of
-// each activation row (read straight from global memory: every warp reads the same few KB, from L1 / L2). The order
-// is fixed, so every output row is bit-identical whatever M is: rows >= M are zeros and never touch the other rows.
+// On this LPDDR5x, a 600 MB tensor streams at 235-238 GB/s with runs of >= 256 B. With 128 B it streams at ~225, and
+// with 64 B at 190-210 GB/s. A direct load of mma fragments from global memory gives the last pattern, because each
+// lane needs its own row. Thus the kernel transposes each chunk into fragment order through a small per-warp
+// shared-memory scratch. It uses __syncwarp only, so the warps stream independently, and the L1 stays free for the
+// activations. The NVFP4 block scales (1/8 of the bytes) come 4 chunks at a time, 128 B per row.
 //
-// INT6 / INT5 (tools/int6_requant.py): w = (c - 32 | 16) * e4m3 block scale (16 k) * global scale, c a 6- or 5-bit code
-// stored as two planes: the low 4 bits exactly like NVFP4's nibbles (so they stream and land in scratch the same way)
-// and the high 2 (1) bits as a [N, K/4] ([N, K/8]) plane, 128 (64) B per row per chunk. Dequantization: 0x4300 | c is
-// the bf16 value 128 + c, minus 160 (144) is q exactly, times the bf16 block scale rounds once (q * s has up to 9
-// significant bits, bf16 holds 8: ~0.2% relative, against the format's 2.2% / 4.2% quantization error).
+// Fragment order. Within each 64-wide group S of a chunk, lane t takes 16 consecutive k at 64S + 16q, four per mma
+// k-step j. (g = t/4 is the weight row / output column that the lane serves, and q = t%4.) The physical k is
+// 64S + 16q + 4j + e for fragment element e. This is a fixed permutation of the k order of the mma inside the step,
+// applied to A and B alike. Thus the B fragments of a lane are 8 (FP4) or 16 (FP8) contiguous scratch bytes per group.
+// Its A fragments are 32 contiguous bytes of each activation row, read directly from global memory (all warps read the
+// same few KB, from L1 / L2). The order is fixed, so each output row is bit-identical for any M: the rows >= M are zeros
+// and never touch the other rows.
+//
+// INT6 / INT5 (tools/int6_requant.py): w = (c - 32 | 16) * e4m3 block scale (16 k) * global scale. c is a 6- or 5-bit
+// code in two planes. The low 4 bits are exactly like the nibbles of NVFP4, so they stream and land in the scratch the
+// same way. The high 2 (1) bits are a [N, K/4] ([N, K/8]) plane, 128 (64) B per row per chunk.
+//
+// The dequantization: 0x4300 | c is the bf16 value 128 + c, and minus 160 (144) this is exactly q. The product with the
+// bf16 block scale rounds once (q * s has up to 9 significant bits, and bf16 holds 8). This is ~0.2% relative, against
+// the 2.2% / 4.2% quantization error of the format.
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
@@ -110,11 +116,11 @@ template <typename T> __device__ __forceinline__ T zero_of() {
     else return __float2bfloat16(0.f);
 }
 
-// out = (x W^T) * scale (+ residual); SWIGLU: out = silu((x W^T) * scale) * ((x W2^T) * scale2)
+// out = (x W^T) * scale (+ residual). SWIGLU: out = silu((x W^T) * scale) * ((x W2^T) * scale2).
 //
-// Split-K: a warp's work item is (tile of 16 rows, K range s of S). S depends only on the matrix shape, never on M, so
-// row results stay bit-identical for every M. With S > 1 each item writes fp32 partials and the last item of a tile
-// to finish (a per-tile counter, self-resetting) adds them in order s = 0..S-1 and runs the epilogue.
+// Split-K: the work item of a warp is (tile of 16 rows, K range s of S). S depends only on the matrix shape, never on M,
+// so the row results stay bit-identical for each M. With S > 1, each item writes fp32 partials. The last item of a tile
+// to finish (a per-tile counter that resets itself) adds them in the order s = 0..S-1 and runs the epilogue.
 template <int F, bool SWIGLU, typename OutT>
 __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __restrict__ x, int M, int N, int K,
                                                         const uint8_t* __restrict__ w, const uint8_t* __restrict__ sf,
@@ -342,10 +348,10 @@ constexpr int ITEMS = 2048;  // warp work items per launch that keep every SM st
 static int* g_cnt = nullptr;
 constexpr int CNT = 1 << 17;
 
-// Skip flag baked into the launches made while it is set (skinny_set_skip): the speculative cycle's draft steps after
-// the first read a device int that the drafter sets once its chain is unlikely to be accepted (engine/spec/mtp.py).
-// It must be written by a kernel that completed before the GEMM's stream predecessor started (it is read before
-// griddepcontrol.wait).
+// Launches made while the skip flag is on contain the flag (skinny_set_skip). The draft steps of the speculative cycle
+// after the first one read a device int. The drafter sets this int when the verify is unlikely to accept its chain
+// (engine/spec/mtp.py). A kernel must write the int. That kernel must complete before the stream predecessor of the GEMM
+// starts, because the GEMM reads the flag before griddepcontrol.wait.
 static const int* g_skip = nullptr;
 
 // Splits for a shape: enough work items (ITEMS) to keep every SM streaming to the end of the grid, at least one

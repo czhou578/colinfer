@@ -1,24 +1,26 @@
-// attn_prefill.cu -- causal prefill attention over an FP8 KV cache, Q K^T on FP8 tensor cores (PLAN.md 4.4 item 3,
+// attn_prefill.cu -- causal prefill attention over an FP8 KV cache, with Q K^T on FP8 tensor cores (PLAN.md 4.4 item 3,
 // docs/history/phase6_progress.md section 8).
 //
-// FlashInfer's FA2 prefill (bf16) runs ~79 TFLOPS on this chip, 81% of the BF16 GEMM peak, and is a third of a chunk's
-// time at 32k context. Here S = Q K^T uses mma.sync.m16n8k32 e4m3 (twice the BF16 rate): K is the cache's own e4m3
-// bytes (unit scale), Q is rounded to e4m3 in the kernel with one scale per (token, head) (amax / 448). Perplexity with
-// that rounding emulated: unchanged at ctx 2048, +0.12% on code at ctx 8192. P V stays f16 x f16 -> fp32 (P rounded to
-// f16, V converted exactly from e4m3).
+// The FA2 prefill (bf16) of FlashInfer runs at ~79 TFLOPS on this chip, 81% of the BF16 GEMM peak. At 32k context, it
+// takes a third of the time of a chunk. Here S = Q K^T uses mma.sync.m16n8k32 e4m3, at twice the BF16 rate. K is the own
+// e4m3 bytes of the cache (unit scale). The kernel rounds Q to e4m3, with one scale per (token, head) (amax / 448). The
+// perplexity with this rounding emulated: no change at ctx 2048, +0.12% on code at ctx 8192. P V stays f16 x f16 -> fp32
+// (P rounded to f16, V converted exactly from e4m3).
 //
-// q    [Hq, T, D] bf16 (the prologue's layout), rows t = 0..T-1 at positions pos + t
-// k, v [Hkv, Lmax, D] e4m3, one slot; the new rows already written. Query t attends keys 0 .. pos + t.
+// q    [Hq, T, D] bf16 (the layout of the prologue), rows t = 0..T-1 at positions pos + t
+// k, v [Hkv, Lmax, D] e4m3, one slot, with the new rows already written. Query t attends keys 0 .. pos + t.
 // out  [T, Hq, D] bf16
 //
-// Grid (ceil(T / 64), Hq), 4 warps; warp w owns query rows 16w .. 16w + 15 of the block's 64. Blocks run the heaviest
-// (last) query tiles first; the 6 query heads of a KV head are adjacent in y, so their KV stream is shared in L2.
+// Grid (ceil(T / 64), Hq), 4 warps. Warp w owns the query rows 16w .. 16w + 15 of the 64 rows of the block. The blocks
+// run the heaviest (last) query tiles first. The 6 query heads of a KV head are adjacent in y, so they share their KV
+// stream in L2.
 //
 // Q K^T fragment order. A lane (g = lane / 4, c = lane % 4) reads 16 consecutive bytes of K row g: head dims
-// 64j + 16c .. +15, used as the B fragments of two k32 steps (bytes 0-7 for step 2j, 8-15 for 2j+1). The sum over head
-// dims does not care which mma k slot a dim lands in as long as Q's A fragment uses the same assignment, which it does
-// (the lane's own 16 Q bytes of the same dims). K rows are 256 bytes apart in shared memory with 16-byte chunks XOR'ed
-// by bit 0 of the row, so the 8 lanes of a quarter-warp (rows 2r, 2r+1) hit 8 different bank groups.
+// 64j + 16c .. +15. It uses them as the B fragments of two k32 steps (bytes 0-7 for step 2j, 8-15 for 2j+1). The sum over
+// the head dims does not depend on the mma k slot of each dim, if the A fragment of Q uses the same assignment. It does:
+// the lane takes its own 16 Q bytes of the same dims. The K rows are 256 bytes apart in shared memory, and the
+// 16-byte chunks are XOR'ed by bit 0 of the row. Thus the 8 lanes of a quarter-warp (rows 2r, 2r+1) hit 8 different bank
+// groups.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

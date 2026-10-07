@@ -1,6 +1,6 @@
-// Torch bindings for the engine's CUDA kernels (built by engine/kernels/__init__.py as `colinfer_kernels`; Python calls
-// them as engine.kernels.ops().<name>). Each wrapper checks shapes / dtypes / strides and launches on the current stream,
-// so every op can be captured into a CUDA graph. Sections follow the source files:
+// Torch bindings for the CUDA kernels of the engine. engine/kernels/__init__.py builds them as `colinfer_kernels`, and
+// Python calls them as engine.kernels.ops().<name>. Each wrapper checks the shapes / dtypes / strides and launches on the
+// current stream, so a CUDA graph can capture each op. The sections follow the source files:
 //
 //   skinny.cu        decode linears: skinny_nvfp4 / skinny_swiglu / skinny_int / skinny_fp8, skinny_skip
 //   gemv.cu, norm.cu bf16_gemv (tiny projections), rmsnorm
@@ -193,9 +193,9 @@ static void check_kv(const torch::Tensor& k, const torch::Tensor& v) {
 }
 
 // Fused q/k RMSNorm + partial RoPE + KV-cache write at the device positions pos_t[b] + t.
-// qp, kp, vp: bf16 [.., features] views with unit-stride rows (e.g. column slices of one stacked q|k|v GEMM output):
-// qp rows hold [Hq, 512] (q | gate per head), kp / vp rows [Hkv, 256]. inv_freq: fp32 [R/2]; q_out: [B, Hq, T, 256].
-// active (optional): int32 [B]; slots with 0 do not write KV.
+// qp, kp, vp: bf16 [.., features] views with unit-stride rows (e.g. column slices of one stacked q|k|v GEMM output).
+// The qp rows hold [Hq, 512] (q | gate per head), and the kp / vp rows [Hkv, 256]. inv_freq: fp32 [R/2]. q_out:
+// [B, Hq, T, 256]. active (optional): int32 [B]. Slots with 0 do not write KV.
 void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::Tensor qn_w, torch::Tensor kn_w, torch::Tensor inv_freq,
                    torch::Tensor pos_t, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor q_out, double eps,
                    c10::optional<torch::Tensor> active) {
@@ -215,9 +215,9 @@ void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::
                                       opt_i32(active, B, "active"), stream()));
 }
 
-// out[b, h, t] = softmax(q k^T * scale) v over the first seq_lens[b] - (T-1-t) cached positions, one KV pass for all
-// T rows of a slot. q: bf16 [B, Hq, T, 256]; caches: e4m3 [B, Hkv, Lmax, 256]; seq_lens: int32 [B] (device).
-// gate (optional): the q_proj output [B, T, Hq, 2*256]; then out is [B, T, Hq*256] = attn * sigmoid(gate).
+// out[b, h, t] = softmax(q k^T * scale) v over the first seq_lens[b] - (T-1-t) cached positions, with one KV pass for all
+// T rows of a slot. q: bf16 [B, Hq, T, 256]. caches: e4m3 [B, Hkv, Lmax, 256]. seq_lens: int32 [B] (device).
+// gate (optional): the q_proj output [B, T, Hq, 2*256]. With it, out is [B, T, Hq*256] = attn * sigmoid(gate).
 void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor seq_lens, torch::Tensor out, double scale,
                  c10::optional<torch::Tensor> gate) {
     CHECK_CUDA_TENSOR(q, torch::kBFloat16);
@@ -265,10 +265,12 @@ void gdn_conv_commit(torch::Tensor mixed, torch::Tensor conv_state, torch::Tenso
     CHECK_LAUNCH(launch_gdn_conv_commit(mixed.data_ptr(), (int)ldm, conv_state.data_ptr(), opt_i32(n, B, "n"), B, T, C, stream()));
 }
 
-// Gated delta rule + gated RMSNorm over T tokens per slot. out (optional) bf16 [B, T, Hv*128]: the outputs of all T tokens;
-// n (optional) int32 [B]: the state advanced by n[b] tokens is written back (0: untouched). At least one of them.
-// qkv bf16 [B, T, 2*Hk*128 + Hv*128] (the conv output); z [B, T, Hv*128]; b, a [B, T, Hv] (z, b, a may be column slices of
-// wider rows; b and a share a row stride); A_log, dt_bias bf16 [Hv]; norm_w bf16 [128]; state fp32 [B, Hv, 128, 128].
+// Gated delta rule + gated RMSNorm over T tokens per slot. The caller must give at least one of out and n:
+//   out (optional): bf16 [B, T, Hv*128], the outputs of all T tokens
+//   n (optional): int32 [B]. The op writes back the state advanced by n[b] tokens (0: no change).
+// qkv bf16 [B, T, 2*Hk*128 + Hv*128] (the conv output). z [B, T, Hv*128]. b, a [B, T, Hv]. z, b and a can be column
+// slices of wider rows, and b and a share a row stride. A_log, dt_bias bf16 [Hv]. norm_w bf16 [128]. state fp32
+// [B, Hv, 128, 128].
 void gdn_delta(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tensor a, torch::Tensor A_log, torch::Tensor dt_bias,
                torch::Tensor norm_w, torch::Tensor state, c10::optional<torch::Tensor> out, int64_t Hk, double eps, c10::optional<torch::Tensor> n) {
     for (auto* t : {&qkv, &A_log, &dt_bias, &norm_w}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
@@ -374,9 +376,9 @@ void fp8_quant(torch::Tensor x, double scale, torch::Tensor out) {
     CHECK_LAUNCH(launch_fp8_quant(x.data_ptr(), out.data_ptr(), x.numel(), (float)scale, stream()));
 }
 
-// bf16(silu(bf16(depthwise causal conv(x)))) for x [T, C] bf16 (rows may be strided), state [C, 3] (previous 3 inputs), w [C, 4];
-// output channels are split into three contiguous tensors outs[0..2] = [T, c1], [T, c2 - c1], [T, C - c2] (q, k, v).
-// l2_eps >= 0: also L2-normalize the first two outputs (q, k) per 128-channel head.
+// bf16(silu(bf16(depthwise causal conv(x)))) for x [T, C] bf16 (rows with any stride), state [C, 3] (the previous 3
+// inputs) and w [C, 4]. The output channels split into three contiguous tensors outs[0..2] = [T, c1], [T, c2 - c1],
+// [T, C - c2] (q, k, v). With l2_eps >= 0, the op also L2-normalizes the first two outputs (q, k) per 128-channel head.
 void causal_conv_silu(torch::Tensor x, torch::Tensor state, torch::Tensor w, std::vector<torch::Tensor> outs, double l2_eps) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.stride(1) == 1, "x: bf16 [T, C], unit-stride rows");
     TORCH_CHECK(outs.size() == 3, "three outputs");
@@ -451,9 +453,9 @@ void gdn_prefill(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tenso
 // ===================================================================================================== attn_prefill.cu
 cudaError_t launch_attn_prefill_fp8(const void*, const void*, const void*, void*, int, int, int, int, int, float, cudaStream_t);
 
-// Causal prefill attention over one slot's e4m3 KV cache, Q K^T on FP8 tensor cores.
-// q: bf16 [1, Hq, T, 256] (rows at positions pos .. pos + T - 1); caches: e4m3 [1, Hkv, Lmax, 256] with the T new rows
-// written; out: bf16 [T, Hq * 256].
+// Causal prefill attention over the e4m3 KV cache of one slot, with Q K^T on FP8 tensor cores.
+// q: bf16 [1, Hq, T, 256] (rows at positions pos .. pos + T - 1). caches: e4m3 [1, Hkv, Lmax, 256], with the T new rows
+// written. out: bf16 [T, Hq * 256].
 void attn_prefill_fp8(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor out, int64_t pos, double scale) {
     CHECK_CUDA_TENSOR(q, torch::kBFloat16);
     check_kv(k_cache, v_cache);

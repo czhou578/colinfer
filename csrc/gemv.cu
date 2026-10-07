@@ -1,10 +1,11 @@
-// gemv.cu -- BF16 GEMV for the tiny decode projections (the GDN layers' b / a gates: 96 rows of 5120), M <= 8 rows.
+// gemv.cu -- BF16 GEMV for the small decode projections (the b / a gates of the GDN layers: 96 rows of 5120),
+// M <= 8 rows.
 //
 //   out[m, n] = sum_k x[m, k] * W[n, k]
 //
-// One block per output row; its 8 warps split K, each lane streaming 16-byte chunks of the row; fp32 accumulation, one
-// warp reduce and a shared-memory sum over the warps. Every quantized linear runs on the tensor-core skinny GEMM
-// (skinny.cu) instead.
+// One block per output row. Its 8 warps split K, and each lane streams 16-byte chunks of the row. The accumulation is
+// fp32, with one warp reduce and a shared-memory sum over the warps. All quantized linears run on the tensor-core skinny
+// GEMM (skinny.cu) instead.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>

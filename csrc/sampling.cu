@@ -1,8 +1,8 @@
 // sampling.cu -- per-slot seeded uniforms for speculative sampling (PLAN.md 4.5).
 //
-// out[b, i] = U(0, 1] from Philox4x32-10 keyed by mix(seed[b]) at counter offset[b] + i. The key is a mixed seed
-// so this stream never coincides with FlashInfer's sampling stream, which uses seed[b] directly with the
-// row index as the subsequence.
+// out[b, i] = U(0, 1] from Philox4x32-10, keyed by mix(seed[b]), at counter offset[b] + i. The key is a mixed seed, so
+// this stream never coincides with the sampling stream of FlashInfer. That stream uses seed[b] directly, with the row
+// index as the subsequence.
 #include <cuda_runtime.h>
 #include <stdint.h>
 
@@ -34,8 +34,8 @@ cudaError_t launch_philox_uniform(const int64_t* seed, const int64_t* offset, fl
     return cudaGetLastError();
 }
 
-// Exact logits of candidate rows of an NVFP4 matrix (the low-rank draft head's rescoring, engine/spec/mtp.py):
-// out[b, j] = gs * sum_k x[b, k] * W[cand[b, j], k]. One warp per candidate; lane: 16-element scale blocks
+// Exact logits of candidate rows of an NVFP4 matrix (the rescoring of the low-rank draft head, engine/spec/mtp.py):
+// out[b, j] = gs * sum_k x[b, k] * W[cand[b, j], k]. One warp per candidate. Each lane takes the 16-element scale blocks
 // lane, lane + 32, ... (fp32 accumulation).
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>

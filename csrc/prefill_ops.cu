@@ -5,7 +5,7 @@
 //   k_gated_rmsnorm        GDN output: o, z bf16 [N, 128] -> bf16(bf16(w * bf16(rmsnorm(o))) * silu(z))
 //   k_add_rmsnorm          residual add + RMSNorm + the next GEMM's activation quantization (NVFP4 and / or e4m3)
 //   k_gate_fp8             attention output gate + e4m3 quantization for o_proj
-// Rounding points follow the PyTorch reference (engine/model/qwen35.py).
+// The rounding points follow the PyTorch reference (engine/model/qwen35.py).
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -37,9 +37,10 @@ __global__ void k_fp8_quant(const __nv_bfloat16* __restrict__ x, uint8_t* __rest
     reinterpret_cast<uint2*>(out)[i] = make_uint2(o[0], o[1]);
 }
 
-// One warp per (t, 128-channel head): lane l owns channels 4l .. 4l+3. Output channels [0, c1) -> o0 [T, c1], [c1, c2) -> o1,
-// [c2, C) -> o2 (all contiguous). l2_eps >= 0: the q and k outputs (channels < c2) are also L2-normalized per head,
-// x / sqrt(sum x^2 + eps) on the bf16 values (the reference's l2norm, eps 1e-6), the chunked delta rule's input.
+// One warp per (t, 128-channel head). Lane l owns the channels 4l .. 4l+3. The output channels [0, c1) go to o0 [T, c1],
+// [c1, c2) to o1 and [c2, C) to o2 (all contiguous). With l2_eps >= 0, the kernel also L2-normalizes the q and k outputs
+// (channels < c2) per head. It computes x / sqrt(sum x^2 + eps) on the bf16 values (the l2norm of the reference, eps
+// 1e-6). This is the input of the chunked delta rule.
 __global__ void k_causal_conv_silu_l2(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ state,
                                       const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ o0, __nv_bfloat16* __restrict__ o1,
                                       __nv_bfloat16* __restrict__ o2, int c1, int c2, int T, int C, float l2_eps) {
@@ -106,9 +107,9 @@ __global__ void k_gated_rmsnorm(const __nv_bfloat16* __restrict__ o, const __nv_
 }
 
 // One block (256 threads) per row of K (K % 8 == 0). x_new = bf16(x + y) (y optional), n = bf16(rmsnorm(x_new) * (1 + w)).
-// Outputs (each optional): x_out (x_new), n_out (bf16), q4/sf4 (NVFP4 of n, static in_scale, swizzled scales),
-// q8 (e4m3 of n / in_scale8). Thread t owns 8-element chunks t, t + 256, ...; the two chunks of a 16-element
-// NVFP4 block are owned by neighbouring threads (t, t ^ 1), which exchange their amax with one shuffle.
+// Outputs (each optional): x_out (x_new), n_out (bf16), q4/sf4 (NVFP4 of n, static in_scale, swizzled scales), q8 (e4m3
+// of n / in_scale8). Thread t owns the 8-element chunks t, t + 256, .... Neighbouring threads (t, t ^ 1) own the two
+// chunks of a 16-element NVFP4 block, and they exchange their amax with one shuffle.
 __global__ void __launch_bounds__(256) k_add_rmsnorm(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ y,
                                                       const __nv_bfloat16* __restrict__ w, float eps, int K, __nv_bfloat16* __restrict__ x_out,
                                                       __nv_bfloat16* __restrict__ n_out, uint8_t* __restrict__ q4, uint8_t* __restrict__ sf4,

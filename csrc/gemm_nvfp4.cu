@@ -1,4 +1,4 @@
-// gemm_nvfp4.cu -- prefill GEMM: NVFP4 x NVFP4 block-scaled, CUTLASS 4.8 SM120 collectives (PLAN.md 4.4 item 2).
+// gemm_nvfp4.cu -- prefill GEMM: NVFP4 x NVFP4 block-scaled, with CUTLASS 4.8 SM120 collectives (PLAN.md 4.4 item 2).
 //
 //   D[M, N] (bf16) = alpha * (A[M, K] . B[N, K]^T) (+ C[M, N])
 //   A: activations, packed e2m1 [M, K/2] (row-major, element 2i in the low nibble) + e4m3 block scales (16)
@@ -7,8 +7,8 @@
 //     offset(r, kb) = ((r / 128) * ceil(KB / 4) + kb / 4) * 512 + (r % 32) * 16 + ((r / 32) % 4) * 4 + kb % 4
 //   with rows padded to 128 and KB = K / 16 padded to 4 (padding zero-filled). See quant_nvfp4 below.
 //   alpha = input_scale * weight_scale_2 (the two NVFP4 global scales).
-// Tile configs from the phase-0 CUTLASS sweep (docs/history/baseline.md section 2). The persistent scheduler's raster
-// swizzle is set to 8: without it the 5120 x 17408 down projection loses 60% to L2 thrash at M = 4096.
+// The tile configs come from the phase-0 CUTLASS sweep (docs/history/baseline.md section 2). The raster swizzle of the
+// persistent scheduler is 8. Without it, the 5120 x 17408 down projection loses 60% to L2 thrash at M = 4096.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -49,11 +49,12 @@ struct Cfg {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
-// ---- the MLP's SwiGLU fused into the up GEMM's epilogue ------------------------------------------------------------------
-// D = NVFP4(silu(C) * alpha * acc), e4m3 scale per 16 outputs, in the CUTLASS scale layout the down GEMM reads as its A
-// scales; C = the gate GEMM's bf16 output. Block scale = e4m3(amax * nc / 6), values * nc / scale with nc = 1 / in_scale of
-// the down projection (Sm120BlockScaleFactorRowStore), the same as quant_nvfp4. The traits come from
-// LinCombBlockScaleFactor (NVFP4 output, bf16 source); the callbacks are the tree below.
+// ---- the SwiGLU of the MLP, fused into the epilogue of the up GEMM -------------------------------------------------------
+// D = NVFP4(silu(C) * alpha * acc), with an e4m3 scale per 16 outputs, in the CUTLASS scale layout that the down GEMM
+// reads as its A scales. C is the bf16 output of the gate GEMM. Block scale = e4m3(amax * nc / 6), and the values are
+// values * nc / scale, with nc = 1 / in_scale of the down projection (Sm120BlockScaleFactorRowStore), the same as
+// quant_nvfp4. The traits come from LinCombBlockScaleFactor (NVFP4 output, bf16 source). The callbacks are the tree
+// below.
 struct SwigluNvfp4 : cutlass::epilogue::fusion::LinCombBlockScaleFactor<16, cutlass::float_e2m1_t, float, cutlass::float_ue4m3_t,
                                                                        cutlass::layout::RowMajor, cutlass::bfloat16_t> {};
 

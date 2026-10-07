@@ -1,14 +1,14 @@
 // gdn_step.cu -- Gated DeltaNet decode kernels: T new tokens per slot (T = 1 plain decode, T = k + 1 speculative
-// verify), on the slot's conv window and fp32 recurrent state.
+// verify), on the conv window and fp32 recurrent state of the slot.
 //
-// One set of kernels serves all three uses, so a token's output does not depend on how it is processed:
+// One set of kernels serves all three uses, so the output of a token does not depend on how the engine processes it:
 //   plain decode   k_conv (T = 1) + k_conv_commit (n = active) + k_delta (outputs, state advanced by n = active)
 //   verify         k_conv (T rows) + k_delta (outputs for all T rows, state untouched)
 //   commit         k_conv_commit (n accepted) + k_delta (no outputs, state advanced by n and written)
-// Verifying T tokens and decoding them one at a time give the same bits (tests/test_spec_gdn.py).
+// A verify of T tokens and their decode one at a time give the same bits (tests/test_spec_gdn.py).
 //
 // k_conv         out[b, t, c] = bf16(silu(bf16(sum_k w[c, k] * x[k]))), x = the conv window followed by tokens 0 .. t:
-//                the depthwise causal conv (kernel 4) of the reference. The window is not written.
+//                the depthwise causal conv (kernel 4) of the reference. The kernel does not write the window.
 // k_conv_commit  conv window <- the last 3 inputs of [window, mixed[b, 0 .. n_b - 1]].
 // k_delta        one block per (slot, value head h), 512 threads. Head h reads q / k of key head h / (Hv / Hk) and v of head
 //                h, L2-normalizes q and k, then per token on its fp32 state S [dk = 128, dv = 128]:
@@ -17,16 +17,24 @@
 //                beta = bf16(sigmoid(b)), g = -exp(A_log) * softplus(a + dt_bias). Rounding points follow transformers'
 //                torch_recurrent_gated_delta_rule + Qwen3_5RMSNormGated (engine/model/qwen35.py).
 //
-// k_delta layout. Warp w owns state rows [32 (w / 4), +32) and columns [32 (w % 4), +32): lane = column, so every state
-// load / store is a coalesced 128-byte row segment and a thread keeps its 32 state values in registers for all T tokens.
-// The kernel is a chain of T dependent steps on 64 KB of state per block (read once), so the per-token work that does not
-// depend on the state goes before the chain (q / k norms, beta and decay of all T tokens: warp t takes token t, with the
-// sums in the same order as a one-token block reduction), the outputs' gated RMSNorm after it (from per-step column
-// partials), and a step is two passes over the registers and one __syncthreads (column partials alternate between two
-// shared buffers). Time at T = 8: ≈17.5 µs fixed (the 3 MB of state per layer) + ≈0.5 µs per token.
+// k_delta layout. Warp w owns the state rows [32 (w / 4), +32) and the columns [32 (w % 4), +32). The lane is the column,
+// so each state load / store is a coalesced 128-byte row segment. A thread keeps its 32 state values in registers for all
+// T tokens.
 //
-// Shapes: mixed, qkv [B, T, C = 2 Hk 128 + Hv 128]; z [B, T, Hv 128]; b, a [B, T, Hv]; n int32 [B] (0 .. T). The rows of
-// mixed, z, b and a may be strided (ldm / ldz / ldba elements apart: column slices of the projection outputs, no copies).
+// The kernel is a chain of T dependent steps on 64 KB of state per block (read once). Thus the per-token work that does
+// not depend on the state goes before the chain: the q / k norms, and the beta and decay of all T tokens. (Warp t takes
+// token t, with the sums in the same order as a one-token block reduction.) The gated RMSNorm of the outputs comes after
+// the chain, from per-step column partials. A step is two passes over the registers and one __syncthreads (the column
+// partials alternate between two shared buffers). Time at T = 8: ≈17.5 µs fixed (the 3 MB of state per layer) +
+// ≈0.5 µs per token.
+//
+// Shapes:
+//   mixed, qkv  [B, T, C = 2 Hk 128 + Hv 128]
+//   z           [B, T, Hv 128]
+//   b, a        [B, T, Hv]
+//   n           int32 [B] (0 .. T)
+// The rows of mixed, z, b and a can have a stride: ldm / ldz / ldba elements apart (column slices of the projection
+// outputs, no copies).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>

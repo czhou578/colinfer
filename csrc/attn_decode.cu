@@ -1,14 +1,16 @@
 // attn_decode.cu -- decode attention for the 16 gated full-attention layers, over an fp8 (e4m3, unit scale) KV cache.
 //
-//   k_prologue  per new token row: q / k zero-centered RMSNorm + partial RoPE; k and v written to the cache at the slot's
-//               device position (so the launch shape is fixed and the step can live in a CUDA graph); q to q_out.
-//   tc::k_tc    multi-row tensor-core attention: one pass over a slot's KV for all of its query rows (G heads x T new
-//               tokens), split over NB key-tile stripes; partials folded by
-//   k_combine   in a fixed order, times sigmoid(gate) (the output gate), ready for o_proj.
+//   k_prologue  per new token row: q / k zero-centered RMSNorm + partial RoPE. It writes k and v to the cache at the
+//               device position of the slot (so the launch shape is fixed, and a CUDA graph can hold the step), and q
+//               to q_out.
+//   tc::k_tc    multi-row tensor-core attention: one pass over the KV of a slot for all of its query rows (G heads x T
+//               new tokens), split over NB key-tile stripes.
+//   k_combine   folds the partials of the stripes in a fixed order, times sigmoid(gate) (the output gate), ready for
+//               o_proj.
 //
 // q        [B, Hq, T, D] bf16, from k_prologue
-// k/v      [B, Hkv, Lmax, D] e4m3 cache, the new tokens' rows already written
-// seq_lens [B] int32 on the device: valid positions after this step (pos + T). Row t of slot b attends to positions
+// k/v      [B, Hkv, Lmax, D] e4m3 cache, with the rows of the new tokens already written
+// seq_lens [B] int32 on the device: the valid positions after this step (pos + T). Row t of slot b attends to positions
 //          [0, seq_len - (T - 1 - t)) (causal among the new rows).
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -40,9 +42,11 @@ struct KvFp8 {
     }
 };
 
-// Folds the NB partials (part_acc [rows, NB, D], part_ml [rows, NB] = (running max, sum)) of each (b, h, t) row in a fixed
-// order. gate == nullptr: out[b, h, t, :] (the q layout). gate != nullptr (the q_proj output [B, T, Hq, 2D],
-// gate in the second half of each head): out[b, t, h, :] = attn * sigmoid(gate), ready for o_proj.
+// Folds the NB partials (part_acc [rows, NB, D], part_ml [rows, NB] = (running max, sum)) of each (b, h, t) row in a
+// fixed order.
+//   gate == nullptr: out[b, h, t, :] (the q layout).
+//   gate != nullptr (the q_proj output [B, T, Hq, 2D], with the gate in the second half of each head):
+//   out[b, t, h, :] = attn * sigmoid(gate), ready for o_proj.
 __global__ void k_combine(const float* __restrict__ part_acc, const float2* __restrict__ part_ml, __nv_bfloat16* __restrict__ out, int splits,
                           const __nv_bfloat16* __restrict__ gate, int Hq, int T) {
     PDL_TRIGGER();
@@ -69,12 +73,12 @@ __global__ void k_combine(const float* __restrict__ part_acc, const float2* __re
     }
 }
 
-// Attention prologue for T new rows per slot, one block (D threads) per (b, t, head) over Hq q-heads,
-// then Hkv k-heads, then Hkv v-heads:
+// Attention prologue for T new rows per slot. One block (D threads) per (b, t, head) runs over Hq q-heads, then Hkv
+// k-heads, then Hkv v-heads:
 //   q:  zero-centered RMSNorm (q_norm) + partial RoPE on the first R dims  -> q_out [B, Hq, T, D]
 //   k:  RMSNorm (k_norm) + RoPE, written to k_cache[b, h, pos_t[b] + t]   (saturating e4m3)
 //   v:  written to v_cache[b, h, pos_t[b] + t]
-// qp: q_proj output [B, T, Hq, 2D] (q in the first D of each head); kp, vp: [B, T, Hkv, D].
+// qp: q_proj output [B, T, Hq, 2D] (q in the first D of each head). kp, vp: [B, T, Hkv, D].
 __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bfloat16* __restrict__ kp, const __nv_bfloat16* __restrict__ vp, int ldq, int ldk, int ldv,
                            const __nv_bfloat16* __restrict__ qn_w, const __nv_bfloat16* __restrict__ kn_w, const float* __restrict__ inv_freq,
                            const int* __restrict__ pos_t, uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
@@ -119,26 +123,26 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
 }
 
 // ------------------------------------------------------------------------------------------------------------------
-// Tensor-core multi-row decode. One block owns one
-// (slot, KV head, tile stripe) and serves every query row of the slot: up to 48 rows (G heads x T rows) as three
-// m16 tiles of mma.sync.m16n8k16 (f16 x f16 -> fp32). Rows beyond 48 take further blocks (grid y).
+// Tensor-core multi-row decode. One block owns one (slot, KV head, tile stripe) and serves all query rows of the slot.
+// These are up to 48 rows (G heads x T rows), as three m16 tiles of mma.sync.m16n8k16 (f16 x f16 -> fp32). Rows beyond
+// 48 take more blocks (grid y).
 //
-// Bit identity. A row's result must not depend on how many other rows share the launch, so plain decode (T = 1)
-// and every verify width produce the same bits:
-//   - keys are processed in TK-key tiles at fixed positions; block z owns tiles z, z + NB, z + 2 NB, ... (NB fixed),
-//     and the combine folds the NB partials in a fixed order;
-//   - mma rows are independent; the softmax of a row is 8 lanes with fixed reduction trees, the same for every row;
-//   - a tile entirely past a row's length (it exists because a longer row of the slot needs it) is an exact no-op:
-//     its keys score -inf, p = 0 exactly, the running max does not move and corr is set to exactly 1.
+// Bit identity. The result of a row must not depend on how many other rows share the launch. Thus plain decode (T = 1)
+// and each verify width give the same bits:
+//   - The kernel processes the keys in TK-key tiles at fixed positions. Block z owns tiles z, z + NB, z + 2 NB, ... (NB
+//     fixed), and the combine folds the NB partials in a fixed order.
+//   - The mma rows are independent. The softmax of a row is 8 lanes with fixed reduction trees, the same for each row.
+//   - A tile that is fully past the length of a row is an exact no-op. (It exists because a longer row of the slot needs
+//     it.) Its keys score -inf, p = 0 exactly, the running max does not move, and corr is exactly 1.
 //
-// Operands. K stays in the raw cache bytes in shared memory: a lane's B fragment for k-step j is 4 consecutive head
-// dims (16j + 4c .. +3, c = lane % 4), which the QK product may take in any order as long as Q's A fragment uses the
-// same order (it does: 8 consecutive bytes of the f16 Q row). e4m3 values are exact in f16.
-// V is converted to an f16 [key][dim] tile and read with ldmatrix.trans; P is rounded to f16 (~5e-4 relative error
-// against fp32 attention, below the bf16 output's own rounding).
+// Operands. K stays in the raw cache bytes in shared memory. The B fragment of a lane for k-step j is 4 consecutive head
+// dims (16j + 4c .. +3, c = lane % 4). The QK product can take them in any order, if the A fragment of Q uses the same
+// order. It does: 8 consecutive bytes of the f16 Q row. e4m3 values are exact in f16.
+// The kernel converts V to an f16 [key][dim] tile and reads it with ldmatrix.trans. It rounds P to f16 (~5e-4 relative
+// error against fp32 attention, below the rounding of the bf16 output).
 //
-// Speed (bench/attn_bench.py, 128k context, fp8 KV): 228-236 GB/s for T = 1, 4 and 8, i.e. a verify of 8 rows costs
-// what plain decode costs. NB = 12: one slot's 4 KV heads x 12 stripes fill the 48 SMs once (one block per SM).
+// Speed (bench/attn_bench.py, 128k context, fp8 KV): 228-236 GB/s for T = 1, 4 and 8. Thus a verify of 8 rows costs the
+// same as plain decode. NB = 12: the 4 KV heads x 12 stripes of one slot fill the 48 SMs once (one block per SM).
 namespace tc {
 
 constexpr int TK = 32, NB = 12, WARPS = 4, QS = D + 8, VS = D + 8, PS = TK + 8, SS = TK + 4, MAXROWS = 48;
@@ -172,9 +176,9 @@ __device__ __forceinline__ uint32_t e4m3x2_h2(uint32_t two) {
     __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffff), __NV_E4M3);
     return (uint32_t)h.x | ((uint32_t)h.y << 16);
 }
-// RS: shared-memory bytes per raw cache row. swz(row, chunk): where a row's 16-byte chunk lands. fp8 rows stay 256 bytes
-// apart (padding them to 272 cut cp.async streaming from ~232 to ~187 GB/s) and XOR-swizzle chunks by row instead, so
-// the 8 rows of a K fragment load hit 8 different bank groups.
+// RS: the shared-memory bytes per raw cache row. swz(row, chunk): where the 16-byte chunk of a row lands. The fp8 rows
+// stay 256 bytes apart, and the kernel XOR-swizzles the chunks by row instead. (A padding to 272 decreased the cp.async
+// streaming from ~232 to ~187 GB/s.) Thus the 8 rows of a K fragment load hit 8 different bank groups.
 struct TcFp8 {
     static constexpr int ROW = D, RS = D, CH = ROW / 16;
     static __device__ __forceinline__ int swz(int r, int ch) { return ch ^ (r & 7); }
@@ -197,9 +201,9 @@ constexpr int smem_bytes(int stages) {
 template <int MT, typename KV>
 constexpr int stages() { return smem_bytes<MT, KV>(4) <= 99 * 1024 ? 4 : smem_bytes<MT, KV>(3) <= 99 * 1024 ? 3 : 2; }
 
-// Grid (B, Hkv * passes, NB), 128 threads. Block (b, kvh, pass, z) handles query rows r = pass * 48 + [0, 48) of slot b
-// (row r = t * G + g: query head kvh * G + g, new token t) over the tiles z + n * NB. Partials go to
-// part_acc / part_ml at ((b * Hq + h) * T + t) * NB + z, the layout k_combine folds (splits = NB).
+// Grid (B, Hkv * passes, NB), 128 threads. Block (b, kvh, pass, z) handles the query rows r = pass * 48 + [0, 48) of
+// slot b, over the tiles z + n * NB. Row r = t * G + g is query head kvh * G + g of new token t. The partials go to
+// part_acc / part_ml at ((b * Hq + h) * T + t) * NB + z, the layout that k_combine folds (splits = NB).
 template <int G, int MT, typename KV>
 __global__ void __launch_bounds__(WARPS * 32) k_tc(const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ kc,
                                                     const uint8_t* __restrict__ vc, const int* __restrict__ seq_lens,
