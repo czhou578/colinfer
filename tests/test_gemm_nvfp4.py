@@ -1,5 +1,5 @@
-"""Prefill NVFP4 GEMM (csrc/gemm_nvfp4.cu): activation quantizer vs the bit-exact emulation, and the
-CUTLASS GEMM vs an fp32 reference on dequantized operands. Run: uv run pytest tests/test_gemm_nvfp4.py -q"""
+"""Prefill NVFP4 GEMM (csrc/gemm_nvfp4.cu): the activation quantizer against the bit-exact emulation, and the CUTLASS
+GEMM against an fp32 reference on dequantized operands. Run: uv run pytest tests/test_gemm_nvfp4.py -q"""
 import os
 import sys
 

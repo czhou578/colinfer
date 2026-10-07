@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """End-to-end checks of engine/runtime/scheduler.py on the real model (needs ~40 GB of GPU memory).
 
-Reference: a plain-decode scheduler (no speculation), each request alone. The MTP scheduler must give the same
-greedy tokens:
-  1. each request alone (batch width 1);
-  2. all four together (widths 3 -> 1 as they finish, a 4th request queued);
-  3. together with a sampled request and a 5000-token chunked prefill (sampled cycle graphs, masked slots);
-plus
+The reference is a plain-decode scheduler (no speculation), with each request alone. The MTP scheduler must give the
+same greedy tokens:
+  1. each request alone (batch width 1)
+  2. all four together (widths 3 -> 1 as they finish, a 4th request queued)
+  3. together with a sampled request and a 5000-token chunked prefill (sampled cycle graphs, masked slots)
+More checks:
   4. seeded sampling at T=0.8: the MTP scheduler emits exactly what plain decode samples, alone and next to one or two
-     other requests (position-keyed draws, engine/spec/accept.py);
-  5. multi-turn: turn 2 restores the end-of-turn-1 checkpoint (stop-token cut keeps it a prefix);
-  6. a second conversation with the same long system prompt, while the first is still decoding, restores the
-     system-prompt checkpoint by copying its KV prefix into another slot; its greedy output matches a run
-     without checkpoints;
-  7. speed: single-slot MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0).
+     other requests (position-keyed draws, engine/spec/accept.py)
+  5. multi-turn: turn 2 restores the end-of-turn-1 checkpoint (the stop-token cut keeps it a prefix)
+  6. a second conversation with the same long system prompt starts while the first one still decodes. It restores the
+     system-prompt checkpoint, with a copy of its KV prefix into another slot. Its greedy output matches a run without
+     checkpoints.
+  7. speed: single-slot MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
 import os

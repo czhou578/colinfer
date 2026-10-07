@@ -1,6 +1,9 @@
-"""Decode attention (csrc/attn_decode.cu) over an fp8 KV cache: accuracy against torch SDPA, every row bit-identical to a
-one-row launch at that row's length (what makes speculation output-invariant), and the full KernelAttention layer
-(prologue + attention + gate) against the reference qwen35.Attention. Run: uv run pytest tests/test_attn_decode.py -q"""
+"""Decode attention (csrc/attn_decode.cu) over an fp8 KV cache. The tests check:
+- the accuracy against torch SDPA
+- that each row is bit-identical to a one-row launch at the length of that row (this makes speculation
+  output-invariant)
+- the full KernelAttention layer (prologue + attention + gate) against the reference qwen35.Attention
+Run: uv run pytest tests/test_attn_decode.py -q"""
 import os
 import sys
 

@@ -1,5 +1,5 @@
-"""Speculative sampling acceptance (engine/spec/accept.py) preserves the target distribution:
-over many independent trials the first two emitted tokens follow p_0 and p_1(.|first) exactly."""
+"""Speculative sampling acceptance (engine/spec/accept.py) keeps the target distribution. Over many independent
+trials, the first two emitted tokens follow p_0 and p_1(.|first) exactly."""
 import os
 import sys
 

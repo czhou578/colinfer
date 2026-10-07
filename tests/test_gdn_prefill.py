@@ -1,6 +1,6 @@
-"""Chunked Gated DeltaNet forward (csrc/gdn_prefill.cu) against the reference chunk_gated_delta_rule (engine/model/
-qwen35.py, fp32): output and the continued state, GVA (16 key heads, 48 value heads), lengths that end mid-chunk.
-Run: uv run pytest tests/test_gdn_prefill.py -q"""
+"""Chunked Gated DeltaNet forward (csrc/gdn_prefill.cu) against the reference chunk_gated_delta_rule
+(engine/model/qwen35.py, fp32): the output and the continued state, GVA (16 key heads, 48 value heads), and lengths
+that end mid-chunk. Run: uv run pytest tests/test_gdn_prefill.py -q"""
 import os
 import sys
 

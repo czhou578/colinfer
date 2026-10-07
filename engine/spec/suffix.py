@@ -1,10 +1,11 @@
-"""Suffix-match drafts (prompt lookup / suffix decoding): when the last tokens of a slot's history occurred earlier in
-that history, in the prompt or in the reply so far, the tokens that followed them then are a draft that costs no GPU
-work. Code edits, quoted text and structured output repeat long spans that the MTP drafter, one token at a time,
-predicts less reliably. Drafts never change outputs: the speculative cycle accepts only what the target itself emits.
+"""Suffix-match drafts (prompt lookup / suffix decoding). The history of a slot is its prompt and the reply so far.
+When the last tokens of the history occurred earlier in it, the tokens that followed them then are a draft that costs
+no GPU work. Code edits, quoted text and structured output repeat long spans. The MTP drafter, one token at a time,
+predicts these spans less reliably. Drafts never change the outputs: the speculative cycle accepts only what the
+target itself emits.
 
-The index maps every NGRAM-token sequence of the history to the positions where it ends and grows as tokens are
-appended; a lookup extends the newest occurrences of the last NGRAM tokens backwards to the longest match.
+The index maps each NGRAM-token sequence of the history to the positions where it ends. It grows with each appended
+token. A lookup extends the newest occurrences of the last NGRAM tokens backwards to the longest match.
 """
 MIN_MATCH = 8    # the server's default --suffix-drafts: shorter repeats are left to the MTP drafter
 NGRAM = 3        # tokens of the lookup key (the shortest match found)

@@ -1,5 +1,5 @@
-"""Tests for engine/weights/quant_emul.py. The FlashInfer comparison needs the GPU and is skipped
-without one. Run: uv run pytest tests/test_quant_emul.py -q"""
+"""Tests for engine/weights/quant_emul.py. The FlashInfer comparison needs the GPU, and pytest skips it without one.
+Run: uv run pytest tests/test_quant_emul.py -q"""
 import os
 import sys
 

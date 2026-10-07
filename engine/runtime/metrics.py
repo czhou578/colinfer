@@ -1,6 +1,6 @@
-"""Minimal Prometheus metrics (PLAN.md 4.6: `/metrics` with step-time histograms). No dependency: counters,
-gauges and fixed-bucket histograms rendered in the Prometheus text format. Written by the engine thread, read by
-the HTTP thread; single attribute updates under the GIL are consistent enough for monitoring."""
+"""Minimal Prometheus metrics (PLAN.md 4.6: `/metrics` with step-time histograms), with no dependency: counters,
+gauges and fixed-bucket histograms in the Prometheus text format. The engine thread writes them, and the HTTP thread
+reads them. Single attribute updates under the GIL are consistent enough for monitoring."""
 from __future__ import annotations
 
 import bisect

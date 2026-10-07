@@ -1,8 +1,11 @@
 """Fast CPU tests for engine/model/qwen35.py and the dequant helpers, on a tiny random model.
 
-Covers paths the 27B parity run does not: prefill continuation (T > 1 with existing state), the
-64-token chunk boundary of the delta rule, stepwise decode vs one-shot prefill, and agreement with
-HF transformers' Qwen3_5ForCausalLM at tiny scale. Run: uv run pytest tests/test_model_small.py -q
+They cover the paths that the 27B parity run does not:
+- prefill continuation (T > 1 with existing state)
+- the 64-token chunk boundary of the delta rule
+- stepwise decode vs one-shot prefill
+- agreement with Qwen3_5ForCausalLM of HF transformers at tiny scale
+Run: uv run pytest tests/test_model_small.py -q
 """
 import os
 import sys

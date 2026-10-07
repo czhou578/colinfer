@@ -1,5 +1,6 @@
 """GDN verify / commit (csrc/gdn_step.cu over T tokens) must reproduce T sequential single-token decode steps bit for
-bit, with mixed / z / b / a read as strided column views of the projection outputs. Run: uv run pytest tests/test_spec_gdn.py -q"""
+bit. The test reads mixed / z / b / a as strided column views of the projection outputs.
+Run: uv run pytest tests/test_spec_gdn.py -q"""
 import os
 import sys
 

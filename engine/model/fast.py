@@ -1,24 +1,27 @@
-"""Decode-path model: the reference architecture (engine/model/qwen35.py) with every op on the engine's CUDA kernels and
-the positions on the device, so a decode step or a whole speculative cycle is one CUDA graph.
+"""Decode-path model: the reference architecture (engine/model/qwen35.py) with each op on the CUDA kernels of the engine,
+and the positions on the device. Thus a decode step, or a full speculative cycle, is one CUDA graph.
 
 Weights (nvidia/Qwen3.8-27B-NVFP4, kept quantized on the GPU, ~20 GB):
-  MLP + lm_head        NVFP4 (Nvfp4Linear): streamed by the tensor-core skinny GEMM (csrc/skinny.cu) at decode, read by
-                       the CUTLASS NVFP4 GEMM at prefill (engine/model/prefill.py).
-  attention / GDN      FP8 (Fp8Linear, StackedFp8Linear): prefill multiplies the FP8 weights (W8A8). Decode streams an
-  projections          INT6 (attention) / INT5 (GDN) copy when its files exist (attach_decode_copies, tools/int6_requant.py:
-                       ~9.5% faster decode, perplexity within 0.25% of the checkpoint), else the FP8 weights themselves.
-  everything else      BF16 (embeddings, norms, the GDN conv and b / a gates).
 
-Bit identity. Every decode linear runs on the skinny GEMM, whose rows are bit-identical whatever the number of rows
-(1..16) in the launch; attention and the GDN recurrence likewise compute a row the same way at any width (csrc/
-attn_decode.cu, csrc/gdn_step.cu). So plain decode, the speculative verify of k+1 rows and any batch of slots produce the
-same bits for the same token, and speculation can never change an output.
+- MLP + lm_head: NVFP4 (Nvfp4Linear). At decode, the tensor-core skinny GEMM (csrc/skinny.cu) streams them. At
+  prefill, the CUTLASS NVFP4 GEMM reads them (engine/model/prefill.py).
+- Attention / GDN projections: FP8 (Fp8Linear, StackedFp8Linear). Prefill multiplies the FP8 weights (W8A8). Decode
+  streams an INT6 (attention) / INT5 (GDN) copy when its files exist (attach_decode_copies, tools/int6_requant.py).
+  This gives ~9.5% faster decode, with perplexity within 0.25% of the checkpoint. Without the files, decode streams the
+  FP8 weights.
+- All other weights: BF16 (embeddings, norms, the GDN conv and b / a gates).
 
-The KV cache is fp8 (e4m3, unit scale, saturating): half of bf16's bytes, and decode attention reads it directly.
+Bit identity. Each decode linear runs on the skinny GEMM. Its rows are bit-identical for any number of rows (1..16) in
+the launch. Attention and the GDN recurrence also compute a row the same way at any width (csrc/attn_decode.cu,
+csrc/gdn_step.cu). Thus plain decode, the speculative verify of k+1 rows and any batch of slots give the same bits for
+the same token. Speculation can never change an output.
+
+The KV cache is fp8 (e4m3, unit scale, saturating). It has half the bytes of bf16, and decode attention reads it
+directly.
 
 Entry points: load_fast_model(path) -> to_fast(model) -> [attach_decode_copies(model, path)] -> DecodeGraph / MtpCycle
-(engine/spec/mtp.py) / prefill(). FastQwen35.forward is one decode step (T = 1 per slot); verify / commit are the
-speculative halves (T = k + 1 rows, then the accepted prefix).
+(engine/spec/mtp.py) / prefill(). FastQwen35.forward is one decode step (T = 1 per slot). verify / commit are the two
+halves of speculation (T = k + 1 rows, then the accepted prefix).
 """
 from __future__ import annotations
 

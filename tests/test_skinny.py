@@ -1,6 +1,8 @@
-"""The tensor-core skinny GEMM (csrc/skinny.cu) on NVFP4, FP8 and SwiGLU weights against an fp32 reference built from the
-loader's dequantization, every output row bit-identical for any number of rows (what keeps plain decode, verify and the
-drafter consistent), the draft early-exit skip flag, and the small decode ops (bf16 GEMV, RMSNorm).
+"""The tensor-core skinny GEMM (csrc/skinny.cu) on NVFP4, FP8 and SwiGLU weights. The tests check:
+- the accuracy against an fp32 reference built from the dequantization of the loader
+- that each output row is bit-identical for any number of rows (this keeps plain decode, verify and the drafter
+  consistent)
+- the skip flag of the draft early exit, and the small decode ops (bf16 GEMV, RMSNorm)
 INT6 / INT5: tests/test_skinny_int.py. Run: uv run pytest tests/test_skinny.py -q"""
 import os
 import sys

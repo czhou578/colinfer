@@ -1,20 +1,22 @@
-"""Prefill path: a prompt in chunks of up to CHUNK tokens, each layer on tensor-core GEMMs over the whole chunk.
+"""Prefill path: the engine processes a prompt in chunks of up to CHUNK tokens. Each layer runs on tensor-core GEMMs
+over the full chunk.
 
-  MLP          W4A4: activations quantized to NVFP4 (static checkpoint input scale) inside the fused add + RMSNorm,
-               CUTLASS SM120 NVFP4 x NVFP4 GEMMs (csrc/gemm_nvfp4.cu): the gate GEMM, then the up GEMM computes
-               silu(gate) * up and quantizes it to NVFP4 in its epilogue; the down GEMM adds the residual.
-  FP8 linears  W8A8: activations quantized to e4m3 with the static input scale, cuBLASLt via torch._scaled_mm (row-wise
-               weight scales, so the stacked q/k/v and qkv/z keep their own scales).
-  attention    the decode prologue on T rows (q/k norm + RoPE + fp8 KV write), then causal attention over the slot's
-               cache: FlashInfer FA2 over a bf16 copy of the cached prefix, or past ATTN_FP8_MIN_CTX tokens of context
-               csrc/attn_prefill.cu (Q K^T on FP8 tensor cores over the cache as stored: 6% faster prefill at 64k,
-               11% at 128k; perplexity +0.25-0.3% from rounding Q to e4m3); output gate fused with the FP8 quantization.
-  GDN          causal conv + SiLU + q/k L2 norm (csrc/prefill_ops.cu) continuing the conv window, the chunked gated
-               delta rule (csrc/gdn_prefill.cu) continuing the recurrent state, gated RMSNorm, out_proj.
+- MLP, W4A4: the fused add + RMSNorm quantizes the activations to NVFP4 (static checkpoint input scale). Then CUTLASS
+  SM120 NVFP4 x NVFP4 GEMMs run (csrc/gemm_nvfp4.cu). The gate GEMM runs first. The up GEMM computes silu(gate) * up
+  and quantizes it to NVFP4 in its epilogue. The down GEMM adds the residual.
+- FP8 linears, W8A8: the fused norm quantizes the activations to e4m3 with the static input scale. cuBLASLt runs the
+  GEMM via torch._scaled_mm, with row-wise weight scales. Thus the stacked q/k/v and qkv/z keep their own scales.
+- Attention: the decode prologue runs on T rows (q/k norm + RoPE + fp8 KV write). Then causal attention runs over the
+  cache of the slot, with FlashInfer FA2 over a bf16 copy of the cached prefix. Past ATTN_FP8_MIN_CTX tokens of
+  context, csrc/attn_prefill.cu runs instead: Q K^T on FP8 tensor cores over the cache as stored. This makes prefill 6%
+  faster at 64k and 11% faster at 128k. It adds 0.25-0.3% to the perplexity, because it rounds Q to e4m3. One kernel
+  applies the output gate and the FP8 quantization.
+- GDN: causal conv + SiLU + q/k L2 norm (csrc/prefill_ops.cu), which continues the conv window. Then the chunked gated
+  delta rule (csrc/gdn_prefill.cu) continues the recurrent state. A gated RMSNorm and out_proj follow.
 
-Works on the same FastQwen35 model / FastState as the decode graph; afterwards the state is exactly what decode expects
-(KV written, conv / recurrent state advanced, pos and pos_t moved). Only the last token's logits are computed, unless
-all_logits (perplexity).
+Prefill works on the same FastQwen35 model / FastState as the decode graph. After it, the state is exactly what decode
+expects: KV written, conv / recurrent state advanced, pos and pos_t moved. Prefill computes only the logits of the last
+token, except with all_logits (perplexity).
 """
 from __future__ import annotations
 

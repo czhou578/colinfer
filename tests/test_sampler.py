@@ -1,5 +1,5 @@
-"""In-graph sampler (engine/runtime/sampler.py): distribution checks against exact truncated
-softmax, per-slot parameters, determinism by (seed, position), and capture inside a CUDA graph."""
+"""In-graph sampler (engine/runtime/sampler.py): distribution checks against an exact truncated softmax, per-slot
+parameters, determinism by (seed, position), and the capture inside a CUDA graph."""
 import os
 import sys
 

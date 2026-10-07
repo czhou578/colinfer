@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Long-context retrieval check (PLAN.md Phase 3 week 11: FP8 KV numerical stability at depth).
 
-Hides a random 6-digit pass key at a given depth inside filler text of the requested length and asks
-the model to repeat it, greedy, thinking off. Exercises chunked prefill (FlashInfer over a long FP8 or
-BF16 cache) and the decode attention kernel at depth.
+The check hides a random 6-digit pass key at a given depth inside filler text of the requested length. Then it asks the
+model to repeat the key, greedy, with thinking off. This tests the chunked prefill (FlashInfer over a long FP8 or BF16
+cache) and the decode attention kernel at depth.
 
   uv run python tests/passkey.py [--lens 16384 65536 131072] [--depths 0.1 0.5 0.9]
   uv run python tests/passkey.py --url http://127.0.0.1:8000 --lens 262000 --depths 0.5   # through the server

@@ -1,5 +1,5 @@
 """Single-slot generation for the Phase 1 reference model: prefill, then one token per forward.
-No graphs, no fusion. Returns tokens and optionally the fp32 logits of the first N steps."""
+No graphs and no fusion. It returns the tokens, and optionally the fp32 logits of the first N steps."""
 from __future__ import annotations
 
 import torch

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""INT6 (or INT5) re-quantization of the checkpoint's FP8 projections (docs/history/phase6_progress.md section 9).
+"""INT6 (or INT5) re-quantization of the FP8 projections of the checkpoint (docs/history/phase6_progress.md section 9).
 
-NVFP4 for the Gated DeltaNet projections costs too much quality (Python-code perplexity +0.4-0.6% per projection type,
-round-to-nearest; AWQ and GPTQ do not fix it). A 6-bit integer with an e4m3 scale per 16 weights and an fp32 global
-scale (6.5 bits per weight against FP8's 8) has a *lower* weight error than the checkpoint's FP8 (2.24% vs 2.67%
-relative to the BF16 originals): signed q in [-31, 31], w = q * s_block * s_global, the block scale chosen among
-amax/31 * {1, .95, .9, .85, .8} by squared error. Stacked projections (q/k/v; in_proj_qkv + in_proj_z) share the
-global scale.
+NVFP4 for the Gated DeltaNet projections costs too much quality: Python-code perplexity +0.4-0.6% per projection type,
+round-to-nearest, and AWQ and GPTQ do not fix it. A 6-bit integer with an e4m3 scale per 16 weights and an fp32 global
+scale needs 6.5 bits per weight, against 8 for FP8. It has a *lower* weight error than the FP8 of the checkpoint (2.24%
+vs 2.67% relative to the BF16 originals).
+
+The format: signed q in [-31, 31], w = q * s_block * s_global. The tool chooses the block scale among
+amax/31 * {1, .95, .9, .85, .8} by the squared error. Stacked projections (q/k/v, and in_proj_qkv + in_proj_z) share
+the global scale.
 
   --simulate: write dequantized BF16 weights (<module>.weight_deq) for tests/perplexity.py --override
   default:    the decode format (attach_decode_copies in engine/model/fast.py, csrc/skinny.cu), codes c = q + 32:

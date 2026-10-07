@@ -1,5 +1,5 @@
-"""INT6 / INT5 skinny GEMM (csrc/skinny.cu) against x @ (q * s)^T with the kernel's one bf16 rounding of q * s, and every
-output row bit-identical for M = 1 and 16. Run: uv run pytest tests/test_skinny_int.py -q"""
+"""INT6 / INT5 skinny GEMM (csrc/skinny.cu) against x @ (q * s)^T, with the one bf16 rounding of q * s that the kernel
+does. Each output row must be bit-identical for M = 1 and 16. Run: uv run pytest tests/test_skinny_int.py -q"""
 import os
 import sys
 

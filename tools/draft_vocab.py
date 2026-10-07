@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build the frequency-ranked draft vocabulary for the MTP drafter (FR-Spec-style truncated lm_head).
 
-Counts token frequencies over a local corpus mix (WikiText prose, Python source, JSON, and chat-formatted
-text), forces the special / control tokens in, and writes the top ids (most frequent first) to
+The tool counts the token frequencies over a local corpus mix (WikiText prose, Python source, JSON, and chat-formatted
+text), and forces the special / control tokens in. It writes the top ids (most frequent first) to
 engine/spec/draft_vocab.npy (uint32). The drafter uses the first N of them.
   uv run python tools/draft_vocab.py [--top 65536]
 """

@@ -1,9 +1,8 @@
 """Checkpoint loading for the Phase 1 reference model.
 
-Loads a Qwen3.5-family safetensors checkpoint into Qwen35ForCausalLM on the GPU, dequantizing
-FP8 (128x128 block scales) and NVFP4 (e2m1 + e4m3 block-16 scales + fp32 global scale) to BF16
-on the fly. Slow and simple on purpose: this is how the quantized weights get validated before
-any custom kernel exists (PLAN.md Phase 1).
+It loads a Qwen3.5-family safetensors checkpoint into Qwen35ForCausalLM on the GPU. On the fly, it dequantizes FP8
+(128x128 block scales) and NVFP4 (e2m1 + e4m3 block-16 scales + fp32 global scale) to BF16. It is slow and simple on
+purpose: this path validates the quantized weights before any custom kernel exists (PLAN.md Phase 1).
 
 Usage:
     model = load_model("Qwen/Qwen3.8-27B")            # repo id in the HF cache, or a local dir

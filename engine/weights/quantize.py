@@ -1,14 +1,15 @@
-"""Weight quantizers shared by the engine and the tools: NVFP4 and block-scaled INT6 / INT5.
+"""Weight quantizers that the engine and the tools share: NVFP4 and block-scaled INT6 / INT5.
 
-NVFP4 (ModelOpt's format, what the checkpoint's MLP and lm_head use): e2m1 values, one e4m3 scale per 16 weights, an
-fp32 global scale. `quantize` picks each block's scale among amax/6, amax/5.5, ..., amax/4 (rounded to e4m3) by
-squared error after e2m1 rounding. The engine uses it for the MTP drafter's decode copies and the low-rank draft head
-(engine/spec/mtp.py).
+NVFP4 (the format of ModelOpt, which the MLP and lm_head of the checkpoint use): e2m1 values, one e4m3 scale per 16
+weights, an fp32 global scale. `quantize` picks the scale of each block among amax/6, amax/5.5, ..., amax/4 (rounded
+to e4m3), by the squared error after e2m1 rounding. The engine uses it for the decode copies of the MTP drafter and for
+the low-rank draft head (engine/spec/mtp.py).
 
-INT6 / INT5 (the decode copies of the checkpoint's FP8 attention / GDN projections, tools/int6_requant.py): signed
-q in [-(2^(b-1) - 1), 2^(b-1) - 1], w = q * block scale (e4m3, per 16 weights) * global scale, the block scale chosen
-among amax/qmax * {1, .95, .9, .85, .8}. Stored as codes c = q + 2^(b-1) split into two planes that csrc/skinny.cu
-streams: the low 4 bits exactly like NVFP4's nibbles, and the high 2 (INT6) or 1 (INT5) bits as a second plane.
+INT6 / INT5 are the decode copies of the FP8 attention / GDN projections of the checkpoint (tools/int6_requant.py).
+Each weight is w = q * block scale (e4m3, per 16 weights) * global scale, with a signed q in
+[-(2^(b-1) - 1), 2^(b-1) - 1]. The quantizer chooses the block scale among amax/qmax * {1, .95, .9, .85, .8}. The file
+stores the codes c = q + 2^(b-1) in two planes that csrc/skinny.cu streams. The low 4 bits are exactly like the
+nibbles of NVFP4, and the high 2 (INT6) or 1 (INT5) bits are a second plane.
 """
 from __future__ import annotations
 

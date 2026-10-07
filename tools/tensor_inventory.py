@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """tensor_inventory.py -- what is inside a safetensors checkpoint, without loading any weights.
 
-Reads only the safetensors headers. Collapses layer indices so a 64-layer model prints one row
-per distinct parameter, reports dtype / shape / count / bytes per row, totals per category
-(backbone, lm_head, embed, mtp, vision), and pairs every quantized weight with its scale
-tensors so the quantization scheme (block size, scale dtype, which modules) is explicit.
+The tool reads only the safetensors headers. It collapses the layer indices, so a 64-layer model prints one row per
+distinct parameter. It reports the dtype / shape / count / bytes per row and the totals per category (backbone,
+lm_head, embed, mtp, vision). It pairs each quantized weight with its scale tensors, so the quantization scheme (block
+size, scale dtype, which modules) is explicit.
 
 Usage:
   uv run python tools/tensor_inventory.py nvidia/Qwen3.8-27B-NVFP4          # repo id (must be in the HF cache)

@@ -1,5 +1,6 @@
 """FP8-QK causal prefill attention (csrc/attn_prefill.cu) against fp32 attention with Q rounded to e4m3 the same way
-(per (token, head) scale amax / 448), K / V the e4m3 cache values. Run: uv run pytest tests/test_attn_prefill_fp8.py -q"""
+(per (token, head) scale amax / 448), and with K / V the e4m3 cache values.
+Run: uv run pytest tests/test_attn_prefill_fp8.py -q"""
 import os
 import sys
 

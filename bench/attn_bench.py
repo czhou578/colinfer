@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Decode attention (csrc/attn_decode.cu, fp8 KV) at T = 1 / 4 / 8 query rows per slot (plain decode, k=3 and k=7
-verify): time per layer and KV read rate, cycling over several layers' caches so short contexts do not run from L2.
+verify). The bench measures the time per layer and the KV read rate. The bench cycles over the caches of several layers, so short contexts
+do not run from L2.
 
    uv run python bench/attn_bench.py [--ctx 8192 32768 131072] [--B 1 3] [--T 1 4 8]
 """

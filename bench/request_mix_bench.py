@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""End-to-end speed on the 40-request mix (docs/history/phase6_progress.md sections 16-19): the tools/drafter_data.py prompts
-(seed 1: code, prose, Q&A, structured; half with thinking on) frozen as token ids in tests/golden/prompts.json, one request
-at a time, greedy, 256 tokens. Reports completion tokens per second of wall time (prefill included) per kind, against a running
-colinfer server or an SGLang server (whose replies also give accepted tokens per verify step).
+"""End-to-end speed on the 40-request mix (docs/history/phase6_progress.md sections 16-19). The prompts are those of
+tools/drafter_data.py (seed 1: code, prose, Q&A, structured, half with thinking on), frozen as token ids in
+tests/golden/prompts.json. The bench sends one request at a time, greedy, 256 tokens. It reports the completion tokens
+per second of wall time (prefill included) per kind. It works against a running colinfer server or an SGLang server
+(whose replies also give the accepted tokens per verify step).
 
    uv run python bench/request_mix_bench.py --port 8002                  # colinfer (python -m engine.server ...)
    uv run python bench/request_mix_bench.py --port 8010 --engine sglang

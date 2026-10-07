@@ -1,17 +1,22 @@
 """Text-only Qwen3.5 / 3.6 / 3.8 family in plain PyTorch (PLAN.md Phase 1).
 
-Mirrors transformers' modeling_qwen3_5.py op for op (same dtypes, same op order) so that greedy
-generation is token-exact against the HF reference. Nothing here is fast; it is the correctness
-reference every later kernel is tested against.
+It mirrors modeling_qwen3_5.py of transformers op for op (same dtypes, same op order). Thus greedy generation is
+token-exact against the HF reference. Nothing here is fast. It is the correctness reference for the tests of each later
+kernel.
 
-Architecture (Qwen3.8-27B): 64 layers, 48 Gated DeltaNet (linear attention) + 16 gated full
-attention (GQA 24/4, head_dim 256, partial RoPE on the first 64 dims, theta 1e7), SwiGLU MLP,
-zero-centered RMSNorm (y = norm(x) * (1 + w)), untied lm_head.
+Architecture (Qwen3.8-27B):
 
-State is explicit (ModelState): per GDN layer a conv window [B, C, K-1] (bf16) and a recurrent
-state [B, Hv, dk, dv] (fp32); per attention layer a static K/V cache [B, Hkv, max_len, D] (bf16).
-Module names match the HF text model with the `model.language_model.` prefix removed, so the
-loader is a prefix strip.
+- 64 layers: 48 Gated DeltaNet (linear attention) + 16 gated full attention (GQA 24/4, head_dim 256, partial RoPE on
+  the first 64 dims, theta 1e7)
+- SwiGLU MLP, zero-centered RMSNorm (y = norm(x) * (1 + w)), untied lm_head
+
+The state is explicit (ModelState):
+
+- per GDN layer, a conv window [B, C, K-1] (bf16) and a recurrent state [B, Hv, dk, dv] (fp32)
+- per attention layer, a static K/V cache [B, Hkv, max_len, D] (bf16)
+
+The module names match the HF text model without the `model.language_model.` prefix, so the loader only strips this
+prefix.
 """
 from __future__ import annotations
 

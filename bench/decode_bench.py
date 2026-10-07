@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Decode step and speculative cycle times on the real model.
 
-Plain decode graph (T=1 per slot) at 1-3 slots, and the MTP cycle graph at widths 1-3 and draft lengths k,
-at a given context length, on the default decode weights (INT6 / INT5 copies when present; --checkpoint-weights: the
-FP8 projections). Cycles run every draft step (--early-exit: with the drafter's early exit, which the bench's dummy
-tokens would trigger on almost every step).
+The bench times the plain decode graph (T=1 per slot) at 1-3 slots. It also times the MTP cycle graph at widths 1-3
+and draft lengths k, at a given context length. It uses the default decode weights: the INT6 / INT5 copies when present, or the
+FP8 projections with --checkpoint-weights. The cycles run each draft step. With --early-exit, they use the early exit
+of the drafter, which the dummy tokens of the bench would trigger on almost every step.
 
    uv run python bench/decode_bench.py [--ctx 8192] [--ks 1 3 5 7]
 """

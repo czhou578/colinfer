@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Skinny GEMM (csrc/skinny.cu) weight-streaming rate per decode shape and format, at M = 1 / 8 / 16 rows, cycling
-over several copies of each weight so nothing runs from L2 (LPDDR5x peak ~238 GB/s).
+"""Skinny GEMM (csrc/skinny.cu) weight-streaming rate per decode shape and format, at M = 1 / 8 / 16 rows. The bench
+cycles over several copies of each weight, so nothing runs from L2 (LPDDR5x peak ~238 GB/s).
 
    uv run python bench/skinny_bench.py
 """

@@ -1,33 +1,37 @@
 """Request scheduler: up to `n_slots` concurrent requests, driven by one engine thread (engine/server/api.py).
 
-* One batched FastState holds every slot (KV cache, GDN conv / recurrent state, positions); with speculation
-  also a batched MtpState (the drafter's own KV cache).
-* Decode with MTP (the default): one CUDA graph per (contiguous slot range [lo, hi), greedy | sampled, draft length
-  k) runs a whole speculative cycle for those slots: verify, acceptance, commit, drafting (engine/spec/mtp.py).
-  Without MTP, one plain decode graph per range. A step uses the smallest range covering the decoding slots; idle
-  and prefilling slots inside it are masked off (state.active), so a step never touches them. Each cycle picks k
-  (3 or 7, when the verify rows fit one weight pass) for the most expected tokens per second given each slot's
-  running acceptance rate and the cycle times measured at startup: code and structured output draft 7, prose 3.
-  With suffix_min > 0, a slot whose history ends in a repeat of at least suffix_min tokens drafts what followed the
-  earlier occurrence instead (engine/spec/suffix.py), up to SUFFIX_K = 15 drafts when it decodes alone.
-  Greedy output does not depend on what the other slots are doing: every kernel computes a slot's rows the same way at
-  any batch width.
-* Prefill: at most one chunk per engine step on a single-slot view (engine/model/prefill.py), then one decode
-  step for the decoding slots, so a long prompt stalls the others for one chunk at a time. With MTP the
-  drafter's KV rows for the chunk are written right after it.
-* Prefix checkpoints: GDN state snapshots (conv + recurrent, 154 MB) in a ring preallocated at startup, taken
-  at prompt end, at generation end, every `ckpt_interval` prompt tokens and at two chat message boundaries
-  (`boundary_token`, <|im_start|>): the end of the first message (a shared system prompt) and the start of the
-  last message before the generation prompt (the conversation so far); prefill chunks are cut there. Attention KV is resumable at any
-  length, GDN state only where a snapshot exists. A new request restores the longest checkpoint whose tokens
-  are a proper prefix of its prompt and prefills only the rest. If that checkpoint's slot is busy, its KV
-  prefix is copied into a free slot (32 KB per token with FP8 KV), so concurrent requests that share a long
-  system prompt each pay for it once. A checkpoint is valid while its slot's token history still starts
-  with the checkpoint's tokens.
-* Finishing: stop tokens (eos_ids), max_new_tokens, the slot length, or the request's hook (stop strings,
-  client gone). The speculative cycle cuts the accepted length after a stop token on the GPU, so a slot's
-  history (`Slot.tokens`, exactly the tokens fed to the model) normally ends at the reply's last token and the
-  end-of-generation checkpoint is a prefix of the next turn's prompt.
+* State. One batched FastState holds all slots (KV cache, GDN conv / recurrent state, positions). With speculation, a
+  batched MtpState also holds the own KV cache of the drafter.
+* Decode with MTP (the default). One CUDA graph per (contiguous slot range [lo, hi), greedy | sampled, draft length k)
+  runs a full speculative cycle for those slots: verify, acceptance, commit and drafts (engine/spec/mtp.py). Without
+  MTP, each range has one plain decode graph.
+  - A step uses the smallest range that covers the decoding slots. It masks off the idle and prefilling slots inside
+    the range (state.active), so a step never touches them.
+  - Each cycle picks k (3 or 7, when the verify rows fit one weight pass) for the most expected tokens per second. It
+    uses the running acceptance rate of each slot and the cycle times measured at startup. Code and structured output
+    draft 7, and prose drafts 3.
+  - With suffix_min > 0, the history of a slot can end in a repeat of at least suffix_min tokens. Then the slot drafts
+    what followed the earlier occurrence instead (engine/spec/suffix.py), up to SUFFIX_K = 15 drafts when it decodes
+    alone.
+  - The greedy output does not depend on the other slots: each kernel computes the rows of a slot the same way at any
+    batch width.
+* Prefill. Each engine step runs at most one chunk on a single-slot view (engine/model/prefill.py), then one decode
+  step for the decoding slots. Thus a long prompt stops the other slots for one chunk at a time. With MTP, the
+  scheduler writes the KV rows of the drafter for the chunk right after the chunk.
+* Prefix checkpoints. A ring, preallocated at startup, holds GDN state snapshots (conv + recurrent, 154 MB).
+  - The scheduler takes a snapshot at the prompt end, at the generation end and every `ckpt_interval` prompt tokens.
+  - It also takes snapshots at two chat message boundaries (`boundary_token`, <|im_start|>). These are the end of the
+    first message (a shared system prompt), and the start of the last message before the generation prompt (the
+    conversation so far). Prefill chunks end there.
+  - Attention KV can resume at any length, but GDN state only where a snapshot exists. A new request restores the
+    longest checkpoint whose tokens are a proper prefix of its prompt, and prefills only the rest.
+  - If the slot of that checkpoint is busy, the scheduler copies its KV prefix into a free slot (32 KB per token with
+    FP8 KV). Thus concurrent requests that share a long system prompt each pay for it once.
+  - A checkpoint is valid while the token history of its slot still starts with the tokens of the checkpoint.
+* Finish. A request ends at a stop token (eos_ids), at max_new_tokens, at the slot length, or by its hook (stop
+  strings, client gone). The speculative cycle cuts the accepted length after a stop token on the GPU. Thus the
+  history of a slot (`Slot.tokens`, exactly the tokens fed to the model) normally ends at the last token of the reply.
+  Then the end-of-generation checkpoint is a prefix of the prompt of the next turn.
 """
 from __future__ import annotations
 

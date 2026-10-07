@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compare our model (from `tests/parity_hf.py ours --ckpt nvidia/Qwen3.8-27B-NVFP4`) against vLLM
-serving the same checkpoint (`tests/vllm_reference.py`).
+"""Compare our model (from `tests/parity_hf.py ours --ckpt nvidia/Qwen3.8-27B-NVFP4`) with vLLM, which serves the same
+checkpoint (`tests/vllm_reference.py`).
 
-KL is computed over vLLM's top-20 support: sum_t p_v(t) * (log p_v(t) - log p_ours(t)), where
-log p_ours comes from our full-vocabulary log-softmax. The probability mass vLLM puts outside its
-top 20 is reported alongside; when it is small the truncated KL is a close lower bound.
+The KL is over the top-20 support of vLLM: sum_t p_v(t) * (log p_v(t) - log p_ours(t)), where log p_ours comes from
+our full-vocabulary log-softmax. The script also reports the probability mass that vLLM puts outside its top 20. When
+this mass is small, the truncated KL is a close lower bound.
 
   uv run python tests/parity_vllm.py tests/parity_out/vllm_nvfp4.json tests/parity_out/ours_nvfp4.pt
 """

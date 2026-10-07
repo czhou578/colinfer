@@ -1,19 +1,18 @@
-"""Fake-quantization that reproduces how W4A4/W8A8 kernels (vLLM 0.25 + FlashInfer) execute the
-mixed-precision ModelOpt checkpoint, in plain PyTorch.
+"""Fake quantization in plain PyTorch. It reproduces how W4A4/W8A8 kernels (vLLM 0.25 + FlashInfer) execute the
+mixed-precision ModelOpt checkpoint.
 
-Three independently switchable effects (names used by --emulate):
-  act_nvfp4    NVFP4 activations for NVFP4 linears (MLP gate/up/down, lm_head): per 16-element block,
-               SF = e4m3(amax / 6 / input_scale), x_q = e2m1_rn(x / (SF * input_scale)); dequant
-               x_q * SF * input_scale. Matches scaled_fp4_quant / fp4_quantize with global scale
-               1 / input_scale.
-  act_fp8      FP8 e4m3 static per-tensor activations for FP8 linears (attention, GDN projections):
-               x_q = e4m3(clamp(x / input_scale, +-448)).
-  fp8_requant  vLLM fuses q/k/v and in_proj_qkv + in_proj_z; shards with different FP8 weight scales
-               are re-rounded onto the largest scale (requantize_with_max_scale).
+Three effects, each with its own switch (the names that --emulate uses):
 
-NVFP4 and FP8 layers are computed in factored form like the real kernels: the unscaled operands
-(e2m1 * block scale, or e4m3 values) are exact in BF16; the per-tensor scales are applied after
-the matmul.
+- act_nvfp4: NVFP4 activations for NVFP4 linears (MLP gate/up/down, lm_head). Per 16-element block:
+  SF = e4m3(amax / 6 / input_scale) and x_q = e2m1_rn(x / (SF * input_scale)). The dequant is x_q * SF * input_scale.
+  This matches scaled_fp4_quant / fp4_quantize with the global scale 1 / input_scale.
+- act_fp8: FP8 e4m3 static per-tensor activations for FP8 linears (attention, GDN projections):
+  x_q = e4m3(clamp(x / input_scale, +-448)).
+- fp8_requant: vLLM fuses q/k/v and in_proj_qkv + in_proj_z. It rounds the shards with different FP8 weight scales
+  again, onto the largest scale (requantize_with_max_scale).
+
+The emulation computes NVFP4 and FP8 layers in factored form, like the real kernels. The unscaled operands (e2m1 *
+block scale, or e4m3 values) are exact in BF16. The per-tensor scales apply after the matmul.
 """
 from __future__ import annotations
 

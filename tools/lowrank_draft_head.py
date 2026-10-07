@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Low-rank draft head (docs/history/phase6_progress.md section 19): the PCA basis of the MTP drafter's normed outputs.
+"""Low-rank draft head (docs/history/phase6_progress.md section 19): the PCA basis of the normed outputs of the MTP
+drafter.
 
-The draft lm head (64k static + 4k prompt rows, NVFP4, ~200 MB) is streamed once per draft step. Its argmax is
-nearly always among the top few candidates of the rank-r approximation  g U (W U)^T  with U the top-r principal
-directions of the drafter outputs g, so the engine scores the approximation (U^T: r x 5120, W U: V x r, NVFP4) and
-rescores the top candidates exactly against the real rows (engine/spec/mtp.py).
+The engine streams the draft lm head (64k static + 4k prompt rows, NVFP4, ~200 MB) once per draft step. Its argmax is
+almost always among the top few candidates of the rank-r approximation g U (W U)^T. U holds the top-r principal
+directions of the drafter outputs g. Thus the engine scores the approximation (U^T: r x 5120, W U: V x r, NVFP4). Then
+it rescores the top candidates exactly against the real rows (engine/spec/mtp.py).
 
-Collects g from real greedy k=7 cycles (tools/drafter_data.py prompts, a seed the evals do not use), fits U on two
-thirds, reports how often the full head's argmax is in the approximation's top K on the rest, and saves U.
+The tool collects g from real greedy k=7 cycles (tools/drafter_data.py prompts, with a seed that the evals do not use).
+It fits U on two thirds and saves U. On the rest, it reports how often the argmax of the full head is in the top K
+of the approximation.
 
    uv run python tools/lowrank_draft_head.py [--n 40] [--rank 1024] [--weights auto]
 """

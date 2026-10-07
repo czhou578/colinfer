@@ -1,15 +1,16 @@
 """Sampling that speculative decoding reproduces exactly (PLAN.md 4.5, Phase 4 week 14 / Phase 5).
 
-Every token is drawn by inverse CDF from the target's processed distribution p_t (temperature -> min-p -> top-k ->
-top-p, exactly what plain sampling uses) with a uniform keyed by (seed, position t). Verification samples the
-target at every verified row with the uniforms of those rows' positions and accepts the leading drafts that equal
-those samples; the first mismatch is replaced by the target's sample, and if every draft matches the last row's
-sample is the bonus token. The emitted sequence is therefore exactly the sequence plain sampling would produce
-(same seed, same logits), whatever the draft length, the batch width or the drafter.
+The engine draws each token by inverse CDF from the processed distribution p_t of the target (temperature -> min-p ->
+top-k -> top-p, exactly what plain sampling uses). It uses a uniform keyed by (seed, position t).
 
-With a deterministic drafter (the MTP argmax), the chance of accepting draft d is P(x_t = d) = p_t(d), the same
-acceptance rate as speculative rejection sampling (Leviathan et al. 2023) with a point-mass proposal, whose
-correction distribution normalize(p_t with d removed) is exactly the law of x_t given x_t != d.
+The verify samples the target at each verified row, with the uniforms of the positions of those rows. It accepts the
+leading drafts that are equal to those samples. The sample of the target replaces the first mismatch. If all drafts
+match, the sample of the last row is the bonus token. Thus the emitted sequence is exactly the sequence that plain
+sampling would give (same seed, same logits). The draft length, the batch width and the drafter do not change it.
+
+With a deterministic drafter (the MTP argmax), the chance to accept draft d is P(x_t = d) = p_t(d). This is the same
+acceptance rate as speculative rejection sampling (Leviathan et al. 2023) with a point-mass proposal. Its correction
+distribution normalize(p_t with d removed) is exactly the law of x_t given x_t != d.
 Everything runs on the device (graph-capturable).
 """
 from __future__ import annotations

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""vLLM side of the quantized-path parity check (PLAN.md 4.7b). Runs in the vLLM 0.25.1 venv,
-NOT the engine venv, and imports nothing from engine/.
+"""vLLM side of the quantized-path parity check (PLAN.md 4.7b). It runs in the vLLM 0.25.1 venv, NOT in the
+engine venv, and it imports nothing from engine/.
 
   VLLM_USE_FASTOKENS=0 ~/Projects/model-benchmarks/.venv/bin/python tests/vllm_reference.py \
       --ckpt nvidia/Qwen3.8-27B-NVFP4 --out tests/parity_out/vllm_nvfp4.json
 
-Writes JSON with, per prompt: input ids, greedy tokens (128), and the top-20 logprobs of the first
-32 steps; plus WikiText perplexity from prompt logprobs over the same windows as tests/perplexity.py.
+It writes JSON with these items per prompt: the input ids, the greedy tokens (128), and the top-20 logprobs of the
+first 32 steps. It also writes the WikiText perplexity from the prompt logprobs, over the same windows as
+tests/perplexity.py.
 """
 import argparse
 import glob

@@ -1,9 +1,9 @@
-"""Force transformers' Qwen3.5 linear-attention functions back to their PyTorch reference paths.
+"""Force the Qwen3.5 linear-attention functions of transformers back to their PyTorch reference paths.
 
-transformers swaps in flash-linear-attention / causal-conv1d kernels at import time when those
-packages are installed (the engine does not depend on them, but an environment may have them). The
-Phase 1 parity results were taken against the PyTorch paths (bit-exact), and FLA's Triton kernels do
-not run on the CPU, so the reference side of every comparison calls this first.
+At import time, transformers swaps in flash-linear-attention / causal-conv1d kernels when those packages are present.
+(The engine does not depend on them, but an environment can have them.) The Phase 1 parity results used the PyTorch
+paths (bit-exact), and the Triton kernels of FLA do not run on the CPU. Thus the reference side of each comparison
+calls this first.
 """
 
 

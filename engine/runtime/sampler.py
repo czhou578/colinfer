@@ -1,15 +1,15 @@
 """In-graph sampler (PLAN.md 4.3 item 7): greedy / temperature / min-p / top-k / top-p per slot.
 
-All parameters live in per-slot device buffers so the sampler is captured inside the decode CUDA graph; the host
-only rewrites the buffers when a slot's request changes.
+All parameters are in per-slot device buffers, so the decode CUDA graph can capture the sampler. The host rewrites the
+buffers only when the request of a slot changes.
 
-Randomness is keyed by position: the token at absolute position t of a request is drawn by inverse CDF from the
-processed distribution with one uniform u = Philox(seed, counter t) (csrc/sampling.cu). So a request's tokens
-depend only on (seed, prompt), never on what else runs in the batch, and speculative decoding reproduces plain
+The position keys the randomness. The sampler draws the token at absolute position t of a request by inverse CDF from
+the processed distribution. It uses one uniform u = Philox(seed, counter t) (csrc/sampling.cu). Thus the tokens of a
+request depend only on (seed, prompt), never on the other requests in the batch. Speculative decoding reproduces plain
 sampling token for token (engine/spec/accept.py).
 
 Order (as in vLLM / HF): temperature -> min-p (relative to the top token) -> top-k -> top-p -> sample.
-temperature == 0 selects the argmax for that slot regardless of the other parameters.
+temperature == 0 selects the argmax for that slot, whatever the other parameters are.
 """
 from __future__ import annotations
 

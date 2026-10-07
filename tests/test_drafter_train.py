@@ -1,8 +1,8 @@
 """tools/train_drafter.py: the training-time-test unroll must compute exactly what chained drafting computes.
 
-On a tiny random MTP head (CPU), depth 1 is the teacher-forced pass and depth s at row i must equal running the
-reference decoder layer incrementally: catch-up rows 0..p with the target hidden states into a KV cache, then s-1
-chain steps that feed the head its own normed output (p = i - s + 1).
+The test uses a tiny random MTP head (CPU). Depth 1 is the teacher-forced pass. Depth s at row i must equal an
+incremental run of the reference decoder layer. This run has catch-up rows 0..p with the target hidden states into a KV
+cache, then s-1 chain steps that feed the head its own normed output (p = i - s + 1).
 """
 import os
 import sys

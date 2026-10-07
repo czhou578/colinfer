@@ -1,14 +1,15 @@
 """Chat formatting and output parsing for the OpenAI-compatible server (PLAN.md 4.6).
 
-* Prompt: the checkpoint's own Jinja chat template via `tokenizer.apply_chat_template` (tools, enable_thinking,
-  reasoning_effort and any other chat_template_kwargs pass straight through). OpenAI-style assistant
-  tool_calls (arguments as a JSON string) are converted to the mapping the template iterates over.
-* Output: tokens are split into reasoning / content / tool calls at the token level (`<think>`, `</think>`,
-  `<tool_call>`, `</tool_call>` are single tokens in this vocabulary), each stream detokenized incrementally.
-  Tool calls use Qwen's XML form (<function=name><parameter=p>value</parameter></function>), converted to
-  OpenAI tool_calls with values typed by the request's JSON schema (as vLLM's qwen3_xml parser does).
-* Stop strings are matched on the decoded text of each stream; text that might be the start of a stop string
-  is held back until it is known not to be.
+* Prompt: the own Jinja chat template of the checkpoint, via `tokenizer.apply_chat_template`. tools, enable_thinking,
+  reasoning_effort and any other chat_template_kwargs pass straight through. OpenAI-style assistant tool_calls
+  (arguments as a JSON string) become the mapping that the template iterates over.
+* Output: the parser splits the tokens into reasoning / content / tool calls at the token level. (`<think>`,
+  `</think>`, `<tool_call>` and `</tool_call>` are single tokens in this vocabulary.) It detokenizes each stream
+  incrementally. Tool calls use the XML form of Qwen (<function=name><parameter=p>value</parameter></function>).
+  The parser converts them to OpenAI tool_calls, and the JSON schema of the request sets the types of the values (as
+  the qwen3_xml parser of vLLM does).
+* Stop strings: the parser matches them on the decoded text of each stream. It holds back text that can be the start
+  of a stop string until it knows that it is not.
 """
 from __future__ import annotations
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Model parity harness (PLAN.md 4.7): greedy generation on 30 fixed prompts x N tokens, our
-plain-PyTorch model vs HF transformers BF16, token-exact plus logit agreement on the first steps.
+"""Model parity harness (PLAN.md 4.7): greedy generation on 30 fixed prompts x N tokens. It compares our plain-PyTorch
+model with HF transformers BF16: token-exact, plus the logit agreement on the first steps.
 
-The two models do not fit on the GPU together with headroom, so each side runs in its own process
-and writes a .pt file; `compare` reads both.
+The two models do not fit on the GPU together with headroom. Thus each side runs in its own process and writes a .pt
+file, and `compare` reads both.
 
   uv run python tests/parity_hf.py ref  --ckpt Qwen/Qwen3.8-27B --out tests/parity_out/hf_bf16.pt
   uv run python tests/parity_hf.py ours --ckpt Qwen/Qwen3.8-27B --out tests/parity_out/ours_bf16.pt

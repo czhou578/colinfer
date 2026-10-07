@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Golden-output check: the engine in its server configuration (INT6 / INT5 decode copies and the drafter files when
-present, MTP speculation with suffix-match drafts, 3 slots) on a fixed request set must reproduce recorded tokens and
-per-token logprobs exactly.
+"""Golden-output check. The engine in its server configuration must reproduce the recorded tokens and per-token
+logprobs of a fixed request set exactly. The server configuration is: INT6 / INT5 decode copies and the drafter files
+when present, MTP speculation with suffix-match drafts, 3 slots.
 
-Requests (all submitted at once, so they also run batched): the first 16 prompts of the 40-prompt mix greedy for up to
-128 tokens; 4 of them sampled (temperature 0.8, top-p 0.95, top-k 20, fixed seeds) for 64 tokens; a 20,000-token WikiText
-prompt greedy for 32 tokens (FP8 prefill attention past 16k, the drafter's long prefill, decode at depth). Each output
-token's logprob is compared bit for bit: it depends on all 248k logits, so any numeric change shows up even when the
-tokens do not change.
+The requests, all submitted at once (so they also run batched):
 
-The prompts are token ids frozen in tests/golden/prompts.json (also read by bench/perf.py and
-bench/request_mix_bench.py): tools/drafter_data.py builds its code prompts from the Python files installed in
-site-packages, so regenerating them in a different environment gives different prompts.
+- the first 16 prompts of the 40-prompt mix, greedy, for up to 128 tokens
+- 4 of them sampled (temperature 0.8, top-p 0.95, top-k 20, fixed seeds), for 64 tokens
+- a 20,000-token WikiText prompt, greedy, for 32 tokens (FP8 prefill attention past 16k, the long prefill of the
+  drafter, decode at depth)
+
+The check compares the logprob of each output token bit for bit. The logprob depends on all 248k logits, so any
+numeric change shows up, even when the tokens do not change.
+
+The prompts are token ids, frozen in tests/golden/prompts.json (bench/perf.py and bench/request_mix_bench.py also read
+them). tools/drafter_data.py builds its code prompts from the Python files installed in site-packages. Thus a new
+generation in a different environment gives different prompts.
 
    uv run python tests/golden.py record          # writes tests/golden/outputs.json
    uv run python tests/golden.py check             # MTP speculation with suffix-match drafts (the default server)

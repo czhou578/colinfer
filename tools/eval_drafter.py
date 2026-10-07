@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Drafter acceptance on fresh prompts (tools/drafter_data.py's mix with another seed), greedy, through the engine's
-real speculative cycle (engine/spec/mtp.py MtpGenerator): accepted drafts per drafted and tokens per cycle, per kind.
-Compares the checkpoint's MTP head with fine-tuned ones (tools/train_drafter.py). Timing-free, so it can share the GPU.
+"""Drafter acceptance on fresh prompts (the mix of tools/drafter_data.py with another seed), greedy, through the real
+speculative cycle of the engine (engine/spec/mtp.py MtpGenerator, fixed k). It reports the share of accepted drafts and
+the tokens per cycle, per kind. It compares the MTP head of the checkpoint with fine-tuned ones
+(tools/train_drafter.py). It measures no time, so it can share the GPU.
 
    uv run python tools/eval_drafter.py [--weights a.safetensors b.safetensors] [--n 40] [--k 3 7]
 """

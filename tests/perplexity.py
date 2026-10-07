@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Perplexity on the WikiText test set (PLAN.md 4.7), per weight configuration.
 
-Uses the cached Salesforce/wikitext wikitext-103-raw-v1 test split (identical to WikiText-2's test
-set). Text is joined with "\\n\\n" as in the HF perplexity guide, tokenized with the checkpoint's
-tokenizer, and scored in non-overlapping windows of --ctx tokens, each from a fresh state. Every
-token but the first of each window is scored.
+It uses the cached Salesforce/wikitext wikitext-103-raw-v1 test split (identical to the test set of WikiText-2). The
+script joins the text with "\\n\\n" as in the HF perplexity guide, and tokenizes it with the tokenizer of the
+checkpoint. It scores the text in non-overlapping windows of --ctx tokens, each from a fresh state. It scores each
+token except the first of each window.
 
   uv run python tests/perplexity.py --ckpt Qwen/Qwen3.8-27B                # BF16
   uv run python tests/perplexity.py --ckpt Qwen/Qwen3.8-27B-FP8            # FP8 dequantized to BF16

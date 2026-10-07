@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Fine-tune the checkpoint's MTP head as a multi-step drafter (docs/history/phase6_progress.md sections 7, 12, 13).
+"""Fine-tune the MTP head of the checkpoint as a multi-step drafter (docs/history/phase6_progress.md sections 7, 12,
+13).
 
-The MTP head ships trained for one step: (embedding of x_{i+1}, target hidden h_i) -> x_{i+2}. The engine chains it
-(engine/spec/mtp.py): step s feeds the head its own previous output instead of a target hidden state, so drafts 2..k
-see inputs the head never trained on, and acceptance falls with depth (prose: ~0.45 per token). This tool fine-tunes it
-the way EAGLE-3 trains its drafter ("training-time test"): every training row is unrolled to depth D exactly as
-drafting runs, on the target model's own replies (tools/drafter_data.py).
+The MTP head ships with training for one step: (embedding of x_{i+1}, target hidden h_i) -> x_{i+2}. The engine chains
+it (engine/spec/mtp.py): step s feeds the head its own previous output instead of a target hidden state. Thus drafts
+2..k see inputs that the head never trained on, and the acceptance falls with depth (prose: ~0.45 per token).
+
+This tool fine-tunes the head the way EAGLE-3 trains its drafter ("training-time test"). It unrolls each training row
+to depth D exactly as the draft steps run, on the own replies of the target model (tools/drafter_data.py).
 
 Depth s, row i (the draft for x_{i+2} made s-1 chain steps after a catch-up row at p = i - s + 1):
     input   token x_{i+1}, hidden = target h_i (s = 1) or the head's own normed output of depth s-1 at row i-1
@@ -13,7 +15,8 @@ Depth s, row i (the draft for x_{i+2} made s-1 chain steps after a catch-up row 
             for t = 2..s (the chain's own earlier steps), exactly the MTP KV cache at inference
     target  the target model's next-token distribution at position i+1 (top-32, restricted to the 64k draft vocabulary
             the engine drafts from), soft cross-entropy
-Rows are scored only where x_{i+2} lies in the reply. The embedding and lm_head stay frozen (shared with the target).
+The loss counts a row only where x_{i+2} is in the reply. The embedding and lm_head stay frozen (shared with the
+target).
 
    uv run python tools/train_drafter.py --extract      # target hidden states + top-k distributions (once per --data file)
    uv run python tools/train_drafter.py --train        # fine-tune; writes ~/.cache/colinfer/drafter/mtp_ft.safetensors

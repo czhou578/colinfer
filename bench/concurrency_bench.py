@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Per-request and aggregate decode speed at 1..N concurrent streams against a running server.
+"""Per-request and aggregate decode speed at 1..N concurrent streams, against a running server.
 
    uv run python bench/concurrency_bench.py --url http://127.0.0.1:8001 [--levels 1 2 3] [--max-tokens 256]
 
-Each stream gets a different prompt (code, JSON, prose mix), greedy, thinking off; requests of a level start
-together. Decode tok/s per request = (completion_tokens - 1) / (t_done - t_first) from the server's timings.
+Each stream gets a different prompt (a mix of code, JSON and prose), greedy, with thinking off. The requests of a level
+start together. Decode tok/s per request = (completion_tokens - 1) / (t_done - t_first), from the timings of the
+server.
 """
 import argparse
 import concurrent.futures as cf

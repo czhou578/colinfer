@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """trace_summary.py -- summarize an nsys trace of decode steps (bench/traces/*.sqlite).
 
-Splits the kernel timeline into steps at the lm_head GEMV (the one fp32-output NVFP4 GEMV), then
-reports per step: wall span, busy time (union of kernel intervals), idle gaps, and the per-kernel
-time breakdown of the median step.
+The script splits the kernel timeline into steps at the lm_head GEMV (the one fp32-output NVFP4 GEMV). Then it reports
+these values per step: the wall span, the busy time (the union of the kernel intervals) and the idle gaps. It also
+reports the per-kernel time breakdown of the median step.
 
   nsys profile --cuda-graph-trace=node --trace=cuda -o bench/traces/X python bench/decode_bench.py ...
   nsys export --type sqlite bench/traces/X.nsys-rep   (nsys stats does this implicitly)

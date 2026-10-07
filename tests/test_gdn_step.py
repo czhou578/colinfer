@@ -1,6 +1,6 @@
 """The GDN decode step (csrc/gdn_step.cu: gdn_conv + gdn_conv_commit + gdn_delta, T = 1) against the reference PyTorch
-GatedDeltaNet (engine/model/qwen35.py) on an existing state, at Qwen3.8-27B dimensions; inactive slots keep their state.
-Run: uv run pytest tests/test_gdn_step.py -q"""
+GatedDeltaNet (engine/model/qwen35.py), on an existing state, at Qwen3.8-27B dimensions. Inactive slots keep their
+state. Run: uv run pytest tests/test_gdn_step.py -q"""
 import os
 import sys
 

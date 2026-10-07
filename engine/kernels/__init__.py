@@ -1,5 +1,5 @@
-"""Builds and loads the CUDA decode kernels in csrc/ (JIT via torch.utils.cpp_extension + ninja,
-cached under build/torch_ext; rebuilt automatically when a source changes)."""
+"""Builds and loads the CUDA decode kernels in csrc/. The build is a JIT build (torch.utils.cpp_extension + ninja),
+cached under build/torch_ext. It runs again automatically when a source changes."""
 import os
 
 _HERE = os.path.dirname(os.path.abspath(__file__))

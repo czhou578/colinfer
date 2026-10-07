@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Repeatable performance baseline of the engine in its server configuration (3 slots x 262,144 tokens, 32 prefix
-checkpoints, INT6 / INT5 decode copies and the drafter files when present, suffix-match drafts), in-process, no HTTP.
+"""Repeatable performance baseline of the engine in its server configuration, in-process, with no HTTP. The server
+configuration is 3 slots x 262,144 tokens, 32 prefix checkpoints, INT6 / INT5 decode copies and the drafter files when
+present, and suffix-match drafts.
 
   prefill   random-token prompts of 2k / 8k / 32k tokens, one token out: TTFT (submit -> first token) and prefill tok/s
   decode    12 chat prompts of the frozen 40-prompt mix (3 per kind), one at a time, 256 tokens greedy, MTP:
             per-request decode tok/s = (tokens - 1) / (last token - first token), and their TTFT
   plain     4 of those prompts, 128 tokens, without speculation (a 1-slot scheduler built after the first is freed)
 
-Each section runs --warmup untimed rounds, then --runs timed ones; the report gives mean, std, min and max over the timed
-rounds. Every round uses fresh prompts or a fresh cache_salt, so prefix checkpoints never shorten a prefill.
+Each section runs --warmup untimed rounds, then --runs timed rounds. The report gives the mean, std, min and max over
+the timed rounds. Each round uses fresh prompts or a fresh cache_salt, so prefix checkpoints never shorten a prefill.
 
-Memory, three ways, because on GB10's unified memory nvidia-smi reports no per-process GPU memory:
+Memory, measured three ways, because nvidia-smi reports no per-process GPU memory on the unified memory of GB10:
   torch     the caching allocator's peak (torch.cuda.max_memory_allocated / _reserved)
   system    MemTotal - min(MemAvailable) over the run, minus the same before the model loaded (/proc/meminfo, sampled 2 Hz)
   rss       the process's peak resident set (VmHWM in /proc/self/status; GPU allocations do not show up there)
-GPU temperature, SM clock and power are sampled alongside (nvidia-smi), to spot thermal throttling between rounds.
+The bench also samples the GPU temperature, SM clock and power (nvidia-smi), to find thermal throttling between rounds.
 
    uv run python bench/perf.py [--runs 3] [--warmup 1] [--suffix N] [--json out.json]
 """

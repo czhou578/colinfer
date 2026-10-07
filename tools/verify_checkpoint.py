@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""verify_checkpoint.py -- check every safetensors shard of a cached Hub checkpoint against its
-published checksum: the repo's crc32.txt when it ships one, otherwise the Hub's LFS sha256.
+"""verify_checkpoint.py -- check each safetensors shard of a cached Hub checkpoint against its published checksum. This is
+the crc32.txt of the repo when it has one, else the LFS sha256 of the Hub.
 
 Usage: uv run python tools/verify_checkpoint.py <repo id> [<repo id> ...]
-Exit status is non-zero if any shard is missing or mismatched.
+The exit status is non-zero if a shard is missing or does not match.
 """
 import hashlib
 import os

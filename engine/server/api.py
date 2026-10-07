@@ -2,14 +2,16 @@
 
     uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 262144] [--spec mtp|none]
 
-Endpoints: /v1/chat/completions and /v1/completions (SSE streaming, usage + timings, logprobs, stop strings,
-seeds, tools, thinking), /v1/models, /health, /metrics (Prometheus), /v1/status (slots and checkpoints).
+Endpoints: /v1/chat/completions and /v1/completions (SSE streaming, usage + timings, logprobs, stop strings, seeds,
+tools, thinking), /v1/models, /health, /metrics (Prometheus), /v1/status (slots and checkpoints).
 
-One engine thread owns the GPU: it loads the model, captures the CUDA graphs and then runs Scheduler.step()
-in a loop. HTTP handlers (asyncio, uvicorn) render the chat template and tokenize off the event loop, hand the
-request to the engine thread through a queue, and receive output events back through an asyncio queue: the
-engine thread detokenizes and parses each token as it is emitted (engine/server/chat.py), so stop strings end
-a request in the same step that produced them. More than `--slots` concurrent requests wait in a FIFO queue.
+One engine thread owns the GPU. It loads the model, captures the CUDA graphs, and then runs Scheduler.step() in a loop.
+The HTTP handlers (asyncio, uvicorn) render the chat template and tokenize outside the event loop. They give the
+request to the engine thread through a queue, and get the output events back through an asyncio queue.
+
+The engine thread detokenizes and parses each token as it emits it (engine/server/chat.py). Thus a stop string ends a
+request in the same step that produced it. When more than `--slots` requests are active, the others wait in a FIFO
+queue.
 """
 from __future__ import annotations
 

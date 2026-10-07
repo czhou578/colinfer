@@ -1,29 +1,32 @@
-"""MTP drafter: the checkpoint's multi-token-prediction block (one gated full-attention decoder layer + fc, BF16 in the
-checkpoint) run once per draft, with its own fp8 KV cache. Optionally fine-tuned weights replace it
-(tools/train_drafter.py; the server's --drafter-weights auto picks ~/.cache/colinfer/drafter/mtp_ft.safetensors).
+"""MTP drafter: the multi-token-prediction block of the checkpoint (one gated full-attention decoder layer + fc, BF16 in
+the checkpoint). It runs once per draft, with its own fp8 KV cache. Fine-tuned weights can replace it
+(tools/train_drafter.py). The --drafter-weights auto option of the server picks
+~/.cache/colinfer/drafter/mtp_ft.safetensors.
 
-Row semantics (as vLLM's Qwen3_5MTP / EAGLE proposer): the MTP row at position i takes (embed(x_{i+1}), h_i), where h_i is
-the target's post-final-norm hidden state at position i, and predicts x_{i+2}:
+Row semantics (as the Qwen3_5MTP / EAGLE proposer of vLLM): the MTP row at position i takes (embed(x_{i+1}), h_i). h_i
+is the post-final-norm hidden state of the target at position i, and the row predicts x_{i+2}:
     x = fc([pre_fc_norm_embedding(embed(x_{i+1})), pre_fc_norm_hidden(h_i)]) -> decoder layer -> mtp.norm -> draft head.
-Chained steps feed the MTP's own normed output as the next hidden.
+Chained steps feed the own normed output of the MTP as the next hidden.
 
-Cost per draft step (the drafter is re-streamed every step, so its bytes are cycle time):
-  * its linears run on NVFP4 copies (round-to-nearest from BF16) on the skinny GEMM;
-  * the draft head scores DRAFT_VOCAB frequent tokens (engine/spec/draft_vocab.npy) plus up to PROMPT_SLOTS tokens of the
-    current prompts, not the 248k vocabulary;
-  * with ~/.cache/colinfer/drafter/draft_head_pca.safetensors (tools/lowrank_draft_head.py) the head is a rank-1024
-    approximation whose top LOWRANK_CANDS candidates are rescored exactly: the same drafts for ~1/5 of the bytes.
-None of this affects outputs, only how many drafts are accepted.
+The cost per draft step (the engine streams the drafter again at each step, so its bytes are cycle time):
+  * Its linears run on NVFP4 copies (round-to-nearest from BF16) on the skinny GEMM.
+  * The draft head scores DRAFT_VOCAB frequent tokens (engine/spec/draft_vocab.npy) plus up to PROMPT_SLOTS tokens of
+    the current prompts. It does not score the 248k vocabulary.
+  * With ~/.cache/colinfer/drafter/draft_head_pca.safetensors (tools/lowrank_draft_head.py), the head is a rank-1024
+    approximation. The engine rescores its top LOWRANK_CANDS candidates exactly. This gives the same drafts for ~1/5 of
+    the bytes.
+None of this changes the outputs, only how many drafts the verify accepts.
 
 MtpCycle captures one CUDA graph per speculative cycle for B slots (k drafts each):
-  1. verify [y, d1..dk] of every slot on the target (hidden states kept); accept the leading drafts that equal the
-     target's argmax, or its position-keyed sample for slots with temperature > 0 (engine/spec/accept.py), so the output
-     is exactly what plain decoding would emit; the accepted length is cut after the first accepted stop token, so the
-     state never runs past the end of a reply; commit n[b] tokens per slot (0 for inactive slots) on a parallel branch;
-  2. MTP catch-up: rows for the newly committed positions with the true target hidden states; the last valid row yields
-     the next d1;
-  3. k-1 chained MTP steps yield d2..dk, stopping early (DRAFT_STOP) once the drafts are unlikely to be accepted; the
-     next cycle's input [y', d1'..dk'] is written in place.
+  1. Verify [y, d1..dk] of each slot on the target, and keep the hidden states. Accept the leading drafts that are
+     equal to the argmax of the target, or to its position-keyed sample for slots with temperature > 0
+     (engine/spec/accept.py). Thus the output is exactly what plain decoding would emit. Cut the accepted length after
+     the first accepted stop token, so the state never goes past the end of a reply. Commit n[b] tokens per slot (0
+     for inactive slots) on a parallel branch.
+  2. MTP catch-up: rows for the newly committed positions, with the true hidden states of the target. The last valid
+     row gives the next d1.
+  3. k-1 chained MTP steps give d2..dk. They stop early (DRAFT_STOP) when the verify is unlikely to accept the drafts.
+     Then the cycle writes the input of the next cycle [y', d1'..dk'] in place.
 """
 from __future__ import annotations
 
