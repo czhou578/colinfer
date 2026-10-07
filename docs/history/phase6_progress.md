@@ -984,6 +984,40 @@ The 40 requests of section 16 (server defaults, tok/s, `bench/request_mix_bench.
 - For the MLP (60% of the bytes), this layout needs a second copy of the weights (+9.6 GB), because the CUTLASS prefill
   reads the checkpoint layout. We did not continue.
 
+## 20. Sliding-window drafter attention: measured, not kept (2026-10-07)
+
+At 128k context, a k=7 cycle takes 111.6 ms, against 85.7 ms at 8k. Of the 25 ms difference, ~8.8 ms is the drafter:
+each of its 7 draft steps reads its own full KV cache. A sliding window would read only the newest positions of that
+cache.
+
+**Prototype.** A WIN variant of the decode attention kernel (`csrc/attn_decode.cu`) attended only the first 32 positions
+of a slot and its last W positions. The first 32 are the attention sinks. It skipped the tiles between them. Only the
+attention module of the drafter used the variant, so the outputs could not change. They did not: the outputs were
+identical on all prompts at each setting.
+
+**Speed.** A k=7 cycle at 128k: 111.6 → 103.0 ms with W = 4096 (-8%). A k=3 cycle: 99.4 → 96.0 ms.
+
+**Acceptance.** Three long prompts, 256 tokens, greedy, the server configuration (suffix-match drafts on). Decode tok/s,
+with the tokens per cycle in parentheses:
+
+| Prompt | No window | W = 1024 | W = 4096 | W = 16384 | W = 4096, chain steps only |
+|---|---|---|---|---|---|
+| WikiText article, summary (20k tokens) | 38.1 (3.40) | 29.9 (2.60) | 29.7 (2.60) | 33.1 (2.93) | 33.4 (2.93) |
+| engine source, code edit (56k tokens) | 44.2 (4.32) | 38.5 (3.59) | 38.5 (3.59) | 41.3 (3.92) | 39.6 (3.86) |
+| csrc/ + docs, list the kernels (145k tokens) | 58.5 (7.03) | 37.7 (4.02) | 37.8 (4.02) | 39.3 (4.25) | 43.1 (4.69) |
+
+- The drafter uses distant context. A summary refers to the start of the article, and a code rewrite to a method 25k
+  tokens earlier. A list refers to files in the middle of the prompt. Even a 16k window on the 20k prompt costs 14% of
+  the tokens per cycle.
+- Without the sinks, the results were about the same (W = 16384 on the 20k prompt: 2.93 tokens per cycle with and
+  without them).
+- In the last column, only the six chained one-row draft steps use the window. The catch-up row, which makes d1, keeps
+  the full context. The k=7 cycle at 128k takes 103.8 ms, but the loss is still 10-26%.
+
+**Conclusion.** For each window size, the acceptance loss is larger than the time saved. We reverted the prototype. To
+decrease the long-context cost of the drafter, keep its full context and decrease its bytes instead, for example with a
+4-bit drafter KV cache.
+
 ## Next
 
 Where the 85 ms of a k=7 cycle go now (`bench/traces/cycle_k7_8k_v3`):

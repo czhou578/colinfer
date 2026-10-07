@@ -15,4 +15,4 @@ measurement rejected. On 2026-10-07, we edited the language of the Markdown logs
 | `phase3_progress.md` | 2026-10-03 | the tensor-core prefill path |
 | `phase4_results.md` | 2026-10-03 | speculative decoding (n-gram, then the MTP head) |
 | `results.md` | 2026-10-04 | Phase 5: the server as a daily driver, against vLLM and SGLang |
-| `phase6_progress.md` | 2026-10-04 to 06 | Phase 6, sections 1-19: skinny GEMM, INT decode copies, decode attention, drafter work, GDN kernels, early exit, low-rank draft head |
+| `phase6_progress.md` | 2026-10-04 to 07 | Phase 6, sections 1-20: skinny GEMM, INT decode copies, decode attention, drafter work, GDN kernels, early exit, low-rank draft head, the sliding-window drafter (not kept) |
