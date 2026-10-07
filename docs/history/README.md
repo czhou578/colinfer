@@ -1,12 +1,13 @@
 # Project history
 
-Dated logs and raw measurements, kept as written. They describe the engine as it was at each date, including paths and
-switches that have since been removed (the alternatives each measurement rejected were deleted on 2026-10-06); the
-current design is in `docs/architecture.md`.
+These files are the dated logs and raw measurements of the project. They describe the engine as it was at each date,
+with paths and switches that the project removed later. On 2026-10-06, the project deleted the alternatives that each
+measurement rejected. On 2026-10-07, we edited the language of the Markdown logs to ASD-STE100 style. Their facts did not change.
+`docs/architecture.md` describes the current design.
 
 | File | Date | Contents |
 |---|---|---|
-| `baseline.md`, `baselines_2026-10-03.md` | 2026-10-02/03 | Phase 0: the chip's bandwidth and GEMM ceilings, vLLM / SGLang baselines, the frozen targets |
+| `baseline.md`, `baselines_2026-10-03.md` | 2026-10-02/03 | Phase 0: the bandwidth and GEMM ceilings of the chip, vLLM / SGLang baselines, the frozen targets |
 | `gemm_peak_2026-10-02.txt`, `gemv_bench_2026-10-03.txt` | 2026-10-02/03 | raw GEMM-ceiling and GEMV benchmark output |
 | `bf16_inventory.txt`, `fp8_inventory.txt`, `nvfp4_inventory.txt` | 2026-10-03 | tensor inventories of the three checkpoints (`tools/tensor_inventory.py`) |
 | `phase1_results.md` | 2026-10-03 | the PyTorch reference model: parity with transformers and vLLM, perplexity per checkpoint |
