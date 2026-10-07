@@ -16,7 +16,7 @@ Memory, three ways, because on GB10's unified memory nvidia-smi reports no per-p
   rss       the process's peak resident set (VmHWM in /proc/self/status; GPU allocations do not show up there)
 GPU temperature, SM clock and power are sampled alongside (nvidia-smi), to spot thermal throttling between rounds.
 
-   uv run python bench/perf.py [--runs 3] [--warmup 1] [--json out.json]
+   uv run python bench/perf.py [--runs 3] [--warmup 1] [--suffix N] [--json out.json]
 """
 import argparse
 import gc
@@ -127,6 +127,7 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--lens", type=int, nargs="+", default=[2048, 8192, 32768])
+    ap.add_argument("--suffix", type=int, default=0, help="suffix-match drafts of at least N tokens (the server's --suffix-drafts)")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     avail0, total = meminfo_kb("MemAvailable"), meminfo_kb("MemTotal")
@@ -136,7 +137,7 @@ def main():
                                                                             capture_output=True, text=True).stdout.strip())
     with torch.inference_mode():
         t0 = time.perf_counter()
-        path, sched = build_engine(spec=True, slots=3, max_seq_len=262144, checkpoints=32)
+        path, sched = build_engine(spec=True, slots=3, max_seq_len=262144, checkpoints=32, suffix_min=a.suffix)
         res["startup_s"] = time.perf_counter() - t0
         prompts = chat_prompts(3)
         rounds = []

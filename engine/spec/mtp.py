@@ -275,13 +275,15 @@ class MtpCycle:
     views into buffers shared by the graphs of every batch width, so a slot keeps its pending input when the width
     changes. params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts that equal the target's
     position-keyed sample, so the output is exactly plain sampling; greedy for the rest; engine/spec/accept.py);
-    None -> greedy cycle.
+    None -> greedy cycle. drafts: MTP drafts made for the next cycle (default k; fewer when k is a suffix-match draft
+    length, engine/spec/suffix.py, whose drafts come from the host).
     After replay: out_tok [B, k+1] (first n[b] valid), n [B] int32, logits [B, k+1, V] fp32 (verify rows, raw),
     H [B, k+1, hidden] (target post-norm hidden of the verify rows)."""
 
     def __init__(self, model: FastQwen35, mtp: Mtp, state: FastState, mst: MtpState, k: int = 3, params=None,
-                 tok: torch.Tensor | None = None, stop_ids: torch.Tensor | None = None):
+                 tok: torch.Tensor | None = None, stop_ids: torch.Tensor | None = None, drafts: int | None = None):
         self.model, self.mtp, self.state, self.mst, self.k, self.params = model, mtp, state, mst, k, params
+        self.drafts = drafts or k
         dev = state.pos_t.device
         B = state.pos_t.shape[0]
         self.tok = tok if tok is not None else torch.zeros(B, k + 1, dtype=torch.long, device=dev)
@@ -340,7 +342,7 @@ class MtpCycle:
         dr = [d]
         self.mst.pos_t.copy_(p0 + n)
         self.skip.zero_()
-        for _ in range(k - 1):
+        for _ in range(self.drafts - 1):
             # every slot's chain is unlikely to survive this far: the remaining steps skip their GEMMs (zero outputs)
             self.skip.copy_(torch.maximum(self.skip, ((cp[:, 0] < DRAFT_STOP) | (st.active == 0)).all().int().view(1)))
             ops().skinny_skip(self.skip)
@@ -352,8 +354,9 @@ class MtpCycle:
             cp = cp * p
             dr.append(d)
             self.mst.pos_t += 1
-        nxt = torch.cat([bonus[:, None]] + dr, 1)                    # [B, k+1] = [y', d1'..dk']
-        self.tok.copy_(torch.where(st.active[:, None] > 0, nxt, tok))
+        nxt = torch.cat([bonus[:, None]] + dr, 1)                    # [B, drafts+1] = [y', d1'..']
+        nd = self.drafts + 1
+        self.tok[:, :nd].copy_(torch.where(st.active[:, None] > 0, nxt, tok[:, :nd]))
         torch.cuda.current_stream().wait_stream(self._side)
         return out_tok, n, logits, H
 

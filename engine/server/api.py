@@ -87,7 +87,8 @@ class Worker(threading.Thread):
             log(f"[engine] MTP drafter: {dw or 'checkpoint weights'}; low-rank draft head: {'on' if mtp.lr_B is not None else 'off'}")
         t2 = time.perf_counter()
         sched = Scheduler(model, n_slots=a.slots, max_seq_len=a.max_seq_len, n_checkpoints=a.checkpoints, mtp=mtp, k=a.k,
-                          selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False, boundary_token=a.boundary_token)
+                          selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False, boundary_token=a.boundary_token,
+                          suffix_min=a.suffix_drafts)
         t3 = time.perf_counter()
         if not a.no_warmup:
             self._warmup(sched, model.cfg.vocab_size)
@@ -97,7 +98,8 @@ class Worker(threading.Thread):
                             warmup_s=round(t4 - t3, 1), total_s=round(t4 - t0, 1))
         mem = torch.cuda.memory_allocated() / 1e9
         log(f"[engine] ready: {self.startup}; {mem:.1f} GB allocated, {torch.cuda.memory_reserved() / 1e9:.1f} GB reserved; "
-            f"{a.slots} slots x {a.max_seq_len} tokens, spec={a.spec}" + (f" k={a.k}" if a.spec == "mtp" else ""))
+            f"{a.slots} slots x {a.max_seq_len} tokens, spec={a.spec}" + (f" k={a.k}" if a.spec == "mtp" else "")
+            + (f", suffix drafts >= {a.suffix_drafts}" if a.spec == "mtp" and a.suffix_drafts else ""))
 
     def _warmup(self, sched, vocab):
         """Runs every code path once (prefill chunks, the decode / spec graphs at each width, greedy and sampled,
@@ -567,6 +569,9 @@ def main(argv=None):
                     help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors (tools/train_drafter.py) when it "
                          "exists, none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
     ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
+    ap.add_argument("--suffix-drafts", type=int, default=0, metavar="N",
+                    help="with MTP: draft the continuation of an earlier occurrence of the last N+ tokens (prompt or reply so far), up to "
+                         "15 tokens when one request decodes; 0 = off. Speeds up replies that repeat their input (code edits)")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
     ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default="int",
                     help="int: decode the attention / GDN projections from INT6 / INT5 copies (tools/int6_requant.py; ~9.5%% faster, "

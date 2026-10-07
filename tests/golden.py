@@ -15,6 +15,7 @@ site-packages, so regenerating them in a different environment gives different p
    uv run python tests/golden.py record          # writes tests/golden/outputs.json
    uv run python tests/golden.py check           # MTP speculation (the default server)
    uv run python tests/golden.py check --plain   # no speculation: must match the same file
+   uv run python tests/golden.py check --suffix 8  # MTP with suffix-match drafts (engine/spec/suffix.py): the same file
    uv run python tests/golden.py prompts         # regenerate prompts.json (environment-dependent, see above)
 """
 import argparse
@@ -34,7 +35,7 @@ PROMPTS = os.path.join(ROOT, "tests", "golden", "prompts.json")
 EOS = (248046, 248044)
 
 
-def build_engine(spec: bool, slots: int = 3, max_seq_len: int = 32768, checkpoints: int = 32):
+def build_engine(spec: bool, slots: int = 3, max_seq_len: int = 32768, checkpoints: int = 32, suffix_min: int = 0):
     """The server's engine (engine/server/api.py Worker._build) without HTTP: model, decode copies, drafter, scheduler."""
     from engine.model.fast import attach_decode_copies, decode_copies_paths, load_fast_model, to_fast
     from engine.runtime.scheduler import Scheduler
@@ -49,7 +50,8 @@ def build_engine(spec: bool, slots: int = 3, max_seq_len: int = 32768, checkpoin
         from engine.spec.mtp import DRAFT_DIR, Mtp
         ft = os.path.join(DRAFT_DIR, "mtp_ft.safetensors")
         mtp = Mtp(model, path, weights=ft if os.path.exists(ft) else None)
-    sched = Scheduler(model, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=7, selftest=False)
+    sched = Scheduler(model, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=7, selftest=False,
+                      suffix_min=suffix_min)
     return path, sched
 
 
@@ -88,12 +90,13 @@ def requests():
     return reqs
 
 
-def run(spec: bool):
-    _, sched = build_engine(spec)
+def run(spec: bool, suffix_min: int = 0):
+    _, sched = build_engine(spec, suffix_min=suffix_min)
     reqs = requests()
     t0 = time.perf_counter()
     sched.run([r for _, r in reqs])
-    print(f"[golden] {len(reqs)} requests in {time.perf_counter() - t0:.1f} s ({'MTP' if spec else 'plain decode'})")
+    print(f"[golden] {len(reqs)} requests in {time.perf_counter() - t0:.1f} s ({'MTP' if spec else 'plain decode'}"
+          + (f", suffix drafts >= {suffix_min}" if suffix_min else "") + ")")
     return {name: {"tokens": r.output, "logprobs": [lp for lp, _ in r.output_logprobs]} for name, r in reqs}
 
 
@@ -101,6 +104,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=("record", "check", "prompts"))
     ap.add_argument("--plain", action="store_true", help="run without speculation")
+    ap.add_argument("--suffix", type=int, default=0, help="with suffix-match drafts of at least this match length")
     a = ap.parse_args()
     if a.mode == "prompts":
         from engine.weights.loader import resolve
@@ -108,7 +112,7 @@ def main():
         print(f"[golden] wrote {PROMPTS}")
         return
     with torch.inference_mode():
-        got = run(spec=not a.plain)
+        got = run(spec=not a.plain, suffix_min=a.suffix)
     if a.mode == "record":
         os.makedirs(os.path.dirname(FILE), exist_ok=True)
         json.dump(got, open(FILE, "w"), separators=(",", ":"))

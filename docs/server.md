@@ -21,6 +21,7 @@ until it exits.
 | `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
 | `--k` | 7 | Longest MTP draft. Each cycle picks k=3 or 7 from measured acceptance (see below). |
+| `--suffix-drafts` | 0 (off) | Suffix-match drafts of at least N matched tokens (8 recommended); see below. |
 | `--drafter-weights` | `auto` | MTP head weights: `auto` uses `~/.cache/colinfer/drafter/mtp_ft.safetensors` (`tools/train_drafter.py`) when it exists; `none` the checkpoint's; or a path. Drafts change speed, never outputs. |
 | `--decode-weights` | `int` | `int`: decode the attention / GDN projections from INT6 / INT5 copies when both files exist in `~/.cache/colinfer/requant/<snapshot>/` (`tools/int6_requant.py --bits 6 --filter self_attn` and `--bits 5 --filter linear_attn`): ~9.5% faster decode, perplexity within 0.25%, +5.2 GB GPU memory. Without the files, or with `checkpoint`, decode reads the FP8 weights. |
 | `--checkpoints` | 32 | Prefix-checkpoint ring, 154 MB each, allocated at startup. |
@@ -98,6 +99,11 @@ Other endpoints:
   each draft step scores a rank-1024 approximation of the draft lm head and rescores its top 256 candidates exactly:
   the same drafts as the full head for ~1/5 of its bytes (k=7 cycle 89.8 → 86.0 ms). Without the file the engine uses
   the full draft head (`docs/history/phase6_progress.md` section 19).
+- **Suffix-match drafts (`--suffix-drafts N`, off by default).** When the last N or more tokens of a request's history
+  (prompt and reply so far) occurred earlier in it, the cycle drafts what followed that earlier occurrence instead of the
+  MTP drafts, up to 15 tokens when the request decodes alone (16 verify rows still fit one weight pass; the cycle costs
+  85 ms instead of 80) (`engine/spec/suffix.py`). With N = 8: code-editing replies that reproduce their input decode
+  ~65% faster (85 → 140 tok/s), the 40-request mix ~1% faster; outputs are unchanged.
 - **Prefix checkpoints.** A request restores the longest checkpoint that is a prefix of its prompt. Checkpoints are taken:
   - at the end of each prompt and each reply;
   - at the end of the first message (a shared system prompt);
