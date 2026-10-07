@@ -258,6 +258,13 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             b.update({k: v for k, v in extra.items() if k not in b})
         if b.get("n", 1) not in (1, None):
             raise BadRequest("n > 1 is not supported")
+        # fields the engine cannot honor: reject them rather than ignore them, unless they leave the output unchanged
+        for k, neutral in (("presence_penalty", 0.0), ("frequency_penalty", 0.0), ("repetition_penalty", 1.0)):
+            if b.get(k) is not None and float(b[k]) != neutral:
+                raise BadRequest(f"{k} is not supported (only {neutral:g}, the neutral value)")
+        rf = b.get("response_format")
+        if rf is not None and not (isinstance(rf, dict) and rf.get("type") == "text"):
+            raise BadRequest("response_format is not supported except {\"type\": \"text\"}: the server has no constrained decoding")
         return b
 
     def make_request(b: dict, prompt: list[int], hook) -> EngineRequest:

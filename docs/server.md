@@ -64,8 +64,12 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
   - `return_token_ids` (a vLLM extension that llama-benchy uses).
   - The server merges an `extra_body` object that a client sends literally inside the JSON.
 
-The server accepts these fields but ignores them: `presence_penalty`, `frequency_penalty`, `repetition_penalty`,
-`response_format`, `user`. It rejects these with a 400: `n > 1`, `echo`, and a prompt longer than the slot.
+The server accepts the `user` field and ignores it. It rejects these with a 400:
+
+- `n > 1`, `echo`, and a prompt longer than the slot
+- `presence_penalty` or `frequency_penalty` other than 0, and `repetition_penalty` other than 1. The sampler has no
+  penalties. The neutral values pass, because they do not change the output.
+- `response_format` other than `{"type": "text"}`. The server has no constrained decoding.
 
 Responses:
 

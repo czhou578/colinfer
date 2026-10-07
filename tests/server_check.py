@@ -110,6 +110,16 @@ def main():
     e2 = post(U + "/chat/completions", {"messages": [{"role": "user", "content": "x " * 300000}], "max_tokens": 4})
     e3 = post(U + "/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "n": 2})
     check("bad requests -> 400", [e1.status_code, e2.status_code, e3.status_code] == [400, 400, 400], e2.json()["error"]["message"][:80])
+    # fields the engine cannot honor are rejected, unless they leave the output unchanged
+    hi = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2, "temperature": 0}
+    rejected = [post(U + "/chat/completions", {**hi, **f}).status_code for f in (
+        {"presence_penalty": 0.5}, {"frequency_penalty": -1}, {"repetition_penalty": 1.1},
+        {"response_format": {"type": "json_object"}}, {"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}})]
+    rejected.append(post(U + "/completions", {"prompt": "hi", "max_tokens": 2, "presence_penalty": 1}).status_code)
+    accepted = [post(U + "/chat/completions", {**hi, **f}).status_code for f in (
+        {"presence_penalty": 0, "frequency_penalty": 0.0, "repetition_penalty": 1}, {"response_format": {"type": "text"}})]
+    check("unsupported penalties / response_format -> 400, neutral values -> 200", rejected == [400] * 6 and accepted == [200, 200],
+          f"{rejected} {accepted}")
 
     # 8. multi-turn prefix reuse
     long_sys = {"role": "system", "content": "Reference: " + " ".join(f"fact {i} is {i * 7 % 13}." for i in range(2000))}
