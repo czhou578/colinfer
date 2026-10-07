@@ -1,7 +1,7 @@
 # Phase 2: decode at the bandwidth roofline (2026-10-03, complete)
 
-Checkpoint `nvidia/Qwen3.8-27B-NVFP4` (stock, mixed NVFP4 / FP8), batch 1, one CUDA graph per decode
-step, host reads every token back. `bench/decode_bench.py --kv-fp8`.
+Checkpoint `nvidia/Qwen3.8-27B-NVFP4` (stock, mixed NVFP4 / FP8), batch 1, one CUDA graph per decode step. The host
+reads each token back. `bench/decode_bench.py --kv-fp8`.
 
 ## Where decode stands
 
@@ -14,12 +14,13 @@ step, host reads every token back. `bench/decode_bench.py --kv-fp8`.
 
 Ceiling = (17.56 GB of weights + FP8 KV + 0.30 GB GDN state read and written) / 233 GB/s.
 
-**Frozen exit target (baseline.md section 5): >= 12.5 tok/s at 8k on the stock checkpoint: met (12.56 to 12.58 over the last three runs; before the b/a
-overlap, 12.49 to 12.57).** The plan's original ">= 13.5 at 8k / >= 11 at
-128k" assumed 15 GB per token and is not reachable on this checkpoint (ceilings 12.95 / 10.5); it applies
-only after re-quantizing attention and GDN to NVFP4.
+**The frozen exit target (baseline.md section 5) was >= 12.5 tok/s at 8k on the stock checkpoint. We met it: 12.56 to
+12.58 over the last three runs, and 12.49 to 12.57 before the b/a overlap.**
 
-### Multiple slots (one graph step decodes all slots; FP8 KV)
+The original plan target was ">= 13.5 at 8k / >= 11 at 128k". It assumed 15 GB per token, and this checkpoint cannot
+reach it (ceilings 12.95 / 10.5). It applies only after a re-quantization of attention and GDN to NVFP4.
+
+### Multiple slots (one graph step decodes all slots, FP8 KV)
 
 | Slots | 8k: ms / step | tok/s per slot | aggregate | per-slot vs 1 slot | 32k aggregate |
 |---|---|---|---|---|---|
@@ -27,15 +28,15 @@ only after re-quantizing attention and GDN to NVFP4.
 | 2 | 83.2 | 12.01 | 24.0 | 0.96x | 22.1 |
 | 3 | 87.4 | 11.44 | **34.3** | **0.92x** | 30.7 |
 
-Plan criterion "3-slot decode >= 0.8x per slot": met (0.92x). Frozen target ">= 34 aggregate at 3 streams":
-met (34.3; vLLM 30.7, SGLang 30.6).
+The plan criterion "3-slot decode >= 0.8x per slot": met (0.92x). The frozen target ">= 34 aggregate at 3 streams":
+met (34.3, against 30.7 for vLLM and 30.6 for SGLang).
 
-## Built this phase
+## Built in this phase
 
 | Piece | File | Result |
 |---|---|---|
 | NVFP4 W4A16 GEMV, fused SiLU*up, residual epilogue, M <= 4 | `csrc/gemv.cu` | 98% of 233 GB/s over all linears of a step (`bench/gemv_bench.py`) |
-| FP8 W8A16 GEMV (per-tensor scale), BF16 GEMV | `csrc/gemv.cu` | 97% / tiny |
+| FP8 W8A16 GEMV (per-tensor scale), BF16 GEMV | `csrc/gemv.cu` | 97% / small |
 | Split-KV GQA decode attention, BF16 or FP8 KV, seq_len read on device | `csrc/attn_decode.cu` | 221-227 GB/s on the KV stream |
 | Fused GDN step: conv + SiLU, then delta rule + gated RMSNorm, one block per head | `csrc/gdn_step.cu` | 300 MB of fp32 state per step in 1.2 ms |
 | Zero-centered RMSNorm | `csrc/norm.cu` | 0.3 ms for 129 per step |
@@ -55,30 +56,36 @@ Tests: `tests/test_gemv.py`, `test_attn_decode.py`, `test_gdn_step.py` (73 tests
 | Fused norms + residuals, FP8 KV | 16/30 | 4.4e-4 |
 | Final path: + fused attention prologue / gate, stacked projections (the 12.53 tok/s configuration) | 14/30 | 4.9e-4 |
 
-All are ~40x or more below the quantized-path gate (KL <= 1.7e-2, docs/history/phase1_results.md). The kernels apply
-the NVFP4 global scale in fp32 rather than rounding dequantized weights to BF16, so they are
-slightly more accurate than the reference, not bit-identical to it.
+All paths are ~40x or more below the gate for quantized paths (KL <= 1.7e-2, docs/history/phase1_results.md). The
+kernels apply the NVFP4 global scale in fp32. They do not round the dequantized weights to BF16. Thus they are slightly
+more accurate than the reference, and not bit-identical to it.
 
 ## Step breakdown at 8k context (79.8 ms)
 
-76.3 ms weight GEMVs (17.56 GB at 230 GB/s), ~1.2 ms attention, 1.2 ms GDN delta rule, 0.4 ms the
-in_proj_b/a BF16 GEMV, 0.3 ms norms, 0.2 ms prologue / combine / conv; the rest is the host round trip.
-Virtually no PyTorch elementwise kernels remain in the step.
+- 76.3 ms weight GEMVs (17.56 GB at 230 GB/s)
+- ~1.2 ms attention
+- 1.2 ms GDN delta rule
+- 0.4 ms the in_proj_b/a BF16 GEMV
+- 0.3 ms norms
+- 0.2 ms prologue / combine / conv
+
+The host round trip uses the rest. Almost no PyTorch elementwise kernels remain in the step.
 
 ## Sampling (in the graph)
 
-`engine/runtime/sampler.py`: greedy, temperature, min-p, top-k, top-p per slot from device buffers, Philox
-offsets advanced on the GPU; ~0.15 ms per step. Uses FlashInfer's rejection sampler, called once per slot:
-**FlashInfer 0.7.0.post1 accepts per-row seed/offset arrays, but row 0's values perturb every row's draw**,
-so batched calls would make a request's output depend on its neighbours (`tests/test_sampler.py::test_slot_independence`).
+`engine/runtime/sampler.py` does greedy, temperature, min-p, top-k and top-p sampling per slot from device buffers. The
+GPU advances the Philox offsets. It takes ~0.15 ms per step. It uses the rejection sampler of FlashInfer, with one call
+per slot. **FlashInfer 0.7.0.post1 accepts per-row seed/offset arrays, but the values of row 0 change the draw of each
+row.** Thus batched calls would make the output of a request depend on its neighbours
+(`tests/test_sampler.py::test_slot_independence`).
 
 ## Trace (`bench/traces/decode_8k_2026-10-03.nsys-rep`, summary `..._summary.txt`, `bench/trace_summary.py`)
 
-Median step 80.3 ms under nsys, **GPU idle 0.36 ms (0.4%)** across 610 kernels: no launch bubbles remain.
-GEMVs are 95.6% of busy time. The in_proj_b/a BF16 GEMV runs on a side stream overlapped with the qkv/z GEMV
-(its 3 ms in the trace is time-sharing SMs with that GEMV, not added latency).
+The median step under nsys was 80.3 ms, with the **GPU idle for 0.36 ms (0.4%)** across 610 kernels. No launch bubbles
+remain. GEMVs use 95.6% of the busy time. The in_proj_b/a BF16 GEMV runs on a side stream, in parallel with the qkv/z
+GEMV. Its 3 ms in the trace is time that it shares the SMs with that GEMV. It does not add latency.
 
 ## Carried forward
 
-- Re-quantize attention + GDN projections to NVFP4 (gated on perplexity) to unlock the 14 tok/s target.
-- Repetition penalty is not implemented in the sampler (needs per-slot token history).
+- Re-quantize the attention + GDN projections to NVFP4 (gated on perplexity) to reach the 14 tok/s target.
+- The sampler does not implement a repetition penalty. It needs the token history of each slot.
