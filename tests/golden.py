@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Golden-output check: the engine in its server configuration (INT6 / INT5 decode copies and the drafter files when
-present, MTP speculation, 3 slots) on a fixed request set must reproduce recorded tokens and per-token logprobs exactly.
+present, MTP speculation with suffix-match drafts, 3 slots) on a fixed request set must reproduce recorded tokens and
+per-token logprobs exactly.
 
 Requests (all submitted at once, so they also run batched): the first 16 prompts of the 40-prompt mix greedy for up to
 128 tokens; 4 of them sampled (temperature 0.8, top-p 0.95, top-k 20, fixed seeds) for 64 tokens; a 20,000-token WikiText
@@ -13,9 +14,9 @@ bench/request_mix_bench.py): tools/drafter_data.py builds its code prompts from 
 site-packages, so regenerating them in a different environment gives different prompts.
 
    uv run python tests/golden.py record          # writes tests/golden/outputs.json
-   uv run python tests/golden.py check           # MTP speculation (the default server)
-   uv run python tests/golden.py check --plain   # no speculation: must match the same file
-   uv run python tests/golden.py check --suffix 8  # MTP with suffix-match drafts (engine/spec/suffix.py): the same file
+   uv run python tests/golden.py check             # MTP speculation with suffix-match drafts (the default server)
+   uv run python tests/golden.py check --suffix 0  # MTP drafts only: must match the same file
+   uv run python tests/golden.py check --plain     # no speculation: the same file
    uv run python tests/golden.py prompts         # regenerate prompts.json (environment-dependent, see above)
 """
 import argparse
@@ -30,12 +31,14 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from engine.spec.suffix import MIN_MATCH  # noqa: E402
+
 FILE = os.path.join(ROOT, "tests", "golden", "outputs.json")
 PROMPTS = os.path.join(ROOT, "tests", "golden", "prompts.json")
 EOS = (248046, 248044)
 
 
-def build_engine(spec: bool, slots: int = 3, max_seq_len: int = 32768, checkpoints: int = 32, suffix_min: int = 0):
+def build_engine(spec: bool, slots: int = 3, max_seq_len: int = 32768, checkpoints: int = 32, suffix_min: int = MIN_MATCH):
     """The server's engine (engine/server/api.py Worker._build) without HTTP: model, decode copies, drafter, scheduler."""
     from engine.model.fast import attach_decode_copies, decode_copies_paths, load_fast_model, to_fast
     from engine.runtime.scheduler import Scheduler
@@ -90,7 +93,7 @@ def requests():
     return reqs
 
 
-def run(spec: bool, suffix_min: int = 0):
+def run(spec: bool, suffix_min: int = MIN_MATCH):
     _, sched = build_engine(spec, suffix_min=suffix_min)
     reqs = requests()
     t0 = time.perf_counter()
@@ -104,7 +107,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=("record", "check", "prompts"))
     ap.add_argument("--plain", action="store_true", help="run without speculation")
-    ap.add_argument("--suffix", type=int, default=0, help="with suffix-match drafts of at least this match length")
+    ap.add_argument("--suffix", type=int, default=MIN_MATCH, help="suffix-match drafts of at least this match length (0: off)")
     a = ap.parse_args()
     if a.mode == "prompts":
         from engine.weights.loader import resolve

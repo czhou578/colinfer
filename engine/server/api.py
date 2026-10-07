@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from engine.runtime.metrics import Metrics
 from engine.runtime.scheduler import Request as EngineRequest
 from engine.server.chat import ChatFormat, OutputParser, TextParser
+from engine.spec.suffix import MIN_MATCH
 
 MAX_TOP_LOGPROBS = 20
 
@@ -569,7 +570,7 @@ def main(argv=None):
                     help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors (tools/train_drafter.py) when it "
                          "exists, none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
     ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
-    ap.add_argument("--suffix-drafts", type=int, default=0, metavar="N",
+    ap.add_argument("--suffix-drafts", type=int, default=MIN_MATCH, metavar="N",
                     help="with MTP: draft the continuation of an earlier occurrence of the last N+ tokens (prompt or reply so far), up to "
                          "15 tokens when one request decodes; 0 = off. Speeds up replies that repeat their input (code edits)")
     ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")

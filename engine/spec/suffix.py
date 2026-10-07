@@ -6,6 +6,7 @@ predicts less reliably. Drafts never change outputs: the speculative cycle accep
 The index maps every NGRAM-token sequence of the history to the positions where it ends and grows as tokens are
 appended; a lookup extends the newest occurrences of the last NGRAM tokens backwards to the longest match.
 """
+MIN_MATCH = 8    # the server's default --suffix-drafts: shorter repeats are left to the MTP drafter
 NGRAM = 3        # tokens of the lookup key (the shortest match found)
 MAX_MATCH = 32   # match lengths are measured up to this
 MAX_CANDS = 16   # occurrences of the key examined, newest first
