@@ -4,8 +4,13 @@ colinfer is a single-user inference engine for **Qwen3.8-27B** (`nvidia/Qwen3.8-
 sm_121). It serves the model through an OpenAI-compatible HTTP API. It is for one person who sends up to three requests
 at the same time.
 
+This is a research engine for one machine and one model, not a general inference server. It has no paged KV cache, no
+multi-GPU support and no other models. The kernels compile for sm_121a only. The design notes and the dated logs in
+`docs/` record each measurement behind the design.
+
 The memory bandwidth of this chip sets the decode speed. Each decode step reads all the weights from LPDDR5x memory at
-~238 GB/s, so plain decode cannot go faster than ~14 tok/s. All the speed above this floor comes from speculative decoding.
+~238 GB/s, so plain decode cannot go faster than ~14 tok/s. All the speed above this floor comes from speculative
+decoding.
 
 | | colinfer | SGLang 0.5.21 | vLLM 0.25.1 |
 |---|---|---|---|
@@ -15,24 +20,40 @@ The memory bandwidth of this chip sets the decode speed. Each decode step reads 
 
 The SGLang and vLLM decode and prefill figures are the phase-0 baselines on the same checkpoint and machine
 (`docs/history/baseline.md` section 4). These runs used FP8 KV and no prefix cache, and they measured decode on a short
-prose prompt. The SGLang prefill figures come from its own per-batch log. The SGLang mix figure is SGLang with the DFlash2
-drafter on the same 40 requests (`docs/history/phase6_progress.md` section 16).
+prose prompt. The SGLang prefill figures come from its own per-batch log. The SGLang mix figure is SGLang with the
+DFlash2 drafter on the same 40 requests (`docs/history/phase6_progress.md` section 16).
 
 Outputs are **token-identical with speculation on or off**, for greedy and for seeded sampling, at any batch width
 (`tests/golden.py`, `tests/scheduler_check.py`). Each quantization choice beyond the checkpoint's own must pass a
 perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
 
+## Requirements
+
+- A DGX Spark: NVIDIA GB10 (compute capability 12.1) with 128 GB of unified memory. Other GPUs are not supported.
+- The CUDA 13.0 toolkit (nvcc) and a 580-series driver (tested with 580.173.02), on aarch64 Linux.
+- [uv](https://docs.astral.sh/uv/). It installs Python 3.12 and the pinned dependencies.
+- The checkpoint `nvidia/Qwen3.8-27B-NVFP4` (21.9 GB) from Hugging Face. The optional INT decode copies (below) also
+  need the BF16 checkpoint `Qwen/Qwen3.8-27B` (55.6 GB).
+- About 65 GB of free unified memory while the server runs. Stop other GPU work first: an over-commit of the shared
+  memory can power off the machine instead of an out-of-memory error.
+
 ## Quick start
 
 ```bash
+git clone --recursive https://github.com/czhou578/colinfer.git && cd colinfer   # CUTLASS is a submodule
 uv sync                                                  # Python 3.12, torch 2.14 (cu130), FlashInfer 0.7 (sm121a)
+uv run hf download nvidia/Qwen3.8-27B-NVFP4             # into the Hugging Face cache
 uv run python -m engine.server                           # 127.0.0.1:8000, 3 slots x 262,144 tokens, MTP speculation
 curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages": [{"role": "user", "content": "hi"}], "stream": true}'
 ```
 
-The CUDA kernels in `csrc/` compile when the engine first uses them (`engine/kernels/__init__.py`). The engine keeps the
-build in `build/torch_ext`. The checkpoint must be in the local Hugging Face cache.
+If you cloned without `--recursive`, run `git submodule update --init` first. The CUDA kernels in `csrc/` compile when
+the engine first uses them, in about a minute (`engine/kernels/__init__.py`). The engine keeps the build in
+`build/torch_ext`.
+
+The server has no authentication. It listens on 127.0.0.1 by default. Do not expose it to a network that you do not
+trust.
 
 Three optional files make decode faster. They do not change the output of the model. You make each file once, offline,
 and the engine uses it when it is present:
@@ -90,3 +111,27 @@ uv run python tests/golden.py check --plain              # the same, without spe
 uv run python tests/scheduler_check.py                   # batching, sampling, prefix reuse: outputs unchanged
 uv run python tests/perplexity.py --engine prefill --ckpt nvidia/Qwen3.8-27B-NVFP4   # quality
 ```
+
+## License
+
+Apache-2.0 (`LICENSE`). Copyright 2026 czhou578.
+
+Third-party material:
+
+- CUTLASS (`csrc/third_party/cutlass`, a git submodule) is BSD-3-Clause, from NVIDIA.
+- The model weights are not part of this repository. They have their own licenses: see the model cards of
+  `Qwen/Qwen3.8-27B` and `nvidia/Qwen3.8-27B-NVFP4`.
+- `tests/golden/prompts.json` holds the token ids of text excerpts from WikiText-103 (CC BY-SA 3.0), TinyStories and the
+  Python source of open-source packages. These excerpts keep their original licenses. `engine/spec/draft_vocab.npy` is a
+  list of token ids, ranked by their frequency in similar text.
+
+## Acknowledgments
+
+- The Qwen team (Qwen3.8-27B), and NVIDIA (the NVFP4 checkpoint, made with ModelOpt, and CUTLASS).
+- FlashInfer, for the prefill attention and the sampling kernels that the engine uses.
+- flash-linear-attention, the reference for the chunked Gated DeltaNet kernels.
+- vLLM and SGLang, the baselines. The row semantics of the MTP drafter follow the Qwen3.5 MTP proposer of vLLM.
+- EAGLE-3 (the training-time test of the drafter fine-tune), DFlash, prompt-lookup and suffix decoding, Marlin and
+  FlashDecoding, whose ideas the docs credit where they apply.
+
+Issues and pull requests are welcome. This is a personal project, so there is no guarantee of support.

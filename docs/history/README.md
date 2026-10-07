@@ -3,7 +3,8 @@
 These files are the dated logs and raw measurements of the project. They describe the engine as it was at each date,
 with paths and switches that the project removed later. On 2026-10-06, the project deleted the alternatives that each
 measurement rejected. On 2026-10-07, we edited the language of the Markdown logs to ASD-STE100 style. Their facts did not change.
-`docs/architecture.md` describes the current design.
+`docs/architecture.md` describes the current design. In the raw outputs, home-directory paths show as `~`. Some logs
+refer to model-benchmarks, a separate benchmark harness that is not part of this repository.
 
 | File | Date | Contents |
 |---|---|---|

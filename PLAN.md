@@ -1,5 +1,9 @@
 # Plan: a single-user inference engine for DGX Spark
 
+> This is the original working plan, written on 2026-09-30 before any code existed. It is kept as written, so it names
+> local paths and projects on the development machine, and some targets and file names changed later.
+> `docs/architecture.md` describes the engine as built, and `docs/history/` records how it got there.
+
 Target: run **Qwen3.8-27B** (and later **DeepSeek V4 Flash**) on one DGX Spark at the
 fastest prefill and decode this chip can physically deliver, for one user making at most
 three concurrent requests.
