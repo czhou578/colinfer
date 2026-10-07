@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""vLLM side of the quantized-path parity check (PLAN.md 4.7b). It runs in the vLLM 0.25.1 venv, NOT in the
-engine venv, and it imports nothing from engine/.
+"""vLLM side of the quantized-path parity check (PLAN.md 4.7b). It runs in a separate venv with vLLM 0.25.1
+($VLLM_PY), NOT in the engine venv, and it imports nothing from engine/.
 
-  VLLM_USE_FASTOKENS=0 ~/Projects/model-benchmarks/.venv/bin/python tests/vllm_reference.py \
+  VLLM_USE_FASTOKENS=0 $VLLM_PY tests/vllm_reference.py \
       --ckpt nvidia/Qwen3.8-27B-NVFP4 --out tests/parity_out/vllm_nvfp4.json
 
 It writes JSON with these items per prompt: the input ids, the greedy tokens (128), and the top-20 logprobs of the

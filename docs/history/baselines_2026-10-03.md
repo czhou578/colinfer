@@ -48,7 +48,7 @@ spec comparison: {"config": {"output_lengths": [512, 1024, 2048]}, "spec_enabled
 
 ### nvidia-Qwen3.8-27B-NVFP4-sglang  (20261003_104445)
 
-- server: `/home/colin-spark/Projects/sglang/.venv/bin/python -m sglang.launch_server --model-path nvidia/Qwen3.8-27B-NVFP4 --host 127.0.0.1 --port 8000 --trust-remote-code --context-length 131072 --max-running-requests 4 --chunked-prefill-size 8192 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --fp`
+- server: `~/Projects/sglang/.venv/bin/python -m sglang.launch_server --model-path nvidia/Qwen3.8-27B-NVFP4 --host 127.0.0.1 --port 8000 --trust-remote-code --context-length 131072 --max-running-requests 4 --chunked-prefill-size 8192 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --fp`
 - env: torch 2.11.0+cu130, vllm 0.25.1 (harness venv), gpu NVIDIA GB10
 - status: completed 
 
@@ -82,7 +82,7 @@ spec comparison: {"config": {"output_lengths": [512, 1024, 2048]}, "spec_enabled
 
 ### nvidia-Qwen3.8-27B-NVFP4-sglang_mtp  (20261003_111305)
 
-- server: `/home/colin-spark/Projects/sglang/.venv/bin/python -m sglang.launch_server --model-path nvidia/Qwen3.8-27B-NVFP4 --host 127.0.0.1 --port 8000 --trust-remote-code --context-length 131072 --max-running-requests 4 --chunked-prefill-size 8192 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --fp`
+- server: `~/Projects/sglang/.venv/bin/python -m sglang.launch_server --model-path nvidia/Qwen3.8-27B-NVFP4 --host 127.0.0.1 --port 8000 --trust-remote-code --context-length 131072 --max-running-requests 4 --chunked-prefill-size 8192 --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer --fp`
 - env: torch 2.11.0+cu130, vllm 0.25.1 (harness venv), gpu NVIDIA GB10
 - status: completed 
 

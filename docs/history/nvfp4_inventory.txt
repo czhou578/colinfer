@@ -1,4 +1,4 @@
-checkpoint: /home/colin-spark/.cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/482ca0f3832238542f8f5295dde86b5f22711d80
+checkpoint: ~/.cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/482ca0f3832238542f8f5295dde86b5f22711d80
 
 [config.json]
   architectures: ["Qwen3_5ForConditionalGeneration"]

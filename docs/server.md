@@ -139,10 +139,12 @@ Other endpoints:
 
 ## systemd
 
-`deploy/colinfer.service` is a user unit:
+`deploy/colinfer.service` is a user unit. Its paths assume that the clone is `~/Projects/colin-inference-engine`. If
+your clone is elsewhere (a plain `git clone` creates `./colinfer`), change `WorkingDirectory` and `ExecStart` first.
+Then, from the root of the clone:
 
 ```bash
-systemctl --user link ~/Projects/colin-inference-engine/deploy/colinfer.service
+systemctl --user link "$PWD/deploy/colinfer.service"
 systemctl --user enable --now colinfer
 journalctl --user -u colinfer -f
 ```

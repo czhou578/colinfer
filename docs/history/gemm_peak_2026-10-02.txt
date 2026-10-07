@@ -77,4 +77,4 @@ backends: 15  (11 CUTLASS configs)
   5120x17408 M=256   nvfp4  166.9 TF (cutlass 128x128x256 coop)   fp8   93.6 TF (cutlass 128x128x128 coop)   bf16   50.4 TF (cuBLAS (torch.matmul))
   5120x17408 M=2048  nvfp4  308.7 TF (cutlass 256x128x128 coop)   fp8  193.3 TF (cuBLASLt (torch._scaled_mm))   bf16   92.1 TF (cuBLAS (torch.matmul))
   5120x17408 M=4096  nvfp4  335.2 TF (cutlass 128x128x256 coop)   fp8  195.4 TF (cuBLASLt (torch._scaled_mm))   bf16   93.4 TF (cuBLAS (torch.matmul))
-wrote /tmp/claude-1000/-home-colin-spark-Projects-colin-inference-engine/d79d7660-bd0d-4a5b-9f0f-a89baceba217/scratchpad/gemm_run2.json
+wrote gemm_run2.json

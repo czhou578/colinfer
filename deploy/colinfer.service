@@ -1,10 +1,12 @@
 # systemd user unit for the OpenAI-compatible server (PLAN.md Phase 5).
-#   systemctl --user link ~/Projects/colin-inference-engine/deploy/colinfer.service
+# WorkingDirectory and ExecStart below assume the clone is ~/Projects/colin-inference-engine. If your clone is elsewhere
+# (a plain `git clone` creates ./colinfer), change both paths first.
+#   systemctl --user link "$PWD/deploy/colinfer.service"   # from the root of the clone
 #   systemctl --user enable --now colinfer        # start now and at login
 #   loginctl enable-linger $USER                  # optional: start at boot without a login session
 #   journalctl --user -u colinfer -f              # logs (one line per finished request)
-# The engine holds ~57 GB of the 121 GB unified memory (weights 21 GB, KV 3 x 262k tokens 26 GB, checkpoint ring
-# 5 GB, drafter KV 3 GB) for as long as it runs; stop it before using the GPU for anything else.
+# The engine holds ~61 GB of the 121 GB unified memory for as long as it runs (weights 20.2 GB, INT copies 5.2 GB,
+# KV 3 x 262k tokens 25.8 GB, checkpoint ring 4.9 GB, drafter ~2.5 GB). Stop it before you use the GPU for other work.
 [Unit]
 Description=colin-inference-engine: Qwen3.8-27B NVFP4, OpenAI API on 127.0.0.1:8000
 After=network.target

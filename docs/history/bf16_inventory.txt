@@ -1,4 +1,4 @@
-checkpoint: /home/colin-spark/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+checkpoint: ~/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
 
 [config.json]
   architectures: ["Qwen3_5ForConditionalGeneration"]

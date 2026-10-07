@@ -14,11 +14,11 @@ repo id with no extra configuration. Our loader finds the same path with
 ## Local paths (snapshot directories, one per Hub commit)
 
 - `Qwen/Qwen3.8-27B` (the reference for the Phase 1 parity harness)
-  `/home/colin-spark/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`
+  `~/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`
 - `Qwen/Qwen3.8-27B-FP8` (the FP8 fallback path and the FP8-vs-NVFP4 comparison)
-  `/home/colin-spark/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B-FP8/snapshots/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`
+  `~/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B-FP8/snapshots/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`
 - `nvidia/Qwen3.8-27B-NVFP4` (the serving checkpoint)
-  `/home/colin-spark/.cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/482ca0f3832238542f8f5295dde86b5f22711d80`
+  `~/.cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/482ca0f3832238542f8f5295dde86b5f22711d80`
 
 ## Verification
 

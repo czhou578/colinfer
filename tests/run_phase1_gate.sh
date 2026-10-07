@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Phase 1 exit gate (PLAN.md 6): BF16 parity vs HF on 30 prompts, NVFP4 path vs vLLM, WikiText
 # perplexity per checkpoint. Sequential: each step owns the GPU. Logs in tests/parity_out/logs/.
+# VLLM_PY: the python of a separate venv with vLLM 0.25.1 (the vLLM side of the parity check, tests/vllm_reference.py).
 set -u
 cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
@@ -11,7 +12,7 @@ step ours_bf16   $PY tests/parity_hf.py ours --ckpt Qwen/Qwen3.8-27B --out $O/ou
 step ref_bf16    $PY tests/parity_hf.py ref  --ckpt Qwen/Qwen3.8-27B --out $O/ref_bf16.pt
 step cmp_bf16    $PY tests/parity_hf.py compare $O/ref_bf16.pt $O/ours_bf16.pt
 step ours_nvfp4  $PY tests/parity_hf.py ours --ckpt nvidia/Qwen3.8-27B-NVFP4 --out $O/ours_nvfp4.pt
-step vllm_nvfp4  env VLLM_USE_FASTOKENS=0 CUTE_DSL_ARCH=sm_121a $HOME/Projects/model-benchmarks/.venv/bin/python tests/vllm_reference.py --ckpt nvidia/Qwen3.8-27B-NVFP4 --out $O/vllm_nvfp4.json
+step vllm_nvfp4  env VLLM_USE_FASTOKENS=0 CUTE_DSL_ARCH=sm_121a ${VLLM_PY:-$HOME/Projects/model-benchmarks/.venv/bin/python} tests/vllm_reference.py --ckpt nvidia/Qwen3.8-27B-NVFP4 --out $O/vllm_nvfp4.json
 step cmp_nvfp4   $PY tests/parity_vllm.py $O/vllm_nvfp4.json $O/ours_nvfp4.pt
 step ppl_bf16    $PY tests/perplexity.py --ckpt Qwen/Qwen3.8-27B --json $O/ppl_bf16.json
 step ppl_fp8     $PY tests/perplexity.py --ckpt Qwen/Qwen3.8-27B-FP8 --json $O/ppl_fp8.json
