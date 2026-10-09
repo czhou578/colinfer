@@ -1,7 +1,7 @@
 # Running the server
 
-The engine includes an OpenAI-compatible server for `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark. `docs/architecture.md`
-describes the design.
+The engine includes a server for `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark. It has an OpenAI-compatible API and an
+Anthropic-compatible API. `docs/architecture.md` describes the design.
 
 ```bash
 uv run python -m engine.server                     # 127.0.0.1:8000, 3 slots x 262,144 tokens, MTP speculation
@@ -32,7 +32,8 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--checkpoints` | 32 | The prefix-checkpoint ring, 154 MB each. The server allocates it at startup. |
 | `--no-prefix-caching` | off | Never reuse a prompt prefix (the same as `--checkpoints 0`). Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
-| `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. |
+| `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
+| `--api-key` | `$COLINFER_API_KEY`, else none | The `/v1/` endpoints require this key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and `/metrics` stay open. |
 
 ## API
 
@@ -99,6 +100,38 @@ Other endpoints:
   - queue depth and busy slots
   - allocator memory
 - `GET /v1/status`. It shows the phase and length of each slot, the checkpoints and the startup timings.
+
+### Anthropic Messages API
+
+`POST /v1/messages` and `POST /v1/messages/count_tokens` accept the Anthropic Messages format. Claude Code uses them
+(`docs/claude_code.md`). The server converts a request to the same chat messages as `/v1/chat/completions`
+(`engine/server/anthropic.py`):
+
+- **System prompt:** the `system` field becomes the first system message. The chat template accepts a system message
+  only at the start. Thus a system message inside `messages` becomes a user turn in `<system-reminder>` tags. Claude
+  Code sends its environment details and reminders this way.
+- **Tools:** `tool_use` blocks become tool calls, and `tool_result` blocks become tool messages. Server tools, for
+  example `web_search_20250305`, are not available. The server leaves them out of the prompt. A request that has only
+  server tools gets a 400 error.
+- **Thinking:**
+  - `thinking.type` `enabled` or `adaptive` turns on reasoning, and `disabled` turns it off. Without `thinking`, the
+    request runs without reasoning, unless the server runs with `--thinking on`.
+  - `output_config.effort` `low` or `medium` sets the reasoning effort. Higher values use the template default.
+  - The reply has a `thinking` block. Send it back unchanged in the next request. The template then repeats the
+    reasoning of the earlier turns, and the server can reuse its prefix checkpoint.
+- **Other fields:**
+  - `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences` work as on the Anthropic API.
+  - `tool_choice` `none` keeps the tools in the prompt and drops the tool calls of the reply. `any` and a named tool
+    have no effect, because the server has no constrained decoding.
+  - Images and documents become a short text note, because the engine reads text only.
+  - A final assistant message (prefill) gets a 400 error.
+  - The server ignores `cache_control`, `metadata`, `context_management`, the thinking budget and `display`.
+- **Usage:** `cache_read_input_tokens` is the prompt part that the server restored from a checkpoint, and `input_tokens`
+  is the rest.
+- **Stream:** the server sends `message_start` at once. Then it sends a `ping` every 10 s until the first output, for
+  example during a long prefill. Thus the stream watchdog of the client does not stop the request.
+- **Errors:** the errors have the Anthropic format. A prompt that is too long gets
+  `prompt is too long: <n> tokens > <max> maximum`. Claude Code recognizes this text and compacts the conversation.
 
 ## Behavior to know
 

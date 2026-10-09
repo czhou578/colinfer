@@ -131,6 +131,49 @@ def main():
     check("multi-turn prefix reuse", c2 > 0.95 * d1["usage"]["prompt_tokens"], f"turn 2: {d2['usage']['prompt_tokens']} prompt tokens, {c2} cached, "
           f"TTFT {d2['timings']['ttft_s']:.3f}s (turn 1 {d1['timings']['ttft_s']:.2f}s)")
 
+    # 9. Anthropic Messages API (/v1/messages)
+    weather = [{"name": "get_weather", "description": "Current weather for a city", "input_schema": WEATHER[0]["function"]["parameters"]}]
+    hdr = {"anthropic-version": "2023-06-01"}
+    q = {"model": "x", "max_tokens": 1500, "tools": weather, "thinking": {"type": "adaptive"},
+         "system": [{"type": "text", "text": "You are a weather assistant.", "cache_control": {"type": "ephemeral"}}],
+         "messages": [{"role": "user", "content": "What's the weather in Paris in celsius for the next 3 days?"}]}
+    d = requests.post(U + "/messages", json=q, headers=hdr, timeout=600).json()
+    kinds = [c["type"] for c in d["content"]]
+    use = next((c for c in d["content"] if c["type"] == "tool_use"), {})
+    check("messages: tool_use (non-stream)", d["type"] == "message" and d["stop_reason"] == "tool_use" and kinds[0] == "thinking"
+          and use.get("name") == "get_weather" and use["input"].get("city") == "Paris" and isinstance(use["input"].get("days", 3), int), f"{kinds} {use.get('input')}")
+    n = requests.post(U + "/messages/count_tokens", json=q, headers=hdr).json()
+    check("messages: count_tokens = input + cached tokens", n.get("input_tokens") == d["usage"]["input_tokens"] + d["usage"]["cache_read_input_tokens"],
+          f"{n} {d['usage']}")
+    # the tool round trip, streamed, with the earlier thinking block sent back and a system message inside `messages`
+    q2 = {**q, "stream": True, "thinking": {"type": "disabled"}, "messages": q["messages"] + [
+        {"role": "assistant", "content": d["content"]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use.get("id", "x"), "content": '{"temp_c": 18, "sky": "clear"}'}]},
+        {"role": "system", "content": "Answer in one sentence."}]}
+    events, text = [], ""
+    with requests.post(U + "/messages", json=q2, headers=hdr, stream=True, timeout=600) as r:
+        for line in r.iter_lines():
+            line = line.decode()
+            if line.startswith("event: "):
+                events.append(line[7:])
+            elif line.startswith("data: "):
+                ev = json.loads(line[6:])
+                if ev["type"] == "content_block_delta" and ev["delta"]["type"] == "text_delta":
+                    text += ev["delta"]["text"]
+                if ev["type"] == "message_delta":
+                    sr, cached = ev["delta"]["stop_reason"], ev["usage"]["cache_read_input_tokens"]
+    body = [e for e in events if e != "ping"]
+    check("messages: tool result -> answer (stream)", body[0] == "message_start" and body[-2:] == ["message_delta", "message_stop"]
+          and sr == "end_turn" and "18" in text and "content_block_start" in body, f"{text[:80]!r}; {cached} cached tokens")
+    s = requests.post(U + "/messages", headers=hdr, json={"max_tokens": 200, "stop_sequences": ["4"],
+                                                          "messages": [{"role": "user", "content": "Count from 1 to 9, separated by spaces."}]}).json()
+    check("messages: stop_sequences", s["stop_reason"] == "stop_sequence" and s["stop_sequence"] == "4", repr(s["content"][-1:]))
+    e1 = requests.post(U + "/messages", headers=hdr, json={"max_tokens": 4, "messages": [{"role": "user", "content": "x " * 300000}]})
+    e2 = requests.post(U + "/messages", headers=hdr, json={"max_tokens": 4, "messages": [{"role": "user", "content": "hi"}],
+                                                           "tools": [{"type": "web_search_20250305", "name": "web_search"}]})
+    check("messages: errors in the Anthropic format", [e1.status_code, e2.status_code] == [400, 400] and e1.json()["type"] == "error"
+          and e1.json()["error"]["message"].startswith("prompt is too long"), e1.json()["error"]["message"])
+
     m = requests.get(a.url + "/metrics").text
     check("/metrics", "colinfer_step_seconds_bucket" in m and "colinfer_ttft_seconds_count" in m)
     print("SERVER CHECK", "PASSED" if ok else "FAILED")

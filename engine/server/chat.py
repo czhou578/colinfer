@@ -157,6 +157,7 @@ class _Stream:
         self.started = False
         self.pending = ""   # held text, not yet emitted
         self.stopped = False
+        self.matched: str | None = None  # the stop string that stopped the stream
 
     def push(self, text: str) -> str:
         if self.stopped or not text:
@@ -170,7 +171,7 @@ class _Stream:
         for s in self.stops:
             i = buf.find(s)
             if i >= 0:
-                self.stopped, self.pending = True, ""
+                self.stopped, self.pending, self.matched = True, "", s
                 return buf[:i].rstrip()
         hold = 0  # the longest suffix that may start a stop string, plus the whitespace before it
         for s in self.stops:
@@ -203,6 +204,10 @@ class OutputParser:
     @property
     def stopped(self) -> bool:
         return any(s.stopped for s in self.streams.values())
+
+    @property
+    def stop_match(self) -> str | None:
+        return next((s.matched for s in self.streams.values() if s.stopped), None)
 
     def _text(self, mode, text):
         out = self.streams[mode].push(text)

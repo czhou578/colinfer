@@ -1,8 +1,8 @@
 # colin-inference-engine
 
 colinfer is a single-user inference engine for **Qwen3.8-27B** (`nvidia/Qwen3.8-27B-NVFP4`) on one **DGX Spark** (GB10,
-sm_121). It serves the model through an OpenAI-compatible HTTP API. It is for one person who sends up to three requests
-at the same time.
+sm_121). It serves the model through an OpenAI-compatible and an Anthropic-compatible HTTP API, so Claude Code can use
+it directly. It is for one person who sends up to three requests at the same time.
 
 This is a research engine for one machine and one model, not a general inference server. It has no paged KV cache, no
 multi-GPU support and no other models. The kernels compile for sm_121a only. The design notes and the dated logs in
@@ -93,7 +93,7 @@ decision. In short:
 | `engine/model/prefill.py` | the prefill path |
 | `engine/spec/` | the MTP drafter and the speculative cycle (`mtp.py`), suffix-match drafts (`suffix.py`), exact acceptance for sampling (`accept.py`) |
 | `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the sampler, metrics, the reference generator |
-| `engine/server/` | the OpenAI-compatible server (`api.py`), the chat template and output parsing (`chat.py`) |
+| `engine/server/` | the HTTP server (`api.py`), the Anthropic Messages API (`anthropic.py`), the chat template and output parsing (`chat.py`) |
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), numerics emulation |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |

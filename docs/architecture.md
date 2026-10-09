@@ -193,8 +193,9 @@ The code is in `engine/runtime/scheduler.py` and `engine/server/api.py`.
   exists. If the slot of the checkpoint is busy, the engine copies its KV prefix to a free slot.
 - **Server.** One engine thread owns the GPU. Asyncio handlers render the chat template, tokenize and stream. The
   engine thread detokenizes and parses each token as the engine emits it: reasoning, content, Qwen XML tool calls and
-  stop strings (`engine/server/chat.py`). A CUDA error fails all requests and stops the process, and systemd restarts
-  it.
+  stop strings (`engine/server/chat.py`). The Anthropic Messages API (`/v1/messages`, for Claude Code) uses the same
+  path: `engine/server/anthropic.py` converts each request to chat messages and each reply to content blocks. A CUDA
+  error fails all requests and stops the process, and systemd restarts it.
 - **Memory.** At startup, the engine uses ≈61 GB. The weights use 20.2 GB and the INT copies 5.2 GB. The KV caches use
   3 × 262k × 32 KB = 25.8 GB. The checkpoint ring uses 4.9 GB, and the drafter KV and copies use ≈2.5 GB.
 - **Startup** takes ≈25 s. The engine loads the weights and runs a numerical self-test of each matmul path

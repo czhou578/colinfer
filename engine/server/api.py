@@ -1,9 +1,11 @@
-"""OpenAI-compatible HTTP server.
+"""OpenAI- and Anthropic-compatible HTTP server.
 
     uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 262144] [--spec mtp|none]
 
 Endpoints: /v1/chat/completions and /v1/completions (SSE streaming, usage + timings, logprobs, stop strings, seeds,
-tools, thinking), /v1/models, /health, /metrics (Prometheus), /v1/status (slots and checkpoints).
+tools, thinking), /v1/messages and /v1/messages/count_tokens (the Anthropic Messages API, engine/server/anthropic.py),
+/v1/models, /health, /metrics (Prometheus), /v1/status (slots and checkpoints). With --api-key, the /v1/ endpoints
+require the key (Authorization: Bearer, or x-api-key).
 
 One engine thread owns the GPU. It loads the model, captures the CUDA graphs, and then runs Scheduler.step() in a loop.
 The HTTP handlers (asyncio, uvicorn) render the chat template and tokenize outside the event loop. They give the
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import queue
@@ -33,6 +36,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from engine.runtime.metrics import Metrics
 from engine.runtime.scheduler import Request as EngineRequest
+from engine.server import anthropic as anth
 from engine.server.chat import ChatFormat, OutputParser, TextParser
 from engine.spec.suffix import MIN_MATCH
 
@@ -235,6 +239,34 @@ def _error(msg, code=400, kind="invalid_request_error"):
     return JSONResponse({"error": {"message": msg, "type": kind, "code": code}}, status_code=code)
 
 
+_ANTH_ERROR = {400: "invalid_request_error", 401: "authentication_error", 404: "not_found_error", 413: "request_too_large",
+               499: "invalid_request_error"}
+
+
+def _anth_error(msg, code=400):
+    """An error in the format of the Anthropic API."""
+    return JSONResponse({"type": "error", "error": {"type": _ANTH_ERROR.get(code, "api_error"), "message": msg}}, status_code=code)
+
+
+class ApiKey:
+    """ASGI middleware: the /v1/ endpoints require the key, as `Authorization: Bearer <key>` or `x-api-key: <key>`."""
+
+    def __init__(self, app, key: str):
+        self.app, self.key = app, key.encode()
+
+    def _ok(self, headers) -> bool:
+        h = {k.decode("latin-1").lower(): v for k, v in headers}
+        auth = h.get("authorization", b"")
+        bearer = auth[7:] if auth[:7].lower() == b"bearer " else b""
+        return hmac.compare_digest(h.get("x-api-key", b""), self.key) or hmac.compare_digest(bearer, self.key)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/v1/") and not self._ok(scope["headers"]):
+            body = {"type": "error", "error": {"type": "authentication_error", "message": "invalid or missing API key", "code": 401}}
+            return await JSONResponse(body, status_code=401)(scope, receive, send)
+        await self.app(scope, receive, send)
+
+
 def _sse(obj) -> str:
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
@@ -248,6 +280,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     app = FastAPI(title="colin-inference-engine")
     fmt = ChatFormat(tokenizer)
     a = worker.args
+    if getattr(a, "api_key", None):
+        app.add_middleware(ApiKey, key=a.api_key)
     max_len, margin = a.max_seq_len, worker.sched.margin
     created = int(time.time())
 
@@ -268,8 +302,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return b
 
     def make_request(b: dict, prompt: list[int], hook) -> EngineRequest:
-        if len(prompt) + margin > max_len:
-            raise BadRequest(f"prompt has {len(prompt)} tokens; this server's maximum context is {max_len} tokens")
+        if len(prompt) + margin > max_len:  # the wording of the Anthropic API, which Claude Code recognizes
+            raise BadRequest(f"prompt is too long: {len(prompt)} tokens > {max_len - margin} maximum")
         mt = b.get("max_completion_tokens") or b.get("max_tokens")
         room = max_len - margin - len(prompt) + 1
         mt = room if mt is None else min(int(mt), room)
@@ -541,6 +575,93 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                              "choices": [{"index": 0, "text": text, "logprobs": lp_block(lps), "finish_reason": r.finish_reason}],
                              "usage": _usage(r), "timings": _timings(r)})
 
+    # -------------------------------------------------------------------------------------- Anthropic messages
+    async def render_messages(b: dict):
+        """Anthropic request body -> (prompt token ids, OpenAI-style tools)."""
+        msgs, tools = anth.to_messages(b), anth.to_tools(b)
+        kw = anth.template_kwargs(b, default_thinking)
+        try:
+            prompt = await asyncio.to_thread(fmt.render, msgs, tools, **kw)
+        except Exception as e:  # template errors (no user message, ...)
+            raise BadRequest(f"chat template: {e}")
+        return prompt, tools
+
+    @app.post("/v1/messages/count_tokens")
+    async def count_tokens(request: Request):
+        try:
+            prompt, _ = await render_messages(await request.json())
+        except (BadRequest, ValueError, TypeError, KeyError, AttributeError) as e:
+            return _anth_error(str(e))
+        return {"input_tokens": len(prompt)}
+
+    @app.post("/v1/messages")
+    async def messages(request: Request):
+        try:
+            b = await request.json()
+            prompt, tools = await render_messages(b)
+            stops = b.get("stop_sequences") or []
+            if not isinstance(stops, list):
+                raise BadRequest("stop_sequences must be a list of strings")
+            parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, [str(s) for s in stops])
+            st = Stream(asyncio.get_running_loop(), tokenizer, parser, None)
+            req = make_request(b, prompt, st)
+        except (BadRequest, ValueError, TypeError, KeyError, AttributeError) as e:
+            return _anth_error(str(e))
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        model = b.get("model") or served_name
+        blocks = anth.Blocks(anth.drops_tool_calls(b))
+        worker.submit(req)
+
+        def stop_of(r: EngineRequest):
+            return anth.stop_reason(r.finish_reason, blocks.n_tool_calls, parser.stop_match)
+
+        if b.get("stream"):
+            async def gen():
+                done = False
+                try:
+                    start = anth.message(mid, model, [], (None, None), anth.usage(len(prompt), 0, 0))
+                    yield anth.sse("message_start", {"type": "message_start", "message": start})
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(st.q.get(), timeout=anth.PING_S)
+                        except asyncio.TimeoutError:  # no output yet (queue, long prefill): keep the connection alive
+                            yield anth.sse("ping", {"type": "ping"})
+                            continue
+                        if item[0] == "error":
+                            done = True
+                            kind = "api_error" if item[2] >= 500 else "invalid_request_error"
+                            yield anth.sse("error", {"type": "error", "error": {"type": kind, "message": item[1]}})
+                            break
+                        if item[0] == "done":
+                            done = True
+                            r = item[1]
+                            for ev in blocks.close():
+                                yield ev
+                            sr, seq = stop_of(r)
+                            yield anth.sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": sr, "stop_sequence": seq},
+                                                             "usage": anth.usage(len(r.prompt), r.reused, len(r.output))})
+                            yield anth.sse("message_stop", {"type": "message_stop"})
+                            log_done(r, "msg")
+                            break
+                        for ev in blocks.add(item[1]):
+                            yield ev
+                finally:
+                    if not done:
+                        worker.abort(req)  # client went away
+            return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+        events = await wait_done(request, st, req)
+        if events is None:
+            return _anth_error("client disconnected", 499)
+        if events[-1][0] == "error":
+            return _anth_error(events[-1][1], events[-1][2])
+        for item in events[:-1]:
+            blocks.add(item[1])
+        blocks.close()
+        r = events[-1][1]
+        log_done(r, "msg")
+        return JSONResponse(anth.message(mid, model, blocks.content, stop_of(r), anth.usage(len(r.prompt), r.reused, len(r.output))))
+
     # -------------------------------------------------------------------------------------- the rest
     @app.get("/v1/models")
     async def models():
@@ -588,7 +709,10 @@ def main(argv=None):
                          "perplexity within 0.25%%) when their files exist; checkpoint: from the FP8 weights")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
-    ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto", help="default enable_thinking (auto: the template's default, on)")
+    ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
+                    help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
+    ap.add_argument("--api-key", default=os.environ.get("COLINFER_API_KEY") or None,
+                    help="require this key on the /v1/ endpoints (Authorization: Bearer, or x-api-key); default: $COLINFER_API_KEY, else no key")
     ap.add_argument("--no-selftest", action="store_true")
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
