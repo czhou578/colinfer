@@ -17,7 +17,6 @@ import torch
 from safetensors import safe_open
 
 from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
-from engine.weights import quant_emul
 from engine.weights.quantize import E2M1_VALUES
 
 PREFIX = "model.language_model."
@@ -93,13 +92,8 @@ def dequant_fp8_tensor(w8: torch.Tensor, scale: torch.Tensor, out_dtype=torch.bf
     return (w8.to(torch.float32) * scale.to(torch.float32)).to(out_dtype)
 
 
-def load_state_dict(path: str, device="cuda", dtype=torch.bfloat16, verbose=True, factored=False) -> tuple[dict, dict, dict]:
-    """Returns (state_dict with model-local names, info dict, quant meta). All weights in `dtype` on `device`.
-
-    factored=False: quantized weights are fully dequantized (weight-only reference path).
-    factored=True:  quantized weights keep only their exact unscaled values (e2m1 * block scale, or
-    e4m3); per-tensor weight and input scales go to quant meta {module: {kind, w_scale, in_scale}}
-    for engine.weights.quant_emul.QuantLinear."""
+def load_state_dict(path: str, device="cuda", dtype=torch.bfloat16) -> dict[str, torch.Tensor]:
+    """The state dict with model-local names, quantized weights fully dequantized. All weights in `dtype` on `device`."""
     files = shard_files(path)
     raw: dict[str, torch.Tensor] = {}
     t0 = time.time()
@@ -112,15 +106,10 @@ def load_state_dict(path: str, device="cuda", dtype=torch.bfloat16, verbose=True
                 t = sf.get_tensor(name)
                 total += t.numel() * t.element_size()
                 raw[name] = t
-    if verbose:
-        print(f"[loader] read {total / 1e9:.1f} GB from {len(files)} shards in {time.time() - t0:.1f}s")
+    print(f"[loader] read {total / 1e9:.1f} GB from {len(files)} shards in {time.time() - t0:.1f}s")
 
     sd: dict[str, torch.Tensor] = {}
-    meta: dict[str, dict] = {}
     info = dict(nvfp4=0, fp8_block=0, fp8_tensor=0, passthrough=0)
-
-    def scalar(n, default=1.0):
-        return float(raw[n].float().max()) if n in raw else default
     for name, t in raw.items():
         kind = quant_kind(name, t, raw)
         if kind == "scale":
@@ -129,43 +118,28 @@ def load_state_dict(path: str, device="cuda", dtype=torch.bfloat16, verbose=True
         base = name[: -len(".weight")]  # used by the quantized kinds, whose names end in .weight
         if kind == "nvfp4":
             gs = raw.get(base + ".weight_scale_2", torch.ones((), device=t.device))
-            if factored:
-                sd[local] = dequant_nvfp4(t, raw[base + ".weight_scale"], torch.ones((), device=t.device), dtype)
-                meta[local[: -len(".weight")]] = dict(kind="nvfp4", w_scale=float(gs.float()), in_scale=scalar(base + ".input_scale"))
-            else:
-                sd[local] = dequant_nvfp4(t, raw[base + ".weight_scale"], gs, dtype)
+            sd[local] = dequant_nvfp4(t, raw[base + ".weight_scale"], gs, dtype)
             info["nvfp4"] += 1
         elif kind == "fp8_block":
             sd[local] = dequant_fp8_block(t, raw[base + ".weight_scale_inv"], 128, dtype)
             info["fp8_block"] += 1
         elif kind == "fp8":
-            if factored:
-                sd[local] = t.to(dtype)
-                meta[local[: -len(".weight")]] = dict(kind="fp8", w_scale=scalar(base + ".weight_scale"), in_scale=scalar(base + ".input_scale"))
-            else:
-                sd[local] = dequant_fp8_tensor(t, raw[base + ".weight_scale"], dtype)
+            sd[local] = dequant_fp8_tensor(t, raw[base + ".weight_scale"], dtype)
             info["fp8_tensor"] += 1
         else:
             sd[local] = t.to(dtype) if t.is_floating_point() else t
             info["passthrough"] += 1
     del raw
-    if verbose:
-        print(f"[loader] tensors: {info}  ({time.time() - t0:.1f}s)")
-    return sd, info, meta
+    print(f"[loader] tensors: {info}  ({time.time() - t0:.1f}s)")
+    return sd
 
 
-def load_model(path_or_repo: str, device="cuda", dtype=torch.bfloat16, verbose=True, emulate: str | None = None) -> Qwen35ForCausalLM:
-    """emulate: comma list of quant_emul.EFFECTS (or 'all') to reproduce W4A4/W8A8 kernel numerics."""
-    effects = quant_emul.parse_effects(emulate)
+def load_model(path_or_repo: str, device="cuda", dtype=torch.bfloat16) -> Qwen35ForCausalLM:
     path = resolve(path_or_repo)
     cfg = Qwen35Config.from_checkpoint(path)
     with torch.device("meta"):
         model = Qwen35ForCausalLM(cfg)
-    sd, _, meta = load_state_dict(path, device, dtype, verbose, factored=bool(effects))
-    if "fp8_requant" in effects:
-        n = quant_emul.requant_fused_fp8(meta, sd)
-        if verbose:
-            print(f"[loader] fp8_requant: re-rounded {n} fused FP8 shards onto the group max scale")
+    sd = load_state_dict(path, device, dtype)
     expected = set(model.state_dict().keys())
     missing = expected - sd.keys()
     unexpected = sd.keys() - expected
@@ -175,12 +149,7 @@ def load_model(path_or_repo: str, device="cuda", dtype=torch.bfloat16, verbose=T
     if missing or unexpected:
         raise RuntimeError(f"state dict mismatch: missing={sorted(missing)[:5]} unexpected={sorted(unexpected)[:5]}")
     model.load_state_dict(sd, strict=True, assign=True)
-    if effects:
-        counts = quant_emul.install(model, meta, effects)
-        if verbose:
-            print(f"[loader] emulating {sorted(effects)} on {counts}")
     model.eval()
-    if verbose:
-        n = sum(p.numel() for p in model.parameters())
-        print(f"[loader] {os.path.basename(path)}: {n / 1e9:.2f} B params on {device} as {dtype}")
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[loader] {os.path.basename(path)}: {n / 1e9:.2f} B params on {device} as {dtype}")
     return model

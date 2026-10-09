@@ -1,4 +1,4 @@
-"""Fast CPU tests for engine/model/qwen35.py, the reference generator and the dequant helpers, on a tiny random model:
+"""Fast CPU tests for engine/model/qwen35.py and the dequant helpers, on a tiny random model:
 - prefill continuation (T > 1 with existing state)
 - the 64-token chunk boundary of the delta rule
 - stepwise decode vs one-shot prefill
@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
-from engine.runtime.generate import generate
 from engine.weights.loader import E2M1_LUT, dequant_fp8_block, dequant_nvfp4
 
 DT = torch.float32
@@ -107,13 +106,3 @@ def test_fp8_block_dequant_ragged_dims():
     out = dequant_fp8_block(w8, s, 128, torch.float32)
     rel = ((out - w).norm() / w.norm()).item()
     assert out.shape == (200, 300) and rel < 0.05, rel
-
-
-@torch.inference_mode()
-def test_generate_greedy_and_eos(model, ids):
-    greedy = generate(model, ids[:, :10], 20)
-    full = model(ids[:, :10], model.new_state(1, 30))  # the first token is the argmax after the prompt
-    assert len(greedy) == 20 and greedy[0] == int(full[0, -1].argmax())
-    stop = greedy[5]
-    cut = generate(model, ids[:, :10], 20, eos_ids=[stop])
-    assert cut == greedy[: greedy.index(stop) + 1]

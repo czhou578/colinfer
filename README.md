@@ -92,9 +92,9 @@ decision. In short:
 | `engine/model/fast.py` | the decode path: kernel modules, decode state, `DecodeGraph`, the INT decode copies |
 | `engine/model/prefill.py` | the prefill path |
 | `engine/spec/` | the MTP drafter and the speculative cycle (`mtp.py`), suffix-match drafts (`suffix.py`), exact acceptance for sampling (`accept.py`) |
-| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the engine build (`build.py`), the sampler, metrics, the reference generator |
+| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the engine build (`build.py`), the sampler, metrics |
 | `engine/server/` | the HTTP server (`api.py`), the Anthropic Messages API (`anthropic.py`), the chat template and output parsing (`chat.py`) |
-| `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), numerics emulation |
+| `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), the fake NVFP4 activation quantization that the kernel tests compare against (`quant_emul.py`) |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |
 | `tools/` | offline artifacts (decode copies, drafter training, low-rank head) and checkpoint utilities |

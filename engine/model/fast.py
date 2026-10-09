@@ -175,7 +175,7 @@ class SwiGLUMLP(nn.Module):
         return self.down(h.view(*shp[:-1], -1), residual)
 
 
-def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35ForCausalLM:
+def load_fast_model(path_or_repo: str, device="cuda") -> Qwen35ForCausalLM:
     """The reference module tree with the checkpoint's NVFP4 / FP8 linears swapped for kernel modules (weights stay
     quantized). Call to_fast() on the result."""
     path = resolve(path_or_repo)
@@ -223,11 +223,10 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
     del raw, plain
     torch.cuda.empty_cache()
     model.eval()
-    if verbose:
-        n4 = sum(isinstance(m, Nvfp4Linear) for m in model.modules())
-        n8 = sum(isinstance(m, Fp8Linear) for m in model.modules())
-        print(f"[fast] {os.path.basename(path)}: {n4} NVFP4 + {n8} FP8 kernel linears, "
-              f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU, loaded in {time.time() - t0:.0f}s")
+    n4 = sum(isinstance(m, Nvfp4Linear) for m in model.modules())
+    n8 = sum(isinstance(m, Fp8Linear) for m in model.modules())
+    print(f"[fast] {os.path.basename(path)}: {n4} NVFP4 + {n8} FP8 kernel linears, "
+          f"{torch.cuda.memory_allocated() / 1e9:.1f} GB on GPU, loaded in {time.time() - t0:.0f}s")
     return model
 
 
@@ -238,8 +237,8 @@ class FastState(ModelState):
     step are masked off). spec: True while FastQwen35.verify runs (the GDN layers then leave their state for commit()).
     view(lo, hi) shares the tensors of slots [lo, hi)."""
 
-    def __init__(self, cfg, batch, max_seq_len, device, dtype=torch.bfloat16):
-        super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.float8_e4m3fn)
+    def __init__(self, cfg, batch, max_seq_len, device):
+        super().__init__(cfg, batch, max_seq_len, device, torch.bfloat16, kv_dtype=torch.float8_e4m3fn)
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
         self.active = torch.ones(batch, dtype=torch.int32, device=device)
         self.spec = False

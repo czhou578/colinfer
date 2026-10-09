@@ -220,8 +220,8 @@ class OutputParser:
     """Token-level splitter for chat output. feed(token) -> list of events:
     ("reasoning", text) | ("content", text) | ("tool_call", {"id", "name", "arguments"})."""
 
-    def __init__(self, fmt: ChatFormat, in_reasoning: bool, tools: list | None, stops: list[str] = (), parse_tools: bool = True):
-        self.fmt, self.tools, self.parse_tools = fmt, tools, parse_tools and bool(tools)
+    def __init__(self, fmt: ChatFormat, in_reasoning: bool, tools: list | None, stops: list[str] = ()):
+        self.fmt, self.tools = fmt, tools
         self.mode = "reasoning" if in_reasoning else "content"
         self.detok = Detokenizer(fmt.tok)
         self.streams = {"reasoning": _Stream(list(stops)), "content": _Stream(list(stops))}
@@ -261,7 +261,7 @@ class OutputParser:
             return self._switch("content")
         if self.mode == "content" and t == f.think_open and not self.any_content and not self.n_tool_calls:
             return self._switch("reasoning")  # the model opened its own thinking block
-        if self.mode == "content" and t == f.tool_open and self.parse_tools:
+        if self.mode == "content" and t == f.tool_open and self.tools:
             ev = self._switch("tool")
             self.tool_ids = []
             return ev

@@ -42,7 +42,6 @@ def main():
     ap.add_argument("--json")
     ap.add_argument("--override-filter", default=None, help="regex: only override linears whose name matches")
     ap.add_argument("--text", help="score this corpus instead of WikiText: a text file, or 'code' (Python standard library sources)")
-    ap.add_argument("--emulate", help="quant emulation effects: act_nvfp4,act_fp8,fp8_requant or all")
     ap.add_argument("--engine", choices=["reference", "prefill"], default="reference",
                     help="reference: Phase 1 PyTorch model; prefill: Phase 3 W4A4 / W8A8 kernel prefill path")
     ap.add_argument("--override", help="reference engine: safetensors replacing the checkpoint's weights, comma-separated: "
@@ -71,7 +70,7 @@ def main():
         from engine.model.prefill import prefill
         model = to_fast(load_fast_model(path))
     else:
-        model = load_model(path, emulate=args.emulate)
+        model = load_model(path)
         if args.override:
             from safetensors import safe_open
 
@@ -108,10 +107,10 @@ def main():
         if (w + 1) % 8 == 0 or w == n_win - 1:
             print(f"[ppl] {w + 1}/{n_win} windows  running ppl {math.exp(nll / count):.4f}  ({time.time() - t0:.0f}s)")
     ppl = math.exp(nll / count)
-    print(f"[ppl] RESULT text={args.text or 'wikitext'} ckpt={args.ckpt} engine={args.engine} emulate={args.emulate} override={args.override} filter={args.override_filter} "
+    print(f"[ppl] RESULT text={args.text or 'wikitext'} ckpt={args.ckpt} engine={args.engine} override={args.override} filter={args.override_filter} "
           f"ctx={args.ctx} tokens={count} ppl={ppl:.4f} nll={nll / count:.5f}")
     if args.json:
-        json.dump(dict(ckpt=args.ckpt, emulate=args.emulate, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)
+        json.dump(dict(ckpt=args.ckpt, ctx=args.ctx, tokens=count, ppl=ppl, nll=nll / count), open(args.json, "w"), indent=1)
 
 
 if __name__ == "__main__":

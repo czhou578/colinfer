@@ -4,8 +4,7 @@ import pytest
 import torch
 
 from engine.weights.loader import E2M1_LUT
-from engine.weights.quant_emul import (e2m1_round, fake_quant_fp8_unscaled, fake_quant_nvfp4_unscaled,
-                                       parse_effects, requant_fused_fp8)
+from engine.weights.quant_emul import e2m1_round, fake_quant_nvfp4_unscaled
 
 
 def test_e2m1_round_ties_to_even_and_saturation():
@@ -19,27 +18,6 @@ def test_nvfp4_unscaled_is_exact_in_bf16():
     x = torch.randn(8, 256).bfloat16()
     q = fake_quant_nvfp4_unscaled(x, 0.003)
     assert torch.equal(q.float().bfloat16().float(), fake_quant_nvfp4_unscaled(x.float(), 0.003))
-
-
-def test_fp8_static_clamps():
-    x = torch.tensor([[1e6, -1e6, 0.0, 1.0]]).bfloat16()
-    assert torch.equal(fake_quant_fp8_unscaled(x, 1.0).float(), torch.tensor([[448.0, -448.0, 0.0, 1.0]]))
-
-
-def test_requant_fused_fp8_moves_to_max_scale():
-    meta = {f"layers.3.self_attn.{p}_proj": dict(kind="fp8", w_scale=s, in_scale=1.0) for p, s in (("q", 1.0), ("k", 0.5), ("v", 0.25))}
-    sd = {k + ".weight": torch.tensor([[2.0, 3.0, 448.0]]).bfloat16() for k in meta}
-    assert requant_fused_fp8(meta, sd) == 2
-    assert all(m["w_scale"] == 1.0 for m in meta.values())
-    assert torch.equal(sd["layers.3.self_attn.k_proj.weight"].float(), torch.tensor([[1.0, 1.5, 224.0]]))
-    assert torch.equal(sd["layers.3.self_attn.v_proj.weight"].float(), torch.tensor([[0.5, 0.75, 112.0]]))
-
-
-def test_parse_effects():
-    assert parse_effects("all") == {"act_nvfp4", "act_fp8", "fp8_requant"}
-    assert parse_effects(None) == set()
-    with pytest.raises(ValueError):
-        parse_effects("act_fp16")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
