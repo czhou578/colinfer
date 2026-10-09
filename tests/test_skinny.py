@@ -1,9 +1,10 @@
-"""The tensor-core skinny GEMM (csrc/skinny.cu) on NVFP4, FP8 and SwiGLU weights. The tests check:
-- the accuracy against an fp32 reference built from the dequantization of the loader
+"""The tensor-core skinny GEMM (csrc/skinny.cu) on NVFP4, FP8, INT6 / INT5 and SwiGLU weights. The tests check:
+- the accuracy against an fp32 reference built from the dequantization of the loader (INT6 / INT5: x @ (q * s)^T,
+  with the one bf16 rounding of q * s that the kernel does)
 - that each output row is bit-identical for any number of rows (this keeps plain decode, verify and the drafter
   consistent)
 - the skip flag of the draft early exit, and the small decode ops (bf16 GEMV, RMSNorm)
-INT6 / INT5: tests/test_skinny_int.py. Run: uv run pytest tests/test_skinny.py -q"""
+Run: uv run pytest tests/test_skinny.py -q"""
 import pytest
 import torch
 
@@ -59,6 +60,28 @@ def test_fp8_row_scales(M):
     out1 = torch.empty(1, N, device="cuda", dtype=torch.bfloat16)
     ops().skinny_fp8(x[-1:].contiguous(), w, 1.0, None, out1, rs)
     assert torch.equal(out1, out[-1:])
+
+
+@pytest.mark.parametrize("bits", [6, 5])
+@pytest.mark.parametrize("N,K", [(256, 512), (1032, 1024), (5120, 6144)])
+@pytest.mark.parametrize("M", [1, 3, 16])
+def test_skinny_int(bits, N, K, M):
+    from engine.weights.quantize import pack5, pack6, quantize_int
+    torch.manual_seed(bits * 1000 + N + M)
+    W = torch.randn(N, K, device="cuda") * 0.02
+    gs = float(W.abs().max()) / (448 * (2 ** (bits - 1) - 1))
+    codes, sf = quantize_int(W, gs, bits)
+    lo, hi = (pack6 if bits == 6 else pack5)(codes)
+    q = codes.float() - 2 ** (bits - 1)
+    wq = (q.view(N, -1, 16) * sf.float()[..., None]).view(N, K).bfloat16().float()
+    x = torch.randn(M, K, device="cuda").bfloat16()
+    res = torch.randn(M, N, device="cuda").bfloat16()
+    out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    ops().skinny_int(x, lo, hi, sf, gs, res, out)
+    assert rel(out, (x.float() @ wq.t()) * gs + res.float()) < 5e-3
+    o1 = torch.empty(1, N, device="cuda", dtype=torch.bfloat16)
+    ops().skinny_int(x[:1].contiguous(), lo, hi, sf, gs, res[:1].contiguous(), o1)
+    assert torch.equal(o1[0], out[0])
 
 
 def test_swiglu():

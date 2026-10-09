@@ -119,14 +119,13 @@ class Slot:
 class Scheduler:
     def __init__(self, model: FastQwen35, n_slots: int = 3, max_seq_len: int = 32768, n_checkpoints: int = 32, mtp=None, k: int = 3,
                  prefill_chunk: int = CHUNK, ckpt_interval: int = 8192, metrics: Metrics | None = None,
-                 keep_finished: bool = True, boundary_token: int | None = None, suffix_min: int = 0):
+                 boundary_token: int | None = None, suffix_min: int = 0):
         prepare_prefill(model)
         self.model, self.mtp, self.k = model, mtp, k
         self.suffix_min = suffix_min if mtp is not None else 0  # > 0: suffix-match drafts of at least this match length
         self.kmax = max(k, SUFFIX_K) if self.suffix_min else k   # longest draft a cycle verifies
         self.n_slots, self.max_seq_len, self.chunk, self.ckpt_interval = n_slots, max_seq_len, prefill_chunk, ckpt_interval
         self.metrics = metrics or Metrics()
-        self.keep_finished = keep_finished
         self.boundary = boundary_token
         self.state = model.new_state(n_slots, max_seq_len)
         dev = self.dev = self.state.pos_t.device
@@ -177,7 +176,6 @@ class Scheduler:
         self.ckpts: list[Checkpoint] = []  # oldest first
         self.free_bufs = list(range(n_checkpoints))
         self.queue: collections.deque[Request] = collections.deque()
-        self.finished: list[Request] = []
         self._rid = 0
         self._evt = torch.cuda.Event()
         torch.cuda.synchronize()
@@ -514,8 +512,6 @@ class Scheduler:
         self.metrics.generated_tokens.inc(len(req.output))
         if req.hook is not None:
             req.hook.finish(req)
-        if self.keep_finished:
-            self.finished.append(req)
 
     def busy(self) -> bool:
         return bool(self.queue) or any(s.phase != "idle" for s in self.slots)
@@ -529,7 +525,6 @@ class Scheduler:
             self._drop(c)
         self.slots = [Slot(i) for i in range(self.n_slots)]
         self.state.pos_t.zero_()
-        self.finished.clear()
         self.metrics.reset()
 
     def run(self, requests: list[Request]) -> list[Request]:

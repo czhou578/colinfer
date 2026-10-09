@@ -72,7 +72,7 @@ class Worker(threading.Thread):
         from engine.runtime.build import build_engine
         sched, self.startup = build_engine(a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=a.checkpoints, spec=a.spec, k=a.k,
                                            drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
-                                           boundary=a.boundary_token, selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False,
+                                           boundary=a.boundary_token, selftest=not a.no_selftest, metrics=self.metrics,
                                            log=log)
         t3 = time.perf_counter()
         if not a.no_warmup:

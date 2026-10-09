@@ -56,7 +56,7 @@ def boundary_token(path: str) -> int:
 
 def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 262144, checkpoints: int = 32, spec: str = "mtp", k: int = 7,
                  drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int", boundary="auto",
-                 selftest: bool = True, metrics=None, keep_finished: bool = True, log=print):
+                 selftest: bool = True, metrics=None, log=print):
     """The scheduler with its model, as `python -m engine.server` builds it from the same flags (the defaults are the
     server's). spec: "mtp" or "none". boundary: the message-boundary token id, "auto" (the checkpoint's) or None.
     Returns (scheduler, the startup seconds of each phase)."""
@@ -76,6 +76,6 @@ def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 26214
         from engine.selftest import run_selftest
         run_selftest(verbose=True)  # refuses to start if any matmul path is numerically wrong
     sched = Scheduler(m, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=k, metrics=metrics,
-                      keep_finished=keep_finished, boundary_token=boundary, suffix_min=suffix_drafts)
+                      boundary_token=boundary, suffix_min=suffix_drafts)
     t3 = time.perf_counter()
     return sched, dict(kernels_s=round(t1 - t0, 1), weights_s=round(t2 - t1, 1), graphs_selftest_s=round(t3 - t2, 1))
