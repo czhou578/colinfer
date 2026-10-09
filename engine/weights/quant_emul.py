@@ -20,9 +20,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from engine.weights.quantize import E2M1_MIDPOINTS, E2M1_VALUES, E4M3_MAX
+
 EFFECTS = ("act_nvfp4", "act_fp8", "fp8_requant")
-_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_E2M1_MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 _TIES_UP = (0.75, 1.75, 3.5)  # round-half-to-even goes to the upper grid point at these midpoints
 
 
@@ -40,8 +40,8 @@ def parse_effects(spec: str | None) -> set[str]:
 
 def e2m1_round(a: torch.Tensor) -> torch.Tensor:
     """Round |a| (fp32, >= 0) to the e2m1 grid, nearest, ties to even, saturating at 6."""
-    mids = torch.tensor(_E2M1_MIDS, device=a.device, dtype=a.dtype)
-    grid = torch.tensor(_E2M1_GRID, device=a.device, dtype=a.dtype)
+    mids = torch.tensor(E2M1_MIDPOINTS, device=a.device, dtype=a.dtype)
+    grid = torch.tensor(E2M1_VALUES, device=a.device, dtype=a.dtype)
     idx = torch.bucketize(a, mids)  # ties go to the lower point
     for t in _TIES_UP:
         idx = idx + (a == t).to(idx.dtype)
@@ -61,7 +61,7 @@ def fake_quant_nvfp4_unscaled(x: torch.Tensor, input_scale: float) -> torch.Tens
 
 def fake_quant_fp8_unscaled(x: torch.Tensor, input_scale: float) -> torch.Tensor:
     """Returns e4m3(clamp(x / input_scale)) as x.dtype (exact)."""
-    return (x.float() / input_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(x.dtype)
+    return (x.float() / input_scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).to(x.dtype)
 
 
 class QuantLinear(nn.Module):
@@ -102,7 +102,7 @@ def requant_fused_fp8(meta: dict, sd: dict) -> int:
                 s = meta[n]["w_scale"]
                 if s != smax:
                     w = sd[n + ".weight"].float() * (s / smax)
-                    sd[n + ".weight"] = w.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(sd[n + ".weight"].dtype)
+                    sd[n + ".weight"] = w.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).to(sd[n + ".weight"].dtype)
                     meta[n]["w_scale"] = smax
                     changed += 1
     return changed

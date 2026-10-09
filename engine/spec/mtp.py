@@ -31,7 +31,6 @@ MtpCycle captures one CUDA graph per speculative cycle for B slots (k drafts eac
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
 
 import numpy as np
@@ -42,9 +41,9 @@ from safetensors import safe_open
 
 from engine.kernels import ops
 from engine.model.fast import FastDecoderLayer, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear
-from engine.model.prefill import ATTN_FP8_MIN_CTX, prefill, prepare_prefill
-from engine.model.qwen35 import DecoderLayer, RMSNorm
-from engine.weights.loader import dequant_nvfp4
+from engine.model.prefill import attend_cached, prefill, prepare_prefill
+from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
+from engine.weights.loader import dequant_nvfp4, weight_map
 from engine.weights.quantize import nvfp4_global_scale, quantize
 
 DRAFT_DIR = os.path.expanduser("~/.cache/colinfer/drafter")
@@ -116,9 +115,8 @@ class Mtp(nn.Module):
                  lowrank: str | None = os.path.join(DRAFT_DIR, "draft_head_pca.safetensors")):
         super().__init__()
         cfg = target.cfg
-        wm = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
         t = {}
-        for name, f in wm.items():
+        for name, f in weight_map(path).items():
             if name.startswith("mtp."):
                 with safe_open(os.path.join(path, f), framework="pt", device="cuda") as sf:
                     t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
@@ -143,9 +141,7 @@ class Mtp(nn.Module):
         with torch.no_grad():
             a.q_norm.weight = nn.Parameter(t[P + "self_attn.q_norm.weight"], requires_grad=False)
             a.k_norm.weight = nn.Parameter(t[P + "self_attn.k_norm.weight"], requires_grad=False)
-        d = cfg.rotary_dim
-        KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]),  # separate: each its own NVFP4 global scale
-                              1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device="cuda") / d)))
+        KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]), rope_inv_freq(cfg, "cuda"))  # separate: own NVFP4 scales
         layer.mlp = DraftMLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
         layer.__class__ = FastDecoderLayer
         self.layer = layer
@@ -226,7 +222,6 @@ class Mtp(nn.Module):
     def prefill(self, tokens: torch.Tensor, hidden: torch.Tensor, st: MtpState, chunk: int = 2048) -> torch.Tensor:
         """MTP rows for a prompt (tokens [T], hidden [T, H]) from position st.pos_t of a single-slot view, writing the
         drafter's KV; returns the normed output of the last row [1, H]. Attention as in the target's prefill."""
-        import flashinfer
         a, layer = self.layer.self_attn, self.layer
         g = None
         for c0 in range(0, tokens.shape[0], chunk):
@@ -237,15 +232,7 @@ class Mtp(nn.Module):
             qp, kp, vp = a.q_proj(h), a.k_proj(h), a.v_proj(h)
             q = torch.empty(1, a.num_heads, T, a.head_dim, device=x.device, dtype=torch.bfloat16)
             ops().attn_prologue(qp, kp, vp, a.q_norm.weight, a.k_norm.weight, a.inv_freq, st.pos_t, st.k[0], st.v[0], q, a.q_norm.eps)
-            p0 = int(st.pos_t)
-            L = p0 + T
-            if L > ATTN_FP8_MIN_CTX:
-                o = torch.empty(T, a.num_heads, a.head_dim, device=x.device, dtype=torch.bfloat16)
-                ops().attn_prefill_fp8(q, st.k[0][0:1], st.v[0][0:1], o.view(T, -1), p0, a.head_dim ** -0.5)
-            else:  # FlashInfer over a bf16 copy of the cached prefix
-                kk, vv = st.k[0][0, :, :L].to(torch.bfloat16), st.v[0][0, :, :L].to(torch.bfloat16)
-                o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
-                                                            sm_scale=a.head_dim ** -0.5)
+            o = attend_cached(q, st.k[0], st.v[0], int(st.pos_t), a.head_dim ** -0.5).view(T, a.num_heads, a.head_dim)
             gate = qp.view(T, a.num_heads, 2 * a.head_dim)[:, :, a.head_dim:]
             x = a.o_proj((o * torch.sigmoid(gate)).reshape(T, -1), x)
             x = layer.mlp(layer.post_attention_layernorm(x), x)

@@ -14,7 +14,7 @@ import torch
 from engine.kernels import ops
 from engine.weights.loader import dequant_nvfp4
 from engine.weights.quant_emul import fake_quant_nvfp4_unscaled
-from engine.weights.quantize import dequant_int, pack5, pack6, quantize_int
+from engine.weights.quantize import dequant_int, int_global_scale, nvfp4_global_scale, pack5, pack6, quantize_int
 
 TOL = 5e-3
 
@@ -65,7 +65,7 @@ def run_selftest(verbose: bool = False) -> dict:
     # INT6 / INT5 decode copies
     wf = torch.randn(264, 1024, device=dev, generator=g) * 0.02
     for bits, pack in ((6, pack6), (5, pack5)):
-        gs = float(wf.abs().max()) / (448.0 * (2 ** (bits - 1) - 1))
+        gs = int_global_scale(float(wf.abs().max()), bits)
         codes, isf = quantize_int(wf, gs, bits)
         lo, hi = pack(codes)
         out = torch.empty(12, 264, device=dev, dtype=torch.bfloat16)
@@ -74,7 +74,7 @@ def run_selftest(verbose: bool = False) -> dict:
     # NVFP4 x NVFP4 CUTLASS GEMM (prefill), both tiles, with residual
     M, N, K = 384, 256, 1024
     xa = torch.randn(M, K, device=dev, generator=g).bfloat16()
-    s_in = float(xa.float().abs().max()) / (6 * 448)
+    s_in = nvfp4_global_scale(xa.float())
     a = torch.empty(M, K // 2, dtype=torch.uint8, device=dev)
     sfa = torch.empty(o.nvfp4_sf_size(M, K), dtype=torch.uint8, device=dev)
     o.nvfp4_quant(xa, s_in, a, sfa)

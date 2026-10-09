@@ -113,24 +113,31 @@ def _mlp(layer, x, y):
     return _gemm_nvfp4(hq, hsf, mlp.p_down, x_new)
 
 
+def attend_cached(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos: int, scale: float) -> torch.Tensor:
+    """Causal attention of T new rows of one slot, q [1, Hq, T, D] bf16 at positions pos .. pos+T-1 (their K / V already
+    in the cache), over that slot's fp8 cache kc / vc [1, Hkv, Lmax, D] -> [T, Hq * D] bf16. The target's prefill and the
+    MTP drafter's both attend through this."""
+    import flashinfer
+    T = q.shape[2]
+    L = pos + T
+    if L > ATTN_FP8_MIN_CTX:  # FP8 Q K^T over the cache as stored
+        o = torch.empty(T, q.shape[1] * q.shape[3], device=q.device, dtype=torch.bfloat16)
+        ops().attn_prefill_fp8(q, kc, vc, o, pos, scale)
+        return o
+    # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix to a BF16 scratch
+    # first is cheaper (and exact: e4m3 -> bf16 is lossless)
+    kk, vv = kc[0, :, :L].to(torch.bfloat16), vc[0, :, :L].to(torch.bfloat16)
+    return flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND", sm_scale=scale).reshape(T, -1)
+
+
 def _attention(attn, q8, state: FastState, li: int):
     """Mixer output (no residual) of a full-attention layer."""
-    import flashinfer
     T = q8.shape[0]
     qp, kp, vp = _fp8_gemm(q8, attn.qkv).split(attn.qkv.sizes, dim=-1)  # strided column views, read in place
     kc, vc = state.k[li], state.v[li]
     q = torch.empty(1, attn.num_heads, T, attn.head_dim, device=q8.device, dtype=torch.bfloat16)
     ops().attn_prologue(qp, kp, vp, attn.q_norm.weight, attn.k_norm.weight, attn.inv_freq, state.pos_t, kc, vc, q, attn.q_norm.eps)
-    L = state.pos + T
-    if L > ATTN_FP8_MIN_CTX:  # FP8 Q K^T over the cache as stored
-        o = torch.empty(T, attn.num_heads * attn.head_dim, device=q8.device, dtype=torch.bfloat16)
-        ops().attn_prefill_fp8(q, kc, vc, o, state.pos, attn.head_dim ** -0.5)
-    else:
-        # FlashInfer's FP8-KV prefill runs ~48 TFLOPS vs ~80 for BF16 on sm_121: casting the cached prefix to a BF16
-        # scratch first is cheaper (and exact: e4m3 -> bf16 is lossless)
-        kk, vv = kc[0, :, :L].to(torch.bfloat16), vc[0, :, :L].to(torch.bfloat16)
-        o = flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND",
-                                                    sm_scale=attn.head_dim ** -0.5).reshape(T, -1)
+    o = attend_cached(q, kc, vc, state.pos, attn.head_dim ** -0.5)
     o8 = torch.empty(T, attn.num_heads * attn.head_dim, dtype=torch.float8_e4m3fn, device=q8.device)
     ops().gate_fp8(o, qp, attn.head_dim, attn.o_proj.in_scale, o8)
     return _fp8_gemm(o8, attn.o_proj)

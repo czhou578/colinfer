@@ -20,7 +20,6 @@ the global scale.
    uv run python tools/int6_requant.py [--bits 6] [--filter linear_attn] [--simulate]
 """
 import argparse
-import json
 import os
 import re
 import sys
@@ -31,8 +30,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.weights.loader import resolve  # noqa: E402
-from engine.weights.quantize import REQUANT_DIR, dequant_int, pack5, pack6, quantize_int  # noqa: E402
+from engine.weights.loader import resolve, weight_map  # noqa: E402
+from engine.weights.quantize import REQUANT_DIR, dequant_int, int_global_scale, pack5, pack6, quantize_int  # noqa: E402
 
 
 def main():
@@ -47,8 +46,7 @@ def main():
     p4, p16 = resolve(a.nvfp4), resolve(a.bf16)
     tag = f"int{a.bits}" + ("_sim" if a.simulate else "") + (f"_{re.sub(r'[^a-z_]', '', a.filter)}" if a.filter else "")
     out = a.out or os.path.join(REQUANT_DIR, os.path.basename(p4), f"attn_gdn_{tag}.safetensors")
-    wm4 = json.load(open(os.path.join(p4, "model.safetensors.index.json")))["weight_map"]
-    wm16 = json.load(open(os.path.join(p16, "model.safetensors.index.json")))["weight_map"]
+    wm4, wm16 = weight_map(p4), weight_map(p16)
     fp8 = []
     for k, f in wm4.items():
         if k.endswith(".weight") and not k.startswith(("mtp.", "model.visual.")) and (not a.filter or re.search(a.filter, k)):
@@ -68,7 +66,7 @@ def main():
     tensors, rel = {}, []
     for gi, (key, names) in enumerate(sorted(groups.items())):
         ws = {n: load(n) for n in names}
-        gs = max(float(w.abs().max()) for w in ws.values()) / (448.0 * (2 ** (a.bits - 1) - 1))
+        gs = int_global_scale(max(float(w.abs().max()) for w in ws.values()), a.bits)
         for n, w in ws.items():
             codes, sf = quantize_int(w, gs, a.bits)
             deq = dequant_int(codes, sf, gs, a.bits)

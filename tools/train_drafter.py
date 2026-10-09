@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.weights.loader import resolve  # noqa: E402
+from engine.weights.loader import resolve, weight_map  # noqa: E402
 
 DIR = os.path.expanduser("~/.cache/colinfer/drafter")
 TOPK = 32
@@ -44,9 +44,8 @@ MAXLEN = 2048
 
 def mtp_tensors(path):
     from safetensors import safe_open
-    wm = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
     t = {}
-    for name, f in wm.items():
+    for name, f in weight_map(path).items():
         if name.startswith("mtp."):
             with safe_open(os.path.join(path, f), framework="pt", device="cuda") as sf:
                 t[name] = sf.get_tensor(name).to(torch.bfloat16)
@@ -97,8 +96,8 @@ class Head(torch.nn.Module):
         self.qn, self.kn = P(L + "self_attn.q_norm.weight"), P(L + "self_attn.k_norm.weight")
         self.gate, self.up, self.down = (P(L + f"mlp.{n}_proj.weight") for n in ("gate", "up", "down"))
         self.eps, self.H, self.Hq, self.Hkv, self.D = cfg.rms_norm_eps, cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
-        d = cfg.rotary_dim
-        self.register_buffer("inv_freq", 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d)), persistent=False)
+        from engine.model.qwen35 import rope_inv_freq
+        self.register_buffer("inv_freq", rope_inv_freq(cfg), persistent=False)
 
     def rms(self, x, w):
         xf = x.float()
@@ -191,7 +190,7 @@ def setup():
     import numpy as np
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     cfg = Qwen35Config.from_checkpoint(path)
-    wm = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
+    wm = weight_map(path)
 
     def get(n):
         with safe_open(os.path.join(path, wm[n]), framework="pt", device="cuda") as f:

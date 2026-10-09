@@ -18,10 +18,46 @@ from safetensors import safe_open
 
 from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
 from engine.weights import quant_emul
+from engine.weights.quantize import E2M1_VALUES
 
 PREFIX = "model.language_model."
 SKIP_PREFIXES = ("model.visual.", "mtp.")
 SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")
+
+
+def weight_map(path: str) -> dict[str, str]:
+    """Tensor name -> its file, in a safetensors checkpoint directory (from its index, else from each file's header)."""
+    idx = os.path.join(path, "model.safetensors.index.json")
+    if os.path.exists(idx):
+        with open(idx) as f:
+            return json.load(f)["weight_map"]
+    out = {}
+    for f in sorted(x for x in os.listdir(path) if x.endswith(".safetensors")):
+        with safe_open(os.path.join(path, f), framework="pt") as sf:
+            out.update(dict.fromkeys(sf.keys(), f))
+    return out
+
+
+def shard_files(path: str) -> list[str]:
+    return sorted(set(weight_map(path).values()))
+
+
+def quant_kind(name: str, t: torch.Tensor, names) -> str:
+    """How the checkpoint stores tensor `name` (`names`: all its tensor names): "scale" (a quantization scale, read with
+    its weight), "nvfp4" (e2m1 + e4m3 block scales + fp32 global scale), "fp8_block" (e4m3, 128x128 block scales),
+    "fp8" (e4m3, per-tensor scale) or "plain"."""
+    if name.endswith(SCALE_SUFFIXES):
+        return "scale"
+    if not name.endswith(".weight"):
+        return "plain"
+    base = name[: -len(".weight")]
+    if t.dtype == torch.uint8 and base + ".weight_scale" in names:
+        return "nvfp4"
+    if t.dtype == torch.float8_e4m3fn and base + ".weight_scale_inv" in names:
+        return "fp8_block"
+    if t.dtype == torch.float8_e4m3fn and base + ".weight_scale" in names:
+        return "fp8"
+    return "plain"
 
 
 def resolve(path_or_repo: str) -> str:
@@ -31,7 +67,7 @@ def resolve(path_or_repo: str) -> str:
     return snapshot_download(path_or_repo, local_files_only=True)
 
 
-E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+E2M1_LUT = torch.tensor(E2M1_VALUES + tuple(-v for v in E2M1_VALUES))  # by 4-bit code: magnitude in bits 0-2, sign in bit 3
 
 
 def dequant_nvfp4(packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor, out_dtype=torch.bfloat16) -> torch.Tensor:
@@ -64,11 +100,7 @@ def load_state_dict(path: str, device="cuda", dtype=torch.bfloat16, verbose=True
     factored=True:  quantized weights keep only their exact unscaled values (e2m1 * block scale, or
     e4m3); per-tensor weight and input scales go to quant meta {module: {kind, w_scale, in_scale}}
     for engine.weights.quant_emul.QuantLinear."""
-    idx_file = os.path.join(path, "model.safetensors.index.json")
-    if os.path.exists(idx_file):
-        files = sorted(set(json.load(open(idx_file))["weight_map"].values()))
-    else:
-        files = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
+    files = shard_files(path)
     raw: dict[str, torch.Tensor] = {}
     t0 = time.time()
     total = 0
@@ -90,11 +122,12 @@ def load_state_dict(path: str, device="cuda", dtype=torch.bfloat16, verbose=True
     def scalar(n, default=1.0):
         return float(raw[n].float().max()) if n in raw else default
     for name, t in raw.items():
-        if name.endswith(SCALE_SUFFIXES):
+        kind = quant_kind(name, t, raw)
+        if kind == "scale":
             continue
         local = name[len(PREFIX):] if name.startswith(PREFIX) else name
-        base = name[: -len(".weight")] if name.endswith(".weight") else None
-        if base is not None and t.dtype == torch.uint8 and (base + ".weight_scale") in raw:
+        base = name[: -len(".weight")]  # used by the quantized kinds, whose names end in .weight
+        if kind == "nvfp4":
             gs = raw.get(base + ".weight_scale_2", torch.ones((), device=t.device))
             if factored:
                 sd[local] = dequant_nvfp4(t, raw[base + ".weight_scale"], torch.ones((), device=t.device), dtype)
@@ -102,10 +135,10 @@ def load_state_dict(path: str, device="cuda", dtype=torch.bfloat16, verbose=True
             else:
                 sd[local] = dequant_nvfp4(t, raw[base + ".weight_scale"], gs, dtype)
             info["nvfp4"] += 1
-        elif base is not None and t.dtype == torch.float8_e4m3fn and (base + ".weight_scale_inv") in raw:
+        elif kind == "fp8_block":
             sd[local] = dequant_fp8_block(t, raw[base + ".weight_scale_inv"], 128, dtype)
             info["fp8_block"] += 1
-        elif base is not None and t.dtype == torch.float8_e4m3fn and (base + ".weight_scale") in raw:
+        elif kind == "fp8":
             if factored:
                 sd[local] = t.to(dtype)
                 meta[local[: -len(".weight")]] = dict(kind="fp8", w_scale=scalar(base + ".weight_scale"), in_scale=scalar(base + ".input_scale"))

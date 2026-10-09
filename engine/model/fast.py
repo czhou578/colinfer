@@ -26,7 +26,6 @@ halves of speculation (T = k + 1 rows, then the accepted prefix).
 from __future__ import annotations
 
 import copy
-import json
 import os
 import time
 
@@ -35,8 +34,8 @@ import torch.nn as nn
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.qwen35 import Attention, DecoderLayer, GatedDeltaNet, ModelState, Qwen35Config, Qwen35ForCausalLM
-from engine.weights.loader import PREFIX, SCALE_SUFFIXES, SKIP_PREFIXES, resolve
+from engine.model.qwen35 import Attention, DecoderLayer, GatedDeltaNet, ModelState, Qwen35Config, Qwen35ForCausalLM, rope_inv_freq
+from engine.weights.loader import PREFIX, SKIP_PREFIXES, quant_kind, resolve, shard_files
 from engine.weights.quantize import REQUANT_DIR
 
 MAX_ROWS = 16  # rows per weight pass of the skinny GEMM: a verify of width * (k + 1) rows must fit
@@ -183,8 +182,7 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
     cfg = Qwen35Config.from_checkpoint(path)
     t0 = time.time()
     raw: dict[str, torch.Tensor] = {}
-    files = sorted(set(json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"].values()))
-    for f in files:
+    for f in shard_files(path):
         with safe_open(os.path.join(path, f), framework="pt", device=device) as sf:
             for n in sf.keys():
                 if not n.startswith(SKIP_PREFIXES):
@@ -194,21 +192,22 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
     quant: dict[str, nn.Module] = {}
     plain: dict[str, torch.Tensor] = {}
     for name, t in raw.items():
-        if name.endswith(SCALE_SUFFIXES):
+        kind = quant_kind(name, t, raw)
+        if kind == "scale":
             continue
         local = name[len(PREFIX):] if name.startswith(PREFIX) else name
-        base = name[: -len(".weight")]
-        mod = local[: -len(".weight")] if local.endswith(".weight") else None
+        if kind == "fp8_block" or (kind == "plain" and t.dtype == torch.float8_e4m3fn):
+            raise NotImplementedError(f"{name}: block-scaled FP8 checkpoints are not supported")
+        if kind == "plain":
+            plain[local] = t.to(torch.bfloat16) if t.is_floating_point() else t
+            continue
+        base, mod = name[: -len(".weight")], local[: -len(".weight")]
         insc = float(raw[base + ".input_scale"].float()) if base + ".input_scale" in raw else 1.0
-        if t.dtype == torch.uint8 and base + ".weight_scale" in raw:
+        if kind == "nvfp4":
             quant[mod] = Nvfp4Linear(t, raw[base + ".weight_scale"], float(raw[base + ".weight_scale_2"].float()), out_fp32=(mod == "lm_head"),
                                      in_scale=insc)
-        elif t.dtype == torch.float8_e4m3fn and base + ".weight_scale" in raw:
-            quant[mod] = Fp8Linear(t, float(raw[base + ".weight_scale"].float()), in_scale=insc)
-        elif t.dtype == torch.float8_e4m3fn:
-            raise NotImplementedError(f"{name}: block-scaled FP8 checkpoints are not supported")
         else:
-            plain[local] = t.to(torch.bfloat16) if t.is_floating_point() else t
+            quant[mod] = Fp8Linear(t, float(raw[base + ".weight_scale"].float()), in_scale=insc)
     missing = set(model.state_dict()) - set(plain) - {m + ".weight" for m in quant}
     if missing:
         raise RuntimeError(f"missing tensors: {sorted(missing)[:5]}")
@@ -420,8 +419,7 @@ class FastQwen35(Qwen35ForCausalLM):
 def to_fast(model: Qwen35ForCausalLM) -> FastQwen35:
     """Switch a load_fast_model() model onto the kernel decode path: kernel attention / GDN / norms, stacked projections."""
     model.__class__ = FastQwen35
-    d = model.cfg.rotary_dim
-    inv_freq = 1.0 / (model.cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=model.embed_tokens.weight.device) / d))
+    inv_freq = rope_inv_freq(model.cfg, model.embed_tokens.weight.device)
     for layer in model.layers:
         if layer.block_type == "full_attention":
             a = layer.self_attn

@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine.kernels import ops  # noqa: E402
-from engine.weights.quantize import nvfp4_global_scale, pack5, pack6, quantize, quantize_int  # noqa: E402
+from engine.weights.quantize import int_global_scale, nvfp4_global_scale, pack5, pack6, quantize, quantize_int  # noqa: E402
 
 # (name, format, N, K) of the decode linears of Qwen3.8-27B (lm_head and the MLP in NVFP4, attention INT6, GDN INT5)
 SHAPES = [("mlp gate|up", "nvfp4", 34816, 5120), ("mlp down", "nvfp4", 5120, 17408), ("lm_head", "nvfp4", 248320, 5120),
@@ -27,7 +27,7 @@ def make(fmt, N, K):
         p, sf = quantize(w, gs)
         return (lambda x, out: ops().skinny_nvfp4(x, p, sf, gs, None, out)), N * K * 0.5625
     bits = 6 if fmt == "int6" else 5
-    gs = float(w.abs().max()) / (448 * (2 ** (bits - 1) - 1))
+    gs = int_global_scale(float(w.abs().max()), bits)
     codes, sf = quantize_int(w, gs, bits)
     lo, hi = (pack6 if bits == 6 else pack5)(codes)
     return (lambda x, out: ops().skinny_int(x, lo, hi, sf, gs, None, out)), N * K * (0.8125 if bits == 6 else 0.6875)

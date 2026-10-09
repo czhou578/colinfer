@@ -17,8 +17,11 @@ import os
 
 import torch
 
-E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-E2M1_MIDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+E4M3_MAX = 448.0  # the largest finite e4m3 value (FP8 weights and activations, the NVFP4 / INT block scales)
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # the e2m1 magnitudes (NVFP4 elements)
+E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+E2M1_GRID = torch.tensor(E2M1_VALUES)
+E2M1_MIDS = torch.tensor(E2M1_MIDPOINTS)
 NVFP4_DIVISORS = (6.0, 5.5, 5.0, 4.5, 4.0)
 INT_DIVISORS = (1.0, 0.95, 0.9, 0.85, 0.8)
 
@@ -27,7 +30,12 @@ REQUANT_DIR = os.path.expanduser("~/.cache/colinfer/requant")
 
 def nvfp4_global_scale(w: torch.Tensor) -> float:
     """The global scale that maps the tensor's largest weight onto e4m3 max x e2m1 max."""
-    return float(w.abs().max()) / (448.0 * 6.0)
+    return float(w.abs().max()) / (E4M3_MAX * E2M1_VALUES[-1])
+
+
+def int_global_scale(amax: float, bits: int) -> float:
+    """The global scale of an INT6 / INT5 copy: the largest weight is the largest code at the largest e4m3 block scale."""
+    return amax / (E4M3_MAX * (2 ** (bits - 1) - 1))
 
 
 def quantize(w: torch.Tensor, gs: float, rows: int = 2048):
@@ -42,7 +50,7 @@ def quantize(w: torch.Tensor, gs: float, rows: int = 2048):
         amax = b.abs().amax(-1, keepdim=True)
         best_err = best_s = best_code = None
         for d in NVFP4_DIVISORS:
-            s = (amax / d).clamp(max=448.0).to(torch.float8_e4m3fn).float()
+            s = (amax / d).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn).float()
             s = torch.where(s == 0, torch.ones_like(s), s)         # all-zero block: any scale
             y = (b / s).clamp(-6.0, 6.0)
             idx = torch.bucketize(y.abs(), mids)                    # nearest e2m1 magnitude
@@ -73,7 +81,7 @@ def quantize_int(w: torch.Tensor, gs: float, bits: int = 6, rows: int = 2048):
         amax = b.abs().amax(-1, keepdim=True)
         best = None
         for d in INT_DIVISORS:
-            s = (amax * d / qmax).clamp(max=448.0).to(torch.float8_e4m3fn).float()
+            s = (amax * d / qmax).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn).float()
             s = torch.where(s == 0, torch.ones_like(s), s)
             q = torch.round(b / s).clamp(-qmax, qmax)
             err = ((q * s - b) ** 2).sum(-1, keepdim=True)

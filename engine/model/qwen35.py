@@ -81,6 +81,12 @@ class Qwen35Config:
         return int(self.head_dim * self.partial_rotary_factor)
 
 
+def rope_inv_freq(cfg: Qwen35Config, device=None) -> torch.Tensor:
+    """The RoPE frequencies of the rotary dims (fp32), as the reference computes them; every attention path uses these."""
+    d = cfg.rotary_dim
+    return 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=device) / d))
+
+
 # ----------------------------------------------------------------------------------------------
 # State
 # ----------------------------------------------------------------------------------------------
@@ -403,8 +409,7 @@ class Qwen35ForCausalLM(nn.Module):
     def rotary(self, positions: torch.Tensor, dtype) -> tuple[torch.Tensor, torch.Tensor]:
         """cos/sin [1, T, rotary_dim] in the model dtype, computed in fp32 like the reference."""
         if self._inv_freq is None or self._inv_freq.device != positions.device:
-            d = self.cfg.rotary_dim
-            self._inv_freq = 1.0 / (self.cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=positions.device) / d))
+            self._inv_freq = rope_inv_freq(self.cfg, positions.device)
         freqs = positions.float()[:, None] * self._inv_freq[None, :]
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]
