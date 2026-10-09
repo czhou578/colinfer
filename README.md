@@ -65,7 +65,7 @@ and the engine uses it when it is present:
 | `~/.cache/colinfer/drafter/draft_head_pca.safetensors` | `tools/lowrank_draft_head.py` | a low-rank draft head: the same drafts for ~1/5 of the draft head's bytes (k=7 cycle 89.8 → 86.0 ms) |
 
 `docs/server.md` describes the flags, the API and the behavior of the server. `deploy/colinfer.service` runs the server
-under systemd.
+under systemd. `docs/claude_code.md` tells you how to use the model from the Claude Code CLI.
 
 ## How it works
 
@@ -99,7 +99,7 @@ decision. In short:
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |
 | `tools/` | offline artifacts (decode copies, drafter training, low-rank head) and checkpoint utilities |
 | `bench/` | decode / prefill / attention / GEMM / end-to-end benchmarks, nsys trace summaries |
-| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project. |
+| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project. |
 | `PLAN.md` | the original plan and targets |
 
 ## Testing
