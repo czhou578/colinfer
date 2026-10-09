@@ -106,10 +106,12 @@ decision. In short:
 ## Testing
 
 ```bash
+tests/check.sh                                           # ruff, pytest, golden.py (both modes), scheduler_check.py, in order; stops at the first failure (~8 min)
+tests/check.sh --quick                                   # ruff and pytest only (~1 min)
 uv run pytest tests/ -q                                  # kernels against PyTorch references, bit-identity properties, the scheduler and the HTTP layer on stubs (~1 min)
 uv run python tests/golden.py check                      # recorded tokens and logprobs, bit for bit (the default server)
 uv run python tests/golden.py check --plain              # the same, without speculation
-uv run python tests/scheduler_check.py                   # batching, sampling, prefix reuse: outputs unchanged
+uv run python tests/scheduler_check.py                   # queueing, sampling, prefix reuse: outputs unchanged
 uv run python tests/perplexity.py --engine prefill --ckpt nvidia/Qwen3.8-27B-NVFP4   # quality
 ```
 

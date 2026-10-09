@@ -7,6 +7,7 @@
 import argparse
 import concurrent.futures as cf
 import json
+import sys
 import time
 
 import requests
@@ -78,8 +79,9 @@ def main():
     body = {"prompt": "The capital of France is", "max_tokens": 12, "temperature": 0.8, "seed": 42, "logprobs": 3}
     r1, r2 = post(U + "/completions", body).json(), post(U + "/completions", body).json()
     lp = r1["choices"][0]["logprobs"]
-    check("completions seeded + logprobs", r1["choices"][0]["text"] == r2["choices"][0]["text"] and len(lp["tokens"]) == r1["usage"]["completion_tokens"]
-          and all(len(t) <= 3 for t in lp["top_logprobs"]), repr(r1["choices"][0]["text"]))
+    check("completions seeded + logprobs", r1["choices"][0]["text"] == r2["choices"][0]["text"]
+          and len(lp["tokens"]) == r1["usage"]["completion_tokens"] and all(len(t) <= 3 for t in lp["top_logprobs"]),
+          repr(r1["choices"][0]["text"]))
 
     # 5. four concurrent requests: three slots, the fourth queues
     def one(i):
@@ -124,9 +126,11 @@ def main():
     # 8. multi-turn prefix reuse
     long_sys = {"role": "system", "content": "Reference: " + " ".join(f"fact {i} is {i * 7 % 13}." for i in range(2000))}
     m1 = [long_sys, {"role": "user", "content": "What is fact 12?"}]
-    d1 = post(U + "/chat/completions", {"messages": m1, "temperature": 0, "max_tokens": 50, "chat_template_kwargs": {"enable_thinking": False}}).json()
+    d1 = post(U + "/chat/completions", {"messages": m1, "temperature": 0, "max_tokens": 50,
+                                        "chat_template_kwargs": {"enable_thinking": False}}).json()
     m2 = m1 + [{"role": "assistant", "content": d1["choices"][0]["message"]["content"]}, {"role": "user", "content": "And fact 13?"}]
-    d2 = post(U + "/chat/completions", {"messages": m2, "temperature": 0, "max_tokens": 50, "chat_template_kwargs": {"enable_thinking": False}}).json()
+    d2 = post(U + "/chat/completions", {"messages": m2, "temperature": 0, "max_tokens": 50,
+                                        "chat_template_kwargs": {"enable_thinking": False}}).json()
     c2 = d2["usage"]["prompt_tokens_details"]["cached_tokens"]
     check("multi-turn prefix reuse", c2 > 0.95 * d1["usage"]["prompt_tokens"], f"turn 2: {d2['usage']['prompt_tokens']} prompt tokens, {c2} cached, "
           f"TTFT {d2['timings']['ttft_s']:.3f}s (turn 1 {d1['timings']['ttft_s']:.2f}s)")
@@ -141,10 +145,11 @@ def main():
     kinds = [c["type"] for c in d["content"]]
     use = next((c for c in d["content"] if c["type"] == "tool_use"), {})
     check("messages: tool_use (non-stream)", d["type"] == "message" and d["stop_reason"] == "tool_use" and kinds[0] == "thinking"
-          and use.get("name") == "get_weather" and use["input"].get("city") == "Paris" and isinstance(use["input"].get("days", 3), int), f"{kinds} {use.get('input')}")
+          and use.get("name") == "get_weather" and use["input"].get("city") == "Paris" and isinstance(use["input"].get("days", 3), int),
+          f"{kinds} {use.get('input')}")
     n = requests.post(U + "/messages/count_tokens", json=q, headers=hdr).json()
-    check("messages: count_tokens = input + cached tokens", n.get("input_tokens") == d["usage"]["input_tokens"] + d["usage"]["cache_read_input_tokens"],
-          f"{n} {d['usage']}")
+    check("messages: count_tokens = input + cached tokens",
+          n.get("input_tokens") == d["usage"]["input_tokens"] + d["usage"]["cache_read_input_tokens"], f"{n} {d['usage']}")
     # the tool round trip, streamed, with the earlier thinking block sent back and a system message inside `messages`
     q2 = {**q, "stream": True, "thinking": {"type": "disabled"}, "messages": q["messages"] + [
         {"role": "assistant", "content": d["content"]},
@@ -165,8 +170,9 @@ def main():
     body = [e for e in events if e != "ping"]
     check("messages: tool result -> answer (stream)", body[0] == "message_start" and body[-2:] == ["message_delta", "message_stop"]
           and sr == "end_turn" and "18" in text and "content_block_start" in body, f"{text[:80]!r}; {cached} cached tokens")
-    s = requests.post(U + "/messages", headers=hdr, json={"max_tokens": 200, "stop_sequences": ["4"],
-                                                          "messages": [{"role": "user", "content": "Count from 1 to 9, separated by spaces."}]}).json()
+    body = {"max_tokens": 200, "stop_sequences": ["4"],
+            "messages": [{"role": "user", "content": "Count from 1 to 9, separated by spaces."}]}
+    s = requests.post(U + "/messages", headers=hdr, json=body).json()
     check("messages: stop_sequences", s["stop_reason"] == "stop_sequence" and s["stop_sequence"] == "4", repr(s["content"][-1:]))
     e1 = requests.post(U + "/messages", headers=hdr, json={"max_tokens": 4, "messages": [{"role": "user", "content": "x " * 300000}]})
     e2 = requests.post(U + "/messages", headers=hdr, json={"max_tokens": 4, "messages": [{"role": "user", "content": "hi"}],
@@ -177,6 +183,7 @@ def main():
     m = requests.get(a.url + "/metrics").text
     check("/metrics", "colinfer_step_seconds_bucket" in m and "colinfer_ttft_seconds_count" in m)
     print("SERVER CHECK", "PASSED" if ok else "FAILED")
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

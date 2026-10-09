@@ -17,10 +17,10 @@ More checks:
   7. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
+import sys
 import time
 
 import torch
-
 from transformers import AutoTokenizer
 
 from engine.runtime.build import build_engine
@@ -89,7 +89,7 @@ def main():
         print(f"[alone] {n:9s} {'IDENTICAL' if same else 'DIFFERENT'} {len(r.output)} tok, {(len(r.output) - 1) / dt:5.1f} tok/s")
     if a.only_alone:
         print("SCHEDULER CHECK", "PASSED" if ok else "FAILED")
-        return
+        sys.exit(0 if ok else 1)
 
     # 2. queued around a sampled request and a long chunked prefill
     long_doc = torch.randint(1000, 150000, (5000,), generator=torch.Generator().manual_seed(0)).tolist()
@@ -173,6 +173,7 @@ def main():
     m = spec.metrics
     print(f"[spec] drafted {m.drafted.get():.0f}, accepted {m.accepted.get():.0f} ({m.accepted.get() / max(m.drafted.get(), 1):.2f})")
     print("SCHEDULER CHECK", "PASSED" if ok else "FAILED")
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

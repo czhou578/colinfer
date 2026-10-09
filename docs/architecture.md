@@ -227,6 +227,9 @@ change from the numerics of the checkpoint (the INT copies, FP8 prefill attentio
 
 ## 8. Validation
 
+`tests/check.sh` runs the checks below in order (ruff, pytest, golden.py with and without speculation,
+scheduler_check.py) and stops at the first failure; `--quick` runs ruff and pytest only.
+
 - `pytest tests/` (≈1 min) tests each kernel against the PyTorch reference or a dequantized fp32 product. It also tests
   row invariance and the bit identity of verify and sequential decode. Other tests cover the prefill ops, the sampler
   and acceptance statistics, chat parsing and the unroll of the drafter trainer. `test_scheduler.py` runs the scheduler
