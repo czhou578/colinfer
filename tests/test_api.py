@@ -100,3 +100,100 @@ def test_max_tokens_limits():
     c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 10**9})
     room = MAX_LEN - MARGIN - 2 + 1
     assert [r.max_new_tokens for r in w.submitted] == [5, 7, room, room]
+
+
+def sse_data(r):
+    """The JSON events of an OpenAI stream. A stream ends with [DONE], or with an error event."""
+    import json
+    lines = [x.removeprefix("data: ") for x in r.text.split("\n\n") if x]
+    events = [json.loads(x) for x in lines if x != "[DONE]"]
+    assert (lines[-1] == "[DONE]") != ("error" in events[-1]) and lines.count("[DONE]") <= 1
+    return events
+
+
+def anth_events(r):
+    import json
+    out = []
+    for x in r.text.split("\n\n"):
+        if x:
+            head, data = x.split("\n", 1)
+            out.append((head.removeprefix("event: "), json.loads(data.removeprefix("data: "))))
+    return out
+
+
+THOUGHT = "Let me add.</think>\n\nThe answer is 4.<|im_end|>"
+TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+CALL = "</think>I'll check.<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>"
+
+
+@pytest.mark.parametrize("reply,tools", [(THOUGHT, None), (CALL, TOOLS)])
+def test_chat_stream_matches_reply(reply, tools):
+    c, _ = client(reply)
+    body = {"messages": USER, "tools": tools, "logprobs": True, "top_logprobs": 1}
+    one = c.post(CHAT, json=body).json()["choices"][0]
+    chunks = sse_data(c.post(CHAT, json={**body, "stream": True, "stream_options": {"include_usage": True}}))
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    deltas = [ch["choices"][0]["delta"] for ch in chunks if ch["choices"]]
+    assert "".join(d.get("reasoning_content", "") for d in deltas) == one["message"].get("reasoning_content", "")
+    assert "".join(d.get("content", "") for d in deltas) == (one["message"]["content"] or "")
+    calls = [t for d in deltas for t in d.get("tool_calls", [])]
+    assert [t.pop("index") for t in calls] == list(range(len(calls)))
+    no_id = lambda cs: [{k: v for k, v in t.items() if k != "id"} for t in cs]  # noqa: E731  (ids are random per request)
+    assert no_id(calls) == no_id(one["message"].get("tool_calls", []))
+    assert chunks[-2]["choices"][0]["finish_reason"] == one["finish_reason"]
+    assert chunks[-1]["usage"]["completion_tokens"] == len(CharTokenizer().encode(reply))
+    lps = [e for ch in chunks if ch["choices"] and ch["choices"][0].get("logprobs") for e in ch["choices"][0]["logprobs"]["content"]]
+    assert len(lps) == len(one["logprobs"]["content"]) > 0
+    if tools:
+        assert one["finish_reason"] == "tool_calls" and one["message"]["content"] == "I'll check."
+        assert one["message"]["tool_calls"][0]["function"] == {"name": "get_weather", "arguments": '{"city": "Paris"}'}
+    else:
+        assert (one["message"]["reasoning_content"], one["message"]["content"], one["finish_reason"]) == ("Let me add.", "The answer is 4.", "stop")
+
+
+def test_completions_stream_matches_reply():
+    c, _ = client("one two three four")
+    one = c.post("/v1/completions", json={"prompt": "count:", "max_tokens": 9, "logprobs": 0}).json()["choices"][0]
+    chunks = sse_data(c.post("/v1/completions", json={"prompt": "count:", "max_tokens": 9, "logprobs": 0, "stream": True}))
+    assert one["text"] == "".join(ch["choices"][0]["text"] for ch in chunks) == "one two t"
+    assert one["finish_reason"] == chunks[-1]["choices"][0]["finish_reason"] == "length"
+    assert one["logprobs"]["tokens"] == [t for ch in chunks if ch["choices"][0]["logprobs"] for t in ch["choices"][0]["logprobs"]["tokens"]]
+
+
+def test_messages_stream_matches_reply():
+    c, _ = client(CALL)
+    body = {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "weather?"}], "thinking": {"type": "enabled"},
+            "tools": [{"name": "get_weather", "input_schema": TOOLS[0]["function"]["parameters"]}]}
+    one = c.post("/v1/messages", json=body).json()
+    ev = anth_events(c.post("/v1/messages", json={**body, "stream": True}))
+    assert [e for e, _ in ev][0] == "message_start" and [e for e, _ in ev][-2:] == ["message_delta", "message_stop"]
+    text = "".join(d["delta"].get("text", "") for e, d in ev if e == "content_block_delta")
+    assert text == "".join(b.get("text", "") for b in one["content"]) == "I'll check."
+    assert [b["type"] for b in one["content"]] == ["text", "tool_use"] and one["content"][1]["input"] == {"city": "Paris"}
+    assert one["stop_reason"] == ev[-2][1]["delta"]["stop_reason"] == "tool_use"
+
+
+@pytest.mark.parametrize("code,kind,anth_kind", [(500, "server_error", "api_error"), (400, "invalid_request_error", "invalid_request_error")])
+def test_engine_errors_have_one_format(code, kind, anth_kind):
+    c, _ = client(error=("engine says no", code))
+    for path, body in ((CHAT, {"messages": USER}), ("/v1/completions", {"prompt": "hi"})):
+        r = c.post(path, json=body)
+        assert r.status_code == code and r.json()["error"] == {"message": "engine says no", "type": kind, "code": code}
+        err = [e for e in sse_data(c.post(path, json={**body, "stream": True})) if "error" in e]
+        assert err == [{"error": {"message": "engine says no", "type": kind, "code": code}}]
+    body = {"max_tokens": 10, "messages": USER}
+    r = c.post("/v1/messages", json=body)
+    assert r.status_code == code and r.json()["error"]["type"] == anth_kind
+    assert anth_events(c.post("/v1/messages", json={**body, "stream": True}))[-1] == ("error", _anth(anth_kind))
+
+
+def _anth(kind):
+    return {"type": "error", "error": {"type": kind, "message": "engine says no"}}
+
+
+def test_empty_prompt_is_rejected_before_the_engine():
+    c, w = client("x")
+    for stream in (False, True):
+        r = c.post("/v1/completions", json={"prompt": "", "stream": stream})
+        assert r.status_code == 400 and "empty" in r.json()["error"]["message"]
+    assert not w.submitted

@@ -235,17 +235,30 @@ def _timings(req: EngineRequest) -> dict:
             "decode_tok_s": round((len(req.output) - 1) / decode_s, 2) if len(req.output) > 1 else None}
 
 
-def _error(msg, code=400, kind="invalid_request_error"):
-    return JSONResponse({"error": {"message": msg, "type": kind, "code": code}}, status_code=code)
+def _error_body(msg: str, code: int) -> dict:
+    """An error in the format of the OpenAI API (a response body, or a stream event); the code sets the type."""
+    return {"error": {"message": msg, "type": "server_error" if code >= 500 else "invalid_request_error", "code": code}}
+
+
+def _error(msg, code=400):
+    return JSONResponse(_error_body(msg, code), status_code=code)
 
 
 _ANTH_ERROR = {400: "invalid_request_error", 401: "authentication_error", 404: "not_found_error", 413: "request_too_large",
                499: "invalid_request_error"}
 
 
+def _anth_error_body(msg: str, code: int) -> dict:
+    """An error in the format of the Anthropic API (a response body, or a stream event)."""
+    return {"type": "error", "error": {"type": _ANTH_ERROR.get(code, "api_error"), "message": msg}}
+
+
 def _anth_error(msg, code=400):
-    """An error in the format of the Anthropic API."""
-    return JSONResponse({"type": "error", "error": {"type": _ANTH_ERROR.get(code, "api_error"), "message": msg}}, status_code=code)
+    return JSONResponse(_anth_error_body(msg, code), status_code=code)
+
+
+def _finish_reason(r: EngineRequest) -> str:
+    return "stop" if r.finish_reason == "abort" else r.finish_reason  # an abort (the client went away) reads as a stop
 
 
 class ApiKey:
@@ -275,6 +288,14 @@ class BadRequest(Exception):
     pass
 
 
+class Failed(Exception):
+    """A request that the engine failed, or whose client went away: the message and the HTTP status."""
+
+    def __init__(self, msg: str, code: int):
+        super().__init__(msg)
+        self.msg, self.code = msg, code
+
+
 # ------------------------------------------------------------------------------------------------ app
 def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, hf_config: dict, default_thinking):
     app = FastAPI(title="colin-inference-engine")
@@ -301,7 +322,9 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             raise BadRequest("response_format is not supported except {\"type\": \"text\"}: the server has no constrained decoding")
         return b
 
-    def make_request(b: dict, prompt: list[int], hook) -> EngineRequest:
+    def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None) -> EngineRequest:
+        if not prompt:
+            raise BadRequest("the prompt is empty")
         if len(prompt) + margin > max_len:  # the wording of the Anthropic API, which Claude Code recognizes
             raise BadRequest(f"prompt is too long: {len(prompt)} tokens > {max_len - margin} maximum")
         mt = b.get("max_completion_tokens")
@@ -328,14 +351,27 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             salt = uuid.uuid4().hex
         return EngineRequest(prompt, max_new_tokens=mt, temperature=temp, top_k=max(top_k, 0), top_p=top_p,
                              min_p=float(b.get("min_p") or 0.0), seed=seed, eos_ids=eos, min_tokens=int(b.get("min_tokens") or 0),
-                             logprobs=None, hook=hook, cache_salt=None if salt is None else str(salt))
+                             logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt))
 
     def stops_of(b: dict) -> list[str]:
         st = b.get("stop")
         return [st] if isinstance(st, str) else list(st or [])
 
-    async def wait_done(request, st: Stream, req: EngineRequest):
-        """Collect events until done (non-streaming); aborts the request if the client goes away."""
+    def include_usage_of(b: dict) -> bool:
+        so = b.get("stream_options")
+        return isinstance(so, dict) and bool(so.get("include_usage"))
+
+    def log_done(req: EngineRequest, kind: str):
+        t = _timings(req)
+        log(f"[{kind} {req.rid}] slot {req.slot} prompt {len(req.prompt)} (cached {req.reused}) -> {len(req.output)} tok, "
+            f"{req.finish_reason}; queue {t['queue_s']:.2f}s ttft {t['ttft_s']:.2f}s decode {t['decode_tok_s'] or 0:.1f} tok/s")
+
+    # -------------------------------------------------------------------------------------- the two ways to answer
+    # Every endpoint answers through these two: result() for a reply in one body, sse_response() for a stream. Each
+    # endpoint gives only the formatting of its API.
+    async def result(request, st: Stream, req: EngineRequest, kind: str) -> tuple[list, EngineRequest]:
+        """Waits for a request without a stream: (its output events ("delta", parser events, ids, logprobs), the
+        finished request). Raises Failed on an engine error, and aborts the request (499) when the client goes away."""
         events = []
         while True:
             try:
@@ -343,16 +379,58 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             except asyncio.TimeoutError:
                 if await request.is_disconnected():
                     worker.abort(req)
-                    return None
+                    raise Failed("client disconnected", 499)
                 continue
+            if item[0] == "error":
+                raise Failed(item[1], item[2])
+            if item[0] == "done":
+                log_done(item[1], kind)
+                return events, item[1]
             events.append(item)
-            if item[0] in ("done", "error"):
-                return events
 
-    def log_done(req: EngineRequest, kind: str):
-        t = _timings(req)
-        log(f"[{kind} {req.rid}] slot {req.slot} prompt {len(req.prompt)} (cached {req.reused}) -> {len(req.output)} tok, "
-            f"{req.finish_reason}; queue {t['queue_s']:.2f}s ttft {t['ttft_s']:.2f}s decode {t['decode_tok_s'] or 0:.1f} tok/s")
+    def sse_response(st: Stream, req: EngineRequest, kind: str, on_delta, on_done, on_error, head=(), ping=None):
+        """Streams a request: the events of `head`, on_delta(event) for each output event, then on_done(request) or
+        on_error(message, code). Each returns a list of SSE strings. ping: (seconds, event), sent while no output
+        arrives (the queue, a long prefill). Aborts the request when the client goes away before the end."""
+        async def gen():
+            finished = False
+            try:
+                for x in head:
+                    yield x
+                while True:
+                    try:
+                        item = await asyncio.wait_for(st.q.get(), timeout=ping[0] if ping else None)
+                    except asyncio.TimeoutError:
+                        yield ping[1]
+                        continue
+                    if item[0] == "delta":
+                        for x in on_delta(item):
+                            yield x
+                        continue
+                    finished = True
+                    if item[0] == "error":
+                        for x in on_error(item[1], item[2]):
+                            yield x
+                    else:
+                        for x in on_done(item[1]):
+                            yield x
+                        log_done(item[1], kind)
+                    return
+            finally:
+                if not finished:
+                    worker.abort(req)  # the client went away
+        return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    def sse_error(msg: str, code: int) -> list[str]:
+        return [_sse(_error_body(msg, code))]
+
+    def stream_end(rid: str, obj: str, model: str, r: EngineRequest, include_usage: bool) -> list[str]:
+        """The last events of an OpenAI stream: the usage chunk (stream_options.include_usage), then [DONE]."""
+        out = []
+        if include_usage:
+            out.append(_sse({"id": rid, "object": obj, "created": int(time.time()), "model": model, "choices": [], "usage": _usage(r),
+                             "timings": _timings(r)}))
+        return out + ["data: [DONE]\n\n"]
 
     # -------------------------------------------------------------------------------------- chat completions
     @app.post("/v1/chat/completions")
@@ -384,17 +462,14 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 n_top = min(int(b.get("top_logprobs") or 0), MAX_TOP_LOGPROBS)
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser, n_top)
-            req = make_request(b, prompt, st)
-            req.logprobs = n_top
+            req = make_request(b, prompt, st, n_top)
+            include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
             return _error(str(e))
-        except (ValueError, TypeError, json.JSONDecodeError) as e:
+        except (ValueError, TypeError) as e:
             return _error(f"bad request: {e}")
         rid = "chatcmpl-" + uuid.uuid4().hex
         model = b.get("model") or served_name
-        stream = bool(b.get("stream"))
-        include_usage = bool((b.get("stream_options") or {}).get("include_usage"))
-        want_ids = bool(b.get("return_token_ids"))
         worker.submit(req)
 
         def chunk(delta, finish=None, extra=None):
@@ -404,91 +479,83 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 c["choices"][0].update(extra)
             return c
 
-        if stream:
-            async def gen():
-                done = False
-                try:
-                    n_calls, first, role_sent, carry_ids, carry_lps = 0, True, False, [], []
-                    while True:
-                        item = await st.q.get()
-                        if not role_sent and item[0] != "error":  # the role chunk goes out with the first output, as vLLM does
-                            role_sent = True
-                            yield _sse(chunk({"role": "assistant", "content": ""}))
-                        if item[0] == "error":
-                            done = True
-                            yield _sse({"error": {"message": item[1], "code": item[2]}})
-                            break
-                        if item[0] == "done":
-                            done = True
-                            fr = item[1].finish_reason
-                            fr = "tool_calls" if parser.n_tool_calls and fr == "stop" else fr
-                            extra = {"token_ids": carry_ids} if want_ids and carry_ids else None
-                            yield _sse(chunk({}, fr if fr != "abort" else "stop", extra))
-                            if include_usage:
-                                yield _sse({"id": rid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                                            "choices": [], "usage": _usage(item[1]), "timings": _timings(item[1])})
-                            yield "data: [DONE]\n\n"
-                            log_done(item[1], "chat")
-                            break
-                        _, ev, ids, lps = item
-                        carry_ids += ids
-                        carry_lps += lps
-                        delta = {}
-                        for kind, x in ev:
-                            if kind == "tool_call":
-                                delta.setdefault("tool_calls", []).append(
-                                    {"index": n_calls, "id": x["id"], "type": "function", "function": {"name": x["name"], "arguments": x["arguments"]}})
-                                n_calls += 1
-                            elif kind == "reasoning":
-                                delta["reasoning_content"] = delta.get("reasoning_content", "") + x
-                                delta["reasoning"] = delta["reasoning_content"]
-                            else:
-                                delta["content"] = delta.get("content", "") + x
-                        if not delta:
-                            continue
-                        extra = {}
-                        if want_ids:
-                            extra["token_ids"] = carry_ids
-                        if n_top is not None:
-                            extra["logprobs"] = {"content": carry_lps}
-                        c = chunk(delta, None, extra)
-                        if first:
-                            first = False
-                            c["request_metrics"] = {"time_to_first_token_s": req.t_first - req.t_submit, "queue_time_s": req.t_admit - req.t_submit,
-                                                    "prompt_time_s": req.t_first - req.t_admit}
-                        carry_ids, carry_lps = [], []
-                        yield _sse(c)
-                finally:
-                    if not done:
-                        worker.abort(req)  # client went away
-            return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        def tool_call(x):
+            return {"id": x["id"], "type": "function", "function": {"name": x["name"], "arguments": x["arguments"]}}
 
-        events = await wait_done(request, st, req)
-        if events is None:
-            return _error("client disconnected", 499)
-        if events[-1][0] == "error":
-            return _error(events[-1][1], events[-1][2], "server_error" if events[-1][2] >= 500 else "invalid_request_error")
+        def finish_reason(r):
+            return "tool_calls" if parser.n_tool_calls and r.finish_reason == "stop" else _finish_reason(r)
+
+        if b.get("stream"):
+            role_sent, first, n_calls, carry_ids, carry_lps = False, True, 0, [], []
+
+            def role():  # the role chunk goes out with the first output, as vLLM does
+                nonlocal role_sent
+                if role_sent:
+                    return []
+                role_sent = True
+                return [_sse(chunk({"role": "assistant", "content": ""}))]
+
+            def on_delta(item):
+                nonlocal first, n_calls, carry_ids, carry_lps
+                _, ev, ids, lps = item
+                carry_ids += ids
+                carry_lps += lps
+                out, delta = role(), {}
+                for kind, x in ev:
+                    if kind == "tool_call":
+                        delta.setdefault("tool_calls", []).append({"index": n_calls, **tool_call(x)})
+                        n_calls += 1
+                    elif kind == "reasoning":
+                        delta["reasoning_content"] = delta.get("reasoning_content", "") + x
+                        delta["reasoning"] = delta["reasoning_content"]
+                    else:
+                        delta["content"] = delta.get("content", "") + x
+                if not delta:
+                    return out
+                extra = {}
+                if want_ids:
+                    extra["token_ids"] = carry_ids
+                if n_top is not None:
+                    extra["logprobs"] = {"content": carry_lps}
+                c = chunk(delta, None, extra)
+                if first:
+                    first = False
+                    c["request_metrics"] = {"time_to_first_token_s": req.t_first - req.t_submit, "queue_time_s": req.t_admit - req.t_submit,
+                                            "prompt_time_s": req.t_first - req.t_admit}
+                carry_ids, carry_lps = [], []
+                return out + [_sse(c)]
+
+            def on_done(r):  # the last chunk carries the ids / logprobs of trailing tokens without text (the stop token)
+                extra = {}
+                if want_ids and carry_ids:
+                    extra["token_ids"] = carry_ids
+                if n_top is not None and carry_lps:
+                    extra["logprobs"] = {"content": carry_lps}
+                return role() + [_sse(chunk({}, finish_reason(r), extra))] + stream_end(rid, "chat.completion.chunk", model, r, include_usage)
+            return sse_response(st, req, "chat", on_delta, on_done, sse_error)
+
+        try:
+            events, r = await result(request, st, req, "chat")
+        except Failed as e:
+            return _error(e.msg, e.code)
         reasoning, content, calls, lps = "", "", [], []
-        for item in events[:-1]:
-            for kind, x in item[1]:
+        for _, ev, _, item_lps in events:
+            for kind, x in ev:
                 if kind == "tool_call":
-                    calls.append({"id": x["id"], "type": "function", "function": {"name": x["name"], "arguments": x["arguments"]}})
+                    calls.append(tool_call(x))
                 elif kind == "reasoning":
                     reasoning += x
                 else:
                     content += x
-            lps += item[3]
-        r = events[-1][1]
-        fr = "tool_calls" if calls and r.finish_reason == "stop" else r.finish_reason
+            lps += item_lps
         msg = {"role": "assistant", "content": content if (content or not calls) else None}
         if reasoning:
             msg["reasoning_content"] = msg["reasoning"] = reasoning
         if calls:
             msg["tool_calls"] = calls
-        choice = {"index": 0, "message": msg, "logprobs": {"content": lps} if n_top is not None else None, "finish_reason": fr}
+        choice = {"index": 0, "message": msg, "logprobs": {"content": lps} if n_top is not None else None, "finish_reason": finish_reason(r)}
         if want_ids:
             choice["token_ids"] = r.output
-        log_done(r, "chat")
         return JSONResponse({"id": rid, "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [choice],
                              "usage": _usage(r), "timings": _timings(r)})
 
@@ -511,15 +578,14 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             n_top = None if b.get("logprobs") is None else min(int(b["logprobs"]), MAX_TOP_LOGPROBS)
             parser = TextParser(tokenizer, stops_of(b))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser, n_top)
-            req = make_request(b, prompt, st)
-            req.logprobs = n_top
+            req = make_request(b, prompt, st, n_top)
+            include_usage = include_usage_of(b)
         except BadRequest as e:
             return _error(str(e))
-        except (ValueError, TypeError, json.JSONDecodeError) as e:
+        except (ValueError, TypeError) as e:
             return _error(f"bad request: {e}")
         rid = "cmpl-" + uuid.uuid4().hex
         model = b.get("model") or served_name
-        include_usage = bool((b.get("stream_options") or {}).get("include_usage"))
         worker.submit(req)
 
         def lp_block(lps):
@@ -533,48 +599,30 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                     "choices": [{"index": 0, "text": text, "logprobs": lp_block(lps or []) if lps else None, "finish_reason": finish}]}
 
         if b.get("stream"):
-            async def gen():
-                done = False
-                try:
-                    carry = []
-                    while True:
-                        item = await st.q.get()
-                        if item[0] == "error":
-                            done = True
-                            yield _sse({"error": {"message": item[1], "code": item[2]}})
-                            break
-                        if item[0] == "done":
-                            done = True
-                            fr = item[1].finish_reason
-                            yield _sse(chunk("", fr if fr != "abort" else "stop", carry))
-                            if include_usage:
-                                yield _sse({"id": rid, "object": "text_completion", "created": int(time.time()), "model": model,
-                                            "choices": [], "usage": _usage(item[1]), "timings": _timings(item[1])})
-                            yield "data: [DONE]\n\n"
-                            log_done(item[1], "cmpl")
-                            break
-                        _, ev, ids, lps = item
-                        carry += lps
-                        text = "".join(x for _, x in ev)
-                        if text:
-                            yield _sse(chunk(text, None, carry))
-                            carry = []
-                finally:
-                    if not done:
-                        worker.abort(req)
-            return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            carry = []
 
-        events = await wait_done(request, st, req)
-        if events is None:
-            return _error("client disconnected", 499)
-        if events[-1][0] == "error":
-            return _error(events[-1][1], events[-1][2])
-        text = "".join(x for item in events[:-1] for _, x in item[1])
-        lps = [e for item in events[:-1] for e in item[3]]
-        r = events[-1][1]
-        log_done(r, "cmpl")
+            def on_delta(item):
+                nonlocal carry
+                _, ev, _, lps = item
+                carry += lps
+                text = "".join(x for _, x in ev)
+                if not text:
+                    return []
+                c, carry = chunk(text, None, carry), []
+                return [_sse(c)]
+
+            def on_done(r):
+                return [_sse(chunk("", _finish_reason(r), carry))] + stream_end(rid, "text_completion", model, r, include_usage)
+            return sse_response(st, req, "cmpl", on_delta, on_done, sse_error)
+
+        try:
+            events, r = await result(request, st, req, "cmpl")
+        except Failed as e:
+            return _error(e.msg, e.code)
+        text = "".join(x for _, ev, _, _ in events for _, x in ev)
+        lps = [e for _, _, _, item_lps in events for e in item_lps]
         return JSONResponse({"id": rid, "object": "text_completion", "created": int(time.time()), "model": model,
-                             "choices": [{"index": 0, "text": text, "logprobs": lp_block(lps), "finish_reason": r.finish_reason}],
+                             "choices": [{"index": 0, "text": text, "logprobs": lp_block(lps), "finish_reason": _finish_reason(r)}],
                              "usage": _usage(r), "timings": _timings(r)})
 
     # -------------------------------------------------------------------------------------- Anthropic messages
@@ -617,52 +665,29 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         def stop_of(r: EngineRequest):
             return anth.stop_reason(r.finish_reason, blocks.n_tool_calls, parser.stop_match)
 
-        if b.get("stream"):
-            async def gen():
-                done = False
-                try:
-                    start = anth.message(mid, model, [], (None, None), anth.usage(len(prompt), 0, 0))
-                    yield anth.sse("message_start", {"type": "message_start", "message": start})
-                    while True:
-                        try:
-                            item = await asyncio.wait_for(st.q.get(), timeout=anth.PING_S)
-                        except asyncio.TimeoutError:  # no output yet (queue, long prefill): keep the connection alive
-                            yield anth.sse("ping", {"type": "ping"})
-                            continue
-                        if item[0] == "error":
-                            done = True
-                            kind = "api_error" if item[2] >= 500 else "invalid_request_error"
-                            yield anth.sse("error", {"type": "error", "error": {"type": kind, "message": item[1]}})
-                            break
-                        if item[0] == "done":
-                            done = True
-                            r = item[1]
-                            for ev in blocks.close():
-                                yield ev
-                            sr, seq = stop_of(r)
-                            yield anth.sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": sr, "stop_sequence": seq},
-                                                             "usage": anth.usage(len(r.prompt), r.reused, len(r.output))})
-                            yield anth.sse("message_stop", {"type": "message_stop"})
-                            log_done(r, "msg")
-                            break
-                        for ev in blocks.add(item[1]):
-                            yield ev
-                finally:
-                    if not done:
-                        worker.abort(req)  # client went away
-            return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        def use(r: EngineRequest):
+            return anth.usage(len(r.prompt), r.reused, len(r.output))
 
-        events = await wait_done(request, st, req)
-        if events is None:
-            return _anth_error("client disconnected", 499)
-        if events[-1][0] == "error":
-            return _anth_error(events[-1][1], events[-1][2])
-        for item in events[:-1]:
-            blocks.add(item[1])
+        if b.get("stream"):
+            def on_done(r):
+                sr, seq = stop_of(r)
+                return blocks.close() + [anth.sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": sr, "stop_sequence": seq},
+                                                                    "usage": use(r)}),
+                                         anth.sse("message_stop", {"type": "message_stop"})]
+            start = anth.message(mid, model, [], (None, None), anth.usage(len(prompt), 0, 0))
+            return sse_response(st, req, "msg", lambda item: blocks.add(item[1]), on_done,
+                                lambda msg, code: [anth.sse("error", _anth_error_body(msg, code))],
+                                head=[anth.sse("message_start", {"type": "message_start", "message": start})],
+                                ping=(anth.PING_S, anth.sse("ping", {"type": "ping"})))
+
+        try:
+            events, r = await result(request, st, req, "msg")
+        except Failed as e:
+            return _anth_error(e.msg, e.code)
+        for _, ev, _, _ in events:
+            blocks.add(ev)
         blocks.close()
-        r = events[-1][1]
-        log_done(r, "msg")
-        return JSONResponse(anth.message(mid, model, blocks.content, stop_of(r), anth.usage(len(r.prompt), r.reused, len(r.output))))
+        return JSONResponse(anth.message(mid, model, blocks.content, stop_of(r), use(r)))
 
     # -------------------------------------------------------------------------------------- the rest
     @app.get("/v1/models")
