@@ -183,13 +183,18 @@ class Worker(threading.Thread):
 
 # ------------------------------------------------------------------------------------------------ request bridge
 class Stream:
-    """One request's bridge from the engine thread (feed / finish / error) to its HTTP handler (an asyncio queue)."""
+    """One request's bridge from the engine thread (feed / finish / error) to its HTTP handler (an asyncio queue).
+
+    feed and finish run on the engine thread, which exits on any exception (a CUDA error poisons the context). So a
+    failure to format the output (a parser bug, a tool schema the parser does not expect) must stay here: it fails this
+    request with a 500, and feed returns True so that the scheduler ends the request."""
 
     def __init__(self, loop, tok, parser, logprobs: int | None):
         self.loop, self.tok, self.parser, self.logprobs = loop, tok, parser, logprobs
         self.q: asyncio.Queue = asyncio.Queue()
         self.ids: list[int] = []
         self.lps: list = []
+        self.failed = False
 
     def _put(self, item):
         self.loop.call_soon_threadsafe(self.q.put_nowait, item)
@@ -199,23 +204,39 @@ class Stream:
         return s, list(s.encode("utf-8", errors="replace"))
 
     def feed(self, t, lp):  # engine thread
-        self.ids.append(t)
-        if lp is not None:
-            s, b = self._tokstr(t)
-            self.lps.append({"token": s, "logprob": lp[0], "bytes": b,
-                             "top_logprobs": [dict(zip(("token", "bytes"), self._tokstr(i)), logprob=v) for i, v in lp[1]]})
-        ev = self.parser.feed(t)
-        if ev:
-            self._put(("delta", ev, self.ids, self.lps))
-            self.ids, self.lps = [], []
-        return self.parser.stopped
+        if self.failed:
+            return True
+        try:
+            self.ids.append(t)
+            if lp is not None:
+                s, b = self._tokstr(t)
+                self.lps.append({"token": s, "logprob": lp[0], "bytes": b,
+                                 "top_logprobs": [dict(zip(("token", "bytes"), self._tokstr(i)), logprob=v) for i, v in lp[1]]})
+            ev = self.parser.feed(t)
+            if ev:
+                self._put(("delta", ev, self.ids, self.lps))
+                self.ids, self.lps = [], []
+            return self.parser.stopped
+        except Exception:  # noqa: BLE001  see the class docstring
+            self._fail()
+            return True
 
     def finish(self, req):  # engine thread
-        ev = self.parser.finish()
+        if self.failed:
+            return
+        try:
+            ev = self.parser.finish()
+        except Exception:  # noqa: BLE001  see the class docstring
+            return self._fail()
         if ev or self.ids:
             self._put(("delta", ev, self.ids, self.lps))
             self.ids, self.lps = [], []
         self._put(("done", req))
+
+    def _fail(self):
+        traceback.print_exc()
+        self.failed = True
+        self.error("internal error while formatting the output", 500)
 
     def error(self, msg, code=500):
         self._put(("error", msg, code))
@@ -355,7 +376,11 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
 
     def stops_of(b: dict) -> list[str]:
         st = b.get("stop")
-        return [st] if isinstance(st, str) else list(st or [])
+        if st is None or isinstance(st, str):
+            return [st] if st else []
+        if isinstance(st, list) and all(isinstance(x, str) for x in st):
+            return st
+        raise BadRequest("stop must be a string or a list of strings")
 
     def include_usage_of(b: dict) -> bool:
         so = b.get("stream_options")

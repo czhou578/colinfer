@@ -197,3 +197,30 @@ def test_empty_prompt_is_rejected_before_the_engine():
         r = c.post("/v1/completions", json={"prompt": "", "stream": stream})
         assert r.status_code == 400 and "empty" in r.json()["error"]["message"]
     assert not w.submitted
+
+
+def test_stop_must_be_strings():
+    c, w = client("ok<|im_end|>")
+    for stop in ([1], 5, ["a", None]):  # a non-string reached the parser on the engine thread, which exits on any error
+        assert c.post(CHAT, json={"messages": USER, "stop": stop}).status_code == 400, stop
+        assert c.post("/v1/completions", json={"prompt": "hi", "stop": stop}).status_code == 400, stop
+    assert not w.submitted
+    assert c.post(CHAT, json={"messages": USER, "stop": "x"}).status_code == 200
+    assert c.post("/v1/completions", json={"prompt": "hi", "stop": ["a", "b"]}).status_code == 200
+
+
+def test_output_failure_fails_only_its_request(monkeypatch):
+    """Stream.feed runs on the engine thread: a parser exception must end that request with a 500 (and feed must tell
+    the scheduler to stop it), not escape into the scheduler step."""
+    import engine.server.chat as chat
+
+    def broken(text, tools):
+        raise RuntimeError("parser bug")
+    monkeypatch.setattr(chat, "parse_tool_call", broken)
+    c, w = client(CALL)
+    body = {"messages": USER, "tools": TOOLS}
+    r = c.post(CHAT, json=body)
+    assert r.status_code == 500 and r.json()["error"]["message"] == "internal error while formatting the output"
+    assert w.submitted[-1].finish_reason == "stop" and len(w.submitted[-1].output) < len(CharTokenizer().encode(CALL))
+    assert sse_data(c.post(CHAT, json={**body, "stream": True}))[-1]["error"]["type"] == "server_error"
+    assert c.post(CHAT, json={"messages": USER}).status_code == 200  # no tools: the parser never calls it

@@ -93,7 +93,9 @@ class Detokenizer:
         return new[len(prev):] if len(new) > len(prev) else ""
 
 
-def _convert(value: str, schema: dict | None):
+def _convert(value: str, schema: dict | bool | None):
+    if schema is not None and not isinstance(schema, dict):  # a boolean JSON schema (true: any value) has no type
+        schema = {}
     t = (schema or {}).get("type")
     if isinstance(t, list):
         t = next((x for x in t if x != "null"), None)
@@ -132,10 +134,12 @@ def parse_tool_call(text: str, tools: list | None) -> dict | None:
             return None
     name = m.group(1).strip()
     props = {}
-    for t in tools or []:
-        fn = t.get("function", t)
-        if fn.get("name") == name:
-            props = (fn.get("parameters") or {}).get("properties") or {}
+    for t in tools or []:  # the client's schemas: any JSON may stand where an object is expected
+        fn = t.get("function", t) if isinstance(t, dict) else None
+        if isinstance(fn, dict) and fn.get("name") == name:
+            params = fn.get("parameters")
+            props = params.get("properties") if isinstance(params, dict) else None
+            props = props if isinstance(props, dict) else {}
     args = {}
     for pm in _PARAM_RE.finditer(text, m.end()):
         key, val = pm.group(1).strip(), pm.group(2)

@@ -133,6 +133,17 @@ def test_parse_tool_call_untyped_and_json():
     assert parse_tool_call("garbage", None) is None
 
 
+def test_tool_schemas_the_parser_does_not_expect():
+    """Boolean JSON schemas (true: any value) and other odd shapes in the client's tools: untyped values, no exception
+    (the parser runs on the engine thread)."""
+    body = "<function=f>\n<parameter=x>\n[1, 2]\n</parameter>\n<parameter=y>\nhi\n</parameter>\n</function>"
+    for params in ({"properties": {"x": True, "y": False}}, {"properties": [1]}, [1], None):
+        c = parse_tool_call(body, [{"type": "function", "function": {"name": "f", "parameters": params}}, 7, {"function": "f"}])
+        assert c["name"] == "f" and json.loads(c["arguments"])["y"] == "hi"
+    c = parse_tool_call(body, [{"type": "function", "function": {"name": "f", "parameters": {"properties": {"x": True}}}}])
+    assert json.loads(c["arguments"])["x"] == [1, 2]
+
+
 def test_truncated_tool_call_keeps_complete_params(fmt):
     body = "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=days>\n4"
     out = run(OutputParser(fmt, False, TOOLS), enc(fmt, body))
