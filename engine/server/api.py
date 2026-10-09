@@ -304,7 +304,9 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     def make_request(b: dict, prompt: list[int], hook) -> EngineRequest:
         if len(prompt) + margin > max_len:  # the wording of the Anthropic API, which Claude Code recognizes
             raise BadRequest(f"prompt is too long: {len(prompt)} tokens > {max_len - margin} maximum")
-        mt = b.get("max_completion_tokens") or b.get("max_tokens")
+        mt = b.get("max_completion_tokens")
+        if mt is None:  # the older name; an `or` would read an explicit max_completion_tokens 0 as unset
+            mt = b.get("max_tokens")
         room = max_len - margin - len(prompt) + 1
         mt = room if mt is None else min(int(mt), room)
         if mt < 1:
