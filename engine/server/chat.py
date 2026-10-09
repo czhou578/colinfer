@@ -46,6 +46,29 @@ class ChatFormat:
         return False
 
 
+def check_messages(messages, tools) -> None:
+    """Raises ValueError unless messages / tools have the shapes that the template and the parser read: the request's
+    errors are then the client's (400), and any other failure of the rendering is the server's (500)."""
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages must be a non-empty list")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict) or not isinstance(m.get("role"), str):
+            raise ValueError(f"messages[{i}] must be an object with a string role")
+        c = m.get("content")
+        if not (c is None or isinstance(c, str) or (isinstance(c, list) and all(isinstance(p, dict) for p in c))):
+            raise ValueError(f"messages[{i}].content must be a string, a list of content parts or null")
+        for k in ("reasoning_content", "reasoning"):
+            if not isinstance(m.get(k), (str, type(None))):
+                raise ValueError(f"messages[{i}].{k} must be a string")
+        calls = m.get("tool_calls")
+        if calls is not None and not (isinstance(calls, list) and all(
+                isinstance(c, dict) and isinstance(c.get("function"), dict) and isinstance(c["function"].get("arguments", {}), (str, dict))
+                for c in calls)):
+            raise ValueError(f"messages[{i}].tool_calls must be a list of {{function: {{name, arguments}}}} objects")
+    if tools is not None and not (isinstance(tools, list) and all(isinstance(t, dict) for t in tools)):
+        raise ValueError("tools must be a list of objects")
+
+
 def _normalize_message(m: dict) -> dict:
     m = dict(m)
     if m.get("content") is None:
@@ -56,11 +79,12 @@ def _normalize_message(m: dict) -> dict:
             c = dict(c)
             fn = dict(c.get("function") or {})
             args = fn.get("arguments")
-            if isinstance(args, str):
+            if isinstance(args, str):  # the template iterates over a mapping: keep any other JSON as one argument
                 try:
-                    fn["arguments"] = json.loads(args) if args.strip() else {}
+                    parsed = json.loads(args) if args.strip() else {}
                 except json.JSONDecodeError:
-                    fn["arguments"] = {"arguments": args}
+                    parsed = None
+                fn["arguments"] = parsed if isinstance(parsed, dict) else {"arguments": args}
             c["function"] = fn
             calls.append(c)
         m["tool_calls"] = calls

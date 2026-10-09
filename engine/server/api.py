@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hmac
+import inspect
 import json
 import os
 import queue
@@ -30,6 +31,7 @@ import time
 import traceback
 import uuid
 
+import jinja2
 import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -37,7 +39,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from engine.runtime.metrics import Metrics
 from engine.runtime.scheduler import Request as EngineRequest
 from engine.server import anthropic as anth
-from engine.server.chat import ChatFormat, OutputParser, TextParser
+from engine.server.chat import ChatFormat, OutputParser, TextParser, check_messages
 from engine.spec.suffix import MIN_MATCH
 
 MAX_TOP_LOGPROBS = 20
@@ -306,7 +308,16 @@ def _sse(obj) -> str:
 
 
 class BadRequest(Exception):
-    pass
+    """The client's error (a 400). The endpoints turn only this into an error reply; any other exception is a bug of the
+    server, which the app's handler logs and answers with a 500."""
+
+
+def _num(v, kind, name: str):
+    """A request field as an int / float, or a BadRequest."""
+    try:
+        return kind(v)
+    except (TypeError, ValueError):
+        raise BadRequest(f"{name} must be a number, not {v!r}") from None
 
 
 class Failed(Exception):
@@ -327,6 +338,18 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     max_len, margin = a.max_seq_len, worker.sched.margin
     created = int(time.time())
 
+    # apply_chat_template's own arguments: a chat_template_kwargs key with one of these names would collide with them
+    reserved_kwargs = set(inspect.signature(tokenizer.apply_chat_template).parameters) - {"self", "kwargs"}
+
+    async def json_body(request: Request) -> dict:
+        try:
+            b = await request.json()
+        except ValueError:
+            raise BadRequest("the body is not valid JSON") from None
+        if not isinstance(b, dict):
+            raise BadRequest("the body must be a JSON object")
+        return b
+
     def body_of(raw: dict) -> dict:
         b = dict(raw)
         extra = b.pop("extra_body", None)
@@ -336,7 +359,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             raise BadRequest("n > 1 is not supported")
         # fields the engine cannot honor: reject them rather than ignore them, unless they leave the output unchanged
         for k, neutral in (("presence_penalty", 0.0), ("frequency_penalty", 0.0), ("repetition_penalty", 1.0)):
-            if b.get(k) is not None and float(b[k]) != neutral:
+            if b.get(k) is not None and _num(b[k], float, k) != neutral:
                 raise BadRequest(f"{k} is not supported (only {neutral:g}, the neutral value)")
         rf = b.get("response_format")
         if rf is not None and not (isinstance(rf, dict) and rf.get("type") == "text"):
@@ -352,18 +375,21 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         if mt is None:  # the older name; an `or` would read an explicit max_completion_tokens 0 as unset
             mt = b.get("max_tokens")
         room = max_len - margin - len(prompt) + 1
-        mt = room if mt is None else min(int(mt), room)
+        mt = room if mt is None else min(_num(mt, int, "max_tokens"), room)
         if mt < 1:
             raise BadRequest("max_tokens must be at least 1")
         temp = b.get("temperature")
-        temp = gen_defaults.get("temperature", 1.0) if temp is None else float(temp)
+        temp = gen_defaults.get("temperature", 1.0) if temp is None else _num(temp, float, "temperature")
         top_k = b.get("top_k")
-        top_k = gen_defaults.get("top_k", 0) if top_k is None else int(top_k)
+        top_k = gen_defaults.get("top_k", 0) if top_k is None else _num(top_k, int, "top_k")
         top_p = b.get("top_p")
-        top_p = gen_defaults.get("top_p", 1.0) if top_p is None else float(top_p)
+        top_p = gen_defaults.get("top_p", 1.0) if top_p is None else _num(top_p, float, "top_p")
         seed = b.get("seed")
-        seed = random.getrandbits(62) if seed is None else int(seed) & ((1 << 62) - 1)
-        stop_ids = tuple(int(t) for t in (b.get("stop_token_ids") or []))
+        seed = random.getrandbits(62) if seed is None else _num(seed, int, "seed") & ((1 << 62) - 1)
+        stop_ids = b.get("stop_token_ids") or []
+        if not isinstance(stop_ids, list):
+            raise BadRequest("stop_token_ids must be a list of token ids")
+        stop_ids = tuple(_num(t, int, "stop_token_ids") for t in stop_ids)
         eos = stop_ids if b.get("ignore_eos") else tuple(sorted(set(fmt.eos_ids) | set(stop_ids)))
         if not (0.0 <= temp <= 100.0) or not (0.0 < top_p <= 1.0):
             raise BadRequest("temperature must be in [0, 100] and top_p in (0, 1]")
@@ -371,7 +397,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         if b.get("cache_prompt") is False:  # llama.cpp's switch: no prefix reuse for this request
             salt = uuid.uuid4().hex
         return EngineRequest(prompt, max_new_tokens=mt, temperature=temp, top_k=max(top_k, 0), top_p=top_p,
-                             min_p=float(b.get("min_p") or 0.0), seed=seed, eos_ids=eos, min_tokens=int(b.get("min_tokens") or 0),
+                             min_p=_num(b.get("min_p") or 0.0, float, "min_p"), seed=seed, eos_ids=eos,
+                             min_tokens=_num(b.get("min_tokens") or 0, int, "min_tokens"),
                              logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt))
 
     def stops_of(b: dict) -> list[str]:
@@ -385,6 +412,20 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     def include_usage_of(b: dict) -> bool:
         so = b.get("stream_options")
         return isinstance(so, dict) and bool(so.get("include_usage"))
+
+    async def render(msgs, tools, kw: dict) -> list[int]:
+        """The prompt of a chat. Malformed messages and the template's own checks (no user message, an unknown role) are
+        the client's errors; any other exception propagates as a bug of the server."""
+        try:
+            check_messages(msgs, tools)
+        except ValueError as e:
+            raise BadRequest(str(e)) from None
+        if reserved_kwargs & set(kw):
+            raise BadRequest(f"chat_template_kwargs cannot set {sorted(reserved_kwargs & set(kw))}")
+        try:
+            return await asyncio.to_thread(fmt.render, msgs, tools, **kw)
+        except jinja2.TemplateError as e:
+            raise BadRequest(f"chat template: {e}") from None
 
     def log_done(req: EngineRequest, kind: str):
         t = _timings(req)
@@ -461,16 +502,19 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         try:
-            b = body_of(await request.json())
+            b = body_of(await json_body(request))
             msgs = b.get("messages")
-            if not isinstance(msgs, list) or not msgs:
-                raise BadRequest("messages must be a non-empty list")
             tool_choice = b.get("tool_choice")
             tools = b.get("tools") if tool_choice != "none" else None
-            kw = dict(b.get("chat_template_kwargs") or {})
+            kw = b.get("chat_template_kwargs") or {}
+            if not isinstance(kw, dict):
+                raise BadRequest("chat_template_kwargs must be an object")
+            kw = dict(kw)
             if "enable_thinking" not in kw and b.get("enable_thinking") is not None:
                 kw["enable_thinking"] = bool(b["enable_thinking"])
             effort = b.get("reasoning_effort")
+            if not isinstance(effort, (str, type(None))):
+                raise BadRequest("reasoning_effort must be a string")
             if effort and "reasoning_effort" not in kw:
                 if effort == "none":
                     kw.setdefault("enable_thinking", False)
@@ -478,21 +522,16 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                     kw["reasoning_effort"] = {"minimal": "low", "low": "low", "medium": "medium"}.get(effort, "xhigh")
             if "enable_thinking" not in kw and default_thinking is not None:
                 kw["enable_thinking"] = default_thinking
-            try:
-                prompt = await asyncio.to_thread(fmt.render, msgs, tools, **kw)
-            except Exception as e:  # template errors (bad roles, no user message, ...)
-                raise BadRequest(f"chat template: {e}")
+            prompt = await render(msgs, tools, kw)
             n_top = None
             if b.get("logprobs"):
-                n_top = min(int(b.get("top_logprobs") or 0), MAX_TOP_LOGPROBS)
+                n_top = min(_num(b.get("top_logprobs") or 0, int, "top_logprobs"), MAX_TOP_LOGPROBS)
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser, n_top)
             req = make_request(b, prompt, st, n_top)
             include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
             return _error(str(e))
-        except (ValueError, TypeError) as e:
-            return _error(f"bad request: {e}")
         rid = "chatcmpl-" + uuid.uuid4().hex
         model = b.get("model") or served_name
         worker.submit(req)
@@ -588,7 +627,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     @app.post("/v1/completions")
     async def completions(request: Request):
         try:
-            b = body_of(await request.json())
+            b = body_of(await json_body(request))
             p = b.get("prompt")
             if isinstance(p, list) and len(p) == 1 and isinstance(p[0], (str, list)):
                 p = p[0]
@@ -600,15 +639,13 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 raise BadRequest("prompt must be a string or a list of token ids (one prompt per request)")
             if b.get("echo"):
                 raise BadRequest("echo is not supported")
-            n_top = None if b.get("logprobs") is None else min(int(b["logprobs"]), MAX_TOP_LOGPROBS)
+            n_top = None if b.get("logprobs") is None else min(_num(b["logprobs"], int, "logprobs"), MAX_TOP_LOGPROBS)
             parser = TextParser(tokenizer, stops_of(b))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser, n_top)
             req = make_request(b, prompt, st, n_top)
             include_usage = include_usage_of(b)
         except BadRequest as e:
             return _error(str(e))
-        except (ValueError, TypeError) as e:
-            return _error(f"bad request: {e}")
         rid = "cmpl-" + uuid.uuid4().hex
         model = b.get("model") or served_name
         worker.submit(req)
@@ -653,26 +690,25 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     # -------------------------------------------------------------------------------------- Anthropic messages
     async def render_messages(b: dict):
         """Anthropic request body -> (prompt token ids, OpenAI-style tools)."""
-        msgs, tools = anth.to_messages(b), anth.to_tools(b)
-        kw = anth.template_kwargs(b, default_thinking)
         try:
-            prompt = await asyncio.to_thread(fmt.render, msgs, tools, **kw)
-        except Exception as e:  # template errors (no user message, ...)
-            raise BadRequest(f"chat template: {e}")
-        return prompt, tools
+            msgs, tools = anth.to_messages(b), anth.to_tools(b)
+            kw = anth.template_kwargs(b, default_thinking)
+        except ValueError as e:  # the conversion's checks of the request
+            raise BadRequest(str(e)) from None
+        return await render(msgs, tools, kw), tools
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request):
         try:
-            prompt, _ = await render_messages(await request.json())
-        except (BadRequest, ValueError, TypeError, KeyError, AttributeError) as e:
+            prompt, _ = await render_messages(await json_body(request))
+        except BadRequest as e:
             return _anth_error(str(e))
         return {"input_tokens": len(prompt)}
 
     @app.post("/v1/messages")
     async def messages(request: Request):
         try:
-            b = await request.json()
+            b = await json_body(request)
             prompt, tools = await render_messages(b)
             stops = b.get("stop_sequences") or []
             if not isinstance(stops, list):
@@ -680,7 +716,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, [str(s) for s in stops])
             st = Stream(asyncio.get_running_loop(), tokenizer, parser, None)
             req = make_request(b, prompt, st)
-        except (BadRequest, ValueError, TypeError, KeyError, AttributeError) as e:
+        except BadRequest as e:
             return _anth_error(str(e))
         mid = "msg_" + uuid.uuid4().hex[:24]
         model = b.get("model") or served_name
@@ -715,6 +751,13 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return JSONResponse(anth.message(mid, model, blocks.content, stop_of(r), use(r)))
 
     # -------------------------------------------------------------------------------------- the rest
+    @app.exception_handler(Exception)
+    async def server_error(request: Request, e: Exception):
+        """A bug of the server, not a bad request: a 500 in the endpoint's format. Starlette raises the exception again
+        afterwards, and uvicorn logs its traceback."""
+        msg = f"internal error: {type(e).__name__}: {e}"
+        return _anth_error(msg, 500) if request.url.path.startswith("/v1/messages") else _error(msg, 500)
+
     @app.get("/v1/models")
     async def models():
         return {"object": "list", "data": [{"id": served_name, "object": "model", "created": created, "owned_by": "colin-inference-engine",

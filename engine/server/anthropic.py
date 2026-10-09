@@ -68,8 +68,8 @@ def _reminder(text: str) -> str:
 def to_messages(body: dict) -> list[dict]:
     """Anthropic `system` + `messages` -> the OpenAI-style message list of engine/server/chat.py ChatFormat.render."""
     raw = body.get("messages")
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("messages must be a non-empty list")
+    if not isinstance(raw, list) or not raw or not all(isinstance(m, dict) for m in raw):
+        raise ValueError("messages must be a non-empty list of objects")
     if raw[-1].get("role") == "assistant":
         raise ValueError("a final assistant message (prefill) is not supported")
     out = []
@@ -105,6 +105,8 @@ def to_messages(body: dict) -> list[dict]:
                 elif t == "text":
                     text.append(b.get("text") or "")
                 elif t == "tool_use":
+                    if not isinstance(b.get("input", {}), dict):
+                        raise ValueError("a tool_use input must be an object")
                     calls.append({"id": b.get("id"), "type": "function", "function": {"name": b.get("name"), "arguments": b.get("input") or {}}})
             msg = {"role": "assistant", "content": "\n\n".join(t for t in text if t)}
             if any(reasoning):
@@ -120,10 +122,15 @@ def to_messages(body: dict) -> list[dict]:
 def to_tools(body: dict) -> list[dict] | None:
     """Anthropic tools -> OpenAI function tools. Server tools are left out."""
     fns, server = [], []
-    for t in body.get("tools") or []:
+    tools = body.get("tools") or []
+    if not isinstance(tools, list) or not all(isinstance(t, dict) for t in tools):
+        raise ValueError("tools must be a list of objects")
+    for t in tools:
         if t.get("type") not in (None, "custom"):
             server.append(str(t.get("type")))
             continue
+        if not isinstance(t.get("name"), str) or not isinstance(t.get("input_schema", {}), dict):
+            raise ValueError("a tool needs a string name, and its input_schema must be an object")
         fn = {"name": t["name"]}
         if t.get("description"):
             fn["description"] = t["description"]
@@ -144,7 +151,8 @@ def template_kwargs(body: dict, default_thinking: bool | None) -> dict:
     else:
         on = bool(default_thinking)
     kw = {"enable_thinking": on}
-    effort = (body.get("output_config") or {}).get("effort")
+    oc = body.get("output_config")
+    effort = oc.get("effort") if isinstance(oc, dict) else None
     if on and effort in ("low", "medium"):
         kw["reasoning_effort"] = effort
     return kw

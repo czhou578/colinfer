@@ -7,6 +7,7 @@ import sys
 import time
 import types
 
+import jinja2
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,9 +36,12 @@ class CharTokenizer:
         inv = {v: k for k, v in SPECIAL.items()}
         return "".join(chr(t - CHAR0) if t >= CHAR0 else ("" if skip_special_tokens else inv[t]) for t in ids)
 
-    def apply_chat_template(self, msgs, tools=None, add_generation_prompt=True, tokenize=False, enable_thinking=True, **kw):
-        text = "".join(f"<|im_start|>{m['role']}\n{m.get('content') or ''}<|im_end|>\n" for m in msgs)
-        return text + "<|im_start|>assistant\n" + ("<think>\n" if enable_thinking else "")
+    def apply_chat_template(self, conversation, tools=None, add_generation_prompt=True, tokenize=False, **kw):
+        for m in conversation:
+            if m["role"] not in ("system", "user", "assistant", "tool"):  # as the checkpoint's template does
+                raise jinja2.TemplateError("Unexpected message role.")
+        text = "".join(f"<|im_start|>{m['role']}\n{m.get('content') or ''}<|im_end|>\n" for m in conversation)
+        return text + "<|im_start|>assistant\n" + ("<think>\n" if kw.get("enable_thinking", True) else "")
 
 
 class FakeWorker:
@@ -75,9 +79,11 @@ class FakeWorker:
         self.aborted.append(req)
 
 
-def client(reply="", error=None, thinking=None):
+def client(reply="", error=None, thinking=None, tokenizer=None):
+    """The app on a FakeWorker. A bug of the server gets its 500 reply (TestClient would raise it instead)."""
     w = FakeWorker(reply, error)
-    return TestClient(build_app(w, CharTokenizer(), "fake", {}, {}, thinking)), w
+    app = build_app(w, tokenizer or CharTokenizer(), "fake", {}, {}, thinking)
+    return TestClient(app, raise_server_exceptions=False), w
 
 
 CHAT = "/v1/chat/completions"
@@ -224,3 +230,55 @@ def test_output_failure_fails_only_its_request(monkeypatch):
     assert w.submitted[-1].finish_reason == "stop" and len(w.submitted[-1].output) < len(CharTokenizer().encode(CALL))
     assert sse_data(c.post(CHAT, json={**body, "stream": True}))[-1]["error"]["type"] == "server_error"
     assert c.post(CHAT, json={"messages": USER}).status_code == 200  # no tools: the parser never calls it
+
+
+def test_template_errors_are_the_clients_and_other_failures_the_servers():
+    c, _ = client("ok<|im_end|>")
+    r = c.post(CHAT, json={"messages": [{"role": "narrator", "content": "x"}]})
+    assert r.status_code == 400 and r.json()["error"]["message"] == "chat template: Unexpected message role."
+
+    class Broken(CharTokenizer):  # a bug in rendering (here: of the tokenizer) used to come back as a 400
+        def apply_chat_template(self, conversation, **kw):
+            raise AttributeError("'NoneType' object has no attribute 'strip'")
+    c, w = client("ok", tokenizer=Broken())
+    r = c.post(CHAT, json={"messages": USER})
+    assert r.status_code == 500 and r.json()["error"]["type"] == "server_error" and "AttributeError" in r.json()["error"]["message"]
+    r = c.post("/v1/messages", json={"max_tokens": 5, "messages": USER})
+    assert r.status_code == 500 and r.json()["error"]["type"] == "api_error"
+    assert not w.submitted
+
+
+@pytest.mark.parametrize("path,body", [
+    (CHAT, [1, 2]),
+    (CHAT, {"messages": ["hi"]}),
+    (CHAT, {"messages": [{"role": 3, "content": "hi"}]}),
+    (CHAT, {"messages": [{"role": "user", "content": 5}]}),
+    (CHAT, {"messages": [{"role": "user", "content": [1]}]}),
+    (CHAT, {"messages": [{"role": "assistant", "content": "", "tool_calls": [{"function": "f"}]}, *USER]}),
+    (CHAT, {"messages": [{"role": "assistant", "content": "", "reasoning_content": 7}, *USER]}),
+    (CHAT, {"messages": USER, "tools": [1]}),
+    (CHAT, {"messages": USER, "chat_template_kwargs": ["x"]}),
+    (CHAT, {"messages": USER, "chat_template_kwargs": {"tokenize": True}}),
+    (CHAT, {"messages": USER, "reasoning_effort": ["high"]}),
+    (CHAT, {"messages": USER, "logprobs": True, "top_logprobs": "x"}),
+    (CHAT, {"messages": USER, "temperature": "hot"}),
+    ("/v1/completions", {"prompt": "hi", "stop_token_ids": 5}),
+    ("/v1/completions", {"prompt": "hi", "seed": {"a": 1}}),
+    ("/v1/messages", {"max_tokens": 5, "messages": [1]}),
+    ("/v1/messages", {"max_tokens": 5, "messages": USER, "tools": [{"input_schema": {}}]}),
+    ("/v1/messages", {"max_tokens": 5, "messages": USER, "tools": [{"name": "t", "input_schema": [1]}]}),
+    ("/v1/messages", {"max_tokens": 5, "messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "t", "input": [1]}]},
+                                                     *USER]}),
+    ("/v1/messages/count_tokens", {"messages": [{"role": "user", "content": 3}]}),
+])
+def test_malformed_requests_are_400(path, body):
+    c, w = client("ok<|im_end|>")
+    r = c.post(path, json=body)
+    assert r.status_code == 400, r.text
+    assert not w.submitted
+
+
+def test_invalid_json_is_400():
+    c, _ = client()
+    for path in (CHAT, "/v1/completions", "/v1/messages"):
+        assert c.post(path, content=b"{not json", headers={"content-type": "application/json"}).status_code == 400
