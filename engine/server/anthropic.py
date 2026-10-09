@@ -172,7 +172,7 @@ def stop_reason(finish: str, n_tool_calls: int, stop_match: str | None) -> tuple
     """(stop_reason, stop_sequence) from the scheduler's finish reason and the parser state."""
     if stop_match is not None:
         return "stop_sequence", stop_match
-    if finish == "length":
+    if finish in ("length", "timeout"):
         return "max_tokens", None
     return ("tool_use" if n_tool_calls else "end_turn"), None
 
@@ -214,7 +214,8 @@ class Blocks:
             if self.open != key:
                 out += self.close()
                 self.open = key
-                self.content.append({"type": "thinking", "thinking": "", "signature": SIGNATURE} if key == "thinking" else {"type": "text", "text": ""})
+                self.content.append({"type": "thinking", "thinking": "", "signature": SIGNATURE} if key == "thinking"
+                                    else {"type": "text", "text": ""})
                 start = {"type": "thinking", "thinking": "", "signature": ""} if key == "thinking" else {"type": "text", "text": ""}
                 out.append(sse("content_block_start", {"type": "content_block_start", "index": len(self.content) - 1, "content_block": start}))
             self.content[-1][key] += x
@@ -228,7 +229,8 @@ class Blocks:
             return []
         i, out = len(self.content) - 1, []
         if self.open == "thinking":
-            out.append(sse("content_block_delta", {"type": "content_block_delta", "index": i, "delta": {"type": "signature_delta", "signature": SIGNATURE}}))
+            out.append(sse("content_block_delta", {"type": "content_block_delta", "index": i,
+                                                   "delta": {"type": "signature_delta", "signature": SIGNATURE}}))
         out.append(sse("content_block_stop", {"type": "content_block_stop", "index": i}))
         self.open = None
         return out

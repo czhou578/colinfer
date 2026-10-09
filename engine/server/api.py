@@ -67,6 +67,10 @@ class Worker(threading.Thread):
     def abort(self, req: EngineRequest):
         self.inbox.put(("abort", req))
 
+    def queued(self) -> int:
+        """Requests waiting to run: in the inbox, or in the scheduler's queue."""
+        return len(self.inbox.queue) + len(self.sched.queue)
+
     def _build(self):
         a, t0 = self.args, time.perf_counter()
         from engine.runtime.build import build_engine
@@ -238,7 +242,7 @@ def _error(msg, code=400):
 
 
 _ANTH_ERROR = {400: "invalid_request_error", 401: "authentication_error", 404: "not_found_error", 413: "request_too_large",
-               499: "invalid_request_error"}
+               499: "invalid_request_error", 529: "overloaded_error"}
 
 
 def _anth_error_body(msg: str, code: int) -> dict:
@@ -251,7 +255,8 @@ def _anth_error(msg, code=400):
 
 
 def _finish_reason(r: EngineRequest) -> str:
-    return "stop" if r.finish_reason == "abort" else r.finish_reason  # an abort (the client went away) reads as a stop
+    # an abort (the client went away) reads as a stop, a timeout as a cut-off
+    return {"abort": "stop", "timeout": "length"}.get(r.finish_reason, r.finish_reason)
 
 
 class ApiKey:
@@ -280,6 +285,10 @@ def _sse(obj) -> str:
 class BadRequest(Exception):
     """The client's error (a 400). The endpoints turn only this into an error reply; any other exception is a bug of the
     server, which the app's handler logs and answers with a 500."""
+
+
+class Busy(Exception):
+    """Too many requests wait already (a 503; a 529 on the Anthropic API, which Claude Code retries)."""
 
 
 def _num(v, kind, name: str):
@@ -376,6 +385,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return tuple(ids)
 
     def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None) -> EngineRequest:
+        if worker.args.max_queue and worker.queued() >= worker.args.max_queue:
+            raise Busy(f"the server is busy: {worker.args.max_queue} requests are waiting")
         if not prompt:
             raise BadRequest("the prompt is empty")
         token_ids(prompt, "prompt")
@@ -388,6 +399,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         mt = room if mt is None else min(_num(mt, int, "max_tokens"), room)
         if mt < 1:
             raise BadRequest("max_tokens must be at least 1")
+        if worker.args.max_output_tokens:
+            mt = min(mt, worker.args.max_output_tokens)
         temp = b.get("temperature")
         temp = gen_defaults.get("temperature", 1.0) if temp is None else _num(temp, float, "temperature")
         top_k = b.get("top_k")
@@ -410,7 +423,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return EngineRequest(prompt, max_new_tokens=mt, temperature=temp, top_k=max(top_k, 0), top_p=top_p,
                              min_p=min_p, seed=seed, eos_ids=eos,
                              min_tokens=_num(b.get("min_tokens") or 0, int, "min_tokens"),
-                             logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt))
+                             logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt),
+                             max_seconds=worker.args.max_request_seconds)
 
     def stops_of(b: dict) -> list[str]:
         st = b.get("stop")
@@ -528,6 +542,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
             return _error(str(e))
+        except Busy as e:
+            return _error(str(e), 503)
         rid = "chatcmpl-" + uuid.uuid4().hex
         model = b.get("model") or served_name
         worker.submit(req)
@@ -642,6 +658,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             include_usage = include_usage_of(b)
         except BadRequest as e:
             return _error(str(e))
+        except Busy as e:
+            return _error(str(e), 503)
         rid = "cmpl-" + uuid.uuid4().hex
         model = b.get("model") or served_name
         worker.submit(req)
@@ -714,6 +732,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             req = make_request(b, prompt, st)
         except BadRequest as e:
             return _anth_error(str(e))
+        except Busy as e:
+            return _anth_error(str(e), 529)
         mid = "msg_" + uuid.uuid4().hex[:24]
         model = b.get("model") or served_name
         blocks = anth.Blocks(anth.drops_tool_calls(b))
@@ -785,6 +805,12 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--slots", type=int, default=3, help="conversations whose KV stays cached; one request runs at a time")
+    ap.add_argument("--max-queue", type=int, default=8,
+                    help="requests that can wait for the running one; past it, a request gets a 503 (/v1/messages: 529). 0: no limit")
+    ap.add_argument("--max-output-tokens", type=int, default=0,
+                    help="cap on the output tokens of a request, whatever its max_tokens asks (0: the room left in the slot)")
+    ap.add_argument("--max-request-seconds", type=float, default=1800.0,
+                    help="a request ends this long after it arrived, running or queued, with finish_reason length (0: never)")
     ap.add_argument("--max-seq-len", type=int, default=262144, help="tokens per slot (prompt + output)")
     ap.add_argument("--spec", choices=("mtp", "none"), default="mtp")
     ap.add_argument("--drafter-weights", default="auto",

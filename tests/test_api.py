@@ -7,10 +7,10 @@ import types
 
 import jinja2
 import pytest
-
 from fastapi.testclient import TestClient
 
 from engine.runtime.metrics import Metrics
+from engine.server import anthropic as anth
 from engine.server import api
 from engine.server.api import build_app
 
@@ -48,7 +48,8 @@ class FakeWorker:
     it. error=(message, code) fails the request instead."""
 
     def __init__(self, reply="", error=None):
-        self.args = types.SimpleNamespace(max_seq_len=MAX_LEN, model="fake")
+        self.args = types.SimpleNamespace(max_seq_len=MAX_LEN, model="fake", max_queue=8, max_output_tokens=0, max_request_seconds=0.0)
+        self.waiting = 0  # what queued() reports
         self.sched = types.SimpleNamespace(margin=MARGIN)
         self.metrics = Metrics()
         self.reply, self.error = CharTokenizer().encode(reply), error
@@ -75,6 +76,9 @@ class FakeWorker:
 
     def abort(self, req):
         self.aborted.append(req)
+
+    def queued(self):
+        return self.waiting
 
 
 def client(reply="", error=None, thinking=None, tokenizer=None):
@@ -329,3 +333,30 @@ def test_values_that_reach_the_gpu_are_checked(body):
     c, w = client("ok")
     assert c.post("/v1/completions", content=body.encode(), headers={"content-type": "application/json"}).status_code == 400
     assert not w.submitted
+
+
+def test_a_full_queue_is_refused_in_the_format_of_each_api():
+    c, w = client("ok<|im_end|>")
+    w.waiting = 8
+    r = c.post(CHAT, json={"messages": USER})
+    assert r.status_code == 503 and r.json()["error"]["type"] == "server_error"
+    assert c.post("/v1/completions", json={"prompt": "hi", "stream": True}).status_code == 503
+    r = c.post("/v1/messages", json={"max_tokens": 5, "messages": USER})
+    assert r.status_code == 529 and r.json()["error"]["type"] == "overloaded_error"
+    assert not w.submitted
+    w.waiting = 7
+    assert c.post(CHAT, json={"messages": USER}).status_code == 200 and len(w.submitted) == 1
+
+
+def test_output_tokens_and_time_of_a_request_are_capped():
+    c, w = client("ok<|im_end|>")
+    w.args.max_output_tokens, w.args.max_request_seconds = 5, 7.5
+    c.post(CHAT, json={"messages": USER, "max_tokens": 100})
+    c.post(CHAT, json={"messages": USER, "max_tokens": 3})
+    c.post("/v1/messages", json={"max_tokens": 50, "messages": USER})
+    assert [r.max_new_tokens for r in w.submitted] == [5, 3, 5] and all(r.max_seconds == 7.5 for r in w.submitted)
+
+
+def test_a_timeout_reads_as_a_cut_off():
+    assert api._finish_reason(types.SimpleNamespace(finish_reason="timeout")) == "length"
+    assert anth.stop_reason("timeout", 0, None) == ("max_tokens", None)

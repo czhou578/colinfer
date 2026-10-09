@@ -219,3 +219,14 @@ def test_submit_checks_token_ids(make):
         with pytest.raises(ValueError):
             sched.submit(bad)
     assert not sched.queue
+
+
+def test_a_time_limit_ends_a_running_request_and_drops_a_queued_one(make):
+    sched, rng = make(), random.Random(9)
+    a = S.Request(prompt(rng, 40), max_new_tokens=2000, max_seconds=0.05)
+    b = S.Request(prompt(rng, 40), max_new_tokens=5, max_seconds=0.01)  # waits behind a, so its time runs out in the queue
+    sched.run([a, b])
+    assert a.finish_reason == "timeout" and 0 < len(a.output) < 2000
+    assert a.output == reference(a.prompt, 2000)[:len(a.output)]
+    assert b.finish_reason == "timeout" and b.output == [] and b.slot == -1
+    assert sched.metrics.requests.get(reason="timeout") == 2

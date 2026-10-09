@@ -26,9 +26,10 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
     longest checkpoint whose tokens are a proper prefix of its prompt, in the slot of that checkpoint, and prefills
     only the rest. A request without one goes to an empty slot, else the least recently used one.
   - A checkpoint is valid while the token history of its slot still starts with the tokens of the checkpoint.
-* Finish. A request ends at a stop token (eos_ids), at max_new_tokens, at the slot length, or by its hook (stop
-  strings, client gone). The speculative cycle cuts the accepted length after a stop token on the GPU. Thus the
-  history of a slot (`Slot.tokens`, exactly the tokens fed to the model) normally ends at the last token of the reply.
+* Finish. A request ends at a stop token (eos_ids), at max_new_tokens, at the slot length, by its hook (stop
+  strings, client gone), or max_seconds after its submit ("timeout", also while it still waits in the queue). The
+  speculative cycle cuts the accepted length after a stop token on the GPU. Thus the history of a slot (`Slot.tokens`,
+  exactly the tokens fed to the model) normally ends at the last token of the reply.
   Then the end-of-generation checkpoint is a prefix of the prompt of the next turn.
 """
 from __future__ import annotations
@@ -68,13 +69,14 @@ class Request:
     logprobs: int | None = None     # None: off; n >= 0: logprob of each output token plus the top n alternatives
     hook: Any = None                # optional: hook.feed(token, logprob) -> True to stop now; hook.finish(request)
     cache_salt: str | None = None   # checkpoints are shared only between requests with the same salt (vLLM semantics)
+    max_seconds: float = 0.0        # > 0: the request ends ("timeout") this long after its submit, running or queued
     # filled in by the scheduler
     rid: int = -1
     slot: int = -1
     output: list = dataclasses.field(default_factory=list)
     output_logprobs: list = dataclasses.field(default_factory=list)  # (logprob, [(id, logprob), ...]) per output token
     done: bool = False
-    finish_reason: str | None = None  # stop | length | abort
+    finish_reason: str | None = None  # stop | length | abort | timeout
     reused: int = 0                 # prompt tokens served from a checkpoint
     t_submit: float = 0.0
     t_admit: float = 0.0
@@ -259,9 +261,15 @@ class Scheduler:
     def _admit(self):
         """The next queued request, when no request runs: into the slot of its longest checkpoint, else an empty slot,
         else the least recently used one."""
-        if not self.queue or self.busy_slot() is not None:
+        if self.busy_slot() is not None:
             return
-        req = self.queue.popleft()
+        while self.queue:  # a request whose time ran out while it waited ends without running
+            req = self.queue.popleft()
+            if not self._expired(req):
+                break
+            self._close(req, "timeout")
+        else:
+            return
         P = req.prompt
         best, L = None, 0
         for c in self.ckpts:  # longest valid checkpoint that is a proper prefix of the prompt
@@ -449,6 +457,8 @@ class Scheduler:
                 return self._finish(s, "stop")
             if len(req.output) >= req.max_new_tokens or len(s.tokens) + self.margin > self.max_seq_len:
                 return self._finish(s, "length")
+            if self._expired(req):
+                return self._finish(s, "timeout")
 
     def _finish(self, s: Slot, reason: str):
         req = s.req
@@ -465,6 +475,10 @@ class Scheduler:
         self.metrics.generated_tokens.inc(len(req.output))
         if req.hook is not None:
             req.hook.finish(req)
+
+    @staticmethod
+    def _expired(req: Request) -> bool:
+        return req.max_seconds > 0 and time.perf_counter() - req.t_submit > req.max_seconds
 
     def busy_slot(self) -> Slot | None:
         """The slot of the running request (prefilling or decoding), if any."""

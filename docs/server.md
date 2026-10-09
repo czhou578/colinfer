@@ -23,6 +23,9 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. |
 | `--served-model-name` | the `--model` value | The id that `/v1/models` reports. Requests can name any model. |
 | `--slots` | 3 | Conversations whose KV stays cached. The server runs one request at a time; the others wait in a FIFO queue. |
+| `--max-queue` | 8 | Requests that can wait for the running one. Past it, a request gets a 503 (`/v1/messages`: 529, `overloaded_error`), which Hermes Agent and Claude Code retry. 0: no limit. |
+| `--max-output-tokens` | 0 | A cap on the output tokens of a request, whatever its `max_tokens` asks. 0: the room left in the slot. |
+| `--max-request-seconds` | 1800 | A request ends this long after it arrived, running or still in the queue, with `finish_reason` `length` (`stop_reason` `max_tokens`). 0: never. |
 | `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
 | `--k` | 7 | The longest MTP draft. Each cycle picks k=3 or 7 from the measured acceptance (see below). |
@@ -190,7 +193,9 @@ Other endpoints:
   the end of the reply. A request that restored the end of a reply does not take this checkpoint.
 - **One request at a time.** A request that arrives while another runs waits in the queue, also behind a long
   prefill. The three slots keep the last three conversations cached: a side request goes to another slot, so the main
-  conversation keeps its cache.
+  conversation keeps its cache. The queue holds `--max-queue` requests; past that, requests are refused with a 503
+  (529 on `/v1/messages`). A request ends `--max-request-seconds` after it arrived, so one runaway request cannot
+  hold the engine for longer than that.
 - **Failures restart the process.** A failed CUDA call fails each in-flight request with a 500 and stops the process.
   Then systemd restarts it. An error while the server formats the output of one request (the parser runs on the engine
   thread) fails only that request, with a 500.
