@@ -37,8 +37,8 @@ def test_gdn_step_matches_reference(B):
         active = torch.ones(B, dtype=torch.int32, device="cuda")
         ops().gdn_conv_commit(mixed, conv, active)
         o = torch.empty_like(z)
-        ops().gdn_delta(qkv, z, b, a, layer.A_log.data, layer.dt_bias.data, layer.norm.weight.data, rec, o, cfg.linear_num_key_heads, cfg.rms_norm_eps,
-                        active)
+        ops().gdn_delta(qkv, z, b, a, layer.A_log.data, layer.dt_bias.data, layer.norm.weight.data, rec, o, cfg.linear_num_key_heads,
+                        cfg.rms_norm_eps, active)
         out = layer.out_proj(o)[:, None]
         # an inactive slot: same outputs, state untouched
         conv_i, rec_i = conv0.clone(), rec0.clone()

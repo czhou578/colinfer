@@ -44,11 +44,25 @@ build-backend = "setuptools.build_meta"
 include = ["engine*", "tests", "tools", "bench"]
 namespaces = true
 
+[tool.ruff]
+line-length = 150
+target-version = "py312"
+
+[tool.ruff.lint]
+# pyflakes, the statement and syntax errors of pycodestyle, import order and the line length. E741 (names such as l, I
+# or O) is off: the model code uses I for the intermediate size and the like.
+select = ["E4", "E7", "E9", "F", "I", "E501"]
+ignore = ["E741"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["engine", "tests", "tools", "bench"]
+
 [dependency-groups]
 dev = [
     "accelerate>=1.15.0",
     "pyarrow>=25.0.1",
     "pytest>=9.0",
+    "ruff>=0.16",
 ]
 
 [tool.uv]

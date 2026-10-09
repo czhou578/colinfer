@@ -19,7 +19,6 @@ import random
 
 import torch
 
-
 DEFAULT_OUT = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca.safetensors")
 
 
@@ -49,9 +48,13 @@ def collect(n: int, seed: int, weights, k: int = 7, max_new: int = 256) -> torch
         x = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=think, tokenize=True)
         x = list(x["input_ids"] if hasattr(x, "keys") else x)[-3000:]
         st, mst, cyc = gen.state, gen.mst, gen.cycle
-        st.reset(); st.pos = 0; mst.pos_t.zero_(); gen.mtp.set_prompt_vocab(x)
+        st.reset()
+        st.pos = 0
+        mst.pos_t.zero_()
+        gen.mtp.set_prompt_vocab(x)
         logits, H = M.prefill(gen.model, torch.tensor([x], device="cuda"), st, return_hidden=True)
-        y = int(logits.argmax(-1)); out = [y]
+        y = int(logits.argmax(-1))
+        out = [y]
         cyc.tok.copy_(torch.tensor([[y] + gen.mtp.first_drafts(torch.tensor(x[1:] + [y], device="cuda"), H, mst, k)], device="cuda"))
         while len(out) < max_new and y not in (248046, 248044):
             cyc.graph.replay()

@@ -40,8 +40,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import (FastDecoderLayer, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup,
-                               Nvfp4Linear, capture)
+from engine.model.fast import FastDecoderLayer, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear, capture
 from engine.model.prefill import attend_cached, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
 from engine.weights.loader import dequant_nvfp4, weight_map

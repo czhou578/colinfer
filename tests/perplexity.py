@@ -49,6 +49,7 @@ def main():
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
+
     from engine.weights.loader import load_model, resolve
     path = resolve(args.ckpt)
     tok = AutoTokenizer.from_pretrained(path)

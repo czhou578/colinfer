@@ -93,7 +93,8 @@ class Head(torch.nn.Module):
         self.q, self.k, self.v, self.o = (P(L + f"self_attn.{n}_proj.weight") for n in "qkvo")
         self.qn, self.kn = P(L + "self_attn.q_norm.weight"), P(L + "self_attn.k_norm.weight")
         self.gate, self.up, self.down = (P(L + f"mlp.{n}_proj.weight") for n in ("gate", "up", "down"))
-        self.eps, self.H, self.Hq, self.Hkv, self.D = cfg.rms_norm_eps, cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        self.eps, self.H, self.D = cfg.rms_norm_eps, cfg.hidden_size, cfg.head_dim
+        self.Hq, self.Hkv = cfg.num_attention_heads, cfg.num_key_value_heads
         from engine.model.qwen35 import rope_inv_freq
         self.register_buffer("inv_freq", rope_inv_freq(cfg), persistent=False)
 
@@ -182,10 +183,11 @@ def shards(feat="feat"):
 
 
 def setup():
+    import numpy as np
+    from safetensors import safe_open
+
     from engine.model.qwen35 import Qwen35Config
     from engine.weights.loader import dequant_nvfp4
-    from safetensors import safe_open
-    import numpy as np
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     cfg = Qwen35Config.from_checkpoint(path)
     wm = weight_map(path)

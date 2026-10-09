@@ -52,8 +52,8 @@ def main():
                 d[3] += gen.stats["steps"] - s0["steps"]
             tot = [sum(v[i] for v in per.values()) for i in range(4)]
             name = os.path.basename(w) if w else "checkpoint MTP"
-            print(f"[{name} k={k}] " + "  ".join(f"{kd}: acc {v[1] / max(v[0], 1):.3f} tok/cycle {v[2] / max(v[3], 1):.2f}" for kd, v in sorted(per.items()))
-                  + f"  | all: acc {tot[1] / max(tot[0], 1):.3f} tok/cycle {tot[2] / max(tot[3], 1):.2f}", flush=True)
+            kinds = "  ".join(f"{kd}: acc {v[1] / max(v[0], 1):.3f} tok/cycle {v[2] / max(v[3], 1):.2f}" for kd, v in sorted(per.items()))
+            print(f"[{name} k={k}] " + kinds + f"  | all: acc {tot[1] / max(tot[0], 1):.3f} tok/cycle {tot[2] / max(tot[3], 1):.2f}", flush=True)
             del gen
             torch.cuda.empty_cache()
 

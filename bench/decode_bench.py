@@ -63,7 +63,6 @@ def main():
             st.pos_t.fill_(a.ctx)
         dt = timed(run)
         print(f"MTP cycle k={k}: {dt * 1e3:6.1f} ms/cycle ({k + 1} verify rows)", flush=True)
-        del cyc
 
 
 if __name__ == "__main__":

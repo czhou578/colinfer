@@ -10,7 +10,6 @@ import pytest
 from engine.server import anthropic as anth
 from engine.server.chat import OutputParser
 
-
 BASH = {"name": "Bash", "description": "Run a shell command", "input_schema": {
     "type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}}
 CACHE = {"type": "ephemeral"}
@@ -46,7 +45,8 @@ def test_claude_code_request_renders(fmt):
     assert [m["role"] for m in msgs] == ["system", "user", "user", "assistant", "tool", "user"]
     assert msgs[0]["content"] == "You are an agent.\n\nHelp with software tasks."
     assert msgs[2]["content"].startswith("<system-reminder>\n# Environment")  # a system message inside `messages`
-    assert msgs[3]["reasoning_content"] == "I should list files." and msgs[3]["tool_calls"][0]["function"]["arguments"] == {"command": "ls", "timeout": 5}
+    assert msgs[3]["reasoning_content"] == "I should list files."
+    assert msgs[3]["tool_calls"][0]["function"]["arguments"] == {"command": "ls", "timeout": 5}
     prompt = render(fmt, body)
     text = fmt.tok.decode(prompt)
     assert text.index("# Tools") < text.index("You are an agent.") < text.index("List the files here.") < text.index("# Environment")
@@ -115,7 +115,8 @@ def test_blocks_from_parser_output(fmt):
     kinds = [(e, d.get("index"), (d.get("delta") or {}).get("type")) for e, d in ev]
     assert kinds[0] == ("content_block_start", 0, None)
     assert ("content_block_delta", 0, "signature_delta") in kinds  # the thinking block gets its signature before it stops
-    assert kinds.index(("content_block_delta", 0, "signature_delta")) < kinds.index(("content_block_stop", 0, None)) < kinds.index(("content_block_start", 1, None))
+    assert kinds.index(("content_block_delta", 0, "signature_delta")) < kinds.index(("content_block_stop", 0, None))
+    assert kinds.index(("content_block_stop", 0, None)) < kinds.index(("content_block_start", 1, None))
     assert kinds[-3:] == [("content_block_start", 2, None), ("content_block_delta", 2, "input_json_delta"), ("content_block_stop", 2, None)]
     assert json.loads(ev[-2][1]["delta"]["partial_json"]) == {"command": "ls -la", "timeout": 30}
     assert anth.stop_reason("stop", blocks.n_tool_calls, parser.stop_match) == ("tool_use", None)

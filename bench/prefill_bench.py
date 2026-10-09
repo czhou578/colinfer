@@ -36,7 +36,8 @@ def main():
         ids = torch.randint(0, 200000, (1, L), device="cuda")
         best = None
         for r in range(a.repeats + 1):
-            st.reset(); st.pos = 0
+            st.reset()
+            st.pos = 0
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             logits = prefill(m, ids, st, chunk=a.chunk)
@@ -47,7 +48,8 @@ def main():
         print(f"{L:7d} {best:8.3f} {L / best:8.0f}", flush=True)
     if a.profile:
         from torch.profiler import ProfilerActivity, profile
-        st.reset(); st.pos = 0
+        st.reset()
+        st.pos = 0
         if a.profile_at:  # the prompt so far, then profile the next chunk
             prefill(m, torch.randint(0, 200000, (1, a.profile_at), device="cuda"), st, chunk=a.chunk)
         ids = torch.randint(0, 200000, (1, a.chunk), device="cuda")

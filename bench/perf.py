@@ -31,8 +31,8 @@ import uuid
 
 import torch
 
-from engine.spec.suffix import MIN_MATCH
 from engine.runtime.build import build_engine
+from engine.spec.suffix import MIN_MATCH
 from tests.golden import EOS, load_prompts
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

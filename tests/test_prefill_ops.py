@@ -3,9 +3,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from engine.weights.loader import E2M1_LUT
 from engine.weights.quant_emul import fake_quant_nvfp4_unscaled
 from tests.test_gemm_nvfp4 import unswizzle
-from engine.weights.loader import E2M1_LUT
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
@@ -81,7 +81,8 @@ def test_add_rmsnorm_outputs(with_y):
     ref_n = n_out  # the quantized outputs must match the kernel's own normed values exactly
     assert torch.equal(q8.float(), (ref_n.float() / s8).clamp(-448, 448).to(torch.float8_e4m3fn).float())
     lut = E2M1_LUT.cuda()
-    got = torch.stack([lut[(q4 & 15).long()], lut[(q4 >> 4).long()]], -1).reshape(M, K) * unswizzle(sf4, M, K).view(torch.float8_e4m3fn).float().repeat_interleave(16, 1)
+    sf = unswizzle(sf4, M, K).view(torch.float8_e4m3fn).float().repeat_interleave(16, 1)
+    got = torch.stack([lut[(q4 & 15).long()], lut[(q4 >> 4).long()]], -1).reshape(M, K) * sf
     assert torch.equal(got, fake_quant_nvfp4_unscaled(ref_n, s4).float())
 
 

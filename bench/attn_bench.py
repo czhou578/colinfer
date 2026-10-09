@@ -53,7 +53,6 @@ def main():
                 t = timeit(run, max(20, 4 * layers))
                 gb = B * Hkv * ctx * D * 2 / 1e9
                 print(f"{B:>2} {ctx:>7} {T:>2} | {t:>10.3f} {gb / t * 1e3:>6.0f}", flush=True)
-            del caches
             torch.cuda.empty_cache()
 
 

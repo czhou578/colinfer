@@ -55,7 +55,8 @@ CODE_TASKS = ["parses a CSV file and prints column averages", "merges overlappin
 
 def wiki_material(rng):
     import pyarrow.parquet as pq
-    files = sorted(glob.glob(os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1/train-*.parquet")))
+    wt = os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1")
+    files = sorted(glob.glob(wt + "/train-*.parquet"))
     lines = pq.read_table(files[0]).column("text").to_pylist()
     titles = [l.strip(" =\n") for l in lines if l.startswith(" = ") and not l.startswith(" = = ")]
     paras = [l.strip() for l in lines if len(l) > 600 and not l.startswith(" =")]
@@ -146,6 +147,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     from transformers import AutoTokenizer
+
     from engine.weights.loader import resolve
     tok = AutoTokenizer.from_pretrained(resolve("nvidia/Qwen3.8-27B-NVFP4"))
     rng = random.Random(a.seed)

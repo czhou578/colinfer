@@ -21,6 +21,7 @@ def main():
     ap.add_argument("--prose-mb", type=float, default=60, help="WikiText-103 train text")
     a = ap.parse_args()
     from transformers import AutoTokenizer
+
     from engine.weights.loader import resolve
     from tests.perplexity import wikitext_test
     tok = AutoTokenizer.from_pretrained(resolve("nvidia/Qwen3.8-27B-NVFP4"))
@@ -45,10 +46,11 @@ def main():
 
     n = add(wikitext_test())
     import pyarrow.parquet as pq
-    val = sorted(glob.glob(os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1/validation-*.parquet")))
+    wt = os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1")
+    val = sorted(glob.glob(wt + "/validation-*.parquet"))
     if val:
         n += add("\n\n".join(pq.read_table(val[0]).column("text").to_pylist()))
-    train = sorted(glob.glob(os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1/train-*.parquet")))
+    train = sorted(glob.glob(wt + "/train-*.parquet"))
     used = 0
     for f in train:
         for t in pq.read_table(f).column("text").to_pylist():

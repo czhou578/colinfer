@@ -1,9 +1,7 @@
 """Chat formatting / output parsing for the server (engine/server/chat.py), on the real Qwen3.8 tokenizer (CPU)."""
 import json
 
-
 from engine.server.chat import Detokenizer, OutputParser, TextParser, parse_tool_call
-
 
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "weather",
                                            "parameters": {"type": "object", "properties": {
@@ -43,8 +41,9 @@ def test_render_thinking_and_tools(fmt):
     p_off = fmt.render([{"role": "user", "content": "hi"}], enable_thinking=False)
     assert fmt.opens_in_reasoning(p_on) and not fmt.opens_in_reasoning(p_off)
     msgs = [{"role": "user", "content": "weather in Paris?"},
-            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
-                                                                   "function": {"name": "get_weather", "arguments": json.dumps({"city": "Paris", "days": 2})}}]},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "get_weather", "arguments": json.dumps({"city": "Paris", "days": 2})}}]},
             {"role": "tool", "tool_call_id": "c1", "content": "sunny"}]
     text = fmt.tok.decode(fmt.render(msgs, TOOLS))
     assert "<function=get_weather>" in text and "<parameter=days>\n2\n</parameter>" in text and "<tool_response>\nsunny" in text
