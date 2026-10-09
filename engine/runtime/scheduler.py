@@ -23,6 +23,11 @@
   - It also takes snapshots at two chat message boundaries (`boundary_token`, <|im_start|>). These are the end of the
     first message (a shared system prompt), and the start of the last message before the generation prompt (the
     conversation so far). Prefill chunks end there.
+  - After a last message of `REPLY_SPLIT_MIN` tokens or more, it also takes a snapshot at the start of the generation
+    prompt. Some clients send a reply back in a different form, for example without its reasoning. The next prompt
+    then differs from the prompt-end snapshot in the last tokens of the generation prompt, but it starts with this
+    snapshot. This snapshot costs one more weight pass (~0.1 s). A request that restored an end-of-generation snapshot
+    comes from a client that sends replies back unchanged, so it does not take this snapshot.
   - Attention KV can resume at any length, but GDN state only where a snapshot exists. A new request restores the
     longest checkpoint whose tokens are a proper prefix of its prompt, and prefills only the rest.
   - If the slot of that checkpoint is busy, the scheduler copies its KV prefix into a free slot (32 KB per token with
@@ -52,6 +57,7 @@ MAX_STOP_IDS = 8  # stop token ids per slot visible to the GPU-side cut (more ar
 K_OPTIONS = (3, 7)  # draft lengths a cycle chooses between (capped by k)
 ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
 SUFFIX_K = MAX_ROWS - 1  # suffix-match draft length of a lone decoding slot: its verify rows still fit one weight pass
+REPLY_SPLIT_MIN = 512  # last-message length from which a prompt also snapshots at the start of the reply
 ATTN_ROWS = 48      # query rows (q heads x verify rows) per pass of the attention kernel over a slot's KV (csrc/attn_decode.cu)
 
 
@@ -89,6 +95,7 @@ class Checkpoint:
     tokens: tuple   # the token history the snapshot corresponds to
     buf: int        # ring index
     salt: str | None = None
+    reply: bool = False  # taken at the end of a generation
 
 
 class Slot:
@@ -219,7 +226,7 @@ class Scheduler:
         self.ckpts.remove(c)
         self.free_bufs.append(c.buf)
 
-    def _snapshot(self, s: Slot):
+    def _snapshot(self, s: Slot, reply: bool = False):
         if not s.tokens or (not self.free_bufs and not self.ckpts):
             return
         key = tuple(s.tokens)
@@ -233,7 +240,7 @@ class Scheduler:
             self.ring_rec[i][buf].copy_(self.state.rec[i][b])
         if self.ring_h is not None:
             self.ring_h[buf].copy_(s.h_last.view(-1))
-        self.ckpts.append(Checkpoint(b, key, buf, s.salt))
+        self.ckpts.append(Checkpoint(b, key, buf, s.salt, reply))
 
     def _restore(self, s: Slot, c: Checkpoint):
         b, L = s.idx, len(c.tokens)
@@ -312,9 +319,17 @@ class Scheduler:
             s.sfx = None
             s.splits = []
             if self.boundary is not None and (self.free_bufs or self.ckpts):
-                # message starts, without the last one (it opens the reply being generated: the prompt-end snapshot)
-                bs = [i for i, t in enumerate(P) if t == self.boundary and i > 0][:-1]
-                s.splits = sorted({p for p in bs[:1] + bs[-1:] if p >= len(s.tokens) + 256})
+                # message starts: the end of the first message (a shared system prompt) and the start of the last one
+                bs = [i for i, t in enumerate(P) if t == self.boundary and i > 0]
+                ps = bs[:-1][:1] + bs[:-1][-1:]
+                # the start of the reply, after a long last message. A client that sends the reply back in another form
+                # (e.g. without its reasoning) misses the prompt-end snapshot by the last tokens of the generation
+                # prompt, and would prefill the last message again. The split costs one more weight pass (~0.1 s), so
+                # a request that restored the end of a reply (its client sends replies back token for token) skips it.
+                echo = best is not None and best.reply
+                if bs and not echo and bs[-1] - (bs[-2] if len(bs) > 1 else 0) >= REPLY_SPLIT_MIN:
+                    ps.append(bs[-1])
+                s.splits = sorted({p for p in ps if p >= len(s.tokens) + 256})
             self.params.set(b, req.temperature, req.top_k, req.top_p, req.min_p, req.seed)
             if self.mtp is not None:
                 ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
@@ -487,7 +502,7 @@ class Scheduler:
     def _finish(self, s: Slot, reason: str):
         req = s.req
         if s.phase == "decode" or not s.todo:
-            self._snapshot(s)  # end of generation: everything fed so far (the last output token was never fed)
+            self._snapshot(s, reply=True)  # end of generation: everything fed so far (the last output token was never fed)
         s.phase, s.req, s.todo = "idle", None, []
         self._close(req, reason)
         s.last_used = req.t_done

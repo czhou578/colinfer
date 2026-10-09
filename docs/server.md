@@ -178,10 +178,17 @@ Other endpoints:
   - at the end of each prompt and each reply
   - at the end of the first message (a shared system prompt)
   - before the last message
+  - after the last message, if it has 512 tokens or more (`REPLY_SPLIT_MIN` in `engine/runtime/scheduler.py`)
   - every 8192 prompt tokens
 
   If the slot of the checkpoint is busy, the server copies its KV prefix into a free slot. Thus parallel agents that
   share a long system prompt pay for it only once.
+
+  The checkpoint after the last message is for clients that send a reply back in a different form. For example, Hermes
+  Agent sends it back without its reasoning. Then the next prompt differs from the end-of-prompt checkpoint in the last
+  token of the generation prompt, and without this checkpoint the server prefills the last message again. This
+  checkpoint costs one more weight pass (~0.1 s). Claude Code sends the reasoning back, and its next prompt restores
+  the end of the reply. A request that restored the end of a reply does not take this checkpoint.
 - **Long prompts do not stop other requests.** A long prompt prefills 2048 tokens per engine step, and the other slots
   decode between the chunks. The other requests become slower, but they do not stop.
 - **Failures restart the process.** A failed CUDA call fails each in-flight request with a 500 and stops the process.

@@ -13,7 +13,10 @@ More checks:
   6. a second conversation with the same long system prompt starts while the first one still decodes. It restores the
      system-prompt checkpoint, with a copy of its KV prefix into another slot. Its greedy output matches a run without
      checkpoints.
-  7. speed: single-slot MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
+  7. a client sends the reply back without its reasoning (as Hermes Agent does). Turn 2 then restores the snapshot at
+     the start of turn 1's reply, not only the start of turn 1's last message. The output of turn 2 is compared with a
+     run without checkpoints.
+  8. speed: single-slot MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
 import os
@@ -150,6 +153,34 @@ def main():
     print(f"[shared system prompt] B reused {rb.reused} (system prompt {sysn}) in slot {rb.slot} while A decoded in slot {ra.slot}; "
           f"TTFT {rb.t_first - rb.t_submit:.3f} s vs {rb2.t_first - rb2.t_submit:.3f} s from scratch; greedy output "
           f"{'IDENTICAL' if same else 'DIFFERENT'} to the uncached run ({sum(x == y for x, y in zip(rb.output, rb2.output))}/{len(rb.output)})")
+
+    # 7. the reply comes back without its reasoning: turn 2 restores the start of turn 1's reply
+    def think_ids(msgs):
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, reasoning_effort="medium", tokenize=True)
+        return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
+    table = "Quarterly figures: " + " ".join(f"Q{i % 4 + 1} {2000 + i // 4}: revenue {900 + 13 * i}, net income {40 + 5 * i}." for i in range(120))
+    m1 = [{"role": "system", "content": "You are a research agent."}, {"role": "user", "content": table + "\nWhich year grew the most?"}]
+    p1 = think_ids(m1)
+    r1 = spec.run([R(p1, max_new_tokens=60)])[0]
+    ans = tok.decode([t for t in r1.output if t not in EOS], skip_special_tokens=True).split("</think>")[-1].strip()
+    p2 = think_ids(m1 + [{"role": "assistant", "content": ans}, {"role": "user", "content": "Now give the total revenue."}])
+    reply_start = max(i for i, t in enumerate(p1) if t == IM_START)
+    r2 = spec.run([R(p2, max_new_tokens=40)])[0]
+    # the same request without checkpoints, with the prefill chunk boundaries of turn 1 and the restored turn 2 (other
+    # boundaries change the prefill numerics, and a near tie can then change the greedy tokens)
+    saved, spec.ckpts, spec.free_bufs = spec.ckpts, [], []
+    r2b = spec.submit(R(p2, max_new_tokens=40))
+    spec._admit()
+    spec.slots[r2b.slot].splits = [reply_start]  # turn 1's only split: its first message is shorter than 256 tokens
+    while spec.busy():
+        spec.step()
+    spec.ckpts, spec.free_bufs = saved, [i for i in range(len(spec.ring_h)) if i not in {c.buf for c in saved}]
+    same = r2.output == r2b.output
+    ok &= r2.reused == reply_start and same
+    print(f"[reply sent back changed] turn 1 last message {reply_start - max(i for i, t in enumerate(p1[:reply_start]) if t == IM_START)} tok; "
+          f"turn 2 reused {r2.reused} (reply start {reply_start}), TTFT {r2.t_first - r2.t_submit:.3f} s vs "
+          f"{r2b.t_first - r2b.t_submit:.3f} s from scratch; greedy output {'IDENTICAL' if same else 'DIFFERENT'} "
+          f"to the uncached run with the same chunk boundaries ({sum(x == y for x, y in zip(r2.output, r2b.output))}/{len(r2.output)})")
 
     m = spec.metrics
     print(f"[spec] drafted {m.drafted.get():.0f}, accepted {m.accepted.get():.0f} ({m.accepted.get() / max(m.drafted.get(), 1):.2f})")

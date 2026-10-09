@@ -188,7 +188,8 @@ The code is in `engine/runtime/scheduler.py` and `engine/server/api.py`.
   stops them.
 - **Prefix checkpoints.** The engine keeps a ring of GDN-state snapshots (conv + recurrent, 154 MB each, 32 by default).
   It takes a snapshot at the end of each prompt and each reply. It also takes one at the end of the first message, one
-  before the last message, and one every 8,192 prompt tokens. A request restores the longest checkpoint that is a proper prefix of its
+  before the last message, and one every 8,192 prompt tokens. After a last message of 512 tokens or more, it takes one
+  after that message too, for clients that send the reply back changed (for example, without its reasoning). A request restores the longest checkpoint that is a proper prefix of its
   prompt, and prefills the rest. Attention KV can resume at any length, but GDN state can resume only where a snapshot
   exists. If the slot of the checkpoint is busy, the engine copies its KV prefix to a free slot.
 - **Server.** One engine thread owns the GPU. Asyncio handlers render the chat template, tokenize and stream. The

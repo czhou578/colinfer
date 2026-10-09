@@ -148,6 +148,31 @@ def test_shared_system_prompt_is_copied_into_a_free_slot(make):
     assert a.output == reference(a.prompt, 200) and b.output == reference(b.prompt, 30)
 
 
+def test_reply_sent_back_in_another_form_restores_the_reply_start(make):
+    sched, rng = make(ckpt_interval=10**6), random.Random(7)
+    system, user = prompt(rng, 300), prompt(rng, S.REPLY_SPLIT_MIN)
+    p1 = chat(rng, system, user)
+    reply_start = len(p1) - 3  # the [BND] that opens the generation prompt
+    r1 = sched.run([S.Request(p1, max_new_tokens=20)])[0]
+    assert any(len(c.tokens) == reply_start for c in sched.ckpts)
+    # the client sends the reply back changed (e.g. without its reasoning): turn 2 differs from p1 after the [BND]
+    p2 = p1[:reply_start + 1] + prompt(rng, 12) + [BND] + prompt(rng, 40) + [BND] + prompt(rng, 2)
+    r2 = sched.run([S.Request(p2, max_new_tokens=20)])[0]
+    assert r2.reused == reply_start and r2.output == reference(p2, 20)
+    assert r1.output == reference(p1, 20)
+
+
+def test_reply_sent_back_unchanged_skips_the_reply_start_snapshot(make):
+    sched, rng = make(ckpt_interval=10**6), random.Random(8)
+    p1 = chat(rng, prompt(rng, 300), prompt(rng, 40))  # a short last message: no reply-start snapshot
+    r1 = sched.run([S.Request(p1, max_new_tokens=20)])[0]
+    p2 = p1 + r1.output + [BND] + prompt(rng, S.REPLY_SPLIT_MIN) + [BND] + prompt(rng, 2)
+    r2 = sched.run([S.Request(p2, max_new_tokens=20)])[0]
+    assert r2.reused == len(p1) + len(r1.output) - 1  # the end of turn 1's generation
+    assert not any(len(c.tokens) == len(p2) - 3 for c in sched.ckpts)  # this client needs no reply-start snapshot
+    assert r2.output == reference(p2, 20)
+
+
 def test_outputs_stay_exact_as_checkpoints_are_evicted(make):
     sched, rng = make(n_checkpoints=4), random.Random(4)
     ps = [prompt(rng, 600) for _ in range(5)]  # snapshots every 128 tokens: the ring of 4 evicts all the time
