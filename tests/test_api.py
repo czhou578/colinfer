@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from engine.runtime.metrics import Metrics  # noqa: E402
+from engine.server import api  # noqa: E402
 from engine.server.api import build_app  # noqa: E402
 
 SPECIAL = {"<think>": 1, "</think>": 2, "<tool_call>": 3, "</tool_call>": 4, "<|im_end|>": 5, "<|endoftext|>": 6, "<|im_start|>": 7}
@@ -246,6 +247,41 @@ def test_template_errors_are_the_clients_and_other_failures_the_servers():
     r = c.post("/v1/messages", json={"max_tokens": 5, "messages": USER})
     assert r.status_code == 500 and r.json()["error"]["type"] == "api_error"
     assert not w.submitted
+
+
+@pytest.mark.parametrize("body,kw", [
+    ({}, {}),
+    ({"reasoning_effort": "none"}, {"enable_thinking": False}),
+    ({"reasoning_effort": "minimal"}, {"reasoning_effort": "low"}),
+    ({"reasoning_effort": "high"}, {"reasoning_effort": "xhigh"}),
+    ({"reasoning_effort": "other"}, {"reasoning_effort": "xhigh"}),  # a top-level name it does not know: the default
+    ({"enable_thinking": False, "reasoning_effort": "low"}, {"enable_thinking": False, "reasoning_effort": "low"}),
+    # Hermes Agent's auxiliary calls, configured for DeepSeek
+    ({"chat_template_kwargs": {"thinking": False, "reasoning_effort": "none"}}, {"thinking": False, "enable_thinking": False}),
+    ({"chat_template_kwargs": {"thinking": True, "enable_thinking": False}}, {"thinking": True, "enable_thinking": False}),
+    ({"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "none"}}, {"enable_thinking": True}),
+    ({"chat_template_kwargs": {"reasoning_effort": "max"}, "reasoning_effort": "low"}, {"reasoning_effort": "xhigh"}),
+    ({"chat_template_kwargs": {"reasoning_effort": "other"}}, {"reasoning_effort": "other"}),  # the template checks it
+])
+def test_template_kwargs_map_other_apis_names(body, kw):
+    assert api._template_kwargs(body, None) == kw
+    assert api._template_kwargs(body, True) == {"enable_thinking": True, **kw}
+
+
+def test_deepseek_style_thinking_off_renders_without_thinking():
+    class Effort(CharTokenizer):  # checks reasoning_effort as the Qwen3.8 template does
+        def apply_chat_template(self, conversation, **kw):
+            effort = kw.get("reasoning_effort", "xhigh")
+            if kw.get("enable_thinking", True) and effort not in ("xhigh", "medium", "low"):
+                raise jinja2.TemplateError(f"Unexpected reasoning effort {effort}.")
+            return super().apply_chat_template(conversation, **kw)
+    c, w = client("ok<|im_end|>", tokenizer=Effort())
+    r = c.post(CHAT, json={"messages": USER, "chat_template_kwargs": {"thinking": False, "reasoning_effort": "none"}})
+    assert r.status_code == 200 and SPECIAL["<think>"] not in w.submitted[-1].prompt
+    assert c.post(CHAT, json={"messages": USER, "reasoning_effort": "medium"}).status_code == 200
+    assert SPECIAL["<think>"] in w.submitted[-1].prompt
+    r = c.post(CHAT, json={"messages": USER, "chat_template_kwargs": {"reasoning_effort": "other"}})
+    assert r.status_code == 400 and "Unexpected reasoning effort" in r.json()["error"]["message"]
 
 
 @pytest.mark.parametrize("path,body", [

@@ -290,6 +290,39 @@ def _num(v, kind, name: str):
         raise BadRequest(f"{name} must be a number, not {v!r}") from None
 
 
+# reasoning_effort names of other APIs and templates -> the levels of the Qwen3.8 template (None: thinking off)
+_EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+
+
+def _template_kwargs(b: dict, default_thinking: bool | None) -> dict:
+    """The chat template kwargs of a chat request: chat_template_kwargs, plus the top-level enable_thinking and
+    reasoning_effort. Clients written for other templates set thinking with `thinking` (DeepSeek) and effort with names
+    that this template rejects ("none", "high", "max"). Thus `thinking` stands for enable_thinking, and the names in
+    _EFFORTS map to the levels of this template. Other values in chat_template_kwargs go to the template unchanged."""
+    kw = b.get("chat_template_kwargs") or {}
+    if not isinstance(kw, dict):
+        raise BadRequest("chat_template_kwargs must be an object")
+    kw = dict(kw)
+    if "enable_thinking" not in kw and isinstance(kw.get("thinking"), bool):
+        kw["enable_thinking"] = kw["thinking"]
+    if "enable_thinking" not in kw and b.get("enable_thinking") is not None:
+        kw["enable_thinking"] = bool(b["enable_thinking"])
+    if not isinstance(b.get("reasoning_effort"), (str, type(None))):
+        raise BadRequest("reasoning_effort must be a string")
+    top_level = "reasoning_effort" not in kw
+    effort = b.get("reasoning_effort") if top_level else kw.pop("reasoning_effort")
+    if isinstance(effort, str) and effort in _EFFORTS:
+        if _EFFORTS[effort] is None:
+            kw.setdefault("enable_thinking", False)
+        else:
+            kw["reasoning_effort"] = _EFFORTS[effort]
+    elif effort:  # another top-level name means the template default; the template checks its own kwargs
+        kw["reasoning_effort"] = "xhigh" if top_level else effort
+    if "enable_thinking" not in kw and default_thinking is not None:
+        kw["enable_thinking"] = default_thinking
+    return kw
+
+
 class Failed(Exception):
     """A request that the engine failed, or whose client went away: the message and the HTTP status."""
 
@@ -484,22 +517,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             msgs = b.get("messages")
             tool_choice = b.get("tool_choice")
             tools = b.get("tools") if tool_choice != "none" else None
-            kw = b.get("chat_template_kwargs") or {}
-            if not isinstance(kw, dict):
-                raise BadRequest("chat_template_kwargs must be an object")
-            kw = dict(kw)
-            if "enable_thinking" not in kw and b.get("enable_thinking") is not None:
-                kw["enable_thinking"] = bool(b["enable_thinking"])
-            effort = b.get("reasoning_effort")
-            if not isinstance(effort, (str, type(None))):
-                raise BadRequest("reasoning_effort must be a string")
-            if effort and "reasoning_effort" not in kw:
-                if effort == "none":
-                    kw.setdefault("enable_thinking", False)
-                else:
-                    kw["reasoning_effort"] = {"minimal": "low", "low": "low", "medium": "medium"}.get(effort, "xhigh")
-            if "enable_thinking" not in kw and default_thinking is not None:
-                kw["enable_thinking"] = default_thinking
+            kw = _template_kwargs(b, default_thinking)
             prompt = await render(msgs, tools, kw)
             n_top = None
             if b.get("logprobs"):

@@ -59,6 +59,13 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
   - `tools`, `tool_choice` (`none` leaves the tools out of the prompt).
   - `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...), plus top-level `enable_thinking` and
     `reasoning_effort` (`none`, `low`, `medium`, `high`).
+  - The template accepts the efforts `xhigh` (its default), `medium` and `low`. The server changes the effort names of
+    other APIs to these levels, in `chat_template_kwargs` and at the top level: `none` turns off thinking, `minimal`
+    becomes `low`, and `high` and `max` become `xhigh`. At the top level, other names also become `xhigh`. In
+    `chat_template_kwargs`, other names go to the template, which rejects them with a 400.
+  - `chat_template_kwargs.thinking` (the name in DeepSeek templates) sets `enable_thinking` when the request does not
+    set it. Thus `{"thinking": false, "reasoning_effort": "none"}`, which Hermes Agent sends for DeepSeek, turns off
+    thinking.
 - **Prefix reuse:** `cache_salt` and `cache_prompt: false`. Only requests with the same salt reuse a checkpoint.
   `cache_prompt: false` stops reuse for this request.
 - **Extras:**
