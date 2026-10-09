@@ -71,6 +71,12 @@ The server accepts the `user` field and ignores it. It rejects these with a 400:
 - `presence_penalty` or `frequency_penalty` other than 0, and `repetition_penalty` other than 1. The sampler has no
   penalties. The neutral values pass, because they do not change the output.
 - `response_format` other than `{"type": "text"}`. The server has no constrained decoding.
+- a malformed request: a body that is not a JSON object, a field of the wrong type (a number field, `stop` other than
+  strings, messages or tools that are not objects), token ids outside the vocabulary (a prompt of token ids,
+  `stop_token_ids`), `min_p` outside [0, 1], `max_tokens` or `max_completion_tokens` below 1, and an error of the chat
+  template (no user message, an unknown role).
+
+Any other error is a bug of the server: a 500 whose message names the exception, with the traceback in the log.
 
 Responses:
 
@@ -172,7 +178,8 @@ Other endpoints:
 - **Long prompts do not stop other requests.** A long prompt prefills 2048 tokens per engine step, and the other slots
   decode between the chunks. The other requests become slower, but they do not stop.
 - **Failures restart the process.** A failed CUDA call fails each in-flight request with a 500 and stops the process.
-  Then systemd restarts it.
+  Then systemd restarts it. An error while the server formats the output of one request (the parser runs on the engine
+  thread) fails only that request, with a 500.
 
 ## systemd
 

@@ -195,7 +195,9 @@ The code is in `engine/runtime/scheduler.py` and `engine/server/api.py`.
   engine thread detokenizes and parses each token as the engine emits it: reasoning, content, Qwen XML tool calls and
   stop strings (`engine/server/chat.py`). The Anthropic Messages API (`/v1/messages`, for Claude Code) uses the same
   path: `engine/server/anthropic.py` converts each request to chat messages and each reply to content blocks. A CUDA
-  error fails all requests and stops the process, and systemd restarts it.
+  error fails all requests and stops the process, and systemd restarts it. Thus the server checks every request value
+  that reaches the engine before it submits the request, and an error in the output parsing of one request fails only
+  that request.
 - **Memory.** At startup, the engine uses ≈61 GB. The weights use 20.2 GB and the INT copies 5.2 GB. The KV caches use
   3 × 262k × 32 KB = 25.8 GB. The checkpoint ring uses 4.9 GB, and the drafter KV and copies use ≈2.5 GB.
 - **Startup** takes ≈25 s. The engine loads the weights and runs a numerical self-test of each matmul path
@@ -227,8 +229,12 @@ change from the numerics of the checkpoint (the INT copies, FP8 prefill attentio
 
 - `pytest tests/` (≈1 min) tests each kernel against the PyTorch reference or a dequantized fp32 product. It also tests
   row invariance and the bit identity of verify and sequential decode. Other tests cover the prefill ops, the sampler
-  and acceptance statistics, chat parsing and the unroll of the drafter trainer.
-- `tests/golden.py` runs 21 recorded requests at once (greedy, seeded-sampled, a 20k-token prompt). They must reproduce
+  and acceptance statistics, chat parsing and the unroll of the drafter trainer. `test_scheduler.py` runs the scheduler
+  on a stub model whose next token depends on the whole history in its state (checkpoints, KV prefix copies, eviction,
+  aborts), and `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
+  errors).
+- `tests/golden.py` runs 21 recorded requests at once (greedy, seeded-sampled, a 20k-token prompt) on the server's engine
+  (`engine/runtime/build.py`, which the server, the checks and the benchmarks share). They must reproduce
   their tokens and per-token logprobs bit for bit: with suffix-match drafts, without them (`--suffix 0`) and without
   speculation (`check --plain`).
 - `tests/scheduler_check.py` compares the outputs of the scheduler with the uncached single-request outputs. It covers

@@ -92,7 +92,7 @@ decision. In short:
 | `engine/model/fast.py` | the decode path: kernel modules, decode state, `DecodeGraph`, the INT decode copies |
 | `engine/model/prefill.py` | the prefill path |
 | `engine/spec/` | the MTP drafter and the speculative cycle (`mtp.py`), suffix-match drafts (`suffix.py`), exact acceptance for sampling (`accept.py`) |
-| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the sampler, metrics, the reference generator |
+| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the engine build (`build.py`), the sampler, metrics, the reference generator |
 | `engine/server/` | the HTTP server (`api.py`), the Anthropic Messages API (`anthropic.py`), the chat template and output parsing (`chat.py`) |
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), numerics emulation |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |
@@ -105,7 +105,7 @@ decision. In short:
 ## Testing
 
 ```bash
-uv run pytest tests/ -q                                  # kernels against PyTorch references, bit-identity properties (~1 min)
+uv run pytest tests/ -q                                  # kernels against PyTorch references, bit-identity properties, the scheduler and the HTTP layer on stubs (~1 min)
 uv run python tests/golden.py check                      # recorded tokens and logprobs, bit for bit (the default server)
 uv run python tests/golden.py check --plain              # the same, without speculation
 uv run python tests/scheduler_check.py                   # batching, sampling, prefix reuse: outputs unchanged
