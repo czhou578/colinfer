@@ -36,9 +36,10 @@ class SamplerParams:
         return v
 
     def set(self, slot: int, temperature: float = 0.0, top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0, seed: int = 0):
-        """top_k <= 0 disables top-k; min_p <= 0 disables min-p."""
+        """top_k <= 0 disables top-k, and so does a top_k of at least the vocabulary (the buffer is int32); min_p <= 0
+        disables min-p."""
         self.temperature[slot] = float(temperature)
-        self.top_k[slot] = int(top_k) if top_k > 0 else self.vocab
+        self.top_k[slot] = min(int(top_k), self.vocab) if top_k > 0 else self.vocab
         self.top_p[slot] = float(top_p)
         self.log_min_p[slot] = math.log(min_p) if min_p > 0 else -math.inf
         self.seed[slot] = int(seed)

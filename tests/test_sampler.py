@@ -103,3 +103,10 @@ def test_captured_in_cuda_graph_follows_position():
         g.replay()
         draws.append(tuple(out.tolist()))
     assert len(set(draws)) > 20
+
+
+
+def test_top_k_beyond_int32_means_no_top_k():
+    p = SamplerParams(1, V, "cuda")
+    p.set(0, temperature=1.0, top_k=3_000_000_000)  # an int32 overflow on the engine thread used to end the server
+    assert int(p.top_k[0]) == V

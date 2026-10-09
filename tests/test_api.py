@@ -19,7 +19,7 @@ from engine.server.api import build_app  # noqa: E402
 SPECIAL = {"<think>": 1, "</think>": 2, "<tool_call>": 3, "</tool_call>": 4, "<|im_end|>": 5, "<|endoftext|>": 6, "<|im_start|>": 7}
 _SPLIT = re.compile("(" + "|".join(re.escape(s) for s in SPECIAL) + ")")
 CHAR0 = 100  # character c is token CHAR0 + ord(c)
-MAX_LEN, MARGIN = 4096, 8
+MAX_LEN, MARGIN, VOCAB = 4096, 8, 1 << 16
 
 
 class CharTokenizer:
@@ -82,7 +82,7 @@ class FakeWorker:
 def client(reply="", error=None, thinking=None, tokenizer=None):
     """The app on a FakeWorker. A bug of the server gets its 500 reply (TestClient would raise it instead)."""
     w = FakeWorker(reply, error)
-    app = build_app(w, tokenizer or CharTokenizer(), "fake", {}, {}, thinking)
+    app = build_app(w, tokenizer or CharTokenizer(), "fake", {}, {"vocab_size": VOCAB}, thinking)
     return TestClient(app, raise_server_exceptions=False), w
 
 
@@ -282,3 +282,18 @@ def test_invalid_json_is_400():
     c, _ = client()
     for path in (CHAT, "/v1/completions", "/v1/messages"):
         assert c.post(path, content=b"{not json", headers={"content-type": "application/json"}).status_code == 400
+
+
+
+@pytest.mark.parametrize("body", [
+    '{"prompt": [5, %d]}' % VOCAB,  # past the embedding: a device-side assert, which no later CUDA op survives
+    '{"prompt": [-1, 5]}',
+    '{"prompt": "hi", "stop_token_ids": [%d]}' % (1 << 40),  # overflowed the stop-id tensor on the engine thread
+    '{"prompt": "hi", "stop_token_ids": [-2]}',
+    '{"prompt": "hi", "min_p": 1.5}',
+    '{"prompt": "hi", "max_tokens": Infinity}',  # Python's JSON parser accepts it; int() raises OverflowError
+])
+def test_values_that_reach_the_gpu_are_checked(body):
+    c, w = client("ok")
+    assert c.post("/v1/completions", content=body.encode(), headers={"content-type": "application/json"}).status_code == 400
+    assert not w.submitted

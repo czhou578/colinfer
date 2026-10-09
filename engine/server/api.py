@@ -316,7 +316,7 @@ def _num(v, kind, name: str):
     """A request field as an int / float, or a BadRequest."""
     try:
         return kind(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: int(Infinity), which Python's JSON parser accepts
         raise BadRequest(f"{name} must be a number, not {v!r}") from None
 
 
@@ -336,6 +336,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     if getattr(a, "api_key", None):
         app.add_middleware(ApiKey, key=a.api_key)
     max_len, margin = a.max_seq_len, worker.sched.margin
+    vocab = hf_config["vocab_size"]  # rows of the embedding: a token id beyond it is a device-side assert, fatal to the engine
     created = int(time.time())
 
     # apply_chat_template's own arguments: a chat_template_kwargs key with one of these names would collide with them
@@ -366,9 +367,15 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             raise BadRequest("response_format is not supported except {\"type\": \"text\"}: the server has no constrained decoding")
         return b
 
+    def token_ids(ids, name: str) -> tuple[int, ...]:
+        if not all(isinstance(t, int) and 0 <= t < vocab for t in ids):
+            raise BadRequest(f"{name} must be token ids in [0, {vocab})")
+        return tuple(ids)
+
     def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None) -> EngineRequest:
         if not prompt:
             raise BadRequest("the prompt is empty")
+        token_ids(prompt, "prompt")
         if len(prompt) + margin > max_len:  # the wording of the Anthropic API, which Claude Code recognizes
             raise BadRequest(f"prompt is too long: {len(prompt)} tokens > {max_len - margin} maximum")
         mt = b.get("max_completion_tokens")
@@ -389,15 +396,16 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         stop_ids = b.get("stop_token_ids") or []
         if not isinstance(stop_ids, list):
             raise BadRequest("stop_token_ids must be a list of token ids")
-        stop_ids = tuple(_num(t, int, "stop_token_ids") for t in stop_ids)
+        stop_ids = token_ids(stop_ids, "stop_token_ids")
         eos = stop_ids if b.get("ignore_eos") else tuple(sorted(set(fmt.eos_ids) | set(stop_ids)))
-        if not (0.0 <= temp <= 100.0) or not (0.0 < top_p <= 1.0):
-            raise BadRequest("temperature must be in [0, 100] and top_p in (0, 1]")
+        min_p = _num(b.get("min_p") or 0.0, float, "min_p")
+        if not (0.0 <= temp <= 100.0) or not (0.0 < top_p <= 1.0) or not (0.0 <= min_p <= 1.0):
+            raise BadRequest("temperature must be in [0, 100], top_p in (0, 1] and min_p in [0, 1]")
         salt = b.get("cache_salt")
         if b.get("cache_prompt") is False:  # llama.cpp's switch: no prefix reuse for this request
             salt = uuid.uuid4().hex
         return EngineRequest(prompt, max_new_tokens=mt, temperature=temp, top_k=max(top_k, 0), top_p=top_p,
-                             min_p=_num(b.get("min_p") or 0.0, float, "min_p"), seed=seed, eos_ids=eos,
+                             min_p=min_p, seed=seed, eos_ids=eos,
                              min_tokens=_num(b.get("min_tokens") or 0, int, "min_tokens"),
                              logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt))
 
