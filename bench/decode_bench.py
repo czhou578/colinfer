@@ -9,15 +9,12 @@ of the drafter, which the dummy tokens of the bench would trigger on almost ever
    uv run python bench/decode_bench.py [--ctx 8192] [--ks 1 3 5 7]
 """
 import argparse
-import os
-import sys
 import time
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.model.fast import DecodeGraph  # noqa: E402
-from engine.runtime.build import load_model  # noqa: E402
+from engine.model.fast import DecodeGraph
+from engine.runtime.build import load_model
 
 
 def timed(fn, n=20):

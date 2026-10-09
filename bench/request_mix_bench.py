@@ -10,13 +10,9 @@ per second of wall time (prefill included) per kind. It works against a running 
 """
 import argparse
 import collections
-import os
-import sys
 import time
 
 import requests
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def main():

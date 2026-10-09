@@ -10,14 +10,12 @@ TTFT(2k) <= 0.6 s (plan 0.8 s), 32k prompt <= 12 s (plan 16 s).
 """
 import argparse
 import os
-import sys
 import time
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.model.fast import load_fast_model, to_fast  # noqa: E402
-from engine.model.prefill import prefill, prepare_prefill  # noqa: E402
+from engine.model.fast import load_fast_model, to_fast
+from engine.model.prefill import prefill, prepare_prefill
 
 
 def main():

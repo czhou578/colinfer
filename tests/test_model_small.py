@@ -1,21 +1,16 @@
-"""Fast CPU tests for engine/model/qwen35.py and the dequant helpers, on a tiny random model.
-
-They cover the paths that the 27B parity run does not:
+"""Fast CPU tests for engine/model/qwen35.py, the reference generator and the dequant helpers, on a tiny random model:
 - prefill continuation (T > 1 with existing state)
 - the 64-token chunk boundary of the delta rule
 - stepwise decode vs one-shot prefill
 - agreement with Qwen3_5ForCausalLM of HF transformers at tiny scale
 Run: uv run pytest tests/test_model_small.py -q
 """
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM  # noqa: E402
-from engine.weights.loader import E2M1_LUT, dequant_fp8_block, dequant_nvfp4  # noqa: E402
+from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
+from engine.runtime.generate import generate
+from engine.weights.loader import E2M1_LUT, dequant_fp8_block, dequant_nvfp4
 
 DT = torch.float32
 
@@ -114,41 +109,11 @@ def test_fp8_block_dequant_ragged_dims():
     assert out.shape == (200, 300) and rel < 0.05, rel
 
 
-# ---- sampling (engine/runtime/generate.py) ----
-from engine.runtime.generate import generate, sample  # noqa: E402
-
-
-def test_sample_greedy_and_topk1_agree():
-    torch.manual_seed(2)
-    logits = torch.randn(4, 101)
-    g = torch.Generator().manual_seed(0)
-    assert torch.equal(sample(logits, 0.0, 0, 1.0, None), logits.argmax(-1))
-    assert torch.equal(sample(logits, 0.7, 1, 1.0, g), logits.argmax(-1))
-
-
-def test_sample_top_p_support():
-    logits = torch.log(torch.tensor([[0.5, 0.3, 0.15, 0.05]]))
-    g = torch.Generator().manual_seed(0)
-    draws = {int(sample(logits, 1.0, 0, 0.7, g)) for _ in range(400)}
-    assert draws == {0, 1}, draws          # 0.5 + 0.3 covers 0.7; tokens 2 and 3 are cut
-    draws = {int(sample(logits, 1.0, 0, 0.85, g)) for _ in range(400)}
-    assert draws == {0, 1, 2}, draws
-
-
-def test_sample_temperature_distribution():
-    logits = torch.log(torch.tensor([[0.6, 0.4]]))
-    g = torch.Generator().manual_seed(0)
-    n = 4000
-    hits = sum(int(sample(logits, 1.0, 0, 1.0, g)) == 0 for _ in range(n))
-    assert abs(hits / n - 0.6) < 0.03, hits / n
-
-
 @torch.inference_mode()
-def test_generate_seeded_sampling_reproducible_and_eos(model, ids):
-    a, _ = generate(model, ids[:, :10], 20, temperature=0.8, top_k=20, top_p=0.95, seed=123)
-    b, _ = generate(model, ids[:, :10], 20, temperature=0.8, top_k=20, top_p=0.95, seed=123)
-    assert a == b and len(a) == 20
-    greedy, _ = generate(model, ids[:, :10], 20)
+def test_generate_greedy_and_eos(model, ids):
+    greedy = generate(model, ids[:, :10], 20)
+    full = model(ids[:, :10], model.new_state(1, 30))  # the first token is the argmax after the prompt
+    assert len(greedy) == 20 and greedy[0] == int(full[0, -1].argmax())
     stop = greedy[5]
-    cut, _ = generate(model, ids[:, :10], 20, eos_ids=[stop])
+    cut = generate(model, ids[:, :10], 20, eos_ids=[stop])
     assert cut == greedy[: greedy.index(stop) + 1]

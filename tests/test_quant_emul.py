@@ -1,14 +1,10 @@
 """Tests for engine/weights/quant_emul.py. The FlashInfer comparison needs the GPU, and pytest skips it without one.
 Run: uv run pytest tests/test_quant_emul.py -q"""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.weights.loader import E2M1_LUT  # noqa: E402
-from engine.weights.quant_emul import (e2m1_round, fake_quant_fp8_unscaled, fake_quant_nvfp4_unscaled,  # noqa: E402
+from engine.weights.loader import E2M1_LUT
+from engine.weights.quant_emul import (e2m1_round, fake_quant_fp8_unscaled, fake_quant_nvfp4_unscaled,
                                        parse_effects, requant_fused_fp8)
 
 

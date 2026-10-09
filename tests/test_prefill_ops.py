@@ -1,17 +1,13 @@
 """Fused prefill glue (csrc/prefill_ops.cu) against PyTorch. Run: uv run pytest tests/test_prefill_ops.py -q"""
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
+from engine.weights.quant_emul import fake_quant_nvfp4_unscaled
+from tests.test_gemm_nvfp4 import unswizzle
+from engine.weights.loader import E2M1_LUT
 
-from engine.weights.quant_emul import fake_quant_nvfp4_unscaled  # noqa: E402
-from tests.test_gemm_nvfp4 import unswizzle  # noqa: E402
-from engine.weights.loader import E2M1_LUT  # noqa: E402
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 
 def ops():

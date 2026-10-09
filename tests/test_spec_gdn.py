@@ -1,13 +1,9 @@
 """GDN verify / commit (csrc/gdn_step.cu over T tokens) must reproduce T sequential single-token decode steps bit for
 bit. The test reads mixed / z / b / a as strided column views of the projection outputs.
 Run: uv run pytest tests/test_spec_gdn.py -q"""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 Hk, Hv = 16, 48

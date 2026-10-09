@@ -1,15 +1,11 @@
 """In-graph sampler (engine/runtime/sampler.py): distribution checks against an exact truncated softmax, per-slot
 parameters, determinism by (seed, position), and the capture inside a CUDA graph."""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
+from engine.runtime.sampler import SamplerParams, sample
 
-from engine.runtime.sampler import SamplerParams, sample  # noqa: E402
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 V = 1000
 
@@ -103,7 +99,6 @@ def test_captured_in_cuda_graph_follows_position():
         g.replay()
         draws.append(tuple(out.tolist()))
     assert len(set(draws)) > 20
-
 
 
 def test_top_k_beyond_int32_means_no_top_k():

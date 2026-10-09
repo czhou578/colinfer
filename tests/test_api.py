@@ -1,21 +1,18 @@
 """The HTTP layer of the server (engine/server/api.py) against a fake engine thread: request validation and the
 responses of /v1/chat/completions, /v1/completions and /v1/messages. No GPU and no checkpoint: a character-level
 tokenizer and a worker that answers each request with a scripted reply."""
-import os
 import re
-import sys
 import time
 import types
 
 import jinja2
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
-from engine.runtime.metrics import Metrics  # noqa: E402
-from engine.server import api  # noqa: E402
-from engine.server.api import build_app  # noqa: E402
+from engine.runtime.metrics import Metrics
+from engine.server import api
+from engine.server.api import build_app
 
 SPECIAL = {"<think>": 1, "</think>": 2, "<tool_call>": 3, "</tool_call>": 4, "<|im_end|>": 5, "<|endoftext|>": 6, "<|im_start|>": 7}
 _SPLIT = re.compile("(" + "|".join(re.escape(s) for s in SPECIAL) + ")")
@@ -318,7 +315,6 @@ def test_invalid_json_is_400():
     c, _ = client()
     for path in (CHAT, "/v1/completions", "/v1/messages"):
         assert c.post(path, content=b"{not json", headers={"content-type": "application/json"}).status_code == 400
-
 
 
 @pytest.mark.parametrize("body", [

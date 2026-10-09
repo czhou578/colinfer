@@ -1,16 +1,12 @@
 """Speculative sampling acceptance (engine/spec/accept.py) keeps the target distribution. Over many independent
 trials, the first two emitted tokens follow p_0 and p_1(.|first) exactly."""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
+from engine.runtime.sampler import SamplerParams
+from engine.spec.accept import draw, inverse_cdf, processed_probs
 
-from engine.runtime.sampler import SamplerParams  # noqa: E402
-from engine.spec.accept import draw, inverse_cdf, processed_probs  # noqa: E402
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 
 def test_inverse_cdf_marginal_is_exact():

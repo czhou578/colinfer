@@ -23,8 +23,6 @@ import time
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 
 def wikitext_test() -> str:
     import pyarrow.parquet as pq

@@ -10,12 +10,8 @@ import argparse
 import collections
 import os
 import random
-import sys
 
 import torch
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def main():
@@ -29,10 +25,10 @@ def main():
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
-    from drafter_data import build_prompts
     from engine.model.fast import load_fast_model, to_fast
     from engine.spec.mtp import MtpGenerator
     from engine.weights.loader import resolve
+    from tools.drafter_data import build_prompts
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
     model = to_fast(load_fast_model(path))

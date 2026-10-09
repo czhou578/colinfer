@@ -34,6 +34,16 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/czhou578/colinfer"
 
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+# `uv sync` installs the project in editable mode, so `import engine`, and the modules that the scripts import from
+# each other (tests.golden, tools.drafter_data, ...), work from any directory.
+[tool.setuptools.packages.find]
+include = ["engine*", "tests", "tools", "bench"]
+namespaces = true
+
 [dependency-groups]
 dev = [
     "accelerate>=1.15.0",

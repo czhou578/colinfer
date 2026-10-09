@@ -1,11 +1,7 @@
 """Low-rank draft head pieces (engine/spec/mtp.py, docs/history/phase6_progress.md section 19)."""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 

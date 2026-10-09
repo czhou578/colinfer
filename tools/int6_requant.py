@@ -22,16 +22,14 @@ the global scale.
 import argparse
 import os
 import re
-import sys
 import time
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.weights.loader import resolve, weight_map  # noqa: E402
-from engine.weights.quantize import REQUANT_DIR, dequant_int, int_global_scale, pack5, pack6, quantize_int  # noqa: E402
+from engine.weights.loader import resolve, weight_map
+from engine.weights.quantize import REQUANT_DIR, dequant_int, int_global_scale, pack5, pack6, quantize_int
 
 
 def main():

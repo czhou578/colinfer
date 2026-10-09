@@ -1,16 +1,12 @@
 """The GDN decode step (csrc/gdn_step.cu: gdn_conv + gdn_conv_commit + gdn_delta, T = 1) against the reference PyTorch
 GatedDeltaNet (engine/model/qwen35.py), on an existing state, at Qwen3.8-27B dimensions. Inactive slots keep their
 state. Run: uv run pytest tests/test_gdn_step.py -q"""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
+from engine.model.qwen35 import GatedDeltaNet, ModelState, Qwen35Config
 
-from engine.model.qwen35 import GatedDeltaNet, ModelState, Qwen35Config  # noqa: E402
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 
 @pytest.mark.parametrize("B", [1, 3])

@@ -4,27 +4,11 @@ The requests have the shape of the requests of Claude Code 2.1.290: system block
 inside `messages`, thinking blocks sent back with their signature, tool_use / tool_result pairs.
 """
 import json
-import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from engine.server import anthropic as anth  # noqa: E402
-from engine.server.chat import ChatFormat, OutputParser  # noqa: E402
-
-
-@pytest.fixture(scope="module")
-def fmt():
-    from transformers import AutoTokenizer
-
-    from engine.weights.loader import resolve
-    try:
-        path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    except Exception:
-        pytest.skip("checkpoint not in the local HF cache")
-    return ChatFormat(AutoTokenizer.from_pretrained(path))
+from engine.server import anthropic as anth
+from engine.server.chat import OutputParser
 
 
 BASH = {"name": "Bash", "description": "Run a shell command", "input_schema": {

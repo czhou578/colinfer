@@ -16,12 +16,9 @@ of the approximation.
 import argparse
 import os
 import random
-import sys
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULT_OUT = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca.safetensors")
 
@@ -29,10 +26,10 @@ DEFAULT_OUT = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca.safet
 def collect(n: int, seed: int, weights, k: int = 7, max_new: int = 256) -> torch.Tensor:
     from transformers import AutoTokenizer
 
-    from drafter_data import build_prompts
     from engine.model.fast import load_fast_model, to_fast
     from engine.spec import mtp as M
     from engine.weights.loader import resolve
+    from tools.drafter_data import build_prompts
     gbuf = torch.zeros(k, 5120, device="cuda", dtype=torch.bfloat16)
     calls = [0]
     orig = M.Mtp.draft

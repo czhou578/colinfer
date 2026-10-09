@@ -1,25 +1,8 @@
 """Chat formatting / output parsing for the server (engine/server/chat.py), on the real Qwen3.8 tokenizer (CPU)."""
 import json
-import os
-import sys
-
-import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from engine.server.chat import ChatFormat, Detokenizer, OutputParser, TextParser, parse_tool_call  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def fmt():
-    from transformers import AutoTokenizer
-
-    from engine.weights.loader import resolve
-    try:
-        path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    except Exception:
-        pytest.skip("checkpoint not in the local HF cache")
-    return ChatFormat(AutoTokenizer.from_pretrained(path))
+from engine.server.chat import Detokenizer, OutputParser, TextParser, parse_tool_call
 
 
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "weather",

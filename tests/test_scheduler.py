@@ -7,19 +7,16 @@ around: a hash of the history in the GDN recurrent state, and the tokens themsel
 sum). Thus an output equals the reference continuation only if the scheduler gave the request exactly the state of its
 own prompt, whatever it restored, copied or batched.
 """
-import os
 import random
-import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
+import engine.runtime.scheduler as S
+from engine.model.fast import FastState
+from engine.model.qwen35 import Qwen35Config
 
-import engine.runtime.scheduler as S  # noqa: E402
-from engine.model.fast import FastState  # noqa: E402
-from engine.model.qwen35 import Qwen35Config  # noqa: E402
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 V, P, L = 64, 1009, 2048  # vocabulary, hash modulus, slot length
 BND = V - 1               # the message-boundary token

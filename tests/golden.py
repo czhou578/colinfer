@@ -32,10 +32,9 @@ import time
 
 import torch
 
+from engine.spec.suffix import MIN_MATCH
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-from engine.spec.suffix import MIN_MATCH  # noqa: E402
 
 FILE = os.path.join(ROOT, "tests", "golden", "outputs.json")
 PROMPTS = os.path.join(ROOT, "tests", "golden", "prompts.json")
@@ -47,8 +46,8 @@ def freeze_prompts(path):
     prompt, as token ids."""
     from transformers import AutoTokenizer
 
-    from drafter_data import build_prompts
     from tests.perplexity import wikitext_test
+    from tools.drafter_data import build_prompts
     tok = AutoTokenizer.from_pretrained(path)
     mix = []
     for p, kind, think in build_prompts(40, random.Random(1)):

@@ -6,13 +6,10 @@ do not run from L2.
    uv run python bench/attn_bench.py [--ctx 8192 32768 131072] [--B 1 3] [--T 1 4 8]
 """
 import argparse
-import os
-import sys
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.kernels import ops  # noqa: E402
+from engine.kernels import ops
 
 Hq, Hkv, D = 24, 4, 256
 

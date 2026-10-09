@@ -40,7 +40,8 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import FastDecoderLayer, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear
+from engine.model.fast import (FastDecoderLayer, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup,
+                               Nvfp4Linear, capture)
 from engine.model.prefill import attend_cached, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
 from engine.weights.loader import dequant_nvfp4, weight_map
@@ -279,15 +280,7 @@ class MtpCycle:
         self._side = torch.cuda.Stream()  # the GDN commit's branch
         self.skip = torch.zeros(1, dtype=torch.int32, device=dev)  # draft early exit flag (skinny_skip)
         state.reset()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s), torch.inference_mode():
-            for _ in range(2):
-                self._body()
-        torch.cuda.current_stream().wait_stream(s)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(self.graph):
-            self.out_tok, self.n, self.logits, self.H = self._body()
+        self.graph, (self.out_tok, self.n, self.logits, self.H) = capture(self._body)
         state.reset()
         mst.pos_t.zero_()
 

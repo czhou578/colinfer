@@ -4,15 +4,12 @@ cycles over several copies of each weight, so nothing runs from L2 (LPDDR5x peak
 
    uv run python bench/skinny_bench.py
 """
-import os
-import sys
 import time
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.kernels import ops  # noqa: E402
-from engine.weights.quantize import int_global_scale, nvfp4_global_scale, pack5, pack6, quantize, quantize_int  # noqa: E402
+from engine.kernels import ops
+from engine.weights.quantize import int_global_scale, nvfp4_global_scale, pack5, pack6, quantize, quantize_int
 
 # (name, format, N, K) of the decode linears of Qwen3.8-27B (lm_head and the MLP in NVFP4, attention INT6, GDN INT5)
 SHAPES = [("mlp gate|up", "nvfp4", 34816, 5120), ("mlp down", "nvfp4", 5120, 17408), ("lm_head", "nvfp4", 248320, 5120),

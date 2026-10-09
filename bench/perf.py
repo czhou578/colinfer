@@ -25,18 +25,17 @@ import json
 import os
 import statistics
 import subprocess
-import sys
 import threading
 import time
 import uuid
 
 import torch
 
+from engine.spec.suffix import MIN_MATCH
+from engine.runtime.build import build_engine
+from tests.golden import EOS, load_prompts
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-from engine.spec.suffix import MIN_MATCH  # noqa: E402
-from engine.runtime.build import build_engine  # noqa: E402
-from tests.golden import EOS, load_prompts  # noqa: E402
 
 
 def meminfo_kb(key: str) -> int:

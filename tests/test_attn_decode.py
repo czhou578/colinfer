@@ -4,14 +4,10 @@
   output-invariant)
 - the full KernelAttention layer (prologue + attention + gate) against the reference qwen35.Attention
 Run: uv run pytest tests/test_attn_decode.py -q"""
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 

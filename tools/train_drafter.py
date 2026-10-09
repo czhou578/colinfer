@@ -28,14 +28,12 @@ import json
 import math
 import os
 import random
-import sys
 import time
 
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.weights.loader import resolve, weight_map  # noqa: E402
+from engine.weights.loader import resolve, weight_map
 
 DIR = os.path.expanduser("~/.cache/colinfer/drafter")
 TOPK = 32

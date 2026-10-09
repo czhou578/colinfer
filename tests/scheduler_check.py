@@ -19,18 +19,15 @@ More checks:
   8. speed: single-slot MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
-import os
-import sys
 import time
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from transformers import AutoTokenizer  # noqa: E402
+from transformers import AutoTokenizer
 
-from engine.runtime.build import build_engine  # noqa: E402
-from engine.runtime.scheduler import Request, Scheduler  # noqa: E402
-from engine.weights.loader import resolve  # noqa: E402
+from engine.runtime.build import build_engine
+from engine.runtime.scheduler import Request, Scheduler
+from engine.weights.loader import resolve
 
 EOS = (248046, 248044)
 IM_START = 248045

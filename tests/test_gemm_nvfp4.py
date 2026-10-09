@@ -1,16 +1,12 @@
 """Prefill NVFP4 GEMM (csrc/gemm_nvfp4.cu): the activation quantizer against the bit-exact emulation, and the CUTLASS
 GEMM against an fp32 reference on dequantized operands. Run: uv run pytest tests/test_gemm_nvfp4.py -q"""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
+from engine.weights.loader import E2M1_LUT, dequant_nvfp4
+from engine.weights.quant_emul import fake_quant_nvfp4_unscaled
 
-from engine.weights.loader import E2M1_LUT, dequant_nvfp4  # noqa: E402
-from engine.weights.quant_emul import fake_quant_nvfp4_unscaled  # noqa: E402
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 
 def ops():

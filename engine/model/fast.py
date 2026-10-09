@@ -475,6 +475,21 @@ def attach_decode_copies(model: FastQwen35, files) -> int:
 
 
 # ------------------------------------------------------------------------------------------------------------ graph
+def capture(body):
+    """(a CUDA graph of body(), the outputs of body() in the graph). Two warm-up runs on a side stream first, so first-use
+    allocations and autotuning stay out of the graph. The warm-up executes body() for real."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.inference_mode():
+        for _ in range(2):
+            body()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.inference_mode(), torch.cuda.graph(graph):
+        out = body()
+    return graph, out
+
+
 class DecodeGraph:
     """One CUDA graph for a plain decode step (T = 1 per slot): embed -> 64 layers -> lm_head -> sampler.
 
@@ -490,17 +505,12 @@ class DecodeGraph:
         B = state.pos_t.shape[0]
         self.params = params if params is not None else SamplerParams(B, model.cfg.vocab_size, state.pos_t.device)
         self.tok = torch.zeros(B, 1, dtype=torch.long, device=state.pos_t.device)
+
+        def body():
+            logits = model(self.tok, state)
+            return logits, sample(logits, self.params, state.pos_t)  # pos_t now holds the predicted token's position
         state.reset()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s), torch.inference_mode():
-            for _ in range(2):
-                sample(model(self.tok, state), self.params, state.pos_t)
-        torch.cuda.current_stream().wait_stream(s)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(self.graph):
-            self.logits = model(self.tok, state)
-            self.next = sample(self.logits, self.params, state.pos_t)  # pos_t now holds the predicted token's position
+        self.graph, (self.logits, self.next) = capture(body)
         state.reset()
 
     def step(self, tokens: torch.Tensor) -> torch.Tensor:

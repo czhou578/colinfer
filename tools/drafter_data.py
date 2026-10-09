@@ -21,7 +21,6 @@ import glob
 import json
 import os
 import random
-import sys
 import threading
 import time
 
@@ -147,7 +146,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     from transformers import AutoTokenizer
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from engine.weights.loader import resolve
     tok = AutoTokenizer.from_pretrained(resolve("nvidia/Qwen3.8-27B-NVFP4"))
     rng = random.Random(a.seed)

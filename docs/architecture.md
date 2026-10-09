@@ -233,15 +233,15 @@ change from the numerics of the checkpoint (the INT copies, FP8 prefill attentio
   and acceptance statistics, chat parsing and the unroll of the drafter trainer. `test_scheduler.py` runs the scheduler
   on a stub model whose next token depends on the whole history in its state (checkpoints, KV prefix copies, eviction,
   aborts), and `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
-  errors).
+  errors). `test_model_small.py` compares the reference model with the Qwen3.5 model of transformers at tiny scale.
 - `tests/golden.py` runs 21 recorded requests at once (greedy, seeded-sampled, a 20k-token prompt) on the server's engine
   (`engine/runtime/build.py`, which the server, the checks and the benchmarks share). They must reproduce
   their tokens and per-token logprobs bit for bit: with suffix-match drafts, without them (`--suffix 0`) and without
   speculation (`check --plain`).
 - `tests/scheduler_check.py` compares the outputs of the scheduler with the uncached single-request outputs. It covers
   single, concurrent, mixed (greedy next to sampled and a long prefill), multi-turn and shared-prefix requests.
-- Other end-to-end checks: `tests/perplexity.py`, `tests/passkey.py` (long-context retrieval), `tests/parity_hf.py` (the
-  reference vs transformers), `tests/server_check.py` (the HTTP API).
+- Other end-to-end checks: `tests/perplexity.py`, `tests/passkey.py` (long-context retrieval), `tests/server_check.py`
+  (the HTTP API).
 - Benchmarks: `bench/perf.py` (the repeatable baseline: prefill, TTFT, decode, memory), `bench/decode_bench.py`,
   `bench/prefill_bench.py`, `bench/request_mix_bench.py` (end to end), `bench/skinny_bench.py`, `bench/attn_bench.py`,
   `bench/trace_summary.py` (nsys).

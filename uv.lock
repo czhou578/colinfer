@@ -139,7 +139,7 @@ wheels = [
 [[package]]
 name = "colin-inference-engine"
 version = "0.0.1"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "flashinfer-jit-cache" },

@@ -4,16 +4,12 @@
   consistent)
 - the skip flag of the draft early exit, and the small decode ops (bf16 GEMV, RMSNorm)
 INT6 / INT5: tests/test_skinny_int.py. Run: uv run pytest tests/test_skinny.py -q"""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
+from engine.weights.loader import dequant_nvfp4
 
-from engine.weights.loader import dequant_nvfp4  # noqa: E402
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 
 
 def ops():

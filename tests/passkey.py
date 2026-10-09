@@ -9,17 +9,14 @@ cache) and the decode attention kernel at depth.
   uv run python tests/passkey.py --url http://127.0.0.1:8000 --lens 262000 --depths 0.5   # through the server
 """
 import argparse
-import os
 import random
 import re
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from transformers import AutoTokenizer  # noqa: E402
+from transformers import AutoTokenizer
 
-from engine.runtime.build import build_engine  # noqa: E402
-from engine.runtime.scheduler import Request  # noqa: E402
-from engine.weights.loader import resolve  # noqa: E402
+from engine.runtime.build import build_engine
+from engine.runtime.scheduler import Request
+from engine.weights.loader import resolve
 
 FILLER = ("The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. ")
 

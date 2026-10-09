@@ -4,14 +4,8 @@ The test uses a tiny random MTP head (CPU). Depth 1 is the teacher-forced pass. 
 incremental run of the reference decoder layer. This run has catch-up rows 0..p with the target hidden states into a KV
 cache, then s-1 chain steps that feed the head its own normed output (p = i - s + 1).
 """
-import os
-import sys
-
 import pytest
 import torch
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
 
 def tiny():
@@ -48,7 +42,7 @@ def reference(cfg, t):
 @pytest.mark.parametrize("depth", [1, 2, 3])
 def test_unroll_matches_incremental_chain(depth):
     from engine.model.qwen35 import ModelState
-    from train_drafter import Head
+    from tools.train_drafter import Head
     cfg, t = tiny()
     head = Head(t, cfg)
     layer, pre_e, pre_h, fnorm = reference(cfg, t)
