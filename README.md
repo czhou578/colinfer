@@ -2,7 +2,7 @@
 
 colinfer is a single-user inference engine for **Qwen3.8-27B** (`nvidia/Qwen3.8-27B-NVFP4`) on one **DGX Spark** (GB10,
 sm_121). It serves the model through an OpenAI-compatible and an Anthropic-compatible HTTP API, so Claude Code can use
-it directly. It is for one person who sends up to three requests at the same time.
+it directly. It is for one person, and it runs one request at a time.
 
 This is a research engine for one machine and one model, not a general inference server. It has no paged KV cache, no
 multi-GPU support and no other models. The kernels compile for sm_121a only. The design notes and the dated logs in
@@ -23,7 +23,7 @@ The SGLang and vLLM decode and prefill figures are the phase-0 baselines on the 
 prose prompt. The SGLang prefill figures come from its own per-batch log. The SGLang mix figure is SGLang with the
 DFlash2 drafter on the same 40 requests (`docs/history/phase6_progress.md` section 16).
 
-Outputs are **token-identical with speculation on or off**, for greedy and for seeded sampling, at any batch width
+Outputs are **token-identical with speculation on or off**, for greedy and for seeded sampling
 (`tests/golden.py`, `tests/scheduler_check.py`). Each quantization choice beyond the checkpoint's own must pass a
 perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
 
@@ -81,8 +81,9 @@ decision. In short:
   the target model itself gives. When a reply repeats earlier text, a cycle can verify up to 15 copied tokens instead.
 - **Prefill** processes prompts in 2,048-token chunks. It uses CUTLASS NVFP4 and cuBLASLt FP8 tensor-core GEMMs, a CUDA
   kernel for the chunked delta rule, and FlashInfer or FP8 attention.
-- **Serving** keeps three fixed slots with contiguous KV caches. A ring of prefix checkpoints (GDN state snapshots) lets
-  multi-turn chats and shared system prompts skip a second prefill.
+- **Serving** runs one request at a time and keeps three fixed slots with contiguous KV caches: the last three
+  conversations stay cached. A ring of prefix checkpoints (GDN state snapshots) lets multi-turn chats and shared system
+  prompts skip a second prefill.
 
 ## Repository
 

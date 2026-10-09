@@ -3,7 +3,7 @@
 logprobs of a fixed request set exactly. The server configuration is: INT6 / INT5 decode copies and the drafter files
 when present, MTP speculation with suffix-match drafts, 3 slots.
 
-The requests, all submitted at once (so they also run batched):
+The requests, all submitted at once (they queue and run one at a time):
 
 - the first 16 prompts of the 40-prompt mix, greedy, for up to 128 tokens
 - 4 of them sampled (temperature 0.8, top-p 0.95, top-k 20, fixed seeds), for 64 tokens

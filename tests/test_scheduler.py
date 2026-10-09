@@ -1,11 +1,11 @@
-"""The bookkeeping of engine/runtime/scheduler.py on a stub model (GPU, no checkpoint): queueing, chunked prefill
-between decode steps, prefix checkpoints (snapshot, restore, the KV prefix copy into another slot, eviction, salts),
-finish reasons, aborts and reset.
+"""The bookkeeping of engine/runtime/scheduler.py on a stub model (GPU, no checkpoint): queueing (one request at a
+time), chunked prefill, prefix checkpoints (snapshot, restore, eviction, salts), a conversation's cache across a side
+request, finish reasons, aborts and reset.
 
 The stub's next token depends on the whole history of its slot, through both kinds of state that the scheduler moves
 around: a hash of the history in the GDN recurrent state, and the tokens themselves in the attention KV cache (their
 sum). Thus an output equals the reference continuation only if the scheduler gave the request exactly the state of its
-own prompt, whatever it restored, copied or batched.
+own prompt, whatever it restored.
 """
 import random
 
@@ -98,10 +98,10 @@ def chat(rng, system, user):
     return [BND] + system + [BND] + user + [BND] + prompt(rng, 2)
 
 
-def test_batched_requests_match_the_reference(make):
+def test_queued_requests_match_the_reference(make):
     sched, rng = make(), random.Random(0)
     reqs = [S.Request(prompt(rng, n), max_new_tokens=m) for n, m in ((5, 20), (70, 7), (200, 33), (130, 12), (9, 40), (300, 3), (640, 25))]
-    sched.run(reqs)  # 7 requests on 3 slots: queueing, prefill chunks between decode steps of every width
+    sched.run(reqs)  # 7 requests on 3 slots, one at a time: queueing, chunked prefill, slot reuse
     for r in reqs:
         assert r.output == reference(r.prompt, r.max_new_tokens) and r.finish_reason == "length"
 
@@ -130,19 +130,20 @@ def test_next_turn_restores_the_end_of_turn_checkpoint(make):
     assert r3.reused == 0 and r3.output == r2.output
 
 
-def test_shared_system_prompt_is_copied_into_a_free_slot(make):
+def test_a_side_request_waits_and_keeps_the_main_conversation_cached(make):
     sched, rng = make(), random.Random(3)
-    system = prompt(rng, 300)
-    a = S.Request(chat(rng, system, prompt(rng, 40)), max_new_tokens=200)
-    sched.submit(a)
-    while sched.slots[0].phase != "decode":
+    main = sched.submit(S.Request(prompt(rng, 150), max_new_tokens=20))
+    while not main.output:
         sched.step()
-    b = S.Request(chat(rng, system, prompt(rng, 25)), max_new_tokens=30)
-    sched.submit(b)
+    side = sched.submit(S.Request(prompt(rng, 60), max_new_tokens=10))  # e.g. a title request while main decodes
+    sched.step()
+    assert side.slot == -1  # it waits for main
     while sched.busy():
         sched.step()
-    assert b.reused == len(system) + 1 and b.slot != a.slot  # restored from a's checkpoint while a decodes in its slot
-    assert a.output == reference(a.prompt, 200) and b.output == reference(b.prompt, 30)
+    assert side.slot != main.slot and side.output == reference(side.prompt, 10)
+    p2 = main.prompt + main.output + prompt(rng, 30)  # main's next turn: its slot still holds its history
+    r2 = sched.run([S.Request(p2, max_new_tokens=20)])[0]
+    assert r2.reused == len(main.prompt) + len(main.output) - 1 and r2.output == reference(p2, 20)
 
 
 def test_reply_sent_back_in_another_form_restores_the_reply_start(make):
@@ -189,13 +190,13 @@ def test_aborts_queued_and_running(make):
     assert sched.abort(reqs[3].rid)  # still queued
     for _ in range(6):
         sched.step()
-    assert sched.abort(reqs[1].rid)  # decoding
+    assert reqs[0].output and sched.abort(reqs[0].rid)  # decoding
     while sched.busy():
         sched.step()
-    assert [r.finish_reason for r in reqs] == ["length", "abort", "length", "abort"] and reqs[3].output == []
-    assert reqs[1].output == reference(reqs[1].prompt, 300)[:len(reqs[1].output)]
-    assert reqs[0].output == reference(reqs[0].prompt, 300) and reqs[2].output == reference(reqs[2].prompt, 300)
-    assert sched.metrics.requests.get(reason="abort") == 2 and not sched.abort(reqs[1].rid)
+    assert [r.finish_reason for r in reqs] == ["abort", "length", "length", "abort"] and reqs[3].output == []
+    assert reqs[0].output == reference(reqs[0].prompt, 300)[:len(reqs[0].output)]
+    assert reqs[1].output == reference(reqs[1].prompt, 300) and reqs[2].output == reference(reqs[2].prompt, 300)
+    assert sched.metrics.requests.get(reason="abort") == 2 and not sched.abort(reqs[0].rid)
 
 
 def test_reset_forgets_everything(make):

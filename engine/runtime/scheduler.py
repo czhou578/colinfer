@@ -1,23 +1,17 @@
-"""Request scheduler: up to `n_slots` concurrent requests, driven by one engine thread (engine/server/api.py).
+"""Request scheduler: one request at a time, driven by one engine thread (engine/server/api.py). Other requests wait
+in a FIFO queue. The `n_slots` slots keep the histories (KV cache, GDN state) of the last conversations, so a side
+request (a title, a subagent) does not overwrite the cache of the main conversation.
 
-* State. One batched FastState holds all slots (KV cache, GDN conv / recurrent state, positions). With speculation, a
-  batched MtpState also holds the own KV cache of the drafter.
-* Decode with MTP (the default). One CUDA graph per (contiguous slot range [lo, hi), greedy | sampled, draft length k)
-  runs a full speculative cycle for those slots: verify, acceptance, commit and drafts (engine/spec/mtp.py). Without
-  MTP, each range has one plain decode graph.
-  - A step uses the smallest range that covers the decoding slots. It masks off the idle and prefilling slots inside
-    the range (state.active), so a step never touches them.
-  - Each cycle picks k (3 or 7, when the verify rows fit one weight pass) for the most expected tokens per second. It
-    uses the running acceptance rate of each slot and the cycle times measured at startup. Code and structured output
-    draft 7, and prose drafts 3.
-  - With suffix_min > 0, the history of a slot can end in a repeat of at least suffix_min tokens. Then the slot drafts
-    what followed the earlier occurrence instead (engine/spec/suffix.py), up to SUFFIX_K = 15 drafts when it decodes
-    alone.
-  - The greedy output does not depend on the other slots: each kernel computes the rows of a slot the same way at any
-    batch width.
-* Prefill. Each engine step runs at most one chunk on a single-slot view (engine/model/prefill.py), then one decode
-  step for the decoding slots. Thus a long prompt stops the other slots for one chunk at a time. With MTP, the
-  scheduler writes the KV rows of the drafter for the chunk right after the chunk.
+* State. One FastState holds all slots (KV cache, GDN conv / recurrent state, positions). With speculation, an MtpState
+  also holds the own KV cache of the drafter. Each slot has its own CUDA graphs, on a single-slot view of the state.
+* Decode with MTP (the default). One CUDA graph per (slot, greedy | sampled, draft length k) runs a full speculative
+  cycle: verify, acceptance, commit and drafts (engine/spec/mtp.py). Without MTP, each slot has one plain decode graph.
+  - Each cycle picks k (3 or 7) for the most expected tokens per second. It uses the running acceptance rate of the
+    request and the cycle times measured at startup. Code and structured output draft 7, and prose drafts 3.
+  - With suffix_min > 0, the history can end in a repeat of at least suffix_min tokens. Then the cycle drafts what
+    followed the earlier occurrence instead (engine/spec/suffix.py), up to SUFFIX_K = 15 drafts.
+* Prefill. An engine step runs one prefill chunk (engine/model/prefill.py) or one decode step. With MTP, the scheduler
+  writes the KV rows of the drafter for the chunk right after the chunk.
 * Prefix checkpoints. A ring, preallocated at startup, holds GDN state snapshots (conv + recurrent, 154 MB).
   - The scheduler takes a snapshot at the prompt end, at the generation end and every `ckpt_interval` prompt tokens.
   - It also takes snapshots at two chat message boundaries (`boundary_token`, <|im_start|>). These are the end of the
@@ -29,9 +23,8 @@
     snapshot. This snapshot costs one more weight pass (~0.1 s). A request that restored an end-of-generation snapshot
     comes from a client that sends replies back unchanged, so it does not take this snapshot.
   - Attention KV can resume at any length, but GDN state only where a snapshot exists. A new request restores the
-    longest checkpoint whose tokens are a proper prefix of its prompt, and prefills only the rest.
-  - If the slot of that checkpoint is busy, the scheduler copies its KV prefix into a free slot (32 KB per token with
-    FP8 KV). Thus concurrent requests that share a long system prompt each pay for it once.
+    longest checkpoint whose tokens are a proper prefix of its prompt, in the slot of that checkpoint, and prefills
+    only the rest. A request without one goes to an empty slot, else the least recently used one.
   - A checkpoint is valid while the token history of its slot still starts with the tokens of the checkpoint.
 * Finish. A request ends at a stop token (eos_ids), at max_new_tokens, at the slot length, or by its hook (stop
   strings, client gone). The speculative cycle cuts the accepted length after a stop token on the GPU. Thus the
@@ -56,7 +49,7 @@ from engine.spec.suffix import SuffixIndex
 MAX_STOP_IDS = 8  # stop token ids per slot visible to the GPU-side cut (more are still honored on the host)
 K_OPTIONS = (3, 7)  # draft lengths a cycle chooses between (capped by k)
 ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
-SUFFIX_K = MAX_ROWS - 1  # suffix-match draft length of a lone decoding slot: its verify rows still fit one weight pass
+SUFFIX_K = MAX_ROWS - 1  # suffix-match draft length: its verify rows still fit one weight pass
 REPLY_SPLIT_MIN = 512  # last-message length from which a prompt also snapshots at the start of the reply
 ATTN_ROWS = 48      # query rows (q heads x verify rows) per pass of the attention kernel over a slot's KV (csrc/attn_decode.cu)
 
@@ -132,28 +125,31 @@ class Scheduler:
         cfg = model.cfg
         self.params = SamplerParams(n_slots, cfg.vocab_size, dev)
         self.margin = (self.kmax + 1) if mtp is not None else 1  # positions one decode step writes beyond the history
+        # draft lengths of K_OPTIONS (capped by k) whose verify rows fit one weight pass of the skinny GEMM (MAX_ROWS =
+        # 16), since a second pass streams every weight again. The pending drafts are a chain: a shorter k uses a prefix.
+        self.k_opts = [kk for kk in sorted({min(kk, k) for kk in K_OPTIONS + (k,)}) if kk + 1 <= MAX_ROWS] or [MAX_ROWS - 1]
         if mtp is not None:
             from engine.spec.mtp import MtpCycle, MtpState
             self.mst = MtpState(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active)
             self.tok = torch.zeros(n_slots, self.kmax + 1, dtype=torch.long, device=dev)
             self.stop_buf = torch.full((n_slots, MAX_STOP_IDS), -1, dtype=torch.long, device=dev)
             self.cycles, self.cycle_s = {}, {}
-            for lo, hi in self._ranges():
-                sv, mv = self.state.view(lo, hi), self.mst.view(lo, hi)
-                for kw in self.k_options(hi - lo) + ([SUFFIX_K] if self.kmax > k and hi - lo == 1 else []):
+            for b in range(n_slots):
+                sv, mv = self.state.view(b, b + 1), self.mst.view(b, b + 1)
+                for kw in self.k_opts + ([SUFFIX_K] if self.kmax > k else []):
                     for sampled in (False, True):
-                        self.cycles[(lo, hi, sampled, kw)] = MtpCycle(model, mtp, sv, mv, kw, params=self.params.view(lo, hi) if sampled else None,
-                                                                      tok=self.tok[lo:hi, :kw + 1], stop_ids=self.stop_buf[lo:hi],
-                                                                      drafts=min(kw, k))
-                    if lo == 0:  # cycle time per (width, k), for choosing k (the state is garbage here and reset below)
-                        g = self.cycles[(lo, hi, False, kw)]
+                        self.cycles[(b, sampled, kw)] = MtpCycle(model, mtp, sv, mv, kw, params=self.params.view(b, b + 1) if sampled else None,
+                                                                 tok=self.tok[b:b + 1, :kw + 1], stop_ids=self.stop_buf[b:b + 1],
+                                                                 drafts=min(kw, k))
+                    if b == 0:  # cycle time per k, for choosing k (the state is garbage here and reset below)
+                        g = self.cycles[(b, False, kw)]
                         g.graph.replay()
                         torch.cuda.synchronize()
                         t0 = time.perf_counter()
                         for _ in range(3):
                             g.graph.replay()
                         torch.cuda.synchronize()
-                        self.cycle_s[(hi - lo, kw)] = (time.perf_counter() - t0) / 3
+                        self.cycle_s[kw] = (time.perf_counter() - t0) / 3
             self.mst.pos_t.zero_()
             # cycle_s is measured at ~0 context; per token of a slot's context a cycle also reads the target's KV once
             # (multi-row attention: whatever k) and the drafter's KV once per draft step (seconds per token, ~240 GB/s)
@@ -162,9 +158,8 @@ class Scheduler:
             self.ctx_draft_s = kv(self.mst.k) / 2.4e11
             self.q_per_kv = cfg.num_attention_heads // cfg.num_key_value_heads
         else:
-            self.graphs = {(lo, hi): DecodeGraph(model, self.state.view(lo, hi), self.params.view(lo, hi)) for lo, hi in self._ranges()}
+            self.graphs = {b: DecodeGraph(model, self.state.view(b, b + 1), self.params.view(b, b + 1)) for b in range(n_slots)}
         self.state.reset()
-        self.state.active.zero_()
         self.slots = [Slot(i) for i in range(n_slots)]
         # checkpoint ring, allocated once
         self.gdn_layers = sorted(self.state.rec)
@@ -180,40 +175,23 @@ class Scheduler:
         self._evt = torch.cuda.Event()
         torch.cuda.synchronize()
 
-    def k_options(self, width: int) -> list[int]:
-        """Draft lengths with a graph at this batch width: those of K_OPTIONS (capped by k) whose verify rows
-        (width * (k+1)) fit one weight pass of the skinny GEMM (MAX_ROWS = 16), since a second pass streams every weight
-        again. A slot's pending drafts are a chain, so a shorter k uses a prefix."""
-        opts = sorted({min(kk, self.k) for kk in K_OPTIONS + (self.k,)})
-        fit = [kk for kk in opts if width * (kk + 1) <= MAX_ROWS]
-        return fit or [max(1, MAX_ROWS // width - 1)]
-
-    def _pick_k(self, width: int, dec) -> int:
-        """The draft length with the most expected tokens per second: sum over slots of (1 - a^(k+1)) / (1 - a), a = the
-        slot's per-token acceptance estimate, over the cycle time: measured at startup, plus the KV reads that grow with
-        the slots' context (the target's once per ATTN_ROWS query rows, the drafter's once per MTP draft step; per slot at
-        128k: ~17 ms + ~1.1 ms per draft step)."""
-        opts = self.k_options(width)
-        if self.kmax > self.k and width == 1 and dec[0].src == "suffix":
-            opts = opts + [self.kmax]
+    def _pick_k(self, s: Slot) -> int:
+        """The draft length with the most expected tokens per second: (1 - a^(k+1)) / (1 - a), a = the per-token
+        acceptance estimate, over the cycle time: measured at startup, plus the KV reads that grow with the context (the
+        target's once per ATTN_ROWS query rows, the drafter's once per MTP draft step; at 128k: ~17 ms + ~1.1 ms per
+        draft step)."""
+        opts = self.k_opts + ([self.kmax] if self.kmax > self.k and s.src == "suffix" else [])
         if len(opts) == 1:
             return opts[0]
+        acc, tried = s.acc[s.src]
+        a = min(acc / max(tried, 1e-6), 0.999)
 
-        def expected(s, kk):
-            acc, tried = s.acc[s.src]
-            a = min(acc / max(tried, 1e-6), 0.999)
-            if s.src == "suffix":  # a suffix match may have fewer tokens to offer
-                kk = min(kk, s.fresh)
-            return (1 - a ** (kk + 1)) / (1 - a)
-        ctx = sum(len(s.tokens) for s in dec)
-        passes = lambda kk: -(-self.q_per_kv * (kk + 1) // ATTN_ROWS)  # noqa: E731 (target KV reads per cycle)
-        return max(opts, key=lambda kk: sum(expected(s, kk) for s in dec) /
-                   (self.cycle_s[(width, kk)] + ctx * (passes(kk) * self.ctx_s + min(kk, self.k) * self.ctx_draft_s)))
-
-    def _ranges(self):
-        """Every contiguous slot range [lo, hi): a step runs the graph of the smallest range covering the decoding
-        slots, so one active request costs a width-1 step whichever slot it is in."""
-        return [(lo, hi) for lo in range(self.n_slots) for hi in range(lo + 1, self.n_slots + 1)]
+        def tokens_per_s(kk):
+            n = min(kk, s.fresh) if s.src == "suffix" else kk  # a suffix match may have fewer tokens to offer
+            passes = -(-self.q_per_kv * (kk + 1) // ATTN_ROWS)  # target KV reads per cycle
+            cycle = self.cycle_s[kk] + len(s.tokens) * (passes * self.ctx_s + min(kk, self.k) * self.ctx_draft_s)
+            return (1 - a ** (n + 1)) / (1 - a) / cycle
+        return max(opts, key=tokens_per_s)
 
     # ---------------------------------------------------------------- checkpoints
     def _valid(self, c: Checkpoint) -> bool:
@@ -241,14 +219,9 @@ class Scheduler:
         self.ckpts.append(Checkpoint(b, key, buf, s.salt, reply))
 
     def _restore(self, s: Slot, c: Checkpoint):
+        """Back to checkpoint c in its own slot s: the KV of the slot already holds c's tokens; the GDN state comes from
+        the ring."""
         b, L = s.idx, len(c.tokens)
-        if c.slot != b:  # the checkpoint's slot is busy: copy its KV prefix here
-            for d in (self.state.k, self.state.v):
-                for t in d.values():
-                    t[b, :, :L].copy_(t[c.slot, :, :L])
-            if self.mtp is not None:
-                for d in (self.mst.k, self.mst.v):
-                    d[0][b, :, :L].copy_(d[0][c.slot, :, :L])
         for i in self.gdn_layers:
             self.state.conv[i][b].copy_(self.ring_conv[i][c.buf])
             self.state.rec[i][b].copy_(self.ring_rec[i][c.buf])
@@ -284,74 +257,68 @@ class Scheduler:
         return False
 
     def _admit(self):
-        while self.queue:
-            free = [s for s in self.slots if s.phase == "idle"]
-            if not free:
-                return
-            req = self.queue.popleft()
-            P = req.prompt
-            best, L = None, 0
-            for c in self.ckpts:  # longest valid checkpoint that is a proper prefix of the prompt
-                n = len(c.tokens)
-                if L < n < len(P) and c.salt == req.cache_salt and tuple(P[:n]) == c.tokens and self._valid(c):
-                    best, L = c, n
-            if best is not None and self.slots[best.slot].phase == "idle":
-                s = self.slots[best.slot]
-            else:  # an empty slot first, then the least recently used
-                s = min(free, key=lambda x: (len(x.tokens) > 0, x.last_used))
-            b = s.idx
-            if best is not None:
-                self._restore(s, best)
-            else:
-                for i in self.gdn_layers:
-                    self.state.conv[i][b].zero_()
-                    self.state.rec[i][b].zero_()
-                s.tokens, s.h_last = [], None
-                self.state.pos_t[b] = 0
-            for c in [c for c in self.ckpts if c.slot == b and not self._valid(c)]:
-                self._drop(c)  # the slot's new history overwrites them
-            req.slot, req.reused, req.t_admit = b, len(s.tokens), time.perf_counter()
-            s.salt = req.cache_salt
-            s.req, s.phase, s.todo, s.y = req, "prefill", list(P[len(s.tokens):]), None
-            s.acc = {"mtp": [1.5, 2.5], "suffix": [4.0, 5.0]}  # priors 0.6 and 0.8
-            s.sfx = None
-            s.splits = []
-            if self.boundary is not None and (self.free_bufs or self.ckpts):
-                # message starts: the end of the first message (a shared system prompt) and the start of the last one
-                bs = [i for i, t in enumerate(P) if t == self.boundary and i > 0]
-                ps = bs[:-1][:1] + bs[:-1][-1:]
-                # the start of the reply, after a long last message. A client that sends the reply back in another form
-                # (e.g. without its reasoning) misses the prompt-end snapshot by the last tokens of the generation
-                # prompt, and would prefill the last message again. The split costs one more weight pass (~0.1 s), so
-                # a request that restored the end of a reply (its client sends replies back token for token) skips it.
-                echo = best is not None and best.reply
-                if bs and not echo and bs[-1] - (bs[-2] if len(bs) > 1 else 0) >= REPLY_SPLIT_MIN:
-                    ps.append(bs[-1])
-                s.splits = sorted({p for p in ps if p >= len(s.tokens) + 256})
-            self.params.set(b, req.temperature, req.top_k, req.top_p, req.min_p, req.seed)
-            if self.mtp is not None:
-                ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
-                self.stop_buf[b] = torch.tensor(ids + [-1] * (MAX_STOP_IDS - len(ids)))
-                toks = list(P)  # draft vocabulary: this prompt's tokens first, then the other active requests'
-                for o in self.slots:
-                    if o.req is not None and o is not s:
-                        toks += o.req.prompt
-                self.mtp.set_prompt_vocab(toks)
-            m = self.metrics
-            m.prompt_tokens.inc(len(P))
-            m.cached_tokens.inc(req.reused)
-            m.queue_seconds.observe(req.t_admit - req.t_submit)
+        """The next queued request, when no request runs: into the slot of its longest checkpoint, else an empty slot,
+        else the least recently used one."""
+        if not self.queue or self.busy_slot() is not None:
+            return
+        req = self.queue.popleft()
+        P = req.prompt
+        best, L = None, 0
+        for c in self.ckpts:  # longest valid checkpoint that is a proper prefix of the prompt
+            n = len(c.tokens)
+            if L < n < len(P) and c.salt == req.cache_salt and tuple(P[:n]) == c.tokens and self._valid(c):
+                best, L = c, n
+        s = self.slots[best.slot] if best is not None else min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
+        b = s.idx
+        if best is not None:
+            self._restore(s, best)
+        else:
+            for i in self.gdn_layers:
+                self.state.conv[i][b].zero_()
+                self.state.rec[i][b].zero_()
+            s.tokens, s.h_last = [], None
+            self.state.pos_t[b] = 0
+        for c in [c for c in self.ckpts if c.slot == b and not self._valid(c)]:
+            self._drop(c)  # the slot's new history overwrites them
+        req.slot, req.reused, req.t_admit = b, len(s.tokens), time.perf_counter()
+        s.salt = req.cache_salt
+        s.req, s.phase, s.todo, s.y = req, "prefill", list(P[len(s.tokens):]), None
+        s.acc = {"mtp": [1.5, 2.5], "suffix": [4.0, 5.0]}  # priors 0.6 and 0.8
+        s.sfx = None
+        s.splits = []
+        if self.boundary is not None and (self.free_bufs or self.ckpts):
+            # message starts: the end of the first message (a shared system prompt) and the start of the last one
+            bs = [i for i, t in enumerate(P) if t == self.boundary and i > 0]
+            ps = bs[:-1][:1] + bs[:-1][-1:]
+            # the start of the reply, after a long last message. A client that sends the reply back in another form
+            # (e.g. without its reasoning) misses the prompt-end snapshot by the last tokens of the generation
+            # prompt, and would prefill the last message again. The split costs one more weight pass (~0.1 s), so
+            # a request that restored the end of a reply (its client sends replies back token for token) skips it.
+            echo = best is not None and best.reply
+            if bs and not echo and bs[-1] - (bs[-2] if len(bs) > 1 else 0) >= REPLY_SPLIT_MIN:
+                ps.append(bs[-1])
+            s.splits = sorted({p for p in ps if p >= len(s.tokens) + 256})
+        self.params.set(b, req.temperature, req.top_k, req.top_p, req.min_p, req.seed)
+        if self.mtp is not None:
+            ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
+            self.stop_buf[b] = torch.tensor(ids + [-1] * (MAX_STOP_IDS - len(ids)))
+            self.mtp.set_prompt_vocab(list(P))  # the draft vocabulary gets this prompt's tokens
+        m = self.metrics
+        m.prompt_tokens.inc(len(P))
+        m.cached_tokens.inc(req.reused)
+        m.queue_seconds.observe(req.t_admit - req.t_submit)
 
     # ---------------------------------------------------------------- one engine iteration
     @torch.inference_mode()
     def step(self):
+        """One prefill chunk or one decode step of the running request (the last prefill chunk is followed by the first
+        decode step)."""
         self._admit()
-        pre = next((s for s in self.slots if s.phase == "prefill"), None)
-        if pre is not None:
-            self._prefill_chunk(pre)
-        dec = [s for s in self.slots if s.phase == "decode"]
-        if dec:
-            self._decode(dec)
+        s = self.busy_slot()
+        if s is not None and s.phase == "prefill":
+            self._prefill_chunk(s)
+        if s is not None and s.phase == "decode":
+            self._decode(s)
         m = self.metrics
         m.queue_depth.set(len(self.queue))
         for ph in ("prefill", "decode"):
@@ -409,58 +376,44 @@ class Scheduler:
         torch.cuda.synchronize()
         self.metrics.step_seconds.observe(time.perf_counter() - t0, kind="prefill")
 
-    def _decode(self, dec: list[Slot]):
+    def _decode(self, s: Slot):
         t0 = time.perf_counter()
-        lo, hi = min(s.idx for s in dec), max(s.idx for s in dec) + 1
-        act = [0] * self.n_slots
-        for s in dec:
-            act[s.idx] = 1
-        self.state.active.copy_(torch.tensor(act, dtype=torch.int32))
         m = self.metrics
         if self.mtp is not None:
-            kk = self._pick_k(hi - lo, dec)
-            g = self.cycles[(lo, hi, any(s.req.temperature > 0 for s in dec), kk)]
+            kk = self._pick_k(s)
+            g = self.cycles[(s.idx, s.req.temperature > 0, kk)]
             g.graph.replay()
             self._evt.record()
             self._evt.synchronize()  # releases the GIL while the GPU works
-            ns, outs = g.n.tolist(), g.out_tok.tolist()
-            for s in dec:
-                b = s.idx - lo
-                nb = ns[b]
-                o = outs[b][:nb]
-                s.tokens.append(s.y)
-                s.tokens += o[:-1]
-                s.y, s.h_last = o[-1], g.H[b, nb - 1]
-                kf = min(kk, s.fresh)  # stale drafts say nothing about acceptance
-                st = s.acc[s.src]
-                st[0] = ACC_DECAY * st[0] + min(nb - 1, kf)
-                st[1] = ACC_DECAY * st[1] + min(nb - 1, kf) + (1 if nb - 1 < kf else 0)
-                s.src, s.fresh = "mtp", min(kk, self.k)
-                m.drafted.inc(kk)
-                m.accepted.inc(nb - 1)
-                m.tokens_per_cycle.observe(nb)
-                lp = self._logprobs(g.logits[b, :nb], o, s.req.logprobs) if s.req.logprobs is not None else None
-                self._emit(s, o, lp)
-                if s.sfx is not None and s.phase == "decode":
-                    s.sfx.extend(o)
-                    self._suffix_drafts(s)
+            nb = int(g.n.tolist()[0])
+            o = g.out_tok.tolist()[0][:nb]
+            s.tokens.append(s.y)
+            s.tokens += o[:-1]
+            s.y, s.h_last = o[-1], g.H[0, nb - 1]
+            kf = min(kk, s.fresh)  # stale drafts say nothing about acceptance
+            st = s.acc[s.src]
+            st[0] = ACC_DECAY * st[0] + min(nb - 1, kf)
+            st[1] = ACC_DECAY * st[1] + min(nb - 1, kf) + (1 if nb - 1 < kf else 0)
+            s.src, s.fresh = "mtp", min(kk, self.k)
+            m.drafted.inc(kk)
+            m.accepted.inc(nb - 1)
+            m.tokens_per_cycle.observe(nb)
+            lp = self._logprobs(g.logits[0, :nb], o, s.req.logprobs) if s.req.logprobs is not None else None
+            self._emit(s, o, lp)
+            if s.sfx is not None and s.phase == "decode":
+                s.sfx.extend(o)
+                self._suffix_drafts(s)
         else:
-            g = self.graphs[(lo, hi)]
-            toks = torch.zeros(hi - lo, dtype=torch.long)
-            for s in dec:
-                toks[s.idx - lo] = s.y
-            nxt = g.step(toks.to(self.dev))
+            g = self.graphs[s.idx]
+            nxt = g.step(torch.tensor([s.y]).to(self.dev))
             self._evt.record()
             self._evt.synchronize()
-            out = nxt.tolist()
-            for s in dec:
-                b = s.idx - lo
-                s.tokens.append(s.y)
-                s.y = out[b]
-                lp = self._logprobs(g.logits[b:b + 1], [out[b]], s.req.logprobs) if s.req.logprobs is not None else None
-                self._emit(s, [out[b]], lp)
-        self.state.active.zero_()
-        m.step_seconds.observe(time.perf_counter() - t0, kind="decode", width=hi - lo)
+            y = int(nxt.tolist()[0])
+            s.tokens.append(s.y)
+            s.y = y
+            lp = self._logprobs(g.logits[0:1], [y], s.req.logprobs) if s.req.logprobs is not None else None
+            self._emit(s, [y], lp)
+        m.step_seconds.observe(time.perf_counter() - t0, kind="decode")
 
     def _suffix_drafts(self, s: Slot):
         """Replace the slot's pending MTP drafts with the continuation of the longest earlier occurrence of its history's
@@ -513,8 +466,12 @@ class Scheduler:
         if req.hook is not None:
             req.hook.finish(req)
 
+    def busy_slot(self) -> Slot | None:
+        """The slot of the running request (prefilling or decoding), if any."""
+        return next((s for s in self.slots if s.phase != "idle"), None)
+
     def busy(self) -> bool:
-        return bool(self.queue) or any(s.phase != "idle" for s in self.slots)
+        return bool(self.queue) or self.busy_slot() is not None
 
     def reset(self):
         """Forgets every slot history and checkpoint, and zeroes the metrics (the server's warm-up ends with it). The

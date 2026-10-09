@@ -139,7 +139,7 @@ The engine streams the drafter weights again at each draft step, so the drafter 
 **Draft length.** The scheduler picks k = 3 or 7 for each cycle, for the most expected tokens per second. With the
 running per-token acceptance a of a slot, a cycle gives (1 − a^{k+1}) / (1 − a) expected tokens. The scheduler divides
 this by the cycle time measured at startup, plus the KV reads that grow with the context. The verify rows must fit one
-skinny pass (width × (k + 1) ≤ 16), so three decoding slots use k = 3.
+skinny pass (k + 1 ≤ 16).
 
 **Suffix-match drafts** (`engine/spec/suffix.py`, `--suffix-drafts`, default 8). The history of a request is its prompt
 and the reply so far. When the last 8 or more tokens of the history occurred earlier in it, the next cycle uses other
@@ -179,13 +179,12 @@ drafter for each chunk right after the chunk. Prefill times: 2k 0.54 s (3.8k tok
 
 The code is in `engine/runtime/scheduler.py` and `engine/server/api.py`.
 
-- **Slots.** One batched state holds `--slots` (3) slots of `--max-seq-len` (262,144) tokens with contiguous KV. At
-  startup, the engine captures CUDA graphs for each contiguous slot range × {greedy, sampled} × draft length. A step
-  replays the smallest range that covers the decoding slots and masks off the other slots (`state.active`). Each kernel
-  computes the rows of a slot the same way at any width, so batching never changes an output.
-- **Engine loop.** Each step admits queued requests and prefills at most one chunk of one prompt. Then it runs one
-  decode cycle for the decoding slots. Thus a long prompt slows the other requests for one chunk at a time, but never
-  stops them.
+- **One request at a time.** The engine runs one request at a time; the others wait in a FIFO queue. One state holds
+  `--slots` (3) slots of `--max-seq-len` (262,144) tokens with contiguous KV. A slot keeps the history of its last
+  conversation, so a side request (a title, a subagent) goes to another slot and does not overwrite the cache of the
+  main conversation. At startup, the engine captures CUDA graphs for each slot × {greedy, sampled} × draft length.
+- **Engine loop.** Each step admits the next queued request when none runs. Then it runs one prefill chunk or one
+  decode cycle of the running request.
 - **Prefix checkpoints.** The engine keeps a ring of GDN-state snapshots (conv + recurrent, 154 MB each, 32 by default).
   It takes a snapshot at the end of each prompt and each reply. It also takes one at the end of the first message, one
   before the last message, and one every 8,192 prompt tokens. After a last message of 512 tokens or more, it takes one
@@ -239,7 +238,7 @@ change from the numerics of the checkpoint (the INT copies, FP8 prefill attentio
   their tokens and per-token logprobs bit for bit: with suffix-match drafts, without them (`--suffix 0`) and without
   speculation (`check --plain`).
 - `tests/scheduler_check.py` compares the outputs of the scheduler with the uncached single-request outputs. It covers
-  single, concurrent, mixed (greedy next to sampled and a long prefill), multi-turn and shared-prefix requests.
+  single and queued requests (greedy around sampled and a long prefill), multi-turn and shared-prefix requests.
 - Other end-to-end checks: `tests/perplexity.py`, `tests/passkey.py` (long-context retrieval), `tests/server_check.py`
   (the HTTP API).
 - Benchmarks: `bench/perf.py` (the repeatable baseline: prefill, TTFT, decode, memory), `bench/decode_bench.py`,

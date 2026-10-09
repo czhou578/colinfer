@@ -38,7 +38,7 @@ from engine.model.qwen35 import Attention, DecoderLayer, GatedDeltaNet, ModelSta
 from engine.weights.loader import PREFIX, SKIP_PREFIXES, quant_kind, resolve, shard_files
 from engine.weights.quantize import REQUANT_DIR
 
-MAX_ROWS = 16  # rows per weight pass of the skinny GEMM: a verify of width * (k + 1) rows must fit
+MAX_ROWS = 16  # rows per weight pass of the skinny GEMM: a verify of k + 1 rows must fit
 GEMV_ROWS = 8  # rows per bf16 GEMV launch (the GDN b / a gates)
 
 
@@ -233,8 +233,8 @@ def load_fast_model(path_or_repo: str, device="cuda") -> Qwen35ForCausalLM:
 # ------------------------------------------------------------------------------------------------------------ state
 class FastState(ModelState):
     """ModelState with an fp8 KV cache and the device-side per-slot positions `pos_t` (int32 [B]) that graph replays
-    advance. active (int32 [B]): decode updates only slots with active == 1 (idle or prefilling slots inside a batched
-    step are masked off). spec: True while FastQwen35.verify runs (the GDN layers then leave their state for commit()).
+    advance. active (int32 [B]): decode updates only slots with active == 1 (all 1 by default; the graphs of the
+    scheduler cover one slot each). spec: True while FastQwen35.verify runs (the GDN layers then leave their state for commit()).
     view(lo, hi) shares the tensors of slots [lo, hi)."""
 
     def __init__(self, cfg, batch, max_seq_len, device):

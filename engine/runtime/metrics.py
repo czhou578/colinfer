@@ -78,7 +78,7 @@ class Histogram:
 
 class Metrics:
     def __init__(self):
-        self.step_seconds = Histogram("colinfer_step_seconds", "engine step time by kind (prefill chunk, decode step / spec cycle) and batch width",
+        self.step_seconds = Histogram("colinfer_step_seconds", "engine step time by kind (prefill chunk, decode step / spec cycle)",
                                       STEP_BUCKETS)
         self.ttft_seconds = Histogram("colinfer_ttft_seconds", "submit to first token, per request", TTFT_BUCKETS)
         self.queue_seconds = Histogram("colinfer_queue_seconds", "submit to slot admission, per request", TTFT_BUCKETS)
@@ -89,7 +89,7 @@ class Metrics:
         self.generated_tokens = Counter("colinfer_generation_tokens_total", "generated tokens")
         self.drafted = Counter("colinfer_spec_draft_tokens_total", "draft tokens proposed")
         self.accepted = Counter("colinfer_spec_accepted_tokens_total", "draft tokens accepted")
-        self.queue_depth = Gauge("colinfer_queue_depth", "requests waiting for a slot")
+        self.queue_depth = Gauge("colinfer_queue_depth", "requests waiting for the running one to finish")
         self.slots_busy = Gauge("colinfer_slots_busy", "slots holding a request, by phase")
         self.memory = Gauge("colinfer_gpu_memory_bytes", "torch allocator: allocated / reserved / cap")
 

@@ -3,20 +3,18 @@
 
 The reference is a plain-decode scheduler (no speculation), with each request alone. The MTP scheduler must give the
 same greedy tokens:
-  1. each request alone (batch width 1)
-  2. all four together (widths 3 -> 1 as they finish, a 4th request queued)
-  3. together with a sampled request and a 5000-token chunked prefill (sampled cycle graphs, masked slots)
+  1. each request alone
+  2. queued around a sampled request and a 5000-token chunked prefill (sampled cycle graphs, slot reuse)
 More checks:
-  4. seeded sampling at T=0.8: the MTP scheduler emits exactly what plain decode samples, alone and next to one or two
+  3. seeded sampling at T=0.8: the MTP scheduler emits exactly what plain decode samples, alone and after one or two
      other requests (position-keyed draws, engine/spec/accept.py)
-  5. multi-turn: turn 2 restores the end-of-turn-1 checkpoint (the stop-token cut keeps it a prefix)
-  6. a second conversation with the same long system prompt starts while the first one still decodes. It restores the
-     system-prompt checkpoint, with a copy of its KV prefix into another slot. Its greedy output matches a run without
-     checkpoints.
-  7. a client sends the reply back without its reasoning (as Hermes Agent does). Turn 2 then restores the snapshot at
+  4. multi-turn: turn 2 restores the end-of-turn-1 checkpoint (the stop-token cut keeps it a prefix)
+  5. a second conversation with the same long system prompt, queued while the first one decodes, restores the
+     system-prompt checkpoint. Its greedy output matches a run without checkpoints.
+  6. a client sends the reply back without its reasoning (as Hermes Agent does). Turn 2 then restores the snapshot at
      the start of turn 1's reply, not only the start of turn 1's last message. The output of turn 2 is compared with a
      run without checkpoints.
-  8. speed: single-slot MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
+  7. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
 import time
@@ -93,21 +91,14 @@ def main():
         print("SCHEDULER CHECK", "PASSED" if ok else "FAILED")
         return
 
-    # 2. all together (3 slots, the 4th waits)
-    rs = spec.run([R(p) for p in prompts])
-    same = [r.output == w for r, w in zip(rs, want)]
-    ok &= all(same)
-    print(f"[together] identical {sum(same)}/{len(same)}; slots {[r.slot for r in rs]}; "
-          f"aggregate {sum(len(r.output) for r in rs) / (max(r.t_done for r in rs) - min(r.t_submit for r in rs)):.1f} tok/s")
-
-    # 3. with a sampled request and a long chunked prefill in flight
+    # 2. queued around a sampled request and a long chunked prefill
     long_doc = torch.randint(1000, 150000, (5000,), generator=torch.Generator().manual_seed(0)).tolist()
     rs = spec.run([R(prompts[0]), R(long_doc, max_new_tokens=24), R(prompts[2], temperature=0.8, top_p=0.95, top_k=20, seed=7), R(prompts[3])])
     same = [rs[0].output == want[0], rs[3].output == want[3]]
     ok &= all(same)
-    print(f"[mixed] greedy requests identical {sum(same)}/2 next to a sampled request and a 5000-token prefill")
+    print(f"[queued] greedy requests identical {sum(same)}/2 around a sampled request and a 5000-token prefill")
 
-    # 4. seeded sampling: speculative output = plain sampling, at any batch width
+    # 3. seeded sampling: speculative output = plain sampling, whatever ran before
     kw = dict(temperature=0.8, top_p=0.95, top_k=20, seed=1234, max_new_tokens=120)
     plain = ref.run([R(prompts[3], **kw)])[0].output
     a1 = spec.run([R(prompts[3], **kw)])[0].output
@@ -115,10 +106,10 @@ def main():
     a3 = spec.run([R(prompts[0]), R(prompts[3], **kw), R(prompts[2], temperature=1.0, seed=5)])[1].output
     rep = plain == a1 == a2 == a3
     ok &= rep
-    print(f"[seeded] T=0.8 plain decode vs MTP alone / next to one / next to two: "
+    print(f"[seeded] T=0.8 plain decode vs MTP alone / after one / after two: "
           f"{'IDENTICAL' if rep else 'DIFFERENT'} ({len(a1)} tok; agree {[sum(x == y for x, y in zip(plain, o)) for o in (a1, a2, a3)]})")
 
-    # 5. multi-turn: turn 2 restores the end of turn 1
+    # 4. multi-turn: turn 2 restores the end of turn 1
     sys_msg = {"role": "system", "content": "You are a careful assistant. Background notes: " + " ".join(f"item {i}" for i in range(1500))}
     m1 = [sys_msg, {"role": "user", "content": "Summarize the background notes in one sentence."}]
     r1 = spec.run([R(chat_ids(tok, m1), max_new_tokens=60)])[0]
@@ -129,7 +120,7 @@ def main():
     print(f"[multi-turn] turn 1: {len(r1.prompt)} + {len(r1.output)} tok; turn 2: {len(p2)} tok, reused {r2.reused}, "
           f"TTFT {r2.t_first - r2.t_submit:.3f} s")
 
-    # 6. shared system prompt, cross-slot restore while the first conversation is still decoding
+    # 5. shared system prompt: a second conversation, queued while the first one decodes
     sys2 = {"role": "system", "content": "You are an agent. Tool manual: " + " ".join(f"rule {i}: be precise." for i in range(900))}
     pa = chat_ids(tok, [sys2, {"role": "user", "content": "Write a long essay about rivers."}])
     pb = chat_ids(tok, [sys2, {"role": "user", "content": "List three prime numbers."}])
@@ -146,12 +137,12 @@ def main():
     spec.ckpts, spec.free_bufs = saved, [i for i in range(len(spec.ring_h)) if i not in {c.buf for c in saved}]
     sysn = next(i for i in range(1, len(pb)) if pb[i] == IM_START)
     same = rb.output == rb2.output
-    ok &= rb.reused == sysn and rb.slot != ra.slot
-    print(f"[shared system prompt] B reused {rb.reused} (system prompt {sysn}) in slot {rb.slot} while A decoded in slot {ra.slot}; "
-          f"TTFT {rb.t_first - rb.t_submit:.3f} s vs {rb2.t_first - rb2.t_submit:.3f} s from scratch; greedy output "
+    ok &= rb.reused == sysn
+    print(f"[shared system prompt] B (queued while A decoded) reused {rb.reused} (system prompt {sysn}); "
+          f"admission to first token {rb.t_first - rb.t_admit:.3f} s vs {rb2.t_first - rb2.t_admit:.3f} s from scratch; greedy output "
           f"{'IDENTICAL' if same else 'DIFFERENT'} to the uncached run ({sum(x == y for x, y in zip(rb.output, rb2.output))}/{len(rb.output)})")
 
-    # 7. the reply comes back without its reasoning: turn 2 restores the start of turn 1's reply
+    # 6. the reply comes back without its reasoning: turn 2 restores the start of turn 1's reply
     def think_ids(msgs):
         ids = tok.apply_chat_template(msgs, add_generation_prompt=True, reasoning_effort="medium", tokenize=True)
         return list(ids["input_ids"] if hasattr(ids, "keys") else ids)

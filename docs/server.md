@@ -22,7 +22,7 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--host`, `--port` | `127.0.0.1`, `8000` | |
 | `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. |
 | `--served-model-name` | the `--model` value | The id that `/v1/models` reports. Requests can name any model. |
-| `--slots` | 3 | Concurrent requests. Other requests wait in a FIFO queue. |
+| `--slots` | 3 | Conversations whose KV stays cached. The server runs one request at a time; the others wait in a FIFO queue. |
 | `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
 | `--k` | 7 | The longest MTP draft. Each cycle picks k=3 or 7 from the measured acceptance (see below). |
@@ -105,7 +105,7 @@ Other endpoints:
 - `GET /v1/models`. The result includes `max_model_len` and the model config.
 - `GET /health`.
 - `GET /metrics` (Prometheus), with:
-  - step time by kind (prefill chunk, or decode cycle by batch width)
+  - step time by kind (prefill chunk, or decode cycle)
   - TTFT and queue time
   - tokens per speculative cycle
   - draft and accepted counters
@@ -153,12 +153,11 @@ Other endpoints:
   `ATTN_FP8_MIN_CTX` in `engine/model/prefill.py` and `docs/history/phase6_progress.md` section 8.
 - **Speculation is always on, except when the server runs with `--spec none`.** The output is token-identical to plain
   decode, greedy or sampled (with the same seed). `--spec none` gives exactly the same tokens, only slower.
-- **The draft length adapts.** A cycle verifies k+1 rows per slot in one weight pass of up to 16 rows. It picks k = 3 or 7
-  for each cycle, for the most expected tokens per second, from the acceptance of each request. Code and structured
-  output usually draft 7, and prose drafts 3. Three decoding slots use k = 3 (12 rows), because k = 7 needs a second
-  weight pass.
+- **The draft length adapts.** A cycle verifies k+1 rows in one weight pass of up to 16 rows. It picks k = 3 or 7 for
+  each cycle, for the most expected tokens per second, from the acceptance of the request. Code and structured output
+  usually draft 7, and prose drafts 3.
 - **The draft steps stop early when they are unlikely to help.** The product of the drafter probabilities of the drafts
-  of a cycle can fall below 0.1 for all decoding slots. Then the remaining draft steps of the cycle skip their weight
+  of a cycle can fall below 0.1. Then the remaining draft steps of the cycle skip their weight
   GEMMs (~0.35 ms instead of ~1.8 ms a step). The verify rejects their junk drafts, so the outputs do not change. See
   `DRAFT_STOP` in `engine/spec/mtp.py` and `docs/history/phase6_progress.md` section 18.
 - **Low-rank draft head.** `tools/lowrank_draft_head.py` makes `~/.cache/colinfer/drafter/draft_head_pca.safetensors`.
@@ -189,8 +188,9 @@ Other endpoints:
   token of the generation prompt, and without this checkpoint the server prefills the last message again. This
   checkpoint costs one more weight pass (~0.1 s). Claude Code sends the reasoning back, and its next prompt restores
   the end of the reply. A request that restored the end of a reply does not take this checkpoint.
-- **Long prompts do not stop other requests.** A long prompt prefills 2048 tokens per engine step, and the other slots
-  decode between the chunks. The other requests become slower, but they do not stop.
+- **One request at a time.** A request that arrives while another runs waits in the queue, also behind a long
+  prefill. The three slots keep the last three conversations cached: a side request goes to another slot, so the main
+  conversation keeps its cache.
 - **Failures restart the process.** A failed CUDA call fails each in-flight request with a 500 and stops the process.
   Then systemd restarts it. An error while the server formats the output of one request (the parser runs on the engine
   thread) fails only that request, with a 500.

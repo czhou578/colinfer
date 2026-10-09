@@ -259,8 +259,8 @@ class MtpCycle:
     """CUDA graph of one speculative cycle with the MTP drafter for B slots (k drafts each).
 
     tok [B, k+1] (the next cycle's input [y, d1..dk] per slot), stop_ids [B, S] (int64, -1 = unused) and params may be
-    views into buffers shared by the graphs of every batch width, so a slot keeps its pending input when the width
-    changes. params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts that equal the target's
+    views into buffers shared by the graphs of every draft length, so a slot keeps its pending input when k changes.
+    params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts that equal the target's
     position-keyed sample, so the output is exactly plain sampling; greedy for the rest; engine/spec/accept.py);
     None -> greedy cycle. drafts: MTP drafts made for the next cycle (default k; fewer when k is a suffix-match draft
     length, engine/spec/suffix.py, whose drafts come from the host).

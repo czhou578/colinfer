@@ -86,7 +86,7 @@ class Worker(threading.Thread):
             + (f", suffix drafts >= {a.suffix_drafts}" if a.spec == "mtp" and a.suffix_drafts else ""))
 
     def _warmup(self, sched, vocab):
-        """Runs every code path once (prefill chunks, the decode / spec graphs at each width, greedy and sampled,
+        """Runs every code path once (prefill chunks, the decode / spec graphs of each slot, greedy and sampled,
         logprobs) so first-use JIT compilation and autotuning happen before serving; then forgets everything."""
         g = torch.Generator().manual_seed(0)
         rnd = lambda n: torch.randint(1000, min(vocab, 150000), (n,), generator=g).tolist()  # noqa: E731
@@ -784,7 +784,7 @@ def main(argv=None):
     ap.add_argument("--served-model-name", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--slots", type=int, default=3)
+    ap.add_argument("--slots", type=int, default=3, help="conversations whose KV stays cached; one request runs at a time")
     ap.add_argument("--max-seq-len", type=int, default=262144, help="tokens per slot (prompt + output)")
     ap.add_argument("--spec", choices=("mtp", "none"), default="mtp")
     ap.add_argument("--drafter-weights", default="auto",
