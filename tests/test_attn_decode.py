@@ -116,9 +116,7 @@ def test_kernel_attention_layer_matches_reference(B, T, pos):
         ka.load_state_dict(ref.state_dict(), strict=False)
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             setattr(ka, name, getattr(ref, name))
-        ka.__class__ = KernelAttention
-        ka.qkv = LinearGroup([ka.q_proj, ka.k_proj, ka.v_proj])
-        ka.inv_freq = inv
+        KernelAttention.adopt(ka, LinearGroup([ka.q_proj, ka.k_proj, ka.v_proj]), inv)
         got = ka(x, None, None, fs, 0, residual=res)
     rel = ((got.float() - want.float()).norm() / want.float().norm()).item()
     assert rel < 3e-2, rel  # the new rows' K / V are rounded to e4m3 on one side only

@@ -25,6 +25,7 @@ halves of speculation (T = k + 1 rows, then the accepted prefix).
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import time
@@ -34,7 +35,7 @@ import torch.nn as nn
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.qwen35 import Attention, GatedDeltaNet, ModelState, Qwen35Config, Qwen35ForCausalLM
+from engine.model.qwen35 import Attention, DecoderLayer, GatedDeltaNet, ModelState, Qwen35Config, Qwen35ForCausalLM
 from engine.weights.loader import PREFIX, SCALE_SUFFIXES, SKIP_PREFIXES, resolve
 from engine.weights.quantize import REQUANT_DIR
 
@@ -164,6 +165,7 @@ class SwiGLUMLP(nn.Module):
     def __init__(self, gate: Nvfp4Linear, up: Nvfp4Linear, down: Nvfp4Linear):
         super().__init__()
         self.gate, self.up, self.down = gate, up, down
+        self.p_gu = self.p_g = self.p_u = self.p_down = None  # the prefill GEMM operands (engine/model/prefill.py prepare_prefill)
 
     def forward(self, x, residual=None):
         shp = x.shape
@@ -234,20 +236,21 @@ def load_fast_model(path_or_repo: str, device="cuda", verbose=True) -> Qwen35For
 class FastState(ModelState):
     """ModelState with an fp8 KV cache and the device-side per-slot positions `pos_t` (int32 [B]) that graph replays
     advance. active (int32 [B]): decode updates only slots with active == 1 (idle or prefilling slots inside a batched
-    step are masked off). view(lo, hi) shares the tensors of slots [lo, hi)."""
+    step are masked off). spec: True while FastQwen35.verify runs (the GDN layers then leave their state for commit()).
+    view(lo, hi) shares the tensors of slots [lo, hi)."""
 
     def __init__(self, cfg, batch, max_seq_len, device, dtype=torch.bfloat16):
         super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype=torch.float8_e4m3fn)
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
         self.active = torch.ones(batch, dtype=torch.int32, device=device)
+        self.spec = False
 
     def reset(self):
         super().reset()
         self.pos_t.zero_()
 
     def view(self, lo: int, hi: int) -> "FastState":
-        v = FastState.__new__(FastState)
-        v.cfg, v.max_seq_len, v.pos = self.cfg, self.max_seq_len, self.pos
+        v = copy.copy(self)  # every field (and the subclass); then the per-slot tensors become slices
         v.conv = {i: t[lo:hi] for i, t in self.conv.items()}
         v.rec = {i: t[lo:hi] for i, t in self.rec.items()}
         v.k = {i: t[lo:hi] for i, t in self.k.items()}
@@ -261,6 +264,15 @@ class KernelAttention(Attention):
     """Gated GQA attention on T new rows per slot (1 for decode, k + 1 for verify): one stacked q / k / v pass, the fused
     prologue (q / k norm, partial RoPE, fp8 KV write at the device positions), multi-row tensor-core attention with the
     output gate fused, o_proj with the residual."""
+    qkv: nn.Module          # q / k / v in one call: StackedFp8Linear (the target) or LinearGroup (the MTP drafter)
+    inv_freq: torch.Tensor  # the RoPE frequencies (rope_inv_freq)
+
+    @classmethod
+    def adopt(cls, attn: Attention, qkv: nn.Module, inv_freq: torch.Tensor) -> "KernelAttention":
+        """Moves a reference Attention, with its weights, onto the kernels (in place)."""
+        attn.__class__ = cls
+        attn.qkv, attn.inv_freq = qkv, inv_freq
+        return attn
 
     def forward(self, x, cos, sin, state: FastState, layer_idx: int, residual=None):
         B, T, _ = x.shape
@@ -307,6 +319,18 @@ class KernelGDN(GatedDeltaNet):
     which advances the state by the accepted count. The mixed / z / b / a tensors stay column views of the projection
     outputs (the kernels take row strides), and the tiny b / a GEMV runs on a side stream beside the qkv / z weight
     pass."""
+    qkvz: StackedFp8Linear  # in_proj_qkv and in_proj_z in one weight pass
+    w_ba: torch.Tensor      # in_proj_b and in_proj_a stacked (bf16, for the GEMV)
+    _spec: tuple | None     # the inputs of the last verify, for commit()
+
+    @classmethod
+    def adopt(cls, gdn: GatedDeltaNet) -> "KernelGDN":
+        """Moves a reference GatedDeltaNet, with its weights, onto the kernels (in place)."""
+        gdn.__class__ = cls
+        gdn.qkvz = StackedFp8Linear([gdn.in_proj_qkv, gdn.in_proj_z])
+        gdn.w_ba = torch.cat([gdn.in_proj_b.weight, gdn.in_proj_a.weight]).contiguous()
+        gdn._spec = None
+        return gdn
 
     def forward(self, x, state: FastState, layer_idx: int, residual=None):
         B, T, _ = x.shape
@@ -326,7 +350,7 @@ class KernelGDN(GatedDeltaNet):
         qkv = torch.empty(B, T, mixed.shape[-1], device=x.device, dtype=torch.bfloat16)
         ops().gdn_conv(mixed, conv, self.conv1d.weight, qkv)
         o = torch.empty(B, T, z.shape[-1], device=x.device, dtype=torch.bfloat16)
-        if getattr(state, "spec", False):
+        if state.spec:
             ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, rec, o, self.num_k_heads, self.norm.eps)
             self._spec = (mixed, qkv, z, b, a)
         else:
@@ -342,18 +366,23 @@ class KernelGDN(GatedDeltaNet):
         ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], None, self.num_k_heads, self.norm.eps, n)
 
 
-def fast_layer_forward(self, x, cos, sin, state):
-    """DecoderLayer.forward with kernel norms and the residual adds fused into the output GEMMs."""
-    h = self.input_layernorm(x)
-    if self.block_type == "linear_attention":
-        x = self.linear_attn(h, state, self.layer_idx, residual=x)
-    else:
-        x = self.self_attn(h, cos, sin, state, self.layer_idx, residual=x)
-    return self.mlp(self.post_attention_layernorm(x), residual=x)
+class FastDecoderLayer(DecoderLayer):
+    """DecoderLayer on kernel modules: kernel norms, and the residual adds fused into the output GEMMs."""
+
+    def forward(self, x, cos, sin, state):
+        h = self.input_layernorm(x)
+        if self.block_type == "linear_attention":
+            x = self.linear_attn(h, state, self.layer_idx, residual=x)
+        else:
+            x = self.self_attn(h, cos, sin, state, self.layer_idx, residual=x)
+        return self.mlp(self.post_attention_layernorm(x), residual=x)
 
 
 # ------------------------------------------------------------------------------------------------------------ model
 class FastQwen35(Qwen35ForCausalLM):
+    prefill_ready = False  # prepare_prefill() has built the prefill GEMM operands (engine/model/prefill.py)
+    p_lm = None            # the lm_head as a prefill GEMM operand, for all-token logits
+
     def new_state(self, batch: int, max_seq_len: int) -> FastState:
         return FastState(self.cfg, batch, max_seq_len, self.embed_tokens.weight.device)
 
@@ -396,17 +425,12 @@ def to_fast(model: Qwen35ForCausalLM) -> FastQwen35:
     for layer in model.layers:
         if layer.block_type == "full_attention":
             a = layer.self_attn
-            a.__class__ = KernelAttention
-            a.inv_freq = inv_freq
-            a.qkv = StackedFp8Linear([a.q_proj, a.k_proj, a.v_proj])  # one weight pass for q, k, v
+            KernelAttention.adopt(a, StackedFp8Linear([a.q_proj, a.k_proj, a.v_proj]), inv_freq)  # one weight pass for q, k, v
         else:
-            g = layer.linear_attn
-            g.__class__ = KernelGDN
-            g.qkvz = StackedFp8Linear([g.in_proj_qkv, g.in_proj_z])
-            g.w_ba = torch.cat([g.in_proj_b.weight, g.in_proj_a.weight]).contiguous()
+            KernelGDN.adopt(layer.linear_attn)
         layer.input_layernorm = KernelRMSNorm(layer.input_layernorm)
         layer.post_attention_layernorm = KernelRMSNorm(layer.post_attention_layernorm)
-        layer.forward = fast_layer_forward.__get__(layer)
+        layer.__class__ = FastDecoderLayer
     model.norm = KernelRMSNorm(model.norm)
     return model
 

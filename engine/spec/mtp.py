@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear, fast_layer_forward
+from engine.model.fast import FastDecoderLayer, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear
 from engine.model.prefill import ATTN_FP8_MIN_CTX, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm
 from engine.weights.loader import dequant_nvfp4
@@ -96,12 +96,9 @@ class MtpState(FastState):
     active: shares the target state's mask, so a graph step never writes the MTP cache of an inactive slot."""
 
     def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None):
-        self.cfg, self.max_seq_len, self.pos = cfg, max_seq_len, 0
-        self.conv, self.rec = {}, {}
-        self.k = {0: torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=torch.float8_e4m3fn)}
-        self.v = {0: torch.zeros_like(self.k[0])}
-        self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
-        self.active = active if active is not None else torch.ones(batch, dtype=torch.int32, device=device)
+        super().__init__(dataclasses.replace(cfg, layer_types=["full_attention"], num_hidden_layers=1), batch, max_seq_len, device)
+        if active is not None:
+            self.active = active
 
     def slot(self, b: int) -> FastState:
         """Single-slot view with its own all-ones mask, for eager (non-graph) MTP work on one slot."""
@@ -146,12 +143,11 @@ class Mtp(nn.Module):
         with torch.no_grad():
             a.q_norm.weight = nn.Parameter(t[P + "self_attn.q_norm.weight"], requires_grad=False)
             a.k_norm.weight = nn.Parameter(t[P + "self_attn.k_norm.weight"], requires_grad=False)
-        a.__class__ = KernelAttention
-        a.qkv = LinearGroup([a.q_proj, a.k_proj, a.v_proj])  # the drafter keeps them separate (each its own NVFP4 global scale)
         d = cfg.rotary_dim
-        a.inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device="cuda") / d))
+        KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]),  # separate: each its own NVFP4 global scale
+                              1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device="cuda") / d)))
         layer.mlp = DraftMLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
-        layer.forward = fast_layer_forward.__get__(layer)
+        layer.__class__ = FastDecoderLayer
         self.layer = layer
         self.embed, self.lm_head, self.cfg = target.embed_tokens, target.lm_head, cfg
         # draft head: the static frequent tokens, then PROMPT_SLOTS rows rewritten per request (set_prompt_vocab)

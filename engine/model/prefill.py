@@ -51,7 +51,7 @@ def _nvfp4_operands(lin_list):
 
 def prepare_prefill(model: FastQwen35):
     """One-time: stacked / swizzled NVFP4 operands for the MLPs. Idempotent."""
-    if getattr(model, "_prefill_ready", False):
+    if model.prefill_ready:
         return
     for layer in model.layers:
         mlp = layer.mlp
@@ -66,7 +66,7 @@ def prepare_prefill(model: FastQwen35):
     if isinstance(model.lm_head, Nvfp4Linear):  # for all-token logits (perplexity); decode uses the skinny GEMM
         model.p_lm = _nvfp4_operands([model.lm_head])
     torch.cuda.empty_cache()
-    model._prefill_ready = True
+    model.prefill_ready = True
 
 
 def _gemm_nvfp4(xq, xsf, op, residual=None):

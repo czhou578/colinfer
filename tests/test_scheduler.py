@@ -46,6 +46,7 @@ class StubModel:
     cfg = CFG
     layers = []
     lm_head = None
+    prefill_ready = False
 
     def new_state(self, batch, max_seq_len):
         return FastState(CFG, batch, max_seq_len, "cuda")
