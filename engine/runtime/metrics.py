@@ -26,6 +26,9 @@ class Counter:
     def get(self, **lab):
         return self.v.get(tuple(sorted(lab.items())), 0.0)
 
+    def clear(self):
+        self.v = {}
+
     def render(self):
         out = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} counter"]
         for key, v in sorted(self.v.items()):
@@ -58,6 +61,9 @@ class Histogram:
         e = self.h.get(tuple(sorted(lab.items())))
         return sum(e[0]) if e else 0
 
+    def clear(self):
+        self.h = {}
+
     def render(self):
         out = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} histogram"]
         for key, (counts, total) in sorted(self.h.items()):
@@ -86,6 +92,10 @@ class Metrics:
         self.queue_depth = Gauge("colinfer_queue_depth", "requests waiting for a slot")
         self.slots_busy = Gauge("colinfer_slots_busy", "slots holding a request, by phase")
         self.memory = Gauge("colinfer_gpu_memory_bytes", "torch allocator: allocated / reserved / cap")
+
+    def reset(self):
+        for m in self.__dict__.values():
+            m.clear()
 
     def render(self) -> str:
         lines = []

@@ -260,6 +260,9 @@ class Scheduler:
             raise ValueError("empty prompt")
         if len(req.prompt) + self.margin > self.max_seq_len:
             raise ValueError(f"prompt of {len(req.prompt)} tokens exceeds the slot length {self.max_seq_len}")
+        V = self.model.cfg.vocab_size  # an id past the embedding is a device-side assert, which ends the engine
+        if min(req.prompt) < 0 or max(req.prompt) >= V or not all(0 <= t < V for t in req.eos_ids):
+            raise ValueError(f"token ids must be in [0, {V})")
         req.rid, self._rid = self._rid, self._rid + 1
         req.t_submit = time.perf_counter()
         req.eos_ids = tuple(req.eos_ids)
@@ -270,9 +273,7 @@ class Scheduler:
         for r in self.queue:
             if r.rid == rid:
                 self.queue.remove(r)
-                r.done, r.finish_reason, r.t_done = True, "abort", time.perf_counter()
-                if r.hook is not None:
-                    r.hook.finish(r)
+                self._close(r, "abort")
                 return True
         for s in self.slots:
             if s.req is not None and s.req.rid == rid:
@@ -488,11 +489,15 @@ class Scheduler:
 
     def _finish(self, s: Slot, reason: str):
         req = s.req
-        req.done, req.finish_reason, req.t_done = True, reason, time.perf_counter()
         if s.phase == "decode" or not s.todo:
             self._snapshot(s)  # end of generation: everything fed so far (the last output token was never fed)
         s.phase, s.req, s.todo = "idle", None, []
+        self._close(req, reason)
         s.last_used = req.t_done
+
+    def _close(self, req: Request, reason: str):
+        """The end of a request, in a slot or still queued: its fields, the metrics, the hook."""
+        req.done, req.finish_reason, req.t_done = True, reason, time.perf_counter()
         self.metrics.requests.inc(reason=reason)
         self.metrics.generated_tokens.inc(len(req.output))
         if req.hook is not None:
@@ -502,6 +507,18 @@ class Scheduler:
 
     def busy(self) -> bool:
         return bool(self.queue) or any(s.phase != "idle" for s in self.slots)
+
+    def reset(self):
+        """Forgets every slot history and checkpoint, and zeroes the metrics (the server's warm-up ends with it). The
+        scheduler must be idle."""
+        if self.busy():
+            raise RuntimeError("reset() needs an idle scheduler")
+        for c in list(self.ckpts):
+            self._drop(c)
+        self.slots = [Slot(i) for i in range(self.n_slots)]
+        self.state.pos_t.zero_()
+        self.finished.clear()
+        self.metrics.reset()
 
     def run(self, requests: list[Request]) -> list[Request]:
         for r in requests:

@@ -121,12 +121,7 @@ class Worker(threading.Thread):
         sched.run(reqs[:1])
         sched.run(reqs[1:])
         sched.run([EngineRequest(rnd(20 + i), max_new_tokens=8, temperature=0.5 * (i % 2)) for i in range(sched.n_slots)])
-        for c in list(sched.ckpts):
-            sched._drop(c)
-        for s in sched.slots:
-            s.tokens, s.h_last, s.last_used = [], None, 0.0
-        sched.state.pos_t.zero_()
-        sched.metrics.__init__()
+        sched.reset()
         torch.cuda.synchronize()
 
     def run(self):
