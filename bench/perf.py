@@ -35,7 +35,8 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from engine.spec.suffix import MIN_MATCH  # noqa: E402
-from tests.golden import EOS, build_engine, load_prompts  # noqa: E402
+from engine.runtime.build import build_engine  # noqa: E402
+from tests.golden import EOS, load_prompts  # noqa: E402
 
 
 def meminfo_kb(key: str) -> int:
@@ -139,7 +140,7 @@ def main():
                                                                             capture_output=True, text=True).stdout.strip())
     with torch.inference_mode():
         t0 = time.perf_counter()
-        path, sched = build_engine(spec=True, slots=3, max_seq_len=262144, checkpoints=32, suffix_min=a.suffix)
+        sched, _ = build_engine(suffix_drafts=a.suffix)  # the server's engine
         res["startup_s"] = time.perf_counter() - t0
         prompts = chat_prompts(3)
         rounds = []
@@ -160,7 +161,7 @@ def main():
         del sched
         gc.collect()
         torch.cuda.empty_cache()
-        path, plain = build_engine(spec=False, slots=1, max_seq_len=8192, checkpoints=0)
+        plain, _ = build_engine(spec="none", slots=1, max_seq_len=8192, checkpoints=0)
         rounds = []
         for i in range(a.warmup + a.runs):
             rounds.append(decode_round(plain, prompts[::3], 128))

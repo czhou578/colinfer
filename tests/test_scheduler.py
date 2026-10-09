@@ -86,7 +86,7 @@ def make(monkeypatch):
     monkeypatch.setattr(S, "prefill", stub_prefill)
 
     def make(**kw):
-        kw = dict(n_slots=3, max_seq_len=L, n_checkpoints=8, prefill_chunk=64, ckpt_interval=128, boundary_token=BND, selftest=False) | kw
+        kw = dict(n_slots=3, max_seq_len=L, n_checkpoints=8, prefill_chunk=64, ckpt_interval=128, boundary_token=BND) | kw
         return S.Scheduler(StubModel(), **kw)
     return make
 

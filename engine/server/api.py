@@ -69,42 +69,17 @@ class Worker(threading.Thread):
 
     def _build(self):
         a, t0 = self.args, time.perf_counter()
-        from engine.kernels import ops
-        from engine.model.fast import attach_decode_copies, decode_copies_paths, load_fast_model, to_fast
-        from engine.runtime.scheduler import Scheduler
-        from engine.weights.loader import resolve
-        ops()  # build / load the CUDA extension
-        t1 = time.perf_counter()
-        path = resolve(a.model)
-        model = to_fast(load_fast_model(path))
-        if a.decode_weights == "int":
-            files = decode_copies_paths(path)
-            if all(os.path.exists(f) for f in files):
-                log(f"[engine] decode streams the INT6 / INT5 projection copies: {attach_decode_copies(model, files)} linears")
-            else:
-                log(f"[engine] no INT6 / INT5 decode copies at {files} (tools/int6_requant.py): decoding the checkpoint's FP8 projections")
-        mtp = None
-        if a.spec == "mtp":
-            from engine.spec.mtp import DRAFT_DIR, Mtp
-            dw = a.drafter_weights
-            if dw == "auto":
-                dw = os.path.join(DRAFT_DIR, "mtp_ft.safetensors")
-                dw = dw if os.path.exists(dw) else None
-            elif dw == "none":
-                dw = None
-            mtp = Mtp(model, path, weights=dw)
-            log(f"[engine] MTP drafter: {dw or 'checkpoint weights'}; low-rank draft head: {'on' if mtp.lr_B is not None else 'off'}")
-        t2 = time.perf_counter()
-        sched = Scheduler(model, n_slots=a.slots, max_seq_len=a.max_seq_len, n_checkpoints=a.checkpoints, mtp=mtp, k=a.k,
-                          selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False, boundary_token=a.boundary_token,
-                          suffix_min=a.suffix_drafts)
+        from engine.runtime.build import build_engine
+        sched, self.startup = build_engine(a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=a.checkpoints, spec=a.spec, k=a.k,
+                                           drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
+                                           boundary=a.boundary_token, selftest=not a.no_selftest, metrics=self.metrics, keep_finished=False,
+                                           log=log)
         t3 = time.perf_counter()
         if not a.no_warmup:
-            self._warmup(sched, model.cfg.vocab_size)
+            self._warmup(sched, sched.model.cfg.vocab_size)
         t4 = time.perf_counter()
         self.sched = sched
-        self.startup = dict(kernels_s=round(t1 - t0, 1), weights_s=round(t2 - t1, 1), graphs_selftest_s=round(t3 - t2, 1),
-                            warmup_s=round(t4 - t3, 1), total_s=round(t4 - t0, 1))
+        self.startup.update(warmup_s=round(t4 - t3, 1), total_s=round(t4 - t0, 1))
         mem = torch.cuda.memory_allocated() / 1e9
         log(f"[engine] ready: {self.startup}; {mem:.1f} GB allocated, {torch.cuda.memory_reserved() / 1e9:.1f} GB reserved; "
             f"{a.slots} slots x {a.max_seq_len} tokens, spec={a.spec}" + (f" k={a.k}" if a.spec == "mtp" else "")

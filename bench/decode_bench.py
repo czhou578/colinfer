@@ -16,8 +16,8 @@ import time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.model.fast import DecodeGraph, attach_decode_copies, decode_copies_paths, load_fast_model, to_fast  # noqa: E402
-from engine.weights.loader import resolve  # noqa: E402
+from engine.model.fast import DecodeGraph  # noqa: E402
+from engine.runtime.build import load_model  # noqa: E402
 
 
 def timed(fn, n=20):
@@ -39,11 +39,7 @@ def main():
     ap.add_argument("--checkpoint-weights", action="store_true", help="decode the FP8 projections instead of the INT6 / INT5 copies")
     ap.add_argument("--early-exit", action="store_true", help="keep the drafter's early exit (engine/spec/mtp.py DRAFT_STOP)")
     a = ap.parse_args()
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    model = to_fast(load_fast_model(path))
-    if not a.checkpoint_weights:
-        files = [f for f in decode_copies_paths(path) if os.path.exists(f)]
-        print(f"INT6 / INT5 decode copies: {attach_decode_copies(model, files)} linears")
+    path, model = load_model(decode_weights="checkpoint" if a.checkpoint_weights else "int")
     from engine.model.prefill import prepare_prefill
     from engine.spec import mtp as mtp_mod
     from engine.spec.mtp import Mtp, MtpCycle, MtpState

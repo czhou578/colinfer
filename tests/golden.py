@@ -42,26 +42,6 @@ PROMPTS = os.path.join(ROOT, "tests", "golden", "prompts.json")
 EOS = (248046, 248044)
 
 
-def build_engine(spec: bool, slots: int = 3, max_seq_len: int = 32768, checkpoints: int = 32, suffix_min: int = MIN_MATCH):
-    """The server's engine (engine/server/api.py Worker._build) without HTTP: model, decode copies, drafter, scheduler."""
-    from engine.model.fast import attach_decode_copies, decode_copies_paths, load_fast_model, to_fast
-    from engine.runtime.scheduler import Scheduler
-    from engine.weights.loader import resolve
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    model = to_fast(load_fast_model(path, verbose=False))
-    files = decode_copies_paths(path)
-    if all(os.path.exists(f) for f in files):
-        attach_decode_copies(model, files)
-    mtp = None
-    if spec:
-        from engine.spec.mtp import DRAFT_DIR, Mtp
-        ft = os.path.join(DRAFT_DIR, "mtp_ft.safetensors")
-        mtp = Mtp(model, path, weights=ft if os.path.exists(ft) else None)
-    sched = Scheduler(model, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=7, selftest=False,
-                      suffix_min=suffix_min)
-    return path, sched
-
-
 def freeze_prompts(path):
     """The 40-prompt mix (tools/drafter_data.py, seed 1, chat template, last 3,000 tokens) and a 20,000-token WikiText
     prompt, as token ids."""
@@ -98,7 +78,8 @@ def requests():
 
 
 def run(spec: bool, suffix_min: int = MIN_MATCH):
-    _, sched = build_engine(spec, suffix_min=suffix_min)
+    from engine.runtime.build import build_engine
+    sched, _ = build_engine(spec="mtp" if spec else "none", max_seq_len=32768, suffix_drafts=suffix_min)  # the server's engine, 32k slots
     reqs = requests()
     t0 = time.perf_counter()
     sched.run([r for _, r in reqs])

@@ -25,9 +25,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from transformers import AutoTokenizer  # noqa: E402
 
-from engine.model.fast import load_fast_model, to_fast  # noqa: E402
+from engine.runtime.build import build_engine  # noqa: E402
 from engine.runtime.scheduler import Request, Scheduler  # noqa: E402
-from engine.spec.mtp import Mtp  # noqa: E402
 from engine.weights.loader import resolve  # noqa: E402
 
 EOS = (248046, 248044)
@@ -67,14 +66,11 @@ def main():
     a = ap.parse_args()
     path = resolve("nvidia/Qwen3.8-27B-NVFP4")
     tok = AutoTokenizer.from_pretrained(path)
-    model = to_fast(load_fast_model(path))
-    if not a.checkpoint_weights:
-        from engine.model.fast import attach_decode_copies, decode_copies_paths
-        print(f"INT6 / INT5 decode copies: {attach_decode_copies(model, decode_copies_paths(path))} linears")
-    mtp = Mtp(model, path)
     t0 = time.perf_counter()
-    ref = Scheduler(model, n_slots=1, max_seq_len=8192, n_checkpoints=0, selftest=True)
-    spec = Scheduler(model, n_slots=3, max_seq_len=32768, n_checkpoints=32, mtp=mtp, k=a.k, selftest=False, boundary_token=IM_START)
+    # the speculative scheduler: the server's engine at 32k slots, with the checkpoint's drafter and no suffix drafts
+    spec, _ = build_engine(path, max_seq_len=32768, k=a.k, drafter_weights="none", suffix_drafts=0,
+                           decode_weights="checkpoint" if a.checkpoint_weights else "int", boundary=IM_START)
+    ref = Scheduler(spec.model, n_slots=1, max_seq_len=8192, n_checkpoints=0)  # plain decode, one request at a time
     print(f"schedulers built in {time.perf_counter() - t0:.1f} s; {torch.cuda.memory_allocated() / 1e9:.1f} GB allocated")
     ok = True
     names = list(PROMPTS)

@@ -17,8 +17,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from transformers import AutoTokenizer  # noqa: E402
 
-from engine.model.fast import load_fast_model, to_fast  # noqa: E402
-from engine.runtime.scheduler import Request, Scheduler  # noqa: E402
+from engine.runtime.build import build_engine  # noqa: E402
+from engine.runtime.scheduler import Request  # noqa: E402
 from engine.weights.loader import resolve  # noqa: E402
 
 FILLER = ("The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. ")
@@ -64,7 +64,7 @@ def main():
                       f"(TTFT {r['timings']['ttft_s']:6.1f} s)", flush=True)
         print(f"PASSKEY {hits}/{len(a.lens) * len(a.depths)}")
         return
-    eng = Scheduler(to_fast(load_fast_model(path)), n_slots=1, max_seq_len=max(a.lens) + 64, n_checkpoints=0)
+    eng, _ = build_engine(path, spec="none", slots=1, max_seq_len=max(a.lens) + 64, checkpoints=0, decode_weights="checkpoint", boundary=None)
     for L in a.lens:
         for d in a.depths:
             key = rng.randint(100000, 999999)

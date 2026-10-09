@@ -111,11 +111,8 @@ class Slot:
 
 class Scheduler:
     def __init__(self, model: FastQwen35, n_slots: int = 3, max_seq_len: int = 32768, n_checkpoints: int = 32, mtp=None, k: int = 3,
-                 prefill_chunk: int = CHUNK, ckpt_interval: int = 8192, selftest: bool = True, metrics: Metrics | None = None,
+                 prefill_chunk: int = CHUNK, ckpt_interval: int = 8192, metrics: Metrics | None = None,
                  keep_finished: bool = True, boundary_token: int | None = None, suffix_min: int = 0):
-        if selftest:
-            from engine.selftest import run_selftest
-            run_selftest(verbose=True)  # refuses to start if any matmul path is numerically wrong
         prepare_prefill(model)
         self.model, self.mtp, self.k = model, mtp, k
         self.suffix_min = suffix_min if mtp is not None else 0  # > 0: suffix-match drafts of at least this match length
