@@ -81,10 +81,10 @@ class FakeWorker:
         return self.waiting
 
 
-def client(reply="", error=None, thinking=None, tokenizer=None):
+def client(reply="", error=None, thinking=None, tokenizer=None, effort=None):
     """The app on a FakeWorker. A bug of the server gets its 500 reply (TestClient would raise it instead)."""
     w = FakeWorker(reply, error)
-    app = build_app(w, tokenizer or CharTokenizer(), "fake", {}, {"vocab_size": VOCAB}, thinking)
+    app = build_app(w, tokenizer or CharTokenizer(), "fake", {}, {"vocab_size": VOCAB}, thinking, effort)
     return TestClient(app, raise_server_exceptions=False), w
 
 
@@ -267,6 +267,42 @@ def test_template_errors_are_the_clients_and_other_failures_the_servers():
 def test_template_kwargs_map_other_apis_names(body, kw):
     assert api._template_kwargs(body, None) == kw
     assert api._template_kwargs(body, True) == {"enable_thinking": True, **kw}
+
+
+@pytest.mark.parametrize("body,effort", [
+    ({}, "medium"),                                          # no effort named: the server's --reasoning-effort
+    ({"reasoning_effort": "low"}, "low"),                    # a request's own level stays
+    ({"reasoning_effort": "high"}, "xhigh"),
+    ({"chat_template_kwargs": {"reasoning_effort": "low"}}, "low"),
+    ({"reasoning_effort": "none"}, None),                    # thinking off: no effort
+    ({"enable_thinking": False}, None),
+])
+def test_server_reasoning_effort_fills_in(body, effort):
+    assert api._template_kwargs(body, None, "medium").get("reasoning_effort") == effort
+
+
+def test_messages_reasoning_effort_default():
+    from engine.server import anthropic as anth
+    on = {"thinking": {"type": "enabled"}}
+    assert anth.template_kwargs(on, None, "medium") == {"enable_thinking": True, "reasoning_effort": "medium"}
+    assert anth.template_kwargs({**on, "output_config": {"effort": "low"}}, None, "medium")["reasoning_effort"] == "low"
+    assert anth.template_kwargs({**on, "output_config": {"effort": "high"}}, None, "medium") == {"enable_thinking": True}  # xhigh
+    assert anth.template_kwargs({}, None, "medium") == {"enable_thinking": False}
+    assert anth.template_kwargs(on, None) == {"enable_thinking": True}  # auto: the template's default
+
+
+def test_server_reasoning_effort_reaches_the_template():
+    seen = []
+
+    class Rec(CharTokenizer):
+        def apply_chat_template(self, conversation, **kw):
+            seen.append(kw.get("reasoning_effort"))
+            return super().apply_chat_template(conversation, **kw)
+    c, _ = client("ok<|im_end|>", tokenizer=Rec(), effort="medium")
+    assert c.post(CHAT, json={"messages": USER}).status_code == 200
+    assert c.post(CHAT, json={"messages": USER, "reasoning_effort": "low"}).status_code == 200
+    assert c.post("/v1/messages", json={"max_tokens": 5, "messages": USER, "thinking": {"type": "enabled"}}).status_code == 200
+    assert seen == ["medium", "low", "medium"]
 
 
 def test_deepseek_style_thinking_off_renders_without_thinking():

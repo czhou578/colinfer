@@ -36,6 +36,7 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--no-prefix-caching` | off | Never reuse a prompt prefix (the same as `--checkpoints 0`). Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
+| `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
 | `--api-key` | `$COLINFER_API_KEY`, else none | The `/v1/` endpoints require this key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and `/metrics` stay open. |
 
 ## API
@@ -132,7 +133,8 @@ Other endpoints:
 - **Thinking:**
   - `thinking.type` `enabled` or `adaptive` turns on reasoning, and `disabled` turns it off. Without `thinking`, the
     request runs without reasoning, unless the server runs with `--thinking on`.
-  - `output_config.effort` `low` or `medium` sets the reasoning effort. Higher values use the template default.
+  - `output_config.effort` `low` or `medium` sets the reasoning effort. Higher values use the template default
+    (`xhigh`). Without an effort, the request gets the server's `--reasoning-effort`.
   - The reply has a `thinking` block. Send it back unchanged in the next request. The template then repeats the
     reasoning of the earlier turns, and the server can reuse its prefix checkpoint.
 - **Other fields:**

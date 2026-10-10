@@ -303,11 +303,12 @@ def _num(v, kind, name: str):
 _EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
 
 
-def _template_kwargs(b: dict, default_thinking: bool | None) -> dict:
+def _template_kwargs(b: dict, default_thinking: bool | None, default_effort: str | None = None) -> dict:
     """The chat template kwargs of a chat request: chat_template_kwargs, plus the top-level enable_thinking and
     reasoning_effort. Clients written for other templates set thinking with `thinking` (DeepSeek) and effort with names
     that this template rejects ("none", "high", "max"). Thus `thinking` stands for enable_thinking, and the names in
-    _EFFORTS map to the levels of this template. Other values in chat_template_kwargs go to the template unchanged."""
+    _EFFORTS map to the levels of this template. Other values in chat_template_kwargs go to the template unchanged.
+    default_effort (--reasoning-effort): the level of a thinking request that names none (None: the template's)."""
     kw = b.get("chat_template_kwargs") or {}
     if not isinstance(kw, dict):
         raise BadRequest("chat_template_kwargs must be an object")
@@ -329,6 +330,8 @@ def _template_kwargs(b: dict, default_thinking: bool | None) -> dict:
         kw["reasoning_effort"] = "xhigh" if top_level else effort
     if "enable_thinking" not in kw and default_thinking is not None:
         kw["enable_thinking"] = default_thinking
+    if default_effort is not None and kw.get("enable_thinking") is not False:
+        kw.setdefault("reasoning_effort", default_effort)
     return kw
 
 
@@ -341,7 +344,8 @@ class Failed(Exception):
 
 
 # ------------------------------------------------------------------------------------------------ app
-def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, hf_config: dict, default_thinking):
+def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, hf_config: dict, default_thinking,
+              default_effort: str | None = None):
     app = FastAPI(title="colin-inference-engine")
     fmt = ChatFormat(tokenizer)
     a = worker.args
@@ -531,7 +535,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             msgs = b.get("messages")
             tool_choice = b.get("tool_choice")
             tools = b.get("tools") if tool_choice != "none" else None
-            kw = _template_kwargs(b, default_thinking)
+            kw = _template_kwargs(b, default_thinking, default_effort)
             prompt = await render(msgs, tools, kw)
             n_top = None
             if b.get("logprobs"):
@@ -706,7 +710,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         """Anthropic request body -> (prompt token ids, OpenAI-style tools)."""
         try:
             msgs, tools = anth.to_messages(b), anth.to_tools(b)
-            kw = anth.template_kwargs(b, default_thinking)
+            kw = anth.template_kwargs(b, default_thinking, default_effort)
         except ValueError as e:  # the conversion's checks of the request
             raise BadRequest(str(e)) from None
         return await render(msgs, tools, kw), tools
@@ -828,6 +832,8 @@ def main(argv=None):
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
+    ap.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "xhigh"), default="auto",
+                    help="the reasoning effort of a thinking request that does not set one (auto: the template's default, xhigh)")
     ap.add_argument("--api-key", default=os.environ.get("COLINFER_API_KEY") or None,
                     help="require this key on the /v1/ endpoints (Authorization: Bearer, or x-api-key); default: $COLINFER_API_KEY, else no key")
     ap.add_argument("--no-selftest", action="store_true")
@@ -859,7 +865,8 @@ def main(argv=None):
     if worker.error is not None:
         raise SystemExit(f"engine failed to start: {worker.error!r}")
     thinking = {"auto": None, "on": True, "off": False}[a.thinking]
-    app = build_app(worker, tokenizer, a.served_model_name or a.model, gen_defaults, hf_config, thinking)
+    effort = None if a.reasoning_effort == "auto" else a.reasoning_effort
+    app = build_app(worker, tokenizer, a.served_model_name or a.model, gen_defaults, hf_config, thinking, effort)
     log(f"[server] startup {time.perf_counter() - t0:.1f} s; listening on http://{a.host}:{a.port}/v1")
     import uvicorn
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=30)

@@ -141,7 +141,9 @@ def to_tools(body: dict) -> list[dict] | None:
     return fns or None
 
 
-def template_kwargs(body: dict, default_thinking: bool | None) -> dict:
+def template_kwargs(body: dict, default_thinking: bool | None, default_effort: str | None = None) -> dict:
+    """enable_thinking from `thinking`, and reasoning_effort from output_config.effort: low / medium as they are, a
+    higher one the template's default (xhigh), none the server's default_effort (None: the template's)."""
     th = body.get("thinking")
     kind = th.get("type") if isinstance(th, dict) else None
     if kind == "disabled":
@@ -155,6 +157,8 @@ def template_kwargs(body: dict, default_thinking: bool | None) -> dict:
     effort = oc.get("effort") if isinstance(oc, dict) else None
     if on and effort in ("low", "medium"):
         kw["reasoning_effort"] = effort
+    elif on and not effort and default_effort is not None:
+        kw["reasoning_effort"] = default_effort
     return kw
 
 
