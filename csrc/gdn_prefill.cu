@@ -17,29 +17,14 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdint.h>
+#include "common.cuh"
 
 namespace gdn {
+using namespace cc;
 
 constexpr int C = 64, DK = 128, DV = 128, BV = 64, WARPS = 4;
 constexpr int KS = DK + 8, VS = BV + 8, AS = C + 1;  // padded shared rows (bf16 / bf16 / fp32)
 
-__device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
-__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(valid ? 16 : 0));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
-__device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
-}
-__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
-}
 __device__ __forceinline__ uint32_t pack(float lo, float hi) {
     const __nv_bfloat162 b = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<const uint32_t*>(&b);
@@ -49,10 +34,10 @@ __device__ __forceinline__ float2 unpack(uint32_t u) { return make_float2(__uint
 // Fragment conventions (m16n8k16, g = lane / 4, q = lane % 4):
 //   A: a0 (row g, k 2q..2q+1), a1 (row g+8, same k), a2 (row g, k 8+2q..), a3 (row g+8, k 8+2q..)
 //   B: b0 (k 2q..2q+1, col g), b1 (k 8+2q.., col g);   C: c0 c1 (row g, cols 2q, 2q+1), c2 c3 (row g+8)
-// ldsm4 of A from row-major [m][k]: lane row (l & 7) + ((l >> 3) & 1) * 8, col (l >> 4) * 8.
-// B from row-major [k][n] (n contiguous): ldsm4t, lane k (l & 7) + ((l >> 3) & 1) * 8, n (l >> 4) * 8 -> n-tiles n0, n0 + 8.
-// B from row-major [n][k] (k contiguous): ldsm4, lane n (l & 7) + (l >> 4) * 8, k ((l >> 3) & 1) * 8 -> n-tiles n0, n0 + 8.
-// A from row-major [k][m] (A transposed): ldsm4t, lane k (l & 7) + (l >> 4) * 8, m ((l >> 3) & 1) * 8.
+// ldsm_x4 of A from row-major [m][k]: lane row (l & 7) + ((l >> 3) & 1) * 8, col (l >> 4) * 8.
+// B from row-major [k][n] (n contiguous): ldsm_x4_t, lane k (l & 7) + ((l >> 3) & 1) * 8, n (l >> 4) * 8 -> n-tiles n0, n0 + 8.
+// B from row-major [n][k] (k contiguous): ldsm_x4, lane n (l & 7) + (l >> 4) * 8, k ((l >> 3) & 1) * 8 -> n-tiles n0, n0 + 8.
+// A from row-major [k][m] (A transposed): ldsm_x4_t, lane k (l & 7) + (l >> 4) * 8, m ((l >> 3) & 1) * 8.
 
 // in-chunk cumulative decay of value head h: G[i] for i < C (padding rows: g = 0), by one warp
 __device__ __forceinline__ void chunk_cumsum(const float* __restrict__ g, int Hv, int h, int t0, int nt, float* Gs, int lane) {
@@ -101,13 +86,13 @@ __global__ void __launch_bounds__(WARPS * 32) k_wy(const __nv_bfloat16* __restri
 #pragma unroll
     for (int s = 0; s < DK / 16; ++s) {
         uint32_t a[4];
-        ldsm4(a, Ks + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
+        ldsm_x4(a, Ks + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
 #pragma unroll
         for (int np = 0; np < 4; ++np) {
             uint32_t b[4];
-            ldsm4(b, Ks + (np * 16 + (lane & 7) + (lane >> 4) * 8) * KS + s * 16 + ((lane >> 3) & 1) * 8);
-            mma(acc[2 * np], a, b[0], b[1]);
-            mma(acc[2 * np + 1], a, b[2], b[3]);
+            ldsm_x4(b, Ks + (np * 16 + (lane & 7) + (lane >> 4) * 8) * KS + s * 16 + ((lane >> 3) & 1) * 8);
+            mma_bf16(acc[2 * np], a, b[0], b[1]);
+            mma_bf16(acc[2 * np + 1], a, b[2], b[3]);
         }
     }
 #pragma unroll
@@ -269,7 +254,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
         // T rows r0, r1 as A fragments (k = token j), column-scaled: diag(beta) for U, diag(beta e^G) for W
         uint32_t ta[4][4];
 #pragma unroll
-        for (int s = 0; s < 4; ++s) ldsm4(ta[s], Tsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * VS + s * 16 + (lane >> 4) * 8);
+        for (int s = 0; s < 4; ++s) ldsm_x4(ta[s], Tsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * VS + s * 16 + (lane >> 4) * 8);
         auto scaled = [&](int s, bool decay, uint32_t (&a)[4]) {
             const int j0 = s * 16 + 2 * q, j1 = j0 + 8;
             const float s00 = Bt[j0] * (decay ? __expf(G[j0]) : 1.f), s01 = Bt[j0 + 1] * (decay ? __expf(G[j0 + 1]) : 1.f);
@@ -292,9 +277,9 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
             for (int np = 0; np < 4; ++np) {
                 uint32_t b[4];
-                ldsm4t(b, Vsm + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
-                mma(vn[2 * np], a, b[0], b[1]);
-                mma(vn[2 * np + 1], a, b[2], b[3]);
+                ldsm_x4_t(b, Vsm + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
+                mma_bf16(vn[2 * np], a, b[0], b[1]);
+                mma_bf16(vn[2 * np + 1], a, b[2], b[3]);
             }
         }
         {
@@ -308,9 +293,9 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
                 for (int np = 0; np < 8; ++np) {
                     uint32_t b[4];
-                    ldsm4t(b, Kc + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * KS + np * 16 + (lane >> 4) * 8);
-                    mma(w[2 * np], a, b[0], b[1]);
-                    mma(w[2 * np + 1], a, b[2], b[3]);
+                    ldsm_x4_t(b, Kc + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * KS + np * 16 + (lane >> 4) * 8);
+                    mma_bf16(w[2 * np], a, b[0], b[1]);
+                    mma_bf16(w[2 * np + 1], a, b[2], b[3]);
                 }
             }
 #pragma unroll
@@ -320,9 +305,9 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
                 for (int np = 0; np < 4; ++np) {
                     uint32_t b[4];
-                    ldsm4t(b, Sb + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
-                    mma(vn[2 * np], a, b[0], b[1]);
-                    mma(vn[2 * np + 1], a, b[2], b[3]);
+                    ldsm_x4_t(b, Sb + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
+                    mma_bf16(vn[2 * np], a, b[0], b[1]);
+                    mma_bf16(vn[2 * np + 1], a, b[2], b[3]);
                 }
             }
         }
@@ -339,13 +324,13 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
         for (int s = 0; s < DK / 16; ++s) {
             uint32_t a[4];
-            ldsm4(a, Qsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
+            ldsm_x4(a, Qsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
 #pragma unroll
             for (int np = 0; np < 4; ++np) {
                 uint32_t b[4];
-                ldsm4(b, Kc + (np * 16 + (lane & 7) + (lane >> 4) * 8) * KS + s * 16 + ((lane >> 3) & 1) * 8);
-                mma(p[2 * np], a, b[0], b[1]);
-                mma(p[2 * np + 1], a, b[2], b[3]);
+                ldsm_x4(b, Kc + (np * 16 + (lane & 7) + (lane >> 4) * 8) * KS + s * 16 + ((lane >> 3) & 1) * 8);
+                mma_bf16(p[2 * np], a, b[0], b[1]);
+                mma_bf16(p[2 * np + 1], a, b[2], b[3]);
             }
         }
 #pragma unroll
@@ -375,13 +360,13 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
             for (int s = 0; s < DK / 16; ++s) {
                 uint32_t a[4];
-                ldsm4(a, Qsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
+                ldsm_x4(a, Qsm + (warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * KS + s * 16 + (lane >> 4) * 8);
 #pragma unroll
                 for (int np = 0; np < 4; ++np) {
                     uint32_t b[4];
-                    ldsm4t(b, Sb + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
-                    mma(acc[2 * np], a, b[0], b[1]);
-                    mma(acc[2 * np + 1], a, b[2], b[3]);
+                    ldsm_x4_t(b, Sb + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
+                    mma_bf16(acc[2 * np], a, b[0], b[1]);
+                    mma_bf16(acc[2 * np + 1], a, b[2], b[3]);
                 }
             }
             const float e0 = __expf(G[r0]), e1 = __expf(G[r1]);
@@ -396,9 +381,9 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
                 for (int np = 0; np < 4; ++np) {
                     uint32_t b[4];
-                    ldsm4t(b, Vn + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
-                    mma(acc[2 * np], a, b[0], b[1]);
-                    mma(acc[2 * np + 1], a, b[2], b[3]);
+                    ldsm_x4_t(b, Vn + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
+                    mma_bf16(acc[2 * np], a, b[0], b[1]);
+                    mma_bf16(acc[2 * np + 1], a, b[2], b[3]);
                 }
             }
 #pragma unroll
@@ -409,7 +394,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
             }
         }
         __syncthreads();  // decayed V_new of every row
-        // S = e^(G_C) S + K^T V_d  (rows k 32w .. 32w + 31): A = K^T (ldsm4t of K [j][k]), B = V_d (ldsm4t of [j][v])
+        // S = e^(G_C) S + K^T V_d  (rows k 32w .. 32w + 31): A = K^T (ldsm_x4_t of K [j][k]), B = V_d (ldsm_x4_t of [j][v])
         {
             const float eC = __expf(GC);
 #pragma unroll
@@ -423,13 +408,13 @@ __global__ void __launch_bounds__(WARPS * 32, 1) k_chunk(const __nv_bfloat16* __
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) {
                     uint32_t a[4];
-                    ldsm4t(a, Kc + (s * 16 + (lane & 7) + (lane >> 4) * 8) * KS + warp * 32 + mt * 16 + ((lane >> 3) & 1) * 8);
+                    ldsm_x4_t(a, Kc + (s * 16 + (lane & 7) + (lane >> 4) * 8) * KS + warp * 32 + mt * 16 + ((lane >> 3) & 1) * 8);
 #pragma unroll
                     for (int np = 0; np < 4; ++np) {
                         uint32_t b[4];
-                        ldsm4t(b, Vsm + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
-                        mma(S[mt][2 * np], a, b[0], b[1]);
-                        mma(S[mt][2 * np + 1], a, b[2], b[3]);
+                        ldsm_x4_t(b, Vsm + (s * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + np * 16 + (lane >> 4) * 8);
+                        mma_bf16(S[mt][2 * np], a, b[0], b[1]);
+                        mma_bf16(S[mt][2 * np + 1], a, b[2], b[3]);
                     }
                 }
             }

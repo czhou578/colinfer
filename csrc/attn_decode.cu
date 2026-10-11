@@ -18,20 +18,13 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdint.h>
+#include "common.cuh"
 #include "pdl.cuh"
 
 namespace attn {
+using namespace cc;
 
 constexpr int D = 256;
-
-__device__ __forceinline__ void bf16x8_to_float(const uint4 v, float (&f)[8]) {
-    const uint32_t u[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        f[2 * i] = __uint_as_float(u[i] << 16);
-        f[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
-    }
-}
 
 // e4m3 cache row writer: saturating (values beyond +-448 clip)
 struct KvFp8 {
@@ -147,35 +140,6 @@ namespace tc {
 
 constexpr int TK = 32, NB = 12, WARPS = 4, QS = D + 8, VS = D + 8, PS = TK + 8, SS = TK + 4, MAXROWS = 48;
 
-__device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
-__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(valid ? 16 : 0));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-__device__ __forceinline__ float ex2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-__device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
-}
-__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
-}
-__device__ __forceinline__ uint32_t e4m3x2_h2(uint32_t two) {
-    __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffff), __NV_E4M3);
-    return (uint32_t)h.x | ((uint32_t)h.y << 16);
-}
 // RS: the shared-memory bytes per raw cache row. swz(row, chunk): where the 16-byte chunk of a row lands. The fp8 rows
 // stay 256 bytes apart, and the kernel XOR-swizzles the chunks by row instead. (A padding to 272 decreased the cp.async
 // streaming from ~232 to ~187 GB/s.) Thus the 8 rows of a K fragment load hit 8 different bank groups.
@@ -296,7 +260,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_tc(const __nv_bfloat16* __restri
                     const __half* qa = Qs + (mt * 16 + (lane >> 2)) * QS + 16 * j + 4 * (lane & 3);
                     const uint2 x0 = *reinterpret_cast<const uint2*>(qa), x1 = *reinterpret_cast<const uint2*>(qa + 8 * QS);
                     const uint32_t a[4] = {x0.x, x1.x, x0.y, x1.y};
-                    mma16816(s[mt], a, b0, b1);
+                    mma_f16(s[mt], a, b0, b1);
                 }
             }
 #pragma unroll
@@ -366,8 +330,8 @@ __global__ void __launch_bounds__(WARPS * 32) k_tc(const __nv_bfloat16* __restri
                 ldsm_x4_t(bv, Vh + (ks * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * VS + warp * 64 + np * 16 + (lane >> 4) * 8);
 #pragma unroll
                 for (int mt = 0; mt < MT; ++mt) {
-                    mma16816(acc[mt][2 * np], a[mt], bv[0], bv[1]);
-                    mma16816(acc[mt][2 * np + 1], a[mt], bv[2], bv[3]);
+                    mma_f16(acc[mt][2 * np], a[mt], bv[0], bv[1]);
+                    mma_f16(acc[mt][2 * np + 1], a[mt], bv[2], bv[3]);
                 }
             }
         }

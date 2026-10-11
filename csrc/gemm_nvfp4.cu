@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "common.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -205,15 +206,8 @@ cudaError_t run(const void* a, const void* sfa, const void* b, const void* sfb, 
 }
 
 // ---- activation quantization: bf16 [M, K] -> packed e2m1 [M, K/2] + swizzled e4m3 scales ----
-__device__ __forceinline__ uint32_t e2m1_code(float a) {  // |a| -> 3-bit magnitude code, RN-even, saturating
-    // grid 0, .5, 1, 1.5, 2, 3, 4, 6 ; midpoints .25 .75 1.25 1.75 2.5 3.5 5 ; ties to even mantissa
-    uint32_t c = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) + (a >= 3.5f) + (a > 5.f);
-    return c;
-}
-
-__device__ __forceinline__ size_t sf_offset(int r, int kb, int kb4) {
-    return ((size_t)(r >> 7) * kb4 + (kb >> 2)) * 512 + (r & 31) * 16 + ((r >> 5) & 3) * 4 + (kb & 3);
-}
+using cc::e2m1_code;
+using cc::sf_offset;
 
 // one thread per 16-element block
 __global__ void k_quant(const __nv_bfloat16* __restrict__ x, uint8_t* __restrict__ q, uint8_t* __restrict__ sf, int M, int K, float inv_in_scale,

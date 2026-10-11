@@ -10,17 +10,12 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "common.cuh"
 
 namespace pf {
+using namespace cc;
 
-__device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16(x)); }
 __device__ __forceinline__ float silu(float x) { return x / (1.f + expf(-x)); }  // precise: must round like torch
-__device__ __forceinline__ uint32_t e2m1_code(float a) {
-    return (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) + (a >= 3.5f) + (a > 5.f);
-}
-__device__ __forceinline__ size_t sf_offset(int r, int kb, int kb4) {
-    return ((size_t)(r >> 7) * kb4 + (kb >> 2)) * 512 + (r & 31) * 16 + ((r >> 5) & 3) * 4 + (kb & 3);
-}
 
 __global__ void k_fp8_quant(const __nv_bfloat16* __restrict__ x, uint8_t* __restrict__ out, size_t n8, float inv_scale) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;

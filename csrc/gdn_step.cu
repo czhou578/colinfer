@@ -39,14 +39,15 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "common.cuh"
 #include "pdl.cuh"
 
 namespace gdn {
+using namespace cc;
 
 constexpr int DK = 128, DV = 128, THREADS = 512, MAX_T = THREADS / 32;
 
-__device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16(x)); }
-__device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
+__device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }  // fast: the decode path, not bit-matched
 
 __global__ void k_conv(const __nv_bfloat16* __restrict__ mixed, const __nv_bfloat16* __restrict__ conv_state, const __nv_bfloat16* __restrict__ w,
                        __nv_bfloat16* __restrict__ out, int T, int C, int ldm) {

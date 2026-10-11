@@ -27,40 +27,18 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdint.h>
+#include "common.cuh"
 
 namespace apf {
+using namespace cc;
 
 constexpr int D = 256, WARPS = 4, BM = 16 * WARPS, VS = D + 8;
 constexpr int BN = 32;  // keys per KV tile: 32 (two blocks per SM) beat 64 (102-106 vs 86-87 TFLOPS)
 
-__device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
-__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(valid ? 16 : 0));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
-__device__ __forceinline__ float ex2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
 __device__ __forceinline__ void mma_fp8(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
-}
-__device__ __forceinline__ uint32_t e4m3x2_h2(uint32_t two) {
-    __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffff), __NV_E4M3);
-    return (uint32_t)h.x | ((uint32_t)h.y << 16);
 }
 __device__ __forceinline__ uint32_t pack_h2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
@@ -70,14 +48,6 @@ __device__ __forceinline__ uint32_t to_e4m3x4(const float* f) {  // 4 floats -> 
     const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(f[0], f[1]), __NV_SATFINITE, __NV_E4M3);
     const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(f[2], f[3]), __NV_SATFINITE, __NV_E4M3);
     return lo | (hi << 16);
-}
-__device__ __forceinline__ void bf16x8_to_float(const uint4 v, float* f) {
-    const uint32_t u[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        f[2 * i] = __uint_as_float(u[i] << 16);
-        f[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
-    }
 }
 
 constexpr int SMEM = 4 * BN * D + BN * VS * 2;  // K, V raw x 2 stages, V f16
