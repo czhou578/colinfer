@@ -8,6 +8,7 @@ the handler reads the events from an asyncio queue.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import queue
 import sys
@@ -17,20 +18,41 @@ import traceback
 
 import torch
 
+from engine.runtime.build import MODEL, build_engine
 from engine.runtime.metrics import Metrics
 from engine.runtime.scheduler import Request as EngineRequest
+from engine.spec.suffix import MIN_MATCH
 
 WARMUP_IDS = (1000, 150000)  # ordinary text tokens for the warm-up prompts: past the control tokens, before the rare tail
 
 
-def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+@dataclasses.dataclass
+class ServerConfig:
+    """What the engine thread builds and the HTTP layer enforces. The defaults are the server's flags (engine/server/api.py
+    main reads its argparse defaults from here), so a test constructs the same object with a few fields changed."""
+    model: str = MODEL
+    slots: int = 3
+    max_seq_len: int = 262144
+    checkpoints: int = 32
+    spec: str = "mtp"
+    k: int = 7
+    drafter_weights: str = "auto"
+    suffix_drafts: int = MIN_MATCH
+    decode_weights: str = "int"
+    boundary_token: int | str | None = "auto"  # the <|im_start|> id, "auto" (from the checkpoint) or None (no message splits)
+    selftest: bool = True
+    warmup: bool = True
+    max_queue: int = 8
+    max_output_tokens: int = 0
+    max_request_seconds: float = 1800.0
+    api_key: str | None = None
+    mem_cap_bytes: int = 0
 
 
 class Worker(threading.Thread):
-    def __init__(self, args):
+    def __init__(self, cfg: ServerConfig, log=print):
         super().__init__(name="engine", daemon=True)
-        self.args = args
+        self.cfg, self.log = cfg, log
         self.inbox: queue.Queue = queue.Queue()
         self.ready = threading.Event()
         self.error: BaseException | None = None
@@ -50,22 +72,20 @@ class Worker(threading.Thread):
         return self.inbox.qsize() + len(self.sched.queue)
 
     def _build(self):
-        a, t0 = self.args, time.perf_counter()
-        from engine.runtime.build import build_engine
-        sched, self.startup = build_engine(a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=a.checkpoints, spec=a.spec, k=a.k,
-                                           drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
-                                           boundary=a.boundary_token, selftest=not a.no_selftest, metrics=self.metrics,
-                                           log=log)
+        c, log, t0 = self.cfg, self.log, time.perf_counter()
+        sched, self.startup = build_engine(c.model, slots=c.slots, max_seq_len=c.max_seq_len, checkpoints=c.checkpoints, spec=c.spec, k=c.k,
+                                           drafter_weights=c.drafter_weights, suffix_drafts=c.suffix_drafts, decode_weights=c.decode_weights,
+                                           boundary=c.boundary_token, selftest=c.selftest, metrics=self.metrics, log=log)
         t3 = time.perf_counter()
-        if not a.no_warmup:
+        if c.warmup:
             self._warmup(sched, sched.model.cfg.vocab_size)
         t4 = time.perf_counter()
         self.sched = sched
         self.startup.update(warmup_s=round(t4 - t3, 1), total_s=round(t4 - t0, 1))
         mem = torch.cuda.memory_allocated() / 1e9
         log(f"[engine] ready: {self.startup}; {mem:.1f} GB allocated, {torch.cuda.memory_reserved() / 1e9:.1f} GB reserved; "
-            f"{a.slots} slots x {a.max_seq_len} tokens, spec={a.spec}" + (f" k={a.k}" if a.spec == "mtp" else "")
-            + (f", suffix drafts >= {a.suffix_drafts}" if a.spec == "mtp" and a.suffix_drafts else ""))
+            f"{c.slots} slots x {c.max_seq_len} tokens, spec={c.spec}" + (f" k={c.k}" if c.spec == "mtp" else "")
+            + (f", suffix drafts >= {c.suffix_drafts}" if c.spec == "mtp" and c.suffix_drafts else ""))
 
     def _warmup(self, sched, vocab):
         """Runs every code path once (prefill chunks, the decode / spec graphs of each slot, greedy and sampled,
@@ -96,8 +116,7 @@ class Worker(threading.Thread):
             self._loop()
 
     def _loop(self):
-        sched, m = self.sched, self.metrics
-        cap = getattr(self.args, "mem_cap_bytes", 0)
+        sched, m, cap = self.sched, self.metrics, self.cfg.mem_cap_bytes
         while True:
             items = []
             if not sched.busy():
@@ -137,7 +156,8 @@ class Worker(threading.Thread):
 
 
 class Stream:
-    """One request's bridge from the engine thread (feed / finish / error) to its HTTP handler (an asyncio queue).
+    """One request's bridge from the engine thread (feed / finish / error) to its HTTP handler (an asyncio queue): the
+    scheduler's Hook (engine/runtime/scheduler.py).
 
     feed and finish run on the engine thread, which exits on any exception (a CUDA error poisons the context). So a
     failure to format the output (a parser bug, a tool schema the parser does not expect) must stay here: it fails this

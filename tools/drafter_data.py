@@ -97,7 +97,7 @@ def code_snippets(rng):
         try:
             src = open(f, errors="replace").read()
             tree = ast.parse(src)
-        except Exception:
+        except (OSError, SyntaxError, ValueError):  # unreadable, or not a Python 3 source
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.end_lineno and 8 <= node.end_lineno - node.lineno <= 40:

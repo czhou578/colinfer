@@ -70,7 +70,7 @@ def main():
         for f in files:
             try:
                 t = open(f, encoding="utf-8").read()
-            except Exception:
+            except (OSError, UnicodeDecodeError):  # unreadable, or not text
                 continue
             if len(t) > 200_000:
                 continue

@@ -67,8 +67,6 @@ def text_of(content) -> str:
             parts.append(b.get("text") or "")
         elif t in ("image", "document"):
             parts.append(f"[{t} omitted: this server reads text only]")
-        elif t == "tool_result":
-            parts.append(text_of(b.get("content")))
     return "\n\n".join(p for p in parts if p)
 
 

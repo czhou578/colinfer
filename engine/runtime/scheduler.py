@@ -37,7 +37,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import time
-from typing import Any
+from typing import Protocol
 
 import torch
 
@@ -46,6 +46,7 @@ from engine.model.prefill import CHUNK, prefill, prepare_prefill
 from engine.runtime.decode import DecodeGraph
 from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, sample
+from engine.spec.mtp import MtpCycle, MtpState
 from engine.spec.suffix import SuffixIndex
 
 MAX_STOP_IDS = 8  # stop token ids per slot visible to the GPU-side cut (more are still honored on the host)
@@ -55,6 +56,20 @@ SUFFIX_K = MAX_ROWS - 1  # suffix-match draft length: its verify rows still fit 
 REPLY_SPLIT_MIN = 512  # last-message length from which a prompt also snapshots at the start of the reply
 SPLIT_MIN_TOKENS = 256  # a split this close to the restored history is dropped: its chunk would be a weight pass for a few tokens
 ATTN_ROWS = 48      # query rows (q heads x verify rows) per pass of the attention kernel over a slot's KV (csrc/attn_decode.cu)
+
+
+class Hook(Protocol):
+    """A request's listener, called on the engine thread (the server's engine/server/worker.py Stream)."""
+
+    def feed(self, token: int, logprob) -> bool:
+        """One output token, with its (logprob, top alternatives) when the request asked for logprobs. True ends the
+        request now (a stop string)."""
+
+    def finish(self, request: Request) -> None:
+        """The end: request.finish_reason and request.output are final."""
+
+    def error(self, msg: str, code: int) -> None:
+        """A failure before the run (a rejected submit) or of the engine (then the process exits)."""
 
 
 @dataclasses.dataclass
@@ -69,7 +84,7 @@ class Request:
     eos_ids: tuple = ()             # stop token ids (finish_reason "stop"; the token is part of the output)
     min_tokens: int = 0             # stop tokens do not end the request before this many output tokens
     logprobs: int | None = None     # None: off; n >= 0: logprob of each output token plus the top n alternatives
-    hook: Any = None                # optional: hook.feed(token, logprob) -> True to stop now; hook.finish(request)
+    hook: Hook | None = None        # optional: see Hook
     cache_salt: str | None = None   # checkpoints are shared only between requests with the same salt (vLLM semantics)
     max_seconds: float = 0.0        # > 0: the request ends ("timeout") this long after its submit, running or queued
     # filled in by the scheduler
@@ -133,7 +148,6 @@ class Scheduler:
         # 16), since a second pass streams every weight again. The pending drafts are a chain: a shorter k uses a prefix.
         self.k_opts = [kk for kk in sorted({min(kk, k) for kk in K_OPTIONS + (k,)}) if kk + 1 <= MAX_ROWS] or [MAX_ROWS - 1]
         if mtp is not None:
-            from engine.spec.mtp import MtpCycle, MtpState
             self.mst = MtpState(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active)
             self.tok = torch.zeros(n_slots, self.kmax + 1, dtype=torch.long, device=dev)
             self.stop_buf = torch.full((n_slots, MAX_STOP_IDS), -1, dtype=torch.long, device=dev)

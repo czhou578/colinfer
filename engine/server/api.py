@@ -35,10 +35,14 @@ from engine.runtime.scheduler import Request as EngineRequest
 from engine.server import anthropic as anth
 from engine.server import openai as oai
 from engine.server.chat import ChatFormat, OutputParser, TextParser, check_messages, template_kwargs
-from engine.server.worker import Stream, Worker, log
-from engine.spec.suffix import MIN_MATCH
+from engine.server.worker import ServerConfig, Stream, Worker
+from engine.weights.loader import resolve
 
 PING_S = 10.0  # seconds between the keep-alive events of a stream that has no output yet (the queue, a long prefill)
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
 def _is_anthropic(path: str) -> bool:
@@ -104,10 +108,10 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
               default_effort: str | None = None):
     app = FastAPI(title="colin-inference-engine")
     fmt = ChatFormat(tokenizer)
-    a = worker.args
-    if getattr(a, "api_key", None):
-        app.add_middleware(ApiKey, key=a.api_key)
-    max_len, margin = a.max_seq_len, worker.sched.margin
+    cfg = worker.cfg
+    if cfg.api_key:
+        app.add_middleware(ApiKey, key=cfg.api_key)
+    max_len, margin = cfg.max_seq_len, worker.sched.margin
     vocab = hf_config["vocab_size"]  # rows of the embedding: a token id beyond it is a device-side assert, fatal to the engine
     created = int(time.time())
 
@@ -145,8 +149,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return tuple(ids)
 
     def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None) -> EngineRequest:
-        if worker.args.max_queue and worker.queued() >= worker.args.max_queue:
-            raise Busy(f"the server is busy: {worker.args.max_queue} requests are waiting")
+        if cfg.max_queue and worker.queued() >= cfg.max_queue:
+            raise Busy(f"the server is busy: {cfg.max_queue} requests are waiting")
         if not prompt:
             raise BadRequest("the prompt is empty")
         token_ids(prompt, "prompt")
@@ -159,8 +163,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         mt = room if mt is None else min(_num(mt, int, "max_tokens"), room)
         if mt < 1:
             raise BadRequest("max_tokens must be at least 1")
-        if worker.args.max_output_tokens:
-            mt = min(mt, worker.args.max_output_tokens)
+        if cfg.max_output_tokens:
+            mt = min(mt, cfg.max_output_tokens)
         temp = b.get("temperature")
         temp = gen_defaults.get("temperature", 1.0) if temp is None else _num(temp, float, "temperature")
         top_k = b.get("top_k")
@@ -184,7 +188,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                              min_p=min_p, seed=seed, eos_ids=eos,
                              min_tokens=_num(b.get("min_tokens") or 0, int, "min_tokens"),
                              logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt),
-                             max_seconds=worker.args.max_request_seconds)
+                             max_seconds=cfg.max_request_seconds)
 
     def stops_of(b: dict, key: str = "stop") -> list[str]:
         """The stop strings of a request: `stop` (OpenAI: a string or a list) or `stop_sequences` (Anthropic: a list)."""
@@ -503,7 +507,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     @app.get("/v1/models")
     async def models():
         return {"object": "list", "data": [{"id": served_name, "object": "model", "created": created, "owned_by": "colin-inference-engine",
-                                            "root": a.model, "max_model_len": max_len, "config": hf_config}]}
+                                            "root": cfg.model, "max_model_len": max_len, "config": hf_config}]}
 
     @app.get("/health")
     async def health():
@@ -525,29 +529,30 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="colin-inference-engine OpenAI-compatible server")
-    ap.add_argument("--model", default="nvidia/Qwen3.8-27B-NVFP4", help="HF repo id (in the local cache) or checkpoint directory")
+    D = ServerConfig()  # the defaults of the flags
+    ap = argparse.ArgumentParser(description="colin-inference-engine: an OpenAI- and Anthropic-compatible server")
+    ap.add_argument("--model", default=D.model, help="HF repo id (in the local cache) or checkpoint directory")
     ap.add_argument("--served-model-name", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--slots", type=int, default=3, help="conversations whose KV stays cached; one request runs at a time")
-    ap.add_argument("--max-queue", type=int, default=8,
+    ap.add_argument("--slots", type=int, default=D.slots, help="conversations whose KV stays cached; one request runs at a time")
+    ap.add_argument("--max-queue", type=int, default=D.max_queue,
                     help="requests that can wait for the running one; past it, a request gets a 503 (/v1/messages: 529). 0: no limit")
-    ap.add_argument("--max-output-tokens", type=int, default=0,
+    ap.add_argument("--max-output-tokens", type=int, default=D.max_output_tokens,
                     help="cap on the output tokens of a request, whatever its max_tokens asks (0: the room left in the slot)")
-    ap.add_argument("--max-request-seconds", type=float, default=1800.0,
+    ap.add_argument("--max-request-seconds", type=float, default=D.max_request_seconds,
                     help="a request ends this long after it arrived, running or queued, with finish_reason length (0: never)")
-    ap.add_argument("--max-seq-len", type=int, default=262144, help="tokens per slot (prompt + output)")
-    ap.add_argument("--spec", choices=("mtp", "none"), default="mtp")
-    ap.add_argument("--drafter-weights", default="auto",
+    ap.add_argument("--max-seq-len", type=int, default=D.max_seq_len, help="tokens per slot (prompt + output)")
+    ap.add_argument("--spec", choices=("mtp", "none"), default=D.spec)
+    ap.add_argument("--drafter-weights", default=D.drafter_weights,
                     help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors (tools/train_drafter.py) when it "
                          "exists, none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
-    ap.add_argument("--k", type=int, default=7, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
-    ap.add_argument("--suffix-drafts", type=int, default=MIN_MATCH, metavar="N",
+    ap.add_argument("--k", type=int, default=D.k, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
+    ap.add_argument("--suffix-drafts", type=int, default=D.suffix_drafts, metavar="N",
                     help="with MTP: draft the continuation of an earlier occurrence of the last N+ tokens (prompt or reply so far), up to "
                          "15 tokens when one request decodes; 0 = off. Speeds up replies that repeat their input (code edits)")
-    ap.add_argument("--checkpoints", type=int, default=32, help="prefix checkpoint ring size (154 MB each)")
-    ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default="int",
+    ap.add_argument("--checkpoints", type=int, default=D.checkpoints, help="prefix checkpoint ring size (154 MB each)")
+    ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default=D.decode_weights,
                     help="int: decode the attention / GDN projections from INT6 / INT5 copies (tools/int6_requant.py; ~9.5%% faster, "
                          "perplexity within 0.25%%) when their files exist; checkpoint: from the FP8 weights")
     ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")
@@ -561,27 +566,27 @@ def main(argv=None):
     ap.add_argument("--no-selftest", action="store_true")
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
-    if a.no_prefix_caching:
-        a.checkpoints = 0
 
     t0 = time.perf_counter()
     total = torch.cuda.get_device_properties(0).total_memory
-    a.mem_cap_bytes = int(min(a.mem_cap_gb * 1e9, total))
-    torch.cuda.set_per_process_memory_fraction(a.mem_cap_bytes / total)
-    log(f"[server] GPU memory cap {a.mem_cap_bytes / 1e9:.0f} GB of {total / 1e9:.0f} GB")
+    mem_cap_bytes = int(min(a.mem_cap_gb * 1e9, total))
+    torch.cuda.set_per_process_memory_fraction(mem_cap_bytes / total)
+    log(f"[server] GPU memory cap {mem_cap_bytes / 1e9:.0f} GB of {total / 1e9:.0f} GB")
 
-    from transformers import AutoTokenizer
-
-    from engine.weights.loader import resolve
+    from transformers import AutoTokenizer  # a slow import: after the memory cap is set, so a crash here is cheap
     path = resolve(a.model)
     tokenizer = AutoTokenizer.from_pretrained(path)
-    a.boundary_token = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    cfg = json.load(open(os.path.join(path, "config.json")))
-    hf_config = cfg.get("text_config", cfg)
+    cfg = ServerConfig(model=a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=0 if a.no_prefix_caching else a.checkpoints,
+                       spec=a.spec, k=a.k, drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
+                       boundary_token=tokenizer.convert_tokens_to_ids("<|im_start|>"), selftest=not a.no_selftest, warmup=not a.no_warmup,
+                       max_queue=a.max_queue, max_output_tokens=a.max_output_tokens, max_request_seconds=a.max_request_seconds,
+                       api_key=a.api_key, mem_cap_bytes=mem_cap_bytes)
+    hf = json.load(open(os.path.join(path, "config.json")))
+    hf_config = hf.get("text_config", hf)
     gen = json.load(open(os.path.join(path, "generation_config.json"))) if os.path.exists(os.path.join(path, "generation_config.json")) else {}
     gen_defaults = {k: gen[k] for k in ("temperature", "top_k", "top_p") if k in gen}
 
-    worker = Worker(a)
+    worker = Worker(cfg, log)
     worker.start()
     worker.ready.wait()
     if worker.error is not None:

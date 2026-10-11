@@ -14,6 +14,7 @@ from engine.server import anthropic as anth
 from engine.server import openai as oai
 from engine.server.api import build_app
 from engine.server.chat import template_kwargs
+from engine.server.worker import ServerConfig
 
 SPECIAL = {"<think>": 1, "</think>": 2, "<tool_call>": 3, "</tool_call>": 4, "<|im_end|>": 5, "<|endoftext|>": 6, "<|im_start|>": 7}
 _SPLIT = re.compile("(" + "|".join(re.escape(s) for s in SPECIAL) + ")")
@@ -49,7 +50,7 @@ class FakeWorker:
     it. error=(message, code) fails the request instead."""
 
     def __init__(self, reply="", error=None):
-        self.args = types.SimpleNamespace(max_seq_len=MAX_LEN, model="fake", max_queue=8, max_output_tokens=0, max_request_seconds=0.0)
+        self.cfg = ServerConfig(model="fake", max_seq_len=MAX_LEN, max_request_seconds=0.0)
         self.waiting = 0  # what queued() reports
         self.sched = types.SimpleNamespace(margin=MARGIN)
         self.metrics = Metrics()
@@ -388,7 +389,7 @@ def test_a_full_queue_is_refused_in_the_format_of_each_api():
 
 def test_output_tokens_and_time_of_a_request_are_capped():
     c, w = client("ok<|im_end|>")
-    w.args.max_output_tokens, w.args.max_request_seconds = 5, 7.5
+    w.cfg.max_output_tokens, w.cfg.max_request_seconds = 5, 7.5
     c.post(CHAT, json={"messages": USER, "max_tokens": 100})
     c.post(CHAT, json={"messages": USER, "max_tokens": 3})
     c.post("/v1/messages", json={"max_tokens": 50, "messages": USER})

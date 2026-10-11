@@ -499,14 +499,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // decode linears
     m.def("skinny_nvfp4", &skinny_nvfp4, "tensor-core NVFP4 x bf16 skinny GEMM, M <= 16", py::arg("x"), py::arg("w"), py::arg("sf"),
           py::arg("gscale"), py::arg("residual"), py::arg("out"));
-    m.def("skinny_swiglu", &skinny_swiglu, "tensor-core silu(x Wg^T) * (x Wu^T), NVFP4, M <= 16");
+    m.def("skinny_swiglu", &skinny_swiglu, "tensor-core silu(x Wg^T) * (x Wu^T), NVFP4, M <= 16", py::arg("x"), py::arg("wg"), py::arg("sg"), py::arg("gg"), py::arg("wu"), py::arg("su"), py::arg("gu"), py::arg("out"));
     m.def("skinny_int", &skinny_int, "tensor-core skinny GEMM, INT6 / INT5 block-16 weights, M <= 16", py::arg("x"), py::arg("wlo"), py::arg("whi"),
           py::arg("sf"), py::arg("gscale"), py::arg("residual"), py::arg("out"));
     m.def("skinny_fp8", &skinny_fp8, "tensor-core FP8 x bf16 skinny GEMM, M <= 16", py::arg("x"), py::arg("w"), py::arg("scale"),
           py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
     m.def("skinny_skip", &skinny_skip, "skinny GEMMs launched from now on return early while *flag != 0 (None: never)", py::arg("flag"));
-    m.def("bf16_gemv", &bf16_gemv, "bf16-weight GEMV, M <= 8");
-    m.def("rmsnorm", &rmsnorm, "zero-centered RMSNorm (1 + w)");
+    m.def("bf16_gemv", &bf16_gemv, "bf16-weight GEMV, M <= 8", py::arg("x"), py::arg("w"), py::arg("out"));
+    m.def("rmsnorm", &rmsnorm, "zero-centered RMSNorm (1 + w)", py::arg("x"), py::arg("w"), py::arg("eps"), py::arg("out"));
     // decode attention
     m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + fp8 KV write", py::arg("qp"), py::arg("kp"), py::arg("vp"),
           py::arg("qn_w"), py::arg("kn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("k_cache"), py::arg("v_cache"), py::arg("q_out"),
@@ -514,33 +514,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_decode", &attn_decode, "tensor-core multi-row GQA decode attention over an fp8 KV cache", py::arg("q"), py::arg("k_cache"),
           py::arg("v_cache"), py::arg("seq_lens"), py::arg("out"), py::arg("scale"), py::arg("gate") = py::none());
     // Gated DeltaNet decode / verify / commit
-    m.def("gdn_conv", &gdn_conv, "GDN causal conv + SiLU over T tokens per slot (window read-only)");
-    m.def("gdn_conv_commit", &gdn_conv_commit, "advance the GDN conv window by n tokens");
+    m.def("gdn_conv", &gdn_conv, "GDN causal conv + SiLU over T tokens per slot (window read-only)", py::arg("mixed"), py::arg("conv_state"), py::arg("w"), py::arg("out"));
+    m.def("gdn_conv_commit", &gdn_conv_commit, "advance the GDN conv window by n tokens", py::arg("mixed"), py::arg("conv_state"), py::arg("n"));
     m.def("gdn_delta", &gdn_delta, "GDN gated delta rule + gated RMSNorm over T tokens per slot", py::arg("qkv"), py::arg("z"), py::arg("b"),
           py::arg("a"), py::arg("A_log"), py::arg("dt_bias"), py::arg("norm_w"), py::arg("state"), py::arg("out"), py::arg("Hk"), py::arg("eps"),
           py::arg("n") = py::none());
     // prefill
-    m.def("nvfp4_sf_size", &nvfp4_sf_size, "bytes of a swizzled NVFP4 scale tensor for [rows, K]");
-    m.def("nvfp4_quant", &nvfp4_quant, "bf16 -> NVFP4 (packed e2m1 + swizzled e4m3 scales), static global scale");
-    m.def("nvfp4_swizzle_sf", &nvfp4_swizzle_sf, "row-major NVFP4 scales -> CUTLASS 128x4 layout");
+    m.def("nvfp4_sf_size", &nvfp4_sf_size, "bytes of a swizzled NVFP4 scale tensor for [rows, K]", py::arg("rows"), py::arg("K"));
+    m.def("nvfp4_quant", &nvfp4_quant, "bf16 -> NVFP4 (packed e2m1 + swizzled e4m3 scales), static global scale", py::arg("x"), py::arg("in_scale"), py::arg("q"), py::arg("sf"));
+    m.def("nvfp4_swizzle_sf", &nvfp4_swizzle_sf, "row-major NVFP4 scales -> CUTLASS 128x4 layout", py::arg("src"), py::arg("dst"), py::arg("K"));
     m.def("nvfp4_gemm", &nvfp4_gemm, "CUTLASS SM120 NVFP4 x NVFP4 GEMM, bf16 out", py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
           py::arg("alpha"), py::arg("residual"), py::arg("out"), py::arg("tile") = 0);
     m.def("nvfp4_gemm_swiglu", &nvfp4_gemm_swiglu, "NVFP4 up GEMM with silu(gate) * acc and NVFP4 quantization fused in the epilogue",
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("alpha"), py::arg("gate"), py::arg("hq"), py::arg("hsf"),
           py::arg("norm_const"), py::arg("tile") = 0);
-    m.def("fp8_quant", &fp8_quant, "bf16 -> e4m3, static scale");
+    m.def("fp8_quant", &fp8_quant, "bf16 -> e4m3, static scale", py::arg("x"), py::arg("scale"), py::arg("out"));
     m.def("causal_conv_silu", &causal_conv_silu, "GDN causal depthwise conv (k=4) + SiLU, token-major, split q|k|v outputs", py::arg("x"),
           py::arg("state"), py::arg("w"), py::arg("outs"), py::arg("l2_eps") = -1.0);
     m.def("add_rmsnorm", &add_rmsnorm, "fused residual add + RMSNorm (+ NVFP4 / FP8 quantization)", py::arg("x"), py::arg("y"), py::arg("w"),
           py::arg("eps"), py::arg("x_out") = py::none(), py::arg("n_out") = py::none(), py::arg("q4") = py::none(), py::arg("sf4") = py::none(),
           py::arg("in_scale4") = 1.0, py::arg("q8") = py::none(), py::arg("in_scale8") = 1.0);
-    m.def("gate_fp8", &gate_fp8, "attention output gate fused with FP8 quantization");
-    m.def("gated_rmsnorm", &gated_rmsnorm, "GDN gated RMSNorm over rows of 128");
+    m.def("gate_fp8", &gate_fp8, "attention output gate fused with FP8 quantization", py::arg("o"), py::arg("gate"), py::arg("D"), py::arg("scale"), py::arg("out"));
+    m.def("gated_rmsnorm", &gated_rmsnorm, "GDN gated RMSNorm over rows of 128", py::arg("o"), py::arg("z"), py::arg("w"), py::arg("eps"), py::arg("out"));
     m.def("gdn_prefill", &gdn_prefill, "chunked Gated DeltaNet forward (prefill), continuing state in place", py::arg("q"), py::arg("k"),
           py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("state"), py::arg("o"), py::arg("scale"));
     m.def("attn_prefill_fp8", &attn_prefill_fp8, "causal prefill attention, FP8 Q K^T over an e4m3 KV cache", py::arg("q"),
           py::arg("k_cache"), py::arg("v_cache"), py::arg("out"), py::arg("pos"), py::arg("scale"));
     // sampling and drafting
-    m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (position-keyed sampling)");
-    m.def("rescore_nvfp4", &rescore_nvfp4, "exact logits of candidate rows of an NVFP4 matrix (low-rank draft head)");
+    m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (position-keyed sampling)", py::arg("seed"), py::arg("offset"), py::arg("out"));
+    m.def("rescore_nvfp4", &rescore_nvfp4, "exact logits of candidate rows of an NVFP4 matrix (low-rank draft head)", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gs"), py::arg("cand"));
 }
