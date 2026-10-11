@@ -58,7 +58,9 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
   - Chat: `logprobs` with `top_logprobs` (at most 20).
   - Completions: `logprobs: n`.
   - The values come from the raw model distribution, before the server applies the temperature.
-- **Streaming:** `stream` with `stream_options.include_usage`.
+- **Streaming:** `stream` with `stream_options.include_usage`. While a stream has no output yet (the queue, a long
+  prefill), the server sends an SSE comment line every 10 s, so an idle timeout of the client or a proxy does not end
+  it.
 - **Prompt rendering:**
   - `tools`, `tool_choice` (`none` leaves the tools out of the prompt).
   - `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...), plus top-level `enable_thinking` and
@@ -127,14 +129,16 @@ Other endpoints:
 - **System prompt:** the `system` field becomes the first system message. The chat template accepts a system message
   only at the start. Thus a system message inside `messages` becomes a user turn in `<system-reminder>` tags. Claude
   Code sends its environment details and reminders this way.
-- **Tools:** `tool_use` blocks become tool calls, and `tool_result` blocks become tool messages. Server tools, for
-  example `web_search_20250305`, are not available. The server leaves them out of the prompt. A request that has only
+- **Tools:** `tool_use` blocks become tool calls, and `tool_result` blocks become tool messages. A result with
+  `is_error` starts with the line `[tool error]`, so the model sees that the call failed. Server tools, for example
+  `web_search_20250305`, are not available. The server leaves them out of the prompt. A request that has only
   server tools gets a 400 error.
 - **Thinking:**
   - `thinking.type` `enabled` or `adaptive` turns on reasoning, and `disabled` turns it off. Without `thinking`, the
     request runs without reasoning, unless the server runs with `--thinking on`.
-  - `output_config.effort` `low` or `medium` sets the reasoning effort. Higher values use the template default
-    (`xhigh`). Without an effort, the request gets the server's `--reasoning-effort`.
+  - `output_config.effort` sets the reasoning effort as `reasoning_effort` does on the chat endpoint: `low` and
+    `medium` as they are, higher values the template default (`xhigh`). Without an effort, the request gets the
+    server's `--reasoning-effort`.
   - The reply has a `thinking` block. Send it back unchanged in the next request. The template then repeats the
     reasoning of the earlier turns, and the server can reuse its prefix checkpoint.
 - **Other fields:**
@@ -146,8 +150,8 @@ Other endpoints:
   - The server ignores `cache_control`, `metadata`, `context_management`, the thinking budget and `display`.
 - **Usage:** `cache_read_input_tokens` is the prompt part that the server restored from a checkpoint, and `input_tokens`
   is the rest.
-- **Stream:** the server sends `message_start` at once. Then it sends a `ping` every 10 s until the first output, for
-  example during a long prefill. Thus the stream watchdog of the client does not stop the request.
+- **Stream:** the server sends `message_start` at once. Then it sends a `ping` event every 10 s until the first output,
+  for example during a long prefill. Thus the stream watchdog of the client does not stop the request.
 - **Errors:** the errors have the Anthropic format. A prompt that is too long gets
   `prompt is too long: <n> tokens > <max> maximum`. Claude Code recognizes this text and compacts the conversation.
 

@@ -83,6 +83,15 @@ def test_tools_and_errors():
     assert anth.drops_tool_calls({"tool_choice": {"type": "none"}}) and not anth.drops_tool_calls({"tool_choice": {"type": "auto"}})
 
 
+def test_tool_result_errors_are_marked():
+    ok = {"type": "tool_result", "tool_use_id": "t1", "content": "a.py"}
+    bad = {"type": "tool_result", "tool_use_id": "t2", "content": "exit code 1\nno such file", "is_error": True}
+    empty = {"type": "tool_result", "tool_use_id": "t3", "content": [], "is_error": True}
+    msgs = anth.to_messages({"messages": [{"role": "user", "content": [ok, bad, empty]}]})
+    assert [m["content"] for m in msgs] == ["a.py", f"{anth.TOOL_ERROR}\nexit code 1\nno such file", anth.TOOL_ERROR]
+    assert all(m["role"] == "tool" for m in msgs)
+
+
 def test_images_become_a_note():
     msgs = anth.to_messages({"messages": [{"role": "user", "content": [
         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}, {"type": "text", "text": "What is this?"}]}]})
@@ -143,8 +152,11 @@ def test_api_key_middleware():
     app.get("/health")(lambda: {"status": "ok"})
     c = TestClient(app)
     assert c.get("/health").status_code == 200  # outside /v1/: open
-    assert c.get("/v1/models").status_code == 401 and c.get("/v1/models").json()["error"]["type"] == "authentication_error"
+    assert c.get("/v1/models").status_code == 401 and c.get("/v1/messages/count_tokens").status_code == 401
     assert c.get("/v1/models", headers={"authorization": "Bearer sk-wrong"}).status_code == 401
+    assert c.get("/v1/models").json() == {"error": {"message": "invalid or missing API key", "type": "invalid_request_error", "code": 401}}
+    assert c.get("/v1/messages/count_tokens").json() == {"type": "error", "error": {"type": "authentication_error",
+                                                                                "message": "invalid or missing API key"}}
     assert c.get("/v1/models", headers={"authorization": "Bearer sk-test"}).status_code == 200
     assert c.get("/v1/models", headers={"x-api-key": "sk-test"}).status_code == 200
 

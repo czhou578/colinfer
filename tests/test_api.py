@@ -11,8 +11,9 @@ from fastapi.testclient import TestClient
 
 from engine.runtime.metrics import Metrics
 from engine.server import anthropic as anth
-from engine.server import api
+from engine.server import openai as oai
 from engine.server.api import build_app
+from engine.server.chat import template_kwargs
 
 SPECIAL = {"<think>": 1, "</think>": 2, "<tool_call>": 3, "</tool_call>": 4, "<|im_end|>": 5, "<|endoftext|>": 6, "<|im_start|>": 7}
 _SPLIT = re.compile("(" + "|".join(re.escape(s) for s in SPECIAL) + ")")
@@ -265,8 +266,8 @@ def test_template_errors_are_the_clients_and_other_failures_the_servers():
     ({"chat_template_kwargs": {"reasoning_effort": "other"}}, {"reasoning_effort": "other"}),  # the template checks it
 ])
 def test_template_kwargs_map_other_apis_names(body, kw):
-    assert api._template_kwargs(body, None) == kw
-    assert api._template_kwargs(body, True) == {"enable_thinking": True, **kw}
+    assert template_kwargs(body, None) == kw
+    assert template_kwargs(body, True) == {"enable_thinking": True, **kw}
 
 
 @pytest.mark.parametrize("body,effort", [
@@ -278,7 +279,7 @@ def test_template_kwargs_map_other_apis_names(body, kw):
     ({"enable_thinking": False}, None),
 ])
 def test_server_reasoning_effort_fills_in(body, effort):
-    assert api._template_kwargs(body, None, "medium").get("reasoning_effort") == effort
+    assert template_kwargs(body, None, "medium").get("reasoning_effort") == effort
 
 
 def test_messages_reasoning_effort_default():
@@ -286,7 +287,7 @@ def test_messages_reasoning_effort_default():
     on = {"thinking": {"type": "enabled"}}
     assert anth.template_kwargs(on, None, "medium") == {"enable_thinking": True, "reasoning_effort": "medium"}
     assert anth.template_kwargs({**on, "output_config": {"effort": "low"}}, None, "medium")["reasoning_effort"] == "low"
-    assert anth.template_kwargs({**on, "output_config": {"effort": "high"}}, None, "medium") == {"enable_thinking": True}  # xhigh
+    assert anth.template_kwargs({**on, "output_config": {"effort": "high"}}, None, "medium") == {"enable_thinking": True, "reasoning_effort": "xhigh"}
     assert anth.template_kwargs({}, None, "medium") == {"enable_thinking": False}
     assert anth.template_kwargs(on, None) == {"enable_thinking": True}  # auto: the template's default
 
@@ -338,6 +339,7 @@ def test_deepseek_style_thinking_off_renders_without_thinking():
     ("/v1/completions", {"prompt": "hi", "stop_token_ids": 5}),
     ("/v1/completions", {"prompt": "hi", "seed": {"a": 1}}),
     ("/v1/messages", {"max_tokens": 5, "messages": [1]}),
+    ("/v1/messages", {"max_tokens": 5, "messages": USER, "stop_sequences": ["a", 1]}),
     ("/v1/messages", {"max_tokens": 5, "messages": USER, "tools": [{"input_schema": {}}]}),
     ("/v1/messages", {"max_tokens": 5, "messages": USER, "tools": [{"name": "t", "input_schema": [1]}]}),
     ("/v1/messages", {"max_tokens": 5, "messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "t", "input": [1]}]},
@@ -394,5 +396,5 @@ def test_output_tokens_and_time_of_a_request_are_capped():
 
 
 def test_a_timeout_reads_as_a_cut_off():
-    assert api._finish_reason(types.SimpleNamespace(finish_reason="timeout")) == "length"
+    assert oai.finish_reason(types.SimpleNamespace(finish_reason="timeout")) == "length"
     assert anth.stop_reason("timeout", 0, None) == ("max_tokens", None)

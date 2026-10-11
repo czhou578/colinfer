@@ -1,8 +1,9 @@
-"""Chat formatting and output parsing for the OpenAI-compatible server (PLAN.md 4.6).
+"""Chat formatting and output parsing for the server (PLAN.md 4.6).
 
 * Prompt: the own Jinja chat template of the checkpoint, via `tokenizer.apply_chat_template`. tools, enable_thinking,
   reasoning_effort and any other chat_template_kwargs pass straight through. OpenAI-style assistant tool_calls
-  (arguments as a JSON string) become the mapping that the template iterates over.
+  (arguments as a JSON string) become the mapping that the template iterates over. template_kwargs() resolves the
+  thinking switch and the effort level of a request, for both APIs of the server.
 * Output: the parser splits the tokens into reasoning / content / tool calls at the token level. (`<think>`,
   `</think>`, `<tool_call>` and `</tool_call>` are single tokens in this vocabulary.) It detokenizes each stream
   incrementally. Tool calls use the XML form of Qwen (<function=name><parameter=p>value</parameter></function>).
@@ -20,6 +21,44 @@ import uuid
 
 _FUNC_RE = re.compile(r"<function=([^>\n]+)>")
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL)
+THINK_SCAN = 64  # tokens from the end of a prompt in which its generation prompt (<|im_start|>assistant, <think>...) lies
+
+# reasoning_effort names of other APIs and templates -> the levels of the Qwen3.8 template (None: thinking off)
+EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+
+
+def template_kwargs(b: dict, default_thinking: bool | None, default_effort: str | None = None) -> dict:
+    """The chat template kwargs of a request: chat_template_kwargs, plus the top-level enable_thinking and
+    reasoning_effort. Clients written for other templates set thinking with `thinking` (DeepSeek) and effort with names
+    that this template rejects ("none", "high", "max"). Thus `thinking` stands for enable_thinking, and the names in
+    EFFORTS map to the levels of this template. Other values in chat_template_kwargs go to the template unchanged.
+    default_thinking: enable_thinking when the request does not say (None: the template's default). default_effort
+    (--reasoning-effort): the level of a thinking request that names none (None: the template's). A bad value is a
+    ValueError (the client's error)."""
+    kw = b.get("chat_template_kwargs") or {}
+    if not isinstance(kw, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    kw = dict(kw)
+    if "enable_thinking" not in kw and isinstance(kw.get("thinking"), bool):
+        kw["enable_thinking"] = kw["thinking"]
+    if "enable_thinking" not in kw and b.get("enable_thinking") is not None:
+        kw["enable_thinking"] = bool(b["enable_thinking"])
+    if not isinstance(b.get("reasoning_effort"), (str, type(None))):
+        raise ValueError("reasoning_effort must be a string")
+    top_level = "reasoning_effort" not in kw
+    effort = b.get("reasoning_effort") if top_level else kw.pop("reasoning_effort")
+    if isinstance(effort, str) and effort in EFFORTS:
+        if EFFORTS[effort] is None:
+            kw.setdefault("enable_thinking", False)
+        else:
+            kw["reasoning_effort"] = EFFORTS[effort]
+    elif effort:  # another top-level name means the template default; the template checks its own kwargs
+        kw["reasoning_effort"] = "xhigh" if top_level else effort
+    if "enable_thinking" not in kw and default_thinking is not None:
+        kw["enable_thinking"] = default_thinking
+    if default_effort is not None and kw.get("enable_thinking") is not False:
+        kw.setdefault("reasoning_effort", default_effort)
+    return kw
 
 
 class ChatFormat:
@@ -38,7 +77,7 @@ class ChatFormat:
 
     def opens_in_reasoning(self, prompt: list[int]) -> bool:
         """True when the prompt ends inside an unclosed <think> (the template's thinking generation prompt)."""
-        for t in reversed(prompt[-64:]):
+        for t in reversed(prompt[-THINK_SCAN:]):
             if t == self.think_close:
                 return False
             if t == self.think_open:
@@ -176,12 +215,14 @@ def parse_tool_call(text: str, tools: list | None) -> dict | None:
 
 
 class _Stream:
-    """One text stream (reasoning or content): strips leading whitespace and holds trailing whitespace (so a
-    stream that ends, or is followed by a tool call, carries no dangling newlines), and holds back text that
-    might begin a stop string."""
+    """One text stream: holds back text that might begin a stop string, and records the stop string that ends it.
+    A chat stream (reasoning or content) also strips leading whitespace and holds trailing whitespace, so that a stream
+    that ends, or is followed by a tool call, carries no dangling newlines. keep_whitespace: a raw text stream
+    (/v1/completions) keeps every character."""
 
-    def __init__(self, stops: list[str]):
+    def __init__(self, stops: list[str], keep_whitespace: bool = False):
         self.stops = [s for s in stops if s]
+        self.keep_ws = keep_whitespace
         self.started = False
         self.pending = ""   # held text, not yet emitted
         self.stopped = False
@@ -191,7 +232,8 @@ class _Stream:
         if self.stopped or not text:
             return ""
         if not self.started:
-            text = text.lstrip()
+            if not self.keep_ws:
+                text = text.lstrip()
             if not text:
                 return ""
             self.started = True
@@ -200,19 +242,21 @@ class _Stream:
             i = buf.find(s)
             if i >= 0:
                 self.stopped, self.pending, self.matched = True, "", s
-                return buf[:i].rstrip()
-        hold = 0  # the longest suffix that may start a stop string, plus the whitespace before it
+                return buf[:i] if self.keep_ws else buf[:i].rstrip()
+        hold = 0  # the longest suffix that may start a stop string (plus the whitespace before it, in a chat stream)
         for s in self.stops:
             for n in range(min(len(s) - 1, len(buf)), 0, -1):
                 if buf.endswith(s[:n]):
                     hold = max(hold, n)
                     break
-        cut = len(buf[: len(buf) - hold].rstrip())
+        cut = len(buf) - hold if self.keep_ws else len(buf[: len(buf) - hold].rstrip())
         self.pending = buf[cut:]
         return buf[:cut]
 
     def flush(self) -> str:
-        out, self.pending = ("" if self.stopped else self.pending.rstrip()), ""
+        """The held text (nothing after a stop), and the end of the stream."""
+        out = "" if self.stopped else (self.pending if self.keep_ws else self.pending.rstrip())
+        self.pending = ""
         return out
 
 
@@ -304,45 +348,25 @@ class OutputParser:
 
 
 class TextParser:
-    """Raw-text output (/v1/completions): one content stream, no reasoning / tool parsing, stop strings."""
+    """Raw-text output (/v1/completions): one content stream that keeps its whitespace, no reasoning / tool parsing,
+    stop strings."""
 
     def __init__(self, tok, stops: list[str] = ()):
         self.detok = Detokenizer(tok)
-        self.stream = _Stream(list(stops))
-        self.stream.started = True  # keep leading whitespace in raw completions
-        self.stops = [s for s in stops if s]
+        self.stream = _Stream(list(stops), keep_whitespace=True)
 
     @property
     def stopped(self) -> bool:
         return self.stream.stopped
 
+    @property
+    def stop_match(self) -> str | None:
+        return self.stream.matched
+
     def feed(self, t: int) -> list:
-        out = self._push(self.detok.add(t))
+        out = self.stream.push(self.detok.add(t))
         return [("content", out)] if out else []
 
-    def _push(self, text):  # stop-string hold only; raw completions keep their whitespace
-        st = self.stream
-        if st.stopped or not text:
-            return ""
-        buf = st.pending + text
-        for s in self.stops:
-            i = buf.find(s)
-            if i >= 0:
-                st.stopped, st.pending = True, ""
-                return buf[:i]
-        hold = 0
-        for s in self.stops:
-            for n in range(min(len(s) - 1, len(buf)), 0, -1):
-                if buf.endswith(s[:n]):
-                    hold = max(hold, n)
-                    break
-        st.pending = buf[len(buf) - hold:] if hold else ""
-        return buf[: len(buf) - hold]
-
     def finish(self) -> list:
-        out = self._push(self.detok.flush())
-        st = self.stream
-        if not st.stopped:
-            out += st.pending
-        st.pending = ""
+        out = self.stream.push(self.detok.flush()) + self.stream.flush()
         return [("content", out)] if out else []

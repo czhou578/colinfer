@@ -104,7 +104,7 @@ def test_text_parser_keeps_whitespace_and_stops(fmt):
         if p.stopped:
             break
     ev += p.finish()
-    assert "".join(x for _, x in ev) == "  leading\n\ntext "
+    assert "".join(x for _, x in ev) == "  leading\n\ntext " and p.stop_match == "###"
 
 
 def test_parse_tool_call_untyped_and_json():

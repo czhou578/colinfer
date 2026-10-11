@@ -6,12 +6,14 @@ request becomes the same message list that /v1/chat/completions renders with the
 * The top-level `system` becomes the first system message. The template accepts a system message only at the start.
   Claude Code also sends system messages inside `messages` (the environment, reminders). Each one becomes a user turn
   in <system-reminder> tags.
-* `tool_use` blocks become assistant tool_calls, and `tool_result` blocks become tool messages. `thinking` blocks
-  become reasoning_content. The template renders the reasoning of earlier turns again, so the next prompt repeats the
-  tokens that the model generated, and the server can reuse its prefix checkpoints.
+* `tool_use` blocks become assistant tool_calls, and `tool_result` blocks become tool messages; a result with
+  `is_error` gets the TOOL_ERROR line in front, so the model sees that the call failed. `thinking` blocks become
+  reasoning_content. The template renders the reasoning of earlier turns again, so the next prompt repeats the tokens
+  that the model generated, and the server can reuse its prefix checkpoints.
 * `thinking.type` sets enable_thinking: off for `disabled`, on for `enabled` and `adaptive`. A request without
   `thinking` runs without reasoning, as on the Anthropic API, unless the server runs with --thinking on.
-  `output_config.effort` low / medium sets reasoning_effort. Higher values keep the template default (xhigh).
+  `output_config.effort` is the reasoning_effort of the chat endpoint: low / medium as they are, higher ones the
+  template's default (engine/server/chat.py template_kwargs resolves both APIs).
 * Image and document blocks become a short text note, because the engine reads text only.
 * Server tools (tools with a `type`, for example web_search_20250305) are left out. A request with only server tools
   gets an error.
@@ -21,19 +23,29 @@ request becomes the same message list that /v1/chat/completions renders with the
   context_management, service_tier, and the thinking budget and display.
 
 A reply holds the content blocks thinking, text and tool_use. A stream sends the Anthropic events: message_start,
-content_block_start / _delta / _stop, message_delta and message_stop. It also sends a ping every PING_S seconds while
-the server has no output, for example during a long prefill. Thus the stream watchdog of the client does not stop it.
+content_block_start / _delta / _stop, message_delta and message_stop. The server also sends a ping while it has no
+output, for example during a long prefill (engine/server/api.py PING_S). Thus the stream watchdog of the client does
+not stop it.
 """
 from __future__ import annotations
 
 import json
 
-PING_S = 10.0
+from engine.server.chat import template_kwargs as _template_kwargs
+
 SIGNATURE = "colinfer"  # thinking blocks carry a signature; clients send it back unchanged, and the server ignores it
+TOOL_ERROR = "[tool error]"  # the first line of a tool result whose block has is_error
+ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 404: "not_found_error", 413: "request_too_large",
+               499: "invalid_request_error", 529: "overloaded_error"}
 
 
 def sse(event: str, obj: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def error_body(msg: str, code: int) -> dict:
+    """An error in the format of the Anthropic API (a response body, or a stream event)."""
+    return {"type": "error", "error": {"type": ERROR_TYPES.get(code, "api_error"), "message": msg}}
 
 
 def _blocks(content) -> list[dict]:
@@ -89,7 +101,10 @@ def to_messages(body: dict) -> list[dict]:
                     if text:
                         out.append({"role": "user", "content": "\n\n".join(text)})
                         text = []
-                    out.append({"role": "tool", "tool_call_id": b.get("tool_use_id"), "content": text_of(b.get("content"))})
+                    result = text_of(b.get("content"))
+                    if b.get("is_error"):
+                        result = f"{TOOL_ERROR}\n{result}" if result else TOOL_ERROR
+                    out.append({"role": "tool", "tool_call_id": b.get("tool_use_id"), "content": result})
                 else:
                     s = text_of([b])
                     if s:
@@ -142,24 +157,22 @@ def to_tools(body: dict) -> list[dict] | None:
 
 
 def template_kwargs(body: dict, default_thinking: bool | None, default_effort: str | None = None) -> dict:
-    """enable_thinking from `thinking`, and reasoning_effort from output_config.effort: low / medium as they are, a
-    higher one the template's default (xhigh), none the server's default_effort (None: the template's)."""
+    """The chat template kwargs of an Anthropic request: `thinking.type` as enable_thinking and output_config.effort as
+    reasoning_effort, resolved by the one resolver of the server (engine/server/chat.py template_kwargs). Without
+    `thinking`, a request runs without reasoning, as on the Anthropic API, unless default_thinking (--thinking) says
+    otherwise."""
     th = body.get("thinking")
     kind = th.get("type") if isinstance(th, dict) else None
+    b = {}
     if kind == "disabled":
-        on = False
+        b["enable_thinking"] = False
     elif kind in ("enabled", "adaptive"):
-        on = True
-    else:
-        on = bool(default_thinking)
-    kw = {"enable_thinking": on}
+        b["enable_thinking"] = True
     oc = body.get("output_config")
     effort = oc.get("effort") if isinstance(oc, dict) else None
-    if on and effort in ("low", "medium"):
-        kw["reasoning_effort"] = effort
-    elif on and not effort and default_effort is not None:
-        kw["reasoning_effort"] = default_effort
-    return kw
+    if isinstance(effort, str):
+        b["reasoning_effort"] = effort
+    return _template_kwargs(b, bool(default_thinking), default_effort)
 
 
 def drops_tool_calls(body: dict) -> bool:

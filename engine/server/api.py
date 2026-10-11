@@ -3,17 +3,16 @@
     uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 262144] [--spec mtp|none]
 
 Endpoints: /v1/chat/completions and /v1/completions (SSE streaming, usage + timings, logprobs, stop strings, seeds,
-tools, thinking), /v1/messages and /v1/messages/count_tokens (the Anthropic Messages API, engine/server/anthropic.py),
-/v1/models, /health, /metrics (Prometheus), /v1/status (slots and checkpoints). With --api-key, the /v1/ endpoints
-require the key (Authorization: Bearer, or x-api-key).
+tools, thinking; engine/server/openai.py formats them), /v1/messages and /v1/messages/count_tokens (the Anthropic
+Messages API, engine/server/anthropic.py), /v1/models, /health, /metrics (Prometheus), /v1/status (slots and
+checkpoints). With --api-key, the /v1/ endpoints require the key (Authorization: Bearer, or x-api-key).
 
-One engine thread owns the GPU. It loads the model, captures the CUDA graphs, and then runs Scheduler.step() in a loop.
-The HTTP handlers (asyncio, uvicorn) render the chat template and tokenize outside the event loop. They give the
-request to the engine thread through a queue, and get the output events back through an asyncio queue.
+The engine thread (engine/server/worker.py) owns the GPU. The HTTP handlers (asyncio, uvicorn) render the chat template
+and tokenize outside the event loop. They give the request to the engine thread through a queue, and get the output
+events back through an asyncio queue.
 
 The engine thread detokenizes and parses each token as it emits it (engine/server/chat.py). Thus a stop string ends a
-request in the same step that produced it. When more than `--slots` requests are active, the others wait in a FIFO
-queue.
+request in the same step that produced it. One request runs at a time; the others wait in a FIFO queue.
 """
 from __future__ import annotations
 
@@ -23,12 +22,8 @@ import hmac
 import inspect
 import json
 import os
-import queue
 import random
-import sys
-import threading
 import time
-import traceback
 import uuid
 
 import jinja2
@@ -36,231 +31,31 @@ import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from engine.runtime.metrics import Metrics
 from engine.runtime.scheduler import Request as EngineRequest
 from engine.server import anthropic as anth
-from engine.server.chat import ChatFormat, OutputParser, TextParser, check_messages
+from engine.server import openai as oai
+from engine.server.chat import ChatFormat, OutputParser, TextParser, check_messages, template_kwargs
+from engine.server.worker import Stream, Worker, log
 from engine.spec.suffix import MIN_MATCH
 
-MAX_TOP_LOGPROBS = 20
+PING_S = 10.0  # seconds between the keep-alive events of a stream that has no output yet (the queue, a long prefill)
 
 
-def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
-
-
-# ------------------------------------------------------------------------------------------------ engine thread
-class Worker(threading.Thread):
-    def __init__(self, args):
-        super().__init__(name="engine", daemon=True)
-        self.args = args
-        self.inbox: queue.Queue = queue.Queue()
-        self.ready = threading.Event()
-        self.error: BaseException | None = None
-        self.metrics = Metrics()
-        self.sched = None
-        self.startup: dict = {}
-
-    def submit(self, req: EngineRequest):
-        self.inbox.put(("submit", req))
-
-    def abort(self, req: EngineRequest):
-        self.inbox.put(("abort", req))
-
-    def queued(self) -> int:
-        """Requests waiting to run: in the inbox, or in the scheduler's queue."""
-        return len(self.inbox.queue) + len(self.sched.queue)
-
-    def _build(self):
-        a, t0 = self.args, time.perf_counter()
-        from engine.runtime.build import build_engine
-        sched, self.startup = build_engine(a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=a.checkpoints, spec=a.spec, k=a.k,
-                                           drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
-                                           boundary=a.boundary_token, selftest=not a.no_selftest, metrics=self.metrics,
-                                           log=log)
-        t3 = time.perf_counter()
-        if not a.no_warmup:
-            self._warmup(sched, sched.model.cfg.vocab_size)
-        t4 = time.perf_counter()
-        self.sched = sched
-        self.startup.update(warmup_s=round(t4 - t3, 1), total_s=round(t4 - t0, 1))
-        mem = torch.cuda.memory_allocated() / 1e9
-        log(f"[engine] ready: {self.startup}; {mem:.1f} GB allocated, {torch.cuda.memory_reserved() / 1e9:.1f} GB reserved; "
-            f"{a.slots} slots x {a.max_seq_len} tokens, spec={a.spec}" + (f" k={a.k}" if a.spec == "mtp" else "")
-            + (f", suffix drafts >= {a.suffix_drafts}" if a.spec == "mtp" and a.suffix_drafts else ""))
-
-    def _warmup(self, sched, vocab):
-        """Runs every code path once (prefill chunks, the decode / spec graphs of each slot, greedy and sampled,
-        logprobs) so first-use JIT compilation and autotuning happen before serving; then forgets everything."""
-        g = torch.Generator().manual_seed(0)
-        rnd = lambda n: torch.randint(1000, min(vocab, 150000), (n,), generator=g).tolist()  # noqa: E731
-        reqs = [EngineRequest(rnd(sched.chunk + 300), max_new_tokens=6, logprobs=5),
-                EngineRequest(rnd(40), max_new_tokens=6, temperature=0.7, top_p=0.95, top_k=20, seed=1),
-                EngineRequest(rnd(30), max_new_tokens=6)]
-        sched.run(reqs[:1])
-        sched.run(reqs[1:])
-        sched.run([EngineRequest(rnd(20 + i), max_new_tokens=8, temperature=0.5 * (i % 2)) for i in range(sched.n_slots)])
-        sched.reset()
-        torch.cuda.synchronize()
-
-    def run(self):
-        try:
-            with torch.inference_mode():
-                self._build()
-        except BaseException as e:  # noqa: BLE001
-            traceback.print_exc()
-            self.error = e
-            self.ready.set()
-            return
-        self.ready.set()
-        with torch.inference_mode():
-            self._loop()
-
-    def _loop(self):
-        sched, m = self.sched, self.metrics
-        cap = getattr(self.args, "mem_cap_bytes", 0)
-        while True:
-            items = []
-            if not sched.busy():
-                try:
-                    items.append(self.inbox.get(timeout=1.0))
-                except queue.Empty:
-                    continue
-            while True:
-                try:
-                    items.append(self.inbox.get_nowait())
-                except queue.Empty:
-                    break
-            try:
-                for kind, req in items:
-                    if kind == "submit":
-                        try:
-                            sched.submit(req)
-                        except ValueError as e:
-                            req.hook.error(str(e), 400)
-                    elif req.rid >= 0 and not req.done:
-                        sched.abort(req.rid)
-                if sched.busy():
-                    sched.step()
-                m.memory.set(torch.cuda.memory_allocated(), kind="allocated")
-                m.memory.set(torch.cuda.memory_reserved(), kind="reserved")
-                m.memory.set(cap, kind="cap")
-            except BaseException:  # noqa: BLE001  a CUDA error poisons the context: fail everything and exit
-                traceback.print_exc()
-                for s in sched.slots:
-                    if s.req is not None and s.req.hook is not None:
-                        s.req.hook.error("engine failure", 500)
-                for r in sched.queue:
-                    if r.hook is not None:
-                        r.hook.error("engine failure", 500)
-                sys.stdout.flush()
-                os._exit(1)  # systemd restarts the service
-
-
-# ------------------------------------------------------------------------------------------------ request bridge
-class Stream:
-    """One request's bridge from the engine thread (feed / finish / error) to its HTTP handler (an asyncio queue).
-
-    feed and finish run on the engine thread, which exits on any exception (a CUDA error poisons the context). So a
-    failure to format the output (a parser bug, a tool schema the parser does not expect) must stay here: it fails this
-    request with a 500, and feed returns True so that the scheduler ends the request."""
-
-    def __init__(self, loop, tok, parser, logprobs: int | None):
-        self.loop, self.tok, self.parser, self.logprobs = loop, tok, parser, logprobs
-        self.q: asyncio.Queue = asyncio.Queue()
-        self.ids: list[int] = []
-        self.lps: list = []
-        self.failed = False
-
-    def _put(self, item):
-        self.loop.call_soon_threadsafe(self.q.put_nowait, item)
-
-    def _tokstr(self, t):
-        s = self.tok.decode([t])
-        return s, list(s.encode("utf-8", errors="replace"))
-
-    def feed(self, t, lp):  # engine thread
-        if self.failed:
-            return True
-        try:
-            self.ids.append(t)
-            if lp is not None:
-                s, b = self._tokstr(t)
-                self.lps.append({"token": s, "logprob": lp[0], "bytes": b,
-                                 "top_logprobs": [dict(zip(("token", "bytes"), self._tokstr(i)), logprob=v) for i, v in lp[1]]})
-            ev = self.parser.feed(t)
-            if ev:
-                self._put(("delta", ev, self.ids, self.lps))
-                self.ids, self.lps = [], []
-            return self.parser.stopped
-        except Exception:  # noqa: BLE001  see the class docstring
-            self._fail()
-            return True
-
-    def finish(self, req):  # engine thread
-        if self.failed:
-            return
-        try:
-            ev = self.parser.finish()
-        except Exception:  # noqa: BLE001  see the class docstring
-            return self._fail()
-        if ev or self.ids:
-            self._put(("delta", ev, self.ids, self.lps))
-            self.ids, self.lps = [], []
-        self._put(("done", req))
-
-    def _fail(self):
-        traceback.print_exc()
-        self.failed = True
-        self.error("internal error while formatting the output", 500)
-
-    def error(self, msg, code=500):
-        self._put(("error", msg, code))
-
-
-def _usage(req: EngineRequest) -> dict:
-    pt, ct = len(req.prompt), len(req.output)
-    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct, "prompt_tokens_details": {"cached_tokens": req.reused}}
-
-
-def _timings(req: EngineRequest) -> dict:
-    pre = len(req.prompt) - req.reused
-    prefill_s = max(req.t_first - req.t_admit, 1e-9)
-    decode_s = max(req.t_done - req.t_first, 1e-9)
-    return {"queue_s": round(req.t_admit - req.t_submit, 4), "ttft_s": round(req.t_first - req.t_submit, 4), "prefill_tokens": pre,
-            "prefill_s": round(prefill_s, 4), "prefill_tok_s": round(pre / prefill_s, 1), "decode_s": round(decode_s, 4),
-            "decode_tok_s": round((len(req.output) - 1) / decode_s, 2) if len(req.output) > 1 else None}
-
-
-def _error_body(msg: str, code: int) -> dict:
-    """An error in the format of the OpenAI API (a response body, or a stream event); the code sets the type."""
-    return {"error": {"message": msg, "type": "server_error" if code >= 500 else "invalid_request_error", "code": code}}
+def _is_anthropic(path: str) -> bool:
+    return path.startswith("/v1/messages")
 
 
 def _error(msg, code=400):
-    return JSONResponse(_error_body(msg, code), status_code=code)
-
-
-_ANTH_ERROR = {400: "invalid_request_error", 401: "authentication_error", 404: "not_found_error", 413: "request_too_large",
-               499: "invalid_request_error", 529: "overloaded_error"}
-
-
-def _anth_error_body(msg: str, code: int) -> dict:
-    """An error in the format of the Anthropic API (a response body, or a stream event)."""
-    return {"type": "error", "error": {"type": _ANTH_ERROR.get(code, "api_error"), "message": msg}}
+    return JSONResponse(oai.error_body(msg, code), status_code=code)
 
 
 def _anth_error(msg, code=400):
-    return JSONResponse(_anth_error_body(msg, code), status_code=code)
-
-
-def _finish_reason(r: EngineRequest) -> str:
-    # an abort (the client went away) reads as a stop, a timeout as a cut-off
-    return {"abort": "stop", "timeout": "length"}.get(r.finish_reason, r.finish_reason)
+    return JSONResponse(anth.error_body(msg, code), status_code=code)
 
 
 class ApiKey:
-    """ASGI middleware: the /v1/ endpoints require the key, as `Authorization: Bearer <key>` or `x-api-key: <key>`."""
+    """ASGI middleware: the /v1/ endpoints require the key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. The
+    401 has the format of the API of the path."""
 
     def __init__(self, app, key: str):
         self.app, self.key = app, key.encode()
@@ -273,13 +68,10 @@ class ApiKey:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["path"].startswith("/v1/") and not self._ok(scope["headers"]):
-            body = {"type": "error", "error": {"type": "authentication_error", "message": "invalid or missing API key", "code": 401}}
+            msg = "invalid or missing API key"
+            body = anth.error_body(msg, 401) if _is_anthropic(scope["path"]) else oai.error_body(msg, 401)
             return await JSONResponse(body, status_code=401)(scope, receive, send)
         await self.app(scope, receive, send)
-
-
-def _sse(obj) -> str:
-    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
 
 class BadRequest(Exception):
@@ -291,56 +83,20 @@ class Busy(Exception):
     """Too many requests wait already (a 503; a 529 on the Anthropic API, which Claude Code retries)."""
 
 
-def _num(v, kind, name: str):
-    """A request field as an int / float, or a BadRequest."""
-    try:
-        return kind(v)
-    except (TypeError, ValueError, OverflowError):  # OverflowError: int(Infinity), which Python's JSON parser accepts
-        raise BadRequest(f"{name} must be a number, not {v!r}") from None
-
-
-# reasoning_effort names of other APIs and templates -> the levels of the Qwen3.8 template (None: thinking off)
-_EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
-
-
-def _template_kwargs(b: dict, default_thinking: bool | None, default_effort: str | None = None) -> dict:
-    """The chat template kwargs of a chat request: chat_template_kwargs, plus the top-level enable_thinking and
-    reasoning_effort. Clients written for other templates set thinking with `thinking` (DeepSeek) and effort with names
-    that this template rejects ("none", "high", "max"). Thus `thinking` stands for enable_thinking, and the names in
-    _EFFORTS map to the levels of this template. Other values in chat_template_kwargs go to the template unchanged.
-    default_effort (--reasoning-effort): the level of a thinking request that names none (None: the template's)."""
-    kw = b.get("chat_template_kwargs") or {}
-    if not isinstance(kw, dict):
-        raise BadRequest("chat_template_kwargs must be an object")
-    kw = dict(kw)
-    if "enable_thinking" not in kw and isinstance(kw.get("thinking"), bool):
-        kw["enable_thinking"] = kw["thinking"]
-    if "enable_thinking" not in kw and b.get("enable_thinking") is not None:
-        kw["enable_thinking"] = bool(b["enable_thinking"])
-    if not isinstance(b.get("reasoning_effort"), (str, type(None))):
-        raise BadRequest("reasoning_effort must be a string")
-    top_level = "reasoning_effort" not in kw
-    effort = b.get("reasoning_effort") if top_level else kw.pop("reasoning_effort")
-    if isinstance(effort, str) and effort in _EFFORTS:
-        if _EFFORTS[effort] is None:
-            kw.setdefault("enable_thinking", False)
-        else:
-            kw["reasoning_effort"] = _EFFORTS[effort]
-    elif effort:  # another top-level name means the template default; the template checks its own kwargs
-        kw["reasoning_effort"] = "xhigh" if top_level else effort
-    if "enable_thinking" not in kw and default_thinking is not None:
-        kw["enable_thinking"] = default_thinking
-    if default_effort is not None and kw.get("enable_thinking") is not False:
-        kw.setdefault("reasoning_effort", default_effort)
-    return kw
-
-
 class Failed(Exception):
     """A request that the engine failed, or whose client went away: the message and the HTTP status."""
 
     def __init__(self, msg: str, code: int):
         super().__init__(msg)
         self.msg, self.code = msg, code
+
+
+def _num(v, kind, name: str):
+    """A request field as an int / float, or a BadRequest."""
+    try:
+        return kind(v)
+    except (TypeError, ValueError, OverflowError):  # OverflowError: int(Infinity), which Python's JSON parser accepts
+        raise BadRequest(f"{name} must be a number, not {v!r}") from None
 
 
 # ------------------------------------------------------------------------------------------------ app
@@ -430,17 +186,25 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                              logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt),
                              max_seconds=worker.args.max_request_seconds)
 
-    def stops_of(b: dict) -> list[str]:
-        st = b.get("stop")
+    def stops_of(b: dict, key: str = "stop") -> list[str]:
+        """The stop strings of a request: `stop` (OpenAI: a string or a list) or `stop_sequences` (Anthropic: a list)."""
+        st = b.get(key)
         if st is None or isinstance(st, str):
             return [st] if st else []
         if isinstance(st, list) and all(isinstance(x, str) for x in st):
             return st
-        raise BadRequest("stop must be a string or a list of strings")
+        raise BadRequest(f"{key} must be a string or a list of strings")
 
     def include_usage_of(b: dict) -> bool:
         so = b.get("stream_options")
         return isinstance(so, dict) and bool(so.get("include_usage"))
+
+    def kwargs_of(b: dict) -> dict:
+        """The chat template kwargs of a request (engine/server/chat.py template_kwargs); a bad value is the client's error."""
+        try:
+            return template_kwargs(b, default_thinking, default_effort)
+        except ValueError as e:
+            raise BadRequest(str(e)) from None
 
     async def render(msgs, tools, kw: dict) -> list[int]:
         """The prompt of a chat. Malformed messages and the template's own checks (no user message, an unknown role) are
@@ -457,7 +221,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             raise BadRequest(f"chat template: {e}") from None
 
     def log_done(req: EngineRequest, kind: str):
-        t = _timings(req)
+        t = oai.timings(req)
         log(f"[{kind} {req.rid}] slot {req.slot} prompt {len(req.prompt)} (cached {req.reused}) -> {len(req.output)} tok, "
             f"{req.finish_reason}; queue {t['queue_s']:.2f}s ttft {t['ttft_s']:.2f}s decode {t['decode_tok_s'] or 0:.1f} tok/s")
 
@@ -483,10 +247,11 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 return events, item[1]
             events.append(item)
 
-    def sse_response(st: Stream, req: EngineRequest, kind: str, on_delta, on_done, on_error, head=(), ping=None):
+    def sse_response(st: Stream, req: EngineRequest, kind: str, on_delta, on_done, on_error, head=(), ping=""):
         """Streams a request: the events of `head`, on_delta(event) for each output event, then on_done(request) or
-        on_error(message, code). Each returns a list of SSE strings. ping: (seconds, event), sent while no output
-        arrives (the queue, a long prefill). Aborts the request when the client goes away before the end."""
+        on_error(message, code). Each returns a list of SSE strings. ping: the text sent every PING_S seconds while no
+        output arrives (the queue, a long prefill), so that an idle timeout of the client or a proxy does not end the
+        stream. Aborts the request when the client goes away before the end."""
         async def gen():
             finished = False
             try:
@@ -494,9 +259,9 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                     yield x
                 while True:
                     try:
-                        item = await asyncio.wait_for(st.q.get(), timeout=ping[0] if ping else None)
+                        item = await asyncio.wait_for(st.q.get(), timeout=PING_S)
                     except asyncio.TimeoutError:
-                        yield ping[1]
+                        yield ping
                         continue
                     if item[0] == "delta":
                         for x in on_delta(item):
@@ -517,15 +282,9 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     def sse_error(msg: str, code: int) -> list[str]:
-        return [_sse(_error_body(msg, code))]
+        return [oai.sse(oai.error_body(msg, code))]
 
-    def stream_end(rid: str, obj: str, model: str, r: EngineRequest, include_usage: bool) -> list[str]:
-        """The last events of an OpenAI stream: the usage chunk (stream_options.include_usage), then [DONE]."""
-        out = []
-        if include_usage:
-            out.append(_sse({"id": rid, "object": obj, "created": int(time.time()), "model": model, "choices": [], "usage": _usage(r),
-                             "timings": _timings(r)}))
-        return out + ["data: [DONE]\n\n"]
+    openai_ping = ": keep-alive\n\n"  # an SSE comment: every client ignores it
 
     # -------------------------------------------------------------------------------------- chat completions
     @app.post("/v1/chat/completions")
@@ -535,13 +294,12 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             msgs = b.get("messages")
             tool_choice = b.get("tool_choice")
             tools = b.get("tools") if tool_choice != "none" else None
-            kw = _template_kwargs(b, default_thinking, default_effort)
-            prompt = await render(msgs, tools, kw)
+            prompt = await render(msgs, tools, kwargs_of(b))
             n_top = None
             if b.get("logprobs"):
-                n_top = min(_num(b.get("top_logprobs") or 0, int, "top_logprobs"), MAX_TOP_LOGPROBS)
+                n_top = min(_num(b.get("top_logprobs") or 0, int, "top_logprobs"), oai.MAX_TOP_LOGPROBS)
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b))
-            st = Stream(asyncio.get_running_loop(), tokenizer, parser, n_top)
+            st = Stream(asyncio.get_running_loop(), tokenizer, parser)
             req = make_request(b, prompt, st, n_top)
             include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
@@ -552,18 +310,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         model = b.get("model") or served_name
         worker.submit(req)
 
-        def chunk(delta, finish=None, extra=None):
-            c = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                 "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]}
-            if extra:
-                c["choices"][0].update(extra)
-            return c
-
-        def tool_call(x):
-            return {"id": x["id"], "type": "function", "function": {"name": x["name"], "arguments": x["arguments"]}}
-
         def finish_reason(r):
-            return "tool_calls" if parser.n_tool_calls and r.finish_reason == "stop" else _finish_reason(r)
+            return "tool_calls" if parser.n_tool_calls and r.finish_reason == "stop" else oai.finish_reason(r)
 
         if b.get("stream"):
             role_sent, first, n_calls, carry_ids, carry_lps = False, True, 0, [], []
@@ -573,7 +321,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 if role_sent:
                     return []
                 role_sent = True
-                return [_sse(chunk({"role": "assistant", "content": ""}))]
+                return [oai.sse(oai.chat_chunk(rid, model, {"role": "assistant", "content": ""}))]
 
             def on_delta(item):
                 nonlocal first, n_calls, carry_ids, carry_lps
@@ -583,7 +331,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 out, delta = role(), {}
                 for kind, x in ev:
                     if kind == "tool_call":
-                        delta.setdefault("tool_calls", []).append({"index": n_calls, **tool_call(x)})
+                        delta.setdefault("tool_calls", []).append({"index": n_calls, **oai.tool_call(x)})
                         n_calls += 1
                     elif kind == "reasoning":
                         delta["reasoning_content"] = delta.get("reasoning_content", "") + x
@@ -597,13 +345,13 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                     extra["token_ids"] = carry_ids
                 if n_top is not None:
                     extra["logprobs"] = {"content": carry_lps}
-                c = chunk(delta, None, extra)
+                c = oai.chat_chunk(rid, model, delta, None, extra)
                 if first:
                     first = False
                     c["request_metrics"] = {"time_to_first_token_s": req.t_first - req.t_submit, "queue_time_s": req.t_admit - req.t_submit,
                                             "prompt_time_s": req.t_first - req.t_admit}
                 carry_ids, carry_lps = [], []
-                return out + [_sse(c)]
+                return out + [oai.sse(c)]
 
             def on_done(r):  # the last chunk carries the ids / logprobs of trailing tokens without text (the stop token)
                 extra = {}
@@ -611,33 +359,20 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                     extra["token_ids"] = carry_ids
                 if n_top is not None and carry_lps:
                     extra["logprobs"] = {"content": carry_lps}
-                return role() + [_sse(chunk({}, finish_reason(r), extra))] + stream_end(rid, "chat.completion.chunk", model, r, include_usage)
-            return sse_response(st, req, "chat", on_delta, on_done, sse_error)
+                return (role() + [oai.sse(oai.chat_chunk(rid, model, {}, finish_reason(r), extra))]
+                        + oai.stream_end(rid, "chat.completion.chunk", model, r, include_usage))
+            return sse_response(st, req, "chat", on_delta, on_done, sse_error, ping=openai_ping)
 
         try:
             events, r = await result(request, st, req, "chat")
         except Failed as e:
             return _error(e.msg, e.code)
-        reasoning, content, calls, lps = "", "", [], []
-        for _, ev, _, item_lps in events:
-            for kind, x in ev:
-                if kind == "tool_call":
-                    calls.append(tool_call(x))
-                elif kind == "reasoning":
-                    reasoning += x
-                else:
-                    content += x
-            lps += item_lps
-        msg = {"role": "assistant", "content": content if (content or not calls) else None}
-        if reasoning:
-            msg["reasoning_content"] = msg["reasoning"] = reasoning
-        if calls:
-            msg["tool_calls"] = calls
+        msg, lps = oai.chat_message(events)
         choice = {"index": 0, "message": msg, "logprobs": {"content": lps} if n_top is not None else None, "finish_reason": finish_reason(r)}
         if want_ids:
             choice["token_ids"] = r.output
         return JSONResponse({"id": rid, "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [choice],
-                             "usage": _usage(r), "timings": _timings(r)})
+                             "usage": oai.usage(r), "timings": oai.timings(r)})
 
     # -------------------------------------------------------------------------------------- completions
     @app.post("/v1/completions")
@@ -655,9 +390,9 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 raise BadRequest("prompt must be a string or a list of token ids (one prompt per request)")
             if b.get("echo"):
                 raise BadRequest("echo is not supported")
-            n_top = None if b.get("logprobs") is None else min(_num(b["logprobs"], int, "logprobs"), MAX_TOP_LOGPROBS)
+            n_top = None if b.get("logprobs") is None else min(_num(b["logprobs"], int, "logprobs"), oai.MAX_TOP_LOGPROBS)
             parser = TextParser(tokenizer, stops_of(b))
-            st = Stream(asyncio.get_running_loop(), tokenizer, parser, n_top)
+            st = Stream(asyncio.get_running_loop(), tokenizer, parser)
             req = make_request(b, prompt, st, n_top)
             include_usage = include_usage_of(b)
         except BadRequest as e:
@@ -667,16 +402,6 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         rid = "cmpl-" + uuid.uuid4().hex
         model = b.get("model") or served_name
         worker.submit(req)
-
-        def lp_block(lps):
-            if n_top is None:
-                return None
-            return {"tokens": [e["token"] for e in lps], "token_logprobs": [e["logprob"] for e in lps],
-                    "top_logprobs": [{t["token"]: t["logprob"] for t in e["top_logprobs"]} for e in lps], "text_offset": []}
-
-        def chunk(text, finish=None, lps=None):
-            return {"id": rid, "object": "text_completion", "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0, "text": text, "logprobs": lp_block(lps or []) if lps else None, "finish_reason": finish}]}
 
         if b.get("stream"):
             carry = []
@@ -688,22 +413,22 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 text = "".join(x for _, x in ev)
                 if not text:
                     return []
-                c, carry = chunk(text, None, carry), []
-                return [_sse(c)]
+                c, carry = oai.text_chunk(rid, model, text, None, carry, n_top), []
+                return [oai.sse(c)]
 
             def on_done(r):
-                return [_sse(chunk("", _finish_reason(r), carry))] + stream_end(rid, "text_completion", model, r, include_usage)
-            return sse_response(st, req, "cmpl", on_delta, on_done, sse_error)
+                last = oai.text_chunk(rid, model, "", oai.finish_reason(r), carry, n_top)
+                return [oai.sse(last)] + oai.stream_end(rid, "text_completion", model, r, include_usage)
+            return sse_response(st, req, "cmpl", on_delta, on_done, sse_error, ping=openai_ping)
 
         try:
             events, r = await result(request, st, req, "cmpl")
         except Failed as e:
             return _error(e.msg, e.code)
-        text = "".join(x for _, ev, _, _ in events for _, x in ev)
-        lps = [e for _, _, _, item_lps in events for e in item_lps]
+        text, lps = oai.completion_text(events)
         return JSONResponse({"id": rid, "object": "text_completion", "created": int(time.time()), "model": model,
-                             "choices": [{"index": 0, "text": text, "logprobs": lp_block(lps), "finish_reason": _finish_reason(r)}],
-                             "usage": _usage(r), "timings": _timings(r)})
+                             "choices": [{"index": 0, "text": text, "logprobs": oai.lp_block(lps, n_top), "finish_reason": oai.finish_reason(r)}],
+                             "usage": oai.usage(r), "timings": oai.timings(r)})
 
     # -------------------------------------------------------------------------------------- Anthropic messages
     async def render_messages(b: dict):
@@ -728,11 +453,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         try:
             b = await json_body(request)
             prompt, tools = await render_messages(b)
-            stops = b.get("stop_sequences") or []
-            if not isinstance(stops, list):
-                raise BadRequest("stop_sequences must be a list of strings")
-            parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, [str(s) for s in stops])
-            st = Stream(asyncio.get_running_loop(), tokenizer, parser, None)
+            parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b, "stop_sequences"))
+            st = Stream(asyncio.get_running_loop(), tokenizer, parser)
             req = make_request(b, prompt, st)
         except BadRequest as e:
             return _anth_error(str(e))
@@ -757,9 +479,9 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                                          anth.sse("message_stop", {"type": "message_stop"})]
             start = anth.message(mid, model, [], (None, None), anth.usage(len(prompt), 0, 0))
             return sse_response(st, req, "msg", lambda item: blocks.add(item[1]), on_done,
-                                lambda msg, code: [anth.sse("error", _anth_error_body(msg, code))],
+                                lambda msg, code: [anth.sse("error", anth.error_body(msg, code))],
                                 head=[anth.sse("message_start", {"type": "message_start", "message": start})],
-                                ping=(anth.PING_S, anth.sse("ping", {"type": "ping"})))
+                                ping=anth.sse("ping", {"type": "ping"}))
 
         try:
             events, r = await result(request, st, req, "msg")
@@ -776,7 +498,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         """A bug of the server, not a bad request: a 500 in the endpoint's format. Starlette raises the exception again
         afterwards, and uvicorn logs its traceback."""
         msg = f"internal error: {type(e).__name__}: {e}"
-        return _anth_error(msg, 500) if request.url.path.startswith("/v1/messages") else _error(msg, 500)
+        return _anth_error(msg, 500) if _is_anthropic(request.url.path) else _error(msg, 500)
 
     @app.get("/v1/models")
     async def models():
