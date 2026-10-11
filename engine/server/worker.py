@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import traceback
+from typing import Literal
 
 import torch
 
@@ -39,7 +40,7 @@ class ServerConfig:
     drafter_weights: str = "auto"
     suffix_drafts: int = MIN_MATCH
     decode_weights: str = "int"
-    boundary_token: int | str | None = "auto"  # the <|im_start|> id, "auto" (from the checkpoint) or None (no message splits)
+    boundary_token: Literal["auto"] | int | None = "auto"  # the <|im_start|> id, "auto" (from the checkpoint) or None (no message splits)
     selftest: bool = True
     warmup: bool = True
     max_queue: int = 8

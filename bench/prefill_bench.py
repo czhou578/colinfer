@@ -10,17 +10,18 @@ TTFT(2k) <= 0.6 s (plan 0.8 s), 32k prompt <= 12 s (plan 16 s).
 """
 import argparse
 import os
-import time
 
 import torch
 
+from bench.timing import timed
 from engine.model.fast import load_fast_model, to_fast
 from engine.model.prefill import prefill, prepare_prefill
+from engine.weights.loader import MODEL
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="nvidia/Qwen3.8-27B-NVFP4")
+    ap.add_argument("--ckpt", default=MODEL)
     ap.add_argument("--lens", type=int, nargs="+", default=[512, 2048, 8192, 32768])
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--repeats", type=int, default=2)
@@ -38,11 +39,7 @@ def main():
         for r in range(a.repeats + 1):
             st.reset()
             st.pos = 0
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            logits = prefill(m, ids, st, chunk=a.chunk)
-            int(logits.argmax())
-            dt = time.perf_counter() - t0
+            dt = timed(lambda: int(prefill(m, ids, st, chunk=a.chunk).argmax()), n=1, warmup=0)
             if r > 0:  # first run warms up FlashInfer / Triton JIT for new shapes
                 best = dt if best is None else min(best, dt)
         print(f"{L:7d} {best:8.3f} {L / best:8.0f}", flush=True)

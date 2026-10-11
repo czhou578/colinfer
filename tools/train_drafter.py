@@ -33,7 +33,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from engine.weights.loader import resolve, weight_map
+from engine.weights.loader import MODEL, resolve, weight_map
 
 DIR = os.path.expanduser("~/.cache/colinfer/drafter")
 TOPK = 32
@@ -55,7 +55,7 @@ def mtp_tensors(path):
 def extract(a):
     from engine.model.fast import load_fast_model, to_fast
     from engine.model.prefill import prefill
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
+    path = resolve(MODEL)
     model = to_fast(load_fast_model(path))
     src = os.path.expanduser(a.data)
     rows = [json.loads(l) for l in open(src)]
@@ -188,7 +188,7 @@ def setup():
 
     from engine.model.qwen35 import Qwen35Config
     from engine.weights.loader import dequant_nvfp4
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
+    path = resolve(MODEL)
     cfg = Qwen35Config.from_checkpoint(path)
     wm = weight_map(path)
 

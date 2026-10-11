@@ -146,10 +146,8 @@ def main():
     ap.add_argument("--out", default=os.path.expanduser("~/.cache/colinfer/drafter/data.jsonl"))
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
-    from transformers import AutoTokenizer
-
-    from engine.weights.loader import resolve
-    tok = AutoTokenizer.from_pretrained(resolve("nvidia/Qwen3.8-27B-NVFP4"))
+    from engine.server.chat import ChatFormat
+    fmt = ChatFormat.from_checkpoint()
     rng = random.Random(a.seed)
     prompts = build_prompts(a.n, rng)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
@@ -165,8 +163,7 @@ def main():
             return
         p, kind, think = prompts[i]
         msgs = [{"role": "user", "content": p}]
-        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=think, tokenize=True)
-        ids = list(ids["input_ids"] if hasattr(ids, "keys") else ids)
+        ids = fmt.render(msgs, enable_thinking=think)
         r = requests.post(a.url + "/v1/chat/completions", json={
             "messages": msgs, "max_tokens": a.max_tokens, "temperature": 0.7, "top_p": 0.95, "top_k": 20, "seed": a.seed * 100000 + i,
             "chat_template_kwargs": {"enable_thinking": think}, "return_token_ids": True}, timeout=3600).json()

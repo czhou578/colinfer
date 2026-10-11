@@ -23,19 +23,15 @@ def main():
     ap.add_argument("--no-baseline", action="store_true", help="skip the checkpoint's MTP head")
     ap.add_argument("--full-head", action="store_true", help="score drafts with the full draft head, not the low-rank one")
     a = ap.parse_args()
-    from transformers import AutoTokenizer
-
     from engine.runtime.build import load_model
+    from engine.server.chat import ChatFormat
     from engine.spec.mtp import MtpGenerator
     from tools.drafter_data import build_prompts
     path, model = load_model()  # the served configuration: the INT6 / INT5 decode copies when present
-    tok = AutoTokenizer.from_pretrained(path)
-    prompts = build_prompts(a.n, random.Random(1))
-    ids = []
-    for p, kind, think in prompts:
-        x = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=think, tokenize=True)
-        ids.append((list(x["input_ids"] if hasattr(x, "keys") else x)[-3000:], kind))
-    eos = (248046, 248044)
+    fmt = ChatFormat.from_checkpoint(path)
+    ids = [(fmt.render([{"role": "user", "content": p}], enable_thinking=think)[-3000:], kind)
+           for p, kind, think in build_prompts(a.n, random.Random(1))]
+    eos = fmt.eos_ids
     for w in ([] if a.no_baseline else [None]) + a.weights:
         for k in a.k:
             gen = MtpGenerator(model, path, max_seq_len=4096, k=k, weights=w, **({"lowrank": None} if a.full_head else {}))

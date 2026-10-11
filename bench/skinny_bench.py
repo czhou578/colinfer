@@ -4,10 +4,11 @@ cycles over several copies of each weight, so nothing runs from L2 (LPDDR5x peak
 
    uv run python bench/skinny_bench.py
 """
-import time
+import itertools
 
 import torch
 
+from bench.timing import timed
 from engine.kernels import ops
 from engine.weights.quantize import int_global_scale, nvfp4_global_scale, pack5, pack6, quantize, quantize_int
 
@@ -38,15 +39,8 @@ def main():
         for M in (1, 8, 16):
             x = torch.randn(M, K, device="cuda").bfloat16()
             out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-            for f in fns:
-                f(x, out)
-            torch.cuda.synchronize()
-            n = 40
-            t = time.perf_counter()
-            for i in range(n):
-                fns[i % len(fns)](x, out)
-            torch.cuda.synchronize()
-            dt = (time.perf_counter() - t) / n
+            it = itertools.cycle(fns)  # rotate over the copies, so short weights do not run from L2
+            dt = timed(lambda: next(it)(x, out), n=40, warmup=len(fns))
             line += f" | M={M:2d} {dt * 1e3:6.3f} ms {nbytes / dt / 1e9:4.0f} GB/s"
         print(line, flush=True)
         del fns

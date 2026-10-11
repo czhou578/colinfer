@@ -12,27 +12,23 @@ import argparse
 import random
 import re
 
-from transformers import AutoTokenizer
-
 from engine.runtime.build import build_engine
 from engine.runtime.scheduler import Request
-from engine.weights.loader import resolve
+from engine.server.chat import ChatFormat
 
 FILLER = ("The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. ")
 
 
-def build(tok, n_tokens, depth, key):
+def build(fmt, n_tokens, depth, key):
+    tok = fmt.tok
     unit = tok(FILLER, add_special_tokens=False).input_ids
     needle = tok(f" The pass key is {key}. Remember it. {key} is the pass key. ", add_special_tokens=False).input_ids
     question = "\n\nWhat is the pass key? Answer with the number only."
-    overhead = len(tok.apply_chat_template([{"role": "user", "content": question}], add_generation_prompt=True, enable_thinking=False,
-                                           tokenize=True)) + len(needle) + 16
+    overhead = len(fmt.render([{"role": "user", "content": question}], enable_thinking=False)) + len(needle) + 16
     body = (unit * (n_tokens // len(unit) + 1))[: max(0, n_tokens - overhead)]
     at = int(len(body) * depth)
     text = tok.decode(body[:at] + needle + body[at:])
-    ids = tok.apply_chat_template([{"role": "user", "content": text + question}], add_generation_prompt=True, enable_thinking=False,
-                                  tokenize=True)
-    return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
+    return fmt.render([{"role": "user", "content": text + question}], enable_thinking=False)
 
 
 def main():
@@ -41,8 +37,8 @@ def main():
     ap.add_argument("--depths", type=float, nargs="+", default=[0.1, 0.5, 0.9])
     ap.add_argument("--url", default=None, help="test a running server (engine/server) over HTTP instead of a local scheduler")
     a = ap.parse_args()
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    tok = AutoTokenizer.from_pretrained(path)
+    fmt = ChatFormat.from_checkpoint()
+    tok = fmt.tok
     rng = random.Random(0)
     hits = 0
     if a.url:
@@ -51,7 +47,7 @@ def main():
         for L in a.lens:
             for d in a.depths:
                 key = rng.randint(100000, 999999)
-                ids = build(tok, L, d, key)
+                ids = build(fmt, L, d, key)
                 r = requests.post(a.url + "/v1/completions", json={"prompt": ids, "max_tokens": 12, "temperature": 0, "cache_prompt": False},
                                   timeout=3600).json()
                 ans = r["choices"][0]["text"].strip()
@@ -61,12 +57,12 @@ def main():
                       f"(TTFT {r['timings']['ttft_s']:6.1f} s)", flush=True)
         print(f"PASSKEY {hits}/{len(a.lens) * len(a.depths)}")
         return
-    eng, _ = build_engine(path, spec="none", slots=1, max_seq_len=max(a.lens) + 64, checkpoints=0, decode_weights="checkpoint", boundary=None)
+    eng, _ = build_engine(spec="none", slots=1, max_seq_len=max(a.lens) + 64, checkpoints=0, decode_weights="checkpoint", boundary=None)
     for L in a.lens:
         for d in a.depths:
             key = rng.randint(100000, 999999)
-            ids = build(tok, L, d, key)
-            r = eng.run([Request(ids, max_new_tokens=12, eos_ids=(248046, 248044))])[0]
+            ids = build(fmt, L, d, key)
+            r = eng.run([Request(ids, max_new_tokens=12, eos_ids=fmt.eos_ids)])[0]
             ans = tok.decode(r.output, skip_special_tokens=True).strip()
             ok = str(key) in re.sub(r"[^0-9]", "", ans) or str(key) in ans
             hits += ok

@@ -23,6 +23,7 @@ from safetensors import safe_open
 from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
 from engine.weights.quantize import E2M1_VALUES
 
+MODEL = "nvidia/Qwen3.8-27B-NVFP4"  # the checkpoint the engine is built for: the default of the server, the tools and the checks
 PREFIX = "model.language_model."
 SKIP_PREFIXES = ("model.visual.", "mtp.")
 SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale")

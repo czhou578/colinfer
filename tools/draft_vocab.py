@@ -20,11 +20,10 @@ def main():
     ap.add_argument("--code-mb", type=float, default=24)
     ap.add_argument("--prose-mb", type=float, default=60, help="WikiText-103 train text")
     a = ap.parse_args()
-    from transformers import AutoTokenizer
-
-    from engine.weights.loader import resolve
+    from engine.server.chat import ChatFormat
     from tests.perplexity import wikitext_test
-    tok = AutoTokenizer.from_pretrained(resolve("nvidia/Qwen3.8-27B-NVFP4"))
+    fmt = ChatFormat.from_checkpoint()
+    tok = fmt.tok
     V = len(tok)
     counts = np.zeros(V + 1024, dtype=np.int64)
 
@@ -79,9 +78,8 @@ def main():
             if used > budget:
                 break
     n += flush()
-    chat = tok.apply_chat_template([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hello! How can I help?"}],
-                                   tokenize=True)
-    special = set(tok.all_special_ids) | set(chat if isinstance(chat, list) else chat["input_ids"])
+    chat = fmt.render([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hello! How can I help?"}])  # the template's tokens
+    special = set(tok.all_special_ids) | set(chat)
     special |= {i for i, t in enumerate(tok.convert_ids_to_tokens(range(V))) if t and t.startswith("<") and t.endswith(">") and len(t) < 32}
     order = np.argsort(-counts[:V], kind="stable")
     top = [i for i in special if i < V] + [int(i) for i in order if int(i) not in special]

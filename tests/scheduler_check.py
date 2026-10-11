@@ -21,14 +21,11 @@ import sys
 import time
 
 import torch
-from transformers import AutoTokenizer
 
 from engine.runtime.build import build_engine
 from engine.runtime.scheduler import Request, Scheduler
-from engine.weights.loader import resolve
+from engine.server.chat import ChatFormat
 
-EOS = (248046, 248044)
-IM_START = 248045
 CODE = '''def parse_config(path):
     with open(path) as f:
         data = json.load(f)
@@ -50,11 +47,6 @@ PROMPTS = {
 }
 
 
-def chat_ids(tok, msgs):
-    ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, tokenize=True)
-    return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
-
-
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -62,17 +54,20 @@ def main():
     ap.add_argument("--only-alone", action="store_true", help="just the single-request speeds")
     ap.add_argument("--checkpoint-weights", action="store_true", help="decode the FP8 projections instead of the INT6 / INT5 copies")
     a = ap.parse_args()
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
-    tok = AutoTokenizer.from_pretrained(path)
+    fmt = ChatFormat.from_checkpoint()
+    tok, EOS, IM_START = fmt.tok, fmt.eos_ids, fmt.im_start
+
+    def chat_ids(msgs):
+        return fmt.render(msgs, enable_thinking=False)
     t0 = time.perf_counter()
     # the speculative scheduler: the server's engine at 32k slots, with the checkpoint's drafter and no suffix drafts
-    spec, _ = build_engine(path, max_seq_len=32768, k=a.k, drafter_weights="none", suffix_drafts=0,
+    spec, _ = build_engine(max_seq_len=32768, k=a.k, drafter_weights="none", suffix_drafts=0,
                            decode_weights="checkpoint" if a.checkpoint_weights else "int", boundary=IM_START)
     ref = Scheduler(spec.model, n_slots=1, max_seq_len=8192, n_checkpoints=0)  # plain decode, one request at a time
     print(f"schedulers built in {time.perf_counter() - t0:.1f} s; {torch.cuda.memory_allocated() / 1e9:.1f} GB allocated")
     ok = True
     names = list(PROMPTS)
-    prompts = [chat_ids(tok, [{"role": "user", "content": PROMPTS[n]}]) for n in names]
+    prompts = [chat_ids([{"role": "user", "content": PROMPTS[n]}]) for n in names]
     N = 200
 
     def R(p, **kw):
@@ -112,18 +107,18 @@ def main():
     # 4. multi-turn: turn 2 restores the end of turn 1
     sys_msg = {"role": "system", "content": "You are a careful assistant. Background notes: " + " ".join(f"item {i}" for i in range(1500))}
     m1 = [sys_msg, {"role": "user", "content": "Summarize the background notes in one sentence."}]
-    r1 = spec.run([R(chat_ids(tok, m1), max_new_tokens=60)])[0]
+    r1 = spec.run([R(chat_ids(m1), max_new_tokens=60)])[0]
     ans = tok.decode([t for t in r1.output if t not in EOS], skip_special_tokens=True)
-    p2 = chat_ids(tok, m1 + [{"role": "assistant", "content": ans}, {"role": "user", "content": "Now count how many items there were."}])
+    p2 = chat_ids(m1 + [{"role": "assistant", "content": ans}, {"role": "user", "content": "Now count how many items there were."}])
     r2 = spec.run([R(p2, max_new_tokens=40)])[0]
-    ok &= r2.reused >= len(chat_ids(tok, m1)) + len(r1.output) - 1
+    ok &= r2.reused >= len(chat_ids(m1)) + len(r1.output) - 1
     print(f"[multi-turn] turn 1: {len(r1.prompt)} + {len(r1.output)} tok; turn 2: {len(p2)} tok, reused {r2.reused}, "
           f"TTFT {r2.t_first - r2.t_submit:.3f} s")
 
     # 5. shared system prompt: a second conversation, queued while the first one decodes
     sys2 = {"role": "system", "content": "You are an agent. Tool manual: " + " ".join(f"rule {i}: be precise." for i in range(900))}
-    pa = chat_ids(tok, [sys2, {"role": "user", "content": "Write a long essay about rivers."}])
-    pb = chat_ids(tok, [sys2, {"role": "user", "content": "List three prime numbers."}])
+    pa = chat_ids([sys2, {"role": "user", "content": "Write a long essay about rivers."}])
+    pb = chat_ids([sys2, {"role": "user", "content": "List three prime numbers."}])
     ra = spec.submit(R(pa, max_new_tokens=300))
     while not ra.output:
         spec.step()
@@ -144,8 +139,7 @@ def main():
 
     # 6. the reply comes back without its reasoning: turn 2 restores the start of turn 1's reply
     def think_ids(msgs):
-        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, reasoning_effort="medium", tokenize=True)
-        return list(ids["input_ids"] if hasattr(ids, "keys") else ids)
+        return fmt.render(msgs, reasoning_effort="medium")
     table = "Quarterly figures: " + " ".join(f"Q{i % 4 + 1} {2000 + i // 4}: revenue {900 + 13 * i}, net income {40 + 5 * i}." for i in range(120))
     m1 = [{"role": "system", "content": "You are a research agent."}, {"role": "user", "content": table + "\nWhich year grew the most?"}]
     p1 = think_ids(m1)

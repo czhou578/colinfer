@@ -19,6 +19,8 @@ import json
 import re
 import uuid
 
+from engine.weights.loader import MODEL, resolve
+
 _FUNC_RE = re.compile(r"<function=([^>\n]+)>")
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL)
 THINK_SCAN = 64  # tokens from the end of a prompt in which its generation prompt (<|im_start|>assistant, <think>...) lies
@@ -62,12 +64,22 @@ def template_kwargs(b: dict, default_thinking: bool | None, default_effort: str 
 
 
 class ChatFormat:
+    """The chat template of the checkpoint and the ids of its control tokens. The server renders every prompt through
+    render(); the tools and the checks use the same object (from_checkpoint), so their prompts are the server's."""
+
     def __init__(self, tokenizer):
         self.tok = tokenizer
         tid = tokenizer.convert_tokens_to_ids
         self.think_open, self.think_close = tid("<think>"), tid("</think>")
         self.tool_open, self.tool_close = tid("<tool_call>"), tid("</tool_call>")
+        self.im_start = tid("<|im_start|>")  # the message boundary (engine/runtime/scheduler.py takes checkpoints there)
         self.eos_ids = tuple(sorted({tid("<|im_end|>"), tid("<|endoftext|>")}))
+
+    @classmethod
+    def from_checkpoint(cls, path_or_repo: str = MODEL) -> ChatFormat:
+        """The chat format of a checkpoint (a repo id in the local HF cache, or a directory)."""
+        from transformers import AutoTokenizer  # a slow import, for the callers that have no tokenizer yet
+        return cls(AutoTokenizer.from_pretrained(resolve(path_or_repo)))
 
     def render(self, messages: list[dict], tools: list | None = None, **template_kwargs) -> list[int]:
         msgs = [_normalize_message(m) for m in messages]

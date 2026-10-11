@@ -32,28 +32,25 @@ import time
 
 import torch
 
+from engine.server.chat import ChatFormat
 from engine.spec.suffix import MIN_MATCH
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FILE = os.path.join(ROOT, "tests", "golden", "outputs.json")
 PROMPTS = os.path.join(ROOT, "tests", "golden", "prompts.json")
-EOS = (248046, 248044)
 
 
-def freeze_prompts(path):
+def freeze_prompts():
     """The 40-prompt mix (tools/drafter_data.py, seed 1, chat template, last 3,000 tokens) and a 20,000-token WikiText
     prompt, as token ids."""
-    from transformers import AutoTokenizer
-
     from tests.perplexity import wikitext_test
     from tools.drafter_data import build_prompts
-    tok = AutoTokenizer.from_pretrained(path)
+    fmt = ChatFormat.from_checkpoint()
     mix = []
     for p, kind, think in build_prompts(40, random.Random(1)):
-        x = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=think, tokenize=True)
-        mix.append(dict(kind=kind, think=think, ids=list(x["input_ids"] if hasattr(x, "keys") else x)[-3000:]))
-    long = tok(wikitext_test()[:400000], add_special_tokens=False).input_ids[:20000]
+        mix.append(dict(kind=kind, think=think, ids=fmt.render([{"role": "user", "content": p}], enable_thinking=think)[-3000:]))
+    long = fmt.tok(wikitext_test()[:400000], add_special_tokens=False).input_ids[:20000]
     json.dump(dict(mix=mix, long=long), open(PROMPTS, "w"), separators=(",", ":"))
 
 
@@ -64,15 +61,15 @@ def load_prompts():
 
 def requests():
     from engine.runtime.scheduler import Request
-    P = load_prompts()
+    P, eos = load_prompts(), ChatFormat.from_checkpoint().eos_ids
     reqs = []
     for i, m in enumerate(P["mix"][:16]):
         x, kind = m["ids"], m["kind"]
-        reqs.append((f"greedy-{i}-{kind}", Request(x, max_new_tokens=128, eos_ids=EOS, logprobs=0)))
+        reqs.append((f"greedy-{i}-{kind}", Request(x, max_new_tokens=128, eos_ids=eos, logprobs=0)))
         if i % 4 == 0:
-            reqs.append((f"sampled-{i}-{kind}", Request(x, max_new_tokens=64, temperature=0.8, top_p=0.95, top_k=20, seed=1000 + i, eos_ids=EOS,
+            reqs.append((f"sampled-{i}-{kind}", Request(x, max_new_tokens=64, temperature=0.8, top_p=0.95, top_k=20, seed=1000 + i, eos_ids=eos,
                                                         logprobs=0)))
-    reqs.append(("long-20k", Request(P["long"], max_new_tokens=32, eos_ids=EOS, logprobs=0)))
+    reqs.append(("long-20k", Request(P["long"], max_new_tokens=32, eos_ids=eos, logprobs=0)))
     return reqs
 
 
@@ -94,8 +91,7 @@ def main():
     ap.add_argument("--suffix", type=int, default=MIN_MATCH, help="suffix-match drafts of at least this match length (0: off)")
     a = ap.parse_args()
     if a.mode == "prompts":
-        from engine.weights.loader import resolve
-        freeze_prompts(resolve("nvidia/Qwen3.8-27B-NVFP4"))
+        freeze_prompts()
         print(f"[golden] wrote {PROMPTS}")
         return
     with torch.inference_mode():

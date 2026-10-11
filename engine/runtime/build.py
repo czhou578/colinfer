@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+from typing import Literal
 
 from engine.kernels import ops
 from engine.model.fast import attach_decode_copies, decode_copies_paths, load_fast_model, to_fast
@@ -16,9 +17,7 @@ from engine.runtime.scheduler import Scheduler
 from engine.selftest import run_selftest
 from engine.spec.mtp import DRAFT_DIR, Mtp
 from engine.spec.suffix import MIN_MATCH
-from engine.weights.loader import resolve
-
-MODEL = "nvidia/Qwen3.8-27B-NVFP4"
+from engine.weights.loader import MODEL, resolve
 
 
 def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print):
@@ -58,8 +57,8 @@ def boundary_token(path: str) -> int:
 
 
 def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 262144, checkpoints: int = 32, spec: str = "mtp", k: int = 7,
-                 drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int", boundary="auto",
-                 selftest: bool = True, metrics=None, log=print):
+                 drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int",
+                 boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, metrics=None, log=print):
     """The scheduler with its model, as `python -m engine.server` builds it from the same flags (the defaults are the
     server's). spec: "mtp" or "none". boundary: the message-boundary token id, "auto" (the checkpoint's) or None.
     Returns (scheduler, the startup seconds of each phase)."""

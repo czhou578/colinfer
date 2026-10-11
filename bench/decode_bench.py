@@ -9,23 +9,12 @@ of the drafter, which the dummy tokens of the bench would trigger on almost ever
    uv run python bench/decode_bench.py [--ctx 8192] [--ks 1 3 5 7]
 """
 import argparse
-import time
 
 import torch
 
+from bench.timing import timed
 from engine.runtime.build import load_model
 from engine.runtime.decode import DecodeGraph
-
-
-def timed(fn, n=20):
-    for _ in range(3):
-        fn()
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(n):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / n
 
 
 def main():

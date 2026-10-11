@@ -28,13 +28,13 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from engine.weights.loader import resolve, weight_map
+from engine.weights.loader import MODEL, resolve, weight_map
 from engine.weights.quantize import REQUANT_DIR, dequant_int, int_global_scale, pack5, pack6, quantize_int
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nvfp4", default="nvidia/Qwen3.8-27B-NVFP4")
+    ap.add_argument("--nvfp4", default=MODEL)
     ap.add_argument("--bf16", default="Qwen/Qwen3.8-27B")
     ap.add_argument("--bits", type=int, default=6, choices=(5, 6))
     ap.add_argument("--filter", default=None, help="regex over module names (default: all 208 FP8 linears)")

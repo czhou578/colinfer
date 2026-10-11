@@ -578,7 +578,7 @@ def main(argv=None):
     tokenizer = AutoTokenizer.from_pretrained(path)
     cfg = ServerConfig(model=a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=0 if a.no_prefix_caching else a.checkpoints,
                        spec=a.spec, k=a.k, drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
-                       boundary_token=tokenizer.convert_tokens_to_ids("<|im_start|>"), selftest=not a.no_selftest, warmup=not a.no_warmup,
+                       boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
                        max_queue=a.max_queue, max_output_tokens=a.max_output_tokens, max_request_seconds=a.max_request_seconds,
                        api_key=a.api_key, mem_cap_bytes=mem_cap_bytes)
     hf = json.load(open(os.path.join(path, "config.json")))

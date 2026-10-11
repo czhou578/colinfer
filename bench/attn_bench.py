@@ -9,22 +9,10 @@ import argparse
 
 import torch
 
+from bench.timing import timed
 from engine.kernels import ops
 
 Hq, Hkv, D = 24, 4, 256
-
-
-def timeit(fn, iters):
-    for _ in range(3):
-        fn()
-    torch.cuda.synchronize()
-    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    a.record()
-    for _ in range(iters):
-        fn()
-    b.record()
-    torch.cuda.synchronize()
-    return a.elapsed_time(b) / iters
 
 
 def main():
@@ -50,7 +38,7 @@ def main():
                     k, v = caches[it[0] % layers]
                     it[0] += 1
                     ops().attn_decode(q, k, v, sl, out, D ** -0.5, gate)
-                t = timeit(run, max(20, 4 * layers))
+                t = timed(run, n=max(20, 4 * layers)) * 1e3  # ms
                 gb = B * Hkv * ctx * D * 2 / 1e9
                 print(f"{B:>2} {ctx:>7} {T:>2} | {t:>10.3f} {gb / t * 1e3:>6.0f}", flush=True)
             torch.cuda.empty_cache()

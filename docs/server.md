@@ -37,6 +37,8 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
+| `--no-selftest` | off | Skip the startup self-test of the matmul kernels (`engine/selftest.py`). For development only: the test is what catches a miscompiled kernel. |
+| `--no-warmup` | off | Skip the warm-up requests. The first real requests then pay for the first-use compilation and autotuning. |
 | `--api-key` | `$COLINFER_API_KEY`, else none | The `/v1/` endpoints require this key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and `/metrics` stay open. |
 
 ## API
