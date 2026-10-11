@@ -21,7 +21,7 @@ def ops():
             extra_cflags=["-O3"],
             extra_include_paths=[os.path.join(_ROOT, "csrc", "third_party", "cutlass", p) for p in ("include", "tools/util/include")],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "--expt-relaxed-constexpr", "--fmad=false",
-                               "-Xptxas=-v" if os.environ.get("COLINFER_PTXAS_VERBOSE") else "-DNOVERBOSE"],
+                               *(["-Xptxas=-v"] if os.environ.get("COLINFER_PTXAS_VERBOSE") else [])],  # register / spill report
             build_directory=build,
             verbose=bool(os.environ.get("COLINFER_BUILD_VERBOSE")),
         )

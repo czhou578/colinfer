@@ -5,11 +5,14 @@ prompts, generated through a running server (engine/server) and saved as token i
 The tool builds the prompts offline from local data:
 - WikiText-103 train (article titles and paragraphs)
 - TinyStories (story openings)
-- Python sources of the installed packages (functions to explain / document / refactor)
+- the Python sources of the transformers package (functions to explain / document / refactor); its version is pinned
+  in uv.lock, so the code corpus changes only with a transformers upgrade
 - templates for questions and structured output
 
-Mix: ~45% prose, 15% Q&A, 25% code, 15% structured, with thinking on for half. The server samples the replies (T=0.7,
-top-p 0.95, top-k 20), so that they vary. The tool does not use the evaluation prompts (tests/scheduler_check.py).
+Mix: ~45% prose, 15% Q&A, 25% code, 15% structured, with thinking on for half. Each corpus draws from its own random
+stream, seeded from the mix's, so a change in one corpus moves only its own choices and not the mix. The server samples
+the replies (T=0.7, top-p 0.95, top-k 20), so that they vary. The tool does not use the evaluation prompts
+(tests/scheduler_check.py).
 
    uv run python -m engine.server --port 8002 &
    uv run python tools/drafter_data.py --url http://127.0.0.1:8002 --n 1500 --out ~/.cache/colinfer/drafter/data.jsonl
@@ -90,7 +93,7 @@ def story_starts(rng):
 
 def code_snippets(rng):
     import transformers
-    files = sorted(glob.glob(os.path.join(os.path.dirname(os.path.dirname(transformers.__file__)), "*", "**", "*.py"), recursive=True))
+    files = sorted(glob.glob(os.path.join(os.path.dirname(transformers.__file__), "**", "*.py"), recursive=True))
     rng.shuffle(files)
     out = []
     for f in files[:3000]:
@@ -105,13 +108,16 @@ def code_snippets(rng):
         if len(out) > 3000:
             break
     rng.shuffle(out)
-    return out
+    return out[:3000]  # a fixed count: the mix's rng.choice over it then consumes the same bits whatever the corpus holds
 
 
 def build_prompts(n, rng):
-    titles, paras = wiki_material(rng)
-    stories = story_starts(rng)
-    snippets = code_snippets(rng)
+    """n prompts of the mix: (prompt, kind, thinking on). rng draws the mix; each corpus gets its own stream seeded from
+    it, so the mix for a seed is stable while a corpus changes."""
+    streams = [random.Random(rng.getrandbits(64)) for _ in range(3)]
+    titles, paras = wiki_material(streams[0])
+    stories = story_starts(streams[1])
+    snippets = code_snippets(streams[2])
     prompts = []
     for i in range(n):
         r = rng.random()

@@ -125,13 +125,14 @@ class Mtp(nn.Module):
                  lowrank: str | None = os.path.join(DRAFT_DIR, "draft_head_pca.safetensors")):
         super().__init__()
         cfg = target.cfg
+        dev = self.dev = target.embed_tokens.weight.device
         t = {}
         for name, f in weight_map(path).items():
             if name.startswith("mtp."):
-                with safe_open(os.path.join(path, f), framework="pt", device="cuda") as sf:
+                with safe_open(os.path.join(path, f), framework="pt", device=str(dev)) as sf:
                     t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
         if weights:
-            with safe_open(weights, framework="pt", device="cuda") as sf:
+            with safe_open(weights, framework="pt", device=str(dev)) as sf:
                 for name in sf.keys():
                     if not (name.startswith("mtp.") and name[4:] in t):
                         raise ValueError(f"{weights}: {name} is not a tensor of the checkpoint's MTP block (tools/train_drafter.py writes them)")
@@ -147,12 +148,12 @@ class Mtp(nn.Module):
         layer.post_attention_layernorm = self._norm(t[P + "post_attention_layernorm.weight"], cfg)
         a = layer.self_attn
         a.q_proj, a.k_proj, a.v_proj, a.o_proj = (DraftLinear(t[P + f"self_attn.{n}_proj.weight"]) for n in "qkvo")
-        a.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to("cuda")
-        a.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to("cuda")
+        a.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to(dev)
+        a.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to(dev)
         with torch.no_grad():
             a.q_norm.weight = nn.Parameter(t[P + "self_attn.q_norm.weight"], requires_grad=False)
             a.k_norm.weight = nn.Parameter(t[P + "self_attn.k_norm.weight"], requires_grad=False)
-        KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]), rope_inv_freq(cfg, "cuda"))  # separate: own NVFP4 scales
+        KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]), rope_inv_freq(cfg, dev))  # separate: own NVFP4 scales
         layer.mlp = DraftMLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
         layer.__class__ = FastDecoderLayer
         self.layer = layer
@@ -162,7 +163,7 @@ class Mtp(nn.Module):
         self.n_static = len(ids)
         self.static_set = set(int(i) for i in ids)
         allids = np.concatenate([ids, np.full(PROMPT_SLOTS, ids[0], dtype=ids.dtype)]).astype(np.int64)
-        self.vocab_ids = torch.tensor(allids, device="cuda")
+        self.vocab_ids = torch.tensor(allids, device=dev)
         lm = target.lm_head
         self.lm_draft = Nvfp4Linear(lm.w[self.vocab_ids].contiguous(), lm.sf[self.vocab_ids].contiguous(), lm.gscale, out_fp32=True)
         self.lr_A = self.lr_B = None
@@ -174,11 +175,11 @@ class Mtp(nn.Module):
         approximated by (g U)(W U)^T (two NVFP4 GEMMs streaming ~1/5 of the head's bytes) and the top LOWRANK_CANDS
         candidates are rescored exactly against the real NVFP4 rows. W U is kept for the whole target vocabulary (143 MB),
         so a request's prompt rows are a gather."""
-        with safe_open(file, framework="pt", device="cuda") as sf:
+        with safe_open(file, framework="pt", device=str(self.dev)) as sf:
             U = sf.get_tensor("U").float()                                        # [H, r]
         lm = self.lm_head
         gs = torch.tensor(lm.gscale)
-        WU = torch.empty(lm.w.shape[0], U.shape[1], device="cuda")
+        WU = torch.empty(lm.w.shape[0], U.shape[1], device=self.dev)
         for i in range(0, lm.w.shape[0], DEQUANT_ROWS):
             WU[i:i + DEQUANT_ROWS] = dequant_nvfp4(lm.w[i:i + DEQUANT_ROWS], lm.sf[i:i + DEQUANT_ROWS], gs, out_dtype=torch.float32) @ U
         gb = nvfp4_global_scale(WU)
@@ -195,7 +196,7 @@ class Mtp(nn.Module):
         slots = self.vocab_ids.numel() - self.n_static
         extra = [t for t in dict.fromkeys(prompt) if t not in self.static_set][:slots]
         extra += [int(self.vocab_ids[0])] * (slots - len(extra))
-        ids = torch.tensor(extra, dtype=torch.long, device="cuda")
+        ids = torch.tensor(extra, dtype=torch.long, device=self.dev)
         self.vocab_ids[self.n_static:] = ids
         self.lm_draft.w[self.n_static:] = self.lm_head.w[ids]
         self.lm_draft.sf[self.n_static:] = self.lm_head.sf[ids]
@@ -359,8 +360,9 @@ class MtpGenerator:
         prepare_prefill(model)
         self.model, self.k = model, k
         self.mtp = Mtp(model, path, weights=weights, **mtp_kw)
+        self.dev = self.mtp.dev
         self.state = model.new_state(1, max_seq_len)
-        self.mst = MtpState(model.cfg, max_seq_len, "cuda", active=self.state.active)
+        self.mst = MtpState(model.cfg, max_seq_len, self.dev, active=self.state.active)
         self.cycle = MtpCycle(model, self.mtp, self.state, self.mst, k)
         self.stats = dict(steps=0, tokens=0, drafted=0, accepted=0)
 
@@ -371,13 +373,13 @@ class MtpGenerator:
         st.pos = 0
         mst.pos_t.zero_()
         self.mtp.set_prompt_vocab(list(input_ids))
-        logits, H = prefill(self.model, torch.tensor([input_ids], device="cuda"), st, return_hidden=True)
+        logits, H = prefill(self.model, torch.tensor([input_ids], device=self.dev), st, return_hidden=True)
         y = int(logits.argmax(-1))
         out = [y]
         eos = set(eos_ids)
         # MTP over the prompt: rows (x_{i+1}, h_i), i = 0..T-1, with x_T = y; the last row drafts d1
-        toks = torch.tensor(list(input_ids[1:]) + [y], device="cuda")
-        cyc.tok.copy_(torch.tensor([[y] + self.mtp.first_drafts(toks, H, mst, k)], device="cuda"))
+        toks = torch.tensor(list(input_ids[1:]) + [y], device=self.dev)
+        cyc.tok.copy_(torch.tensor([[y] + self.mtp.first_drafts(toks, H, mst, k)], device=self.dev))
         while len(out) < max_new_tokens and y not in eos:
             cyc.graph.replay()
             n = int(cyc.n)

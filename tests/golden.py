@@ -14,8 +14,9 @@ The check compares the logprob of each output token bit for bit. The logprob dep
 numeric change shows up, even when the tokens do not change.
 
 The prompts are token ids, frozen in tests/golden/prompts.json (bench/perf.py and bench/request_mix_bench.py also read
-them). tools/drafter_data.py builds its code prompts from the Python files installed in site-packages. Thus a new
-generation in a different environment gives different prompts.
+them). tools/drafter_data.py builds its code prompts from the sources of the transformers package and its prose from
+local datasets, so a new generation gives the same prompts until one of those changes; the frozen file is what the
+check compares against either way.
 
    uv run python tests/golden.py record          # writes tests/golden/outputs.json
    uv run python tests/golden.py check             # MTP speculation with suffix-match drafts (the default server)
