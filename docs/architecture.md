@@ -66,8 +66,8 @@ The GPU holds 20.2 GB of checkpoint weights and 5.2 GB of INT copies. A decode s
 - Positions move to the device (`FastState.pos_t`).
 - The KV cache is fp8 (e4m3, unit scale, saturating: 32 KB per token).
 
-`DecodeGraph` captures one decode step (embedding → 64 layers → lm_head → sampler) as a CUDA graph. The host only writes
-the input tokens and replays the graph.
+`DecodeGraph` (`engine/runtime/decode.py`) captures one decode step (embedding → 64 layers → lm_head → sampler) as a
+CUDA graph. The host only writes the input tokens and replays the graph.
 
 The table shows the kernels of each layer, in order. The engine launches each kernel with programmatic dependent
 launch. Thus the next GEMM starts to stream its weights while the previous kernel finishes.
@@ -177,7 +177,7 @@ drafter for each chunk right after the chunk. Prefill times: 2k 0.54 s (3.8k tok
 
 ## 6. Serving
 
-The code is in `engine/runtime/scheduler.py` and `engine/server/api.py`.
+The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the engine thread) and `engine/server/api.py`.
 
 - **One request at a time.** The engine runs one request at a time; the others wait in a FIFO queue. One state holds
   `--slots` (3) slots of `--max-seq-len` (262,144) tokens with contiguous KV. A slot keeps the history of its last

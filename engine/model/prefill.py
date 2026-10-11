@@ -28,6 +28,14 @@ from engine.model.fast import FastQwen35, FastState, Nvfp4Linear, StackedFp8Line
 
 CHUNK = 2048            # tokens per chunk: larger chunks make the FP8 GEMMs slower per token (docs/history/phase6_progress.md)
 ATTN_FP8_MIN_CTX = 16384  # context length above which prefill attention runs on csrc/attn_prefill.cu
+# NVFP4 GEMM tile by row count (csrc/gemm_nvfp4.cu): the 256x128x128 tile from this many rows, the 128x128x256 tile
+# below. In the phase-0 sweep the large tile won from M = 2048 and the small one up to M = 256 (docs/history/baseline.md
+# section 2); the switch sits between.
+TILE0_MIN_M = 1536
+
+
+def _tile(M: int) -> int:
+    return 0 if M >= TILE0_MIN_M else 1
 
 
 def _nvfp4_operands(lin_list):
@@ -71,7 +79,7 @@ def prepare_prefill(model: FastQwen35):
 
 def _gemm_nvfp4(xq, xsf, op, residual=None):
     out = torch.empty(xq.shape[0], op["N"], device=xq.device, dtype=torch.bfloat16)
-    ops().nvfp4_gemm(xq, xsf, op["w"], op["sf"], op["alpha"], residual, out, 0 if xq.shape[0] >= 1536 else 1)
+    ops().nvfp4_gemm(xq, xsf, op["w"], op["sf"], op["alpha"], residual, out, _tile(xq.shape[0]))
     return out
 
 
@@ -109,7 +117,7 @@ def _mlp(layer, x, y):
     hsf = torch.empty(ops().nvfp4_sf_size(M, I), dtype=torch.uint8, device=x.device)
     g = _gemm_nvfp4(xq, xsf, mlp.p_g)  # the gate GEMM, then the up GEMM computes silu(gate) * up and quantizes it
     u = mlp.p_u
-    ops().nvfp4_gemm_swiglu(xq, xsf, u["w"], u["sf"], u["alpha"], g, hq, hsf, mlp.p_down["nc"], 0 if M >= 1536 else 1)
+    ops().nvfp4_gemm_swiglu(xq, xsf, u["w"], u["sf"], u["alpha"], g, hq, hsf, mlp.p_down["nc"], _tile(M))
     return _gemm_nvfp4(hq, hsf, mlp.p_down, x_new)
 
 

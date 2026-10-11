@@ -17,6 +17,8 @@ import math
 
 import torch
 
+from engine.spec.accept import draw
+
 
 class SamplerParams:
     def __init__(self, batch: int, vocab: int, device):
@@ -48,5 +50,4 @@ class SamplerParams:
 def sample(logits: torch.Tensor, p: SamplerParams, pos: torch.Tensor) -> torch.Tensor:
     """logits [B, V] fp32 -> token ids [B] int64. pos [B]: the position of the token being sampled (device).
     Graph-capturable (no host syncs)."""
-    from engine.spec.accept import draw
     return draw(logits[:, None], p, pos)[:, 0]

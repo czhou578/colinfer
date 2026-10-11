@@ -25,13 +25,11 @@ def main():
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
-    from engine.model.fast import load_fast_model, to_fast
+    from engine.runtime.build import load_model
     from engine.spec.mtp import MtpGenerator
-    from engine.weights.loader import resolve
     from tools.drafter_data import build_prompts
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
+    path, model = load_model()  # the served configuration: the INT6 / INT5 decode copies when present
     tok = AutoTokenizer.from_pretrained(path)
-    model = to_fast(load_fast_model(path))
     prompts = build_prompts(a.n, random.Random(1))
     ids = []
     for p, kind, think in prompts:

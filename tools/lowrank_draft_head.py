@@ -25,9 +25,8 @@ DEFAULT_OUT = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca.safet
 def collect(n: int, seed: int, weights, k: int = 7, max_new: int = 256) -> torch.Tensor:
     from transformers import AutoTokenizer
 
-    from engine.model.fast import load_fast_model, to_fast
+    from engine.runtime.build import load_model
     from engine.spec import mtp as M
-    from engine.weights.loader import resolve
     from tools.drafter_data import build_prompts
     gbuf = torch.zeros(k, 5120, device="cuda", dtype=torch.bfloat16)
     calls = [0]
@@ -38,9 +37,8 @@ def collect(n: int, seed: int, weights, k: int = 7, max_new: int = 256) -> torch
         calls[0] += 1
         return orig(self, g)
     M.Mtp.draft = draft
-    path = resolve("nvidia/Qwen3.8-27B-NVFP4")
+    path, model = load_model()  # the served configuration: the INT6 / INT5 decode copies when present
     tok = AutoTokenizer.from_pretrained(path)
-    model = to_fast(load_fast_model(path))
     M.DRAFT_STOP = 0.0  # every draft step runs: all drafter outputs are real
     gen = M.MtpGenerator(model, path, max_seq_len=4096, k=k, weights=weights, lowrank=None)  # collect with the full head
     G = []

@@ -13,8 +13,8 @@ import time
 
 import torch
 
-from engine.model.fast import DecodeGraph
 from engine.runtime.build import load_model
+from engine.runtime.decode import DecodeGraph
 
 
 def timed(fn, n=20):

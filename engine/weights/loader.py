@@ -1,8 +1,12 @@
-"""Checkpoint loading for the Phase 1 reference model.
+"""Checkpoint files and dequantization.
 
-It loads a Qwen3.5-family safetensors checkpoint into Qwen35ForCausalLM on the GPU. On the fly, it dequantizes FP8
-(128x128 block scales) and NVFP4 (e2m1 + e4m3 block-16 scales + fp32 global scale) to BF16. It is slow and simple on
-purpose: this path validates the quantized weights before any custom kernel exists (PLAN.md Phase 1).
+The decode model (engine/model/fast.py) reads a Qwen3.5-family safetensors checkpoint through resolve, weight_map /
+shard_files and quant_kind, and keeps the weights quantized. dequant_nvfp4 is the reference dequantization (e2m1 + e4m3
+block-16 scales + fp32 global scale) that the self-test, the kernel tests and the drafter tools compare against.
+
+load_model builds the plain PyTorch reference model (engine/model/qwen35.py) with every weight dequantized to BF16, FP8
+(128x128 block scales or a per-tensor scale) included. It is slow and simple on purpose: it is the reference of the
+perplexity harness (tests/perplexity.py).
 
 Usage:
     model = load_model("Qwen/Qwen3.8-27B")            # repo id in the HF cache, or a local dir

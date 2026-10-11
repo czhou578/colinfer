@@ -19,9 +19,9 @@ the same token. Speculation can never change an output.
 The KV cache is fp8 (e4m3, unit scale, saturating). It has half the bytes of bf16, and decode attention reads it
 directly.
 
-Entry points: load_fast_model(path) -> to_fast(model) -> [attach_decode_copies(model, path)] -> DecodeGraph / MtpCycle
-(engine/spec/mtp.py) / prefill(). FastQwen35.forward is one decode step (T = 1 per slot). verify / commit are the two
-halves of speculation (T = k + 1 rows, then the accepted prefix).
+Entry points: load_fast_model(path) -> to_fast(model) -> [attach_decode_copies(model, path)] -> DecodeGraph
+(engine/runtime/decode.py) / MtpCycle (engine/spec/mtp.py) / prefill(). FastQwen35.forward is one decode step (T = 1
+per slot). verify / commit are the two halves of speculation (T = k + 1 rows, then the accepted prefix).
 """
 from __future__ import annotations
 
@@ -49,7 +49,26 @@ def _rows(fn, x2, r2, out):
         fn(x2[i:i + MAX_ROWS], None if r2 is None else r2[i:i + MAX_ROWS], out[i:i + MAX_ROWS])
 
 
-class Nvfp4Linear(nn.Module):
+class RowsLinear(nn.Module):
+    """A linear whose decode path is rows(x2, r2, out): x2 [M, in_features] bf16 rows -> out [M, out_features], plus the
+    residual rows r2 (or None) in the epilogue. forward flattens the leading dims of x around it."""
+    in_features: int
+    out_features: int
+    out_dtype = torch.bfloat16
+
+    def rows(self, x2: torch.Tensor, r2: torch.Tensor | None, out: torch.Tensor):
+        raise NotImplementedError
+
+    def forward(self, x, residual=None):
+        shp = x.shape
+        x2 = x.reshape(-1, self.in_features).contiguous()
+        out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=self.out_dtype)
+        r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
+        self.rows(x2, r2, out)
+        return out.view(*shp[:-1], self.out_features)
+
+
+class Nvfp4Linear(RowsLinear):
     """NVFP4 weights: packed e2m1 w [N, K/2], e4m3 block scales sf [N, K/16], fp32 global scale; in_scale: the static
     activation scale prefill quantizes with. out_fp32: logits."""
 
@@ -58,18 +77,11 @@ class Nvfp4Linear(nn.Module):
         self.register_buffer("w", w, persistent=False)
         self.register_buffer("sf", sf, persistent=False)
         self.gscale, self.out_fp32, self.in_scale = float(gscale), out_fp32, float(in_scale)
+        self.out_dtype = torch.float32 if out_fp32 else torch.bfloat16
         self.out_features, self.in_features = w.shape[0], w.shape[1] * 2
 
     def rows(self, x2, r2, out):
         _rows(lambda x, r, o: ops().skinny_nvfp4(x, self.w, self.sf, self.gscale, r, o), x2, r2, out)
-
-    def forward(self, x, residual=None):
-        shp = x.shape
-        x2 = x.reshape(-1, self.in_features).contiguous()
-        out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.float32 if self.out_fp32 else torch.bfloat16)
-        r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
-        self.rows(x2, r2, out)
-        return out.view(*shp[:-1], self.out_features)
 
 
 class IntLinear(nn.Module):
@@ -88,7 +100,7 @@ class IntLinear(nn.Module):
         _rows(lambda x, r, o: ops().skinny_int(x, self.wlo, self.whi, self.sf, self.gscale, r, o), x2, r2, out)
 
 
-class Fp8Linear(nn.Module):
+class Fp8Linear(RowsLinear):
     """FP8 weights w [N, K] with a per-tensor scale (prefill's W8A8 GEMM reads them). dec: an optional IntLinear copy
     that decode streams instead (attach_decode_copies)."""
 
@@ -104,14 +116,6 @@ class Fp8Linear(nn.Module):
             self.dec.rows(x2, r2, out)
         else:
             _rows(lambda x, r, o: ops().skinny_fp8(x, self.w, self.scale, r, o), x2, r2, out)
-
-    def forward(self, x, residual=None):
-        shp = x.shape
-        x2 = x.reshape(-1, self.in_features).contiguous()
-        out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
-        r2 = residual.reshape(-1, self.out_features).contiguous() if residual is not None else None
-        self.rows(x2, r2, out)
-        return out.view(*shp[:-1], self.out_features)
 
 
 class StackedFp8Linear(nn.Module):
@@ -454,7 +458,8 @@ def attach_decode_copies(model: FastQwen35, files) -> int:
                 if not all(PREFIX + m + ".qweight_lo" in keys for m in names):
                     return None
                 gs = {float(f.get_tensor(PREFIX + m + ".weight_scale_2")) for m in names}
-                assert len(gs) == 1, names
+                if len(gs) != 1:
+                    raise RuntimeError(f"{file}: {names} must share one global scale to stay one launch (tools/int6_requant.py)")
                 cat = lambda suffix: torch.cat([f.get_tensor(PREFIX + m + suffix) for m in names]).contiguous()  # noqa: E731
                 return IntLinear(cat(".qweight_lo"), cat(".qweight_hi"), cat(".weight_scale"), gs.pop())
             for i, layer in enumerate(model.layers):
@@ -487,33 +492,3 @@ def capture(body):
     with torch.inference_mode(), torch.cuda.graph(graph):
         out = body()
     return graph, out
-
-
-class DecodeGraph:
-    """One CUDA graph for a plain decode step (T = 1 per slot): embed -> 64 layers -> lm_head -> sampler.
-
-    Capture runs on a fresh state and resets it afterwards (warm-up executes the step for real). Per step the host writes
-    the input tokens into a static buffer, replays, and reads back the sampled ids (logits in self.logits)."""
-
-    def __init__(self, model: FastQwen35, state: FastState, params=None):
-        """params: optional SamplerParams (B slots) shared with other graphs; default: a private one."""
-        from engine.model.prefill import prepare_prefill
-        from engine.runtime.sampler import SamplerParams, sample
-        prepare_prefill(model)  # re-points weights (stacking); must happen before the graph records addresses
-        self.model, self.state = model, state
-        B = state.pos_t.shape[0]
-        self.params = params if params is not None else SamplerParams(B, model.cfg.vocab_size, state.pos_t.device)
-        self.tok = torch.zeros(B, 1, dtype=torch.long, device=state.pos_t.device)
-
-        def body():
-            logits = model(self.tok, state)
-            return logits, sample(logits, self.params, state.pos_t)  # pos_t now holds the predicted token's position
-        state.reset()
-        self.graph, (self.logits, self.next) = capture(body)
-        state.reset()
-
-    def step(self, tokens: torch.Tensor) -> torch.Tensor:
-        """tokens: [B] long on the device. Returns sampled ids [B] (device; greedy for slots with temperature 0)."""
-        self.tok.copy_(tokens.view(-1, 1))
-        self.graph.replay()
-        return self.next

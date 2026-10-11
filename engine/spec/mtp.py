@@ -40,9 +40,21 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 from engine.kernels import ops
-from engine.model.fast import FastDecoderLayer, FastQwen35, FastState, KernelAttention, KernelRMSNorm, LinearGroup, Nvfp4Linear, capture
+from engine.model.fast import (
+    MAX_ROWS,
+    FastDecoderLayer,
+    FastQwen35,
+    FastState,
+    KernelAttention,
+    KernelRMSNorm,
+    LinearGroup,
+    Nvfp4Linear,
+    RowsLinear,
+    capture,
+)
 from engine.model.prefill import attend_cached, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
+from engine.spec.accept import draw
 from engine.weights.loader import dequant_nvfp4, weight_map
 from engine.weights.quantize import nvfp4_global_scale, quantize
 
@@ -50,15 +62,16 @@ DRAFT_DIR = os.path.expanduser("~/.cache/colinfer/drafter")
 DRAFT_VOCAB = 65536   # static draft vocabulary (a smaller one loses as much acceptance as it saves time)
 PROMPT_SLOTS = 4096   # draft-head rows rewritten per request with prompt tokens outside the static vocabulary
 LOWRANK_CANDS = 256   # low-rank head: candidates rescored exactly (64: 0.6% of drafts change, 256: none measured)
+DEQUANT_ROWS = 16384  # lm_head rows dequantized to fp32 at a time for the low-rank head (16384 x 5120 x 4 B = 336 MB)
 # Draft early exit: once the product of the drafter's probabilities of a cycle's drafts so far is below this for every
 # active slot, the remaining draft steps skip their GEMMs (a skipped step costs ~0.35 ms instead of ~1.8 ms; its junk
 # drafts are rejected by verify, outputs are unchanged). 40-request mix: 37.2 -> 38.1 tok/s.
 DRAFT_STOP = 0.1
 
 
-class DraftLinear(nn.Module):
+class DraftLinear(RowsLinear):
     """A drafter linear: BF16 weights for the prompt pass (cuBLAS, many rows) and an NVFP4 copy that the draft steps
-    stream (skinny GEMM, <= 16 rows)."""
+    stream (skinny GEMM, up to MAX_ROWS rows). The residual is added after the GEMM, not in its epilogue."""
 
     def __init__(self, w: torch.Tensor):
         super().__init__()
@@ -69,16 +82,13 @@ class DraftLinear(nn.Module):
         packed, sf = quantize(wf, gs)
         self.low = Nvfp4Linear(packed, sf, gs)
 
-    def forward(self, x, residual=None):
-        shp = x.shape
-        x2 = x.reshape(-1, self.in_features).contiguous()
-        if x2.shape[0] <= 16:
-            out = torch.empty(x2.shape[0], self.out_features, device=x.device, dtype=torch.bfloat16)
+    def rows(self, x2, r2, out):
+        if x2.shape[0] <= MAX_ROWS:
             self.low.rows(x2, None, out)
         else:
-            out = F.linear(x2, self.w)
-        out = out.view(*shp[:-1], self.out_features)
-        return out if residual is None else out + residual
+            out.copy_(F.linear(x2, self.w))
+        if r2 is not None:
+            out += r2
 
 
 class DraftMLP(nn.Module):
@@ -123,7 +133,8 @@ class Mtp(nn.Module):
         if weights:
             with safe_open(weights, framework="pt", device="cuda") as sf:
                 for name in sf.keys():
-                    assert name.startswith("mtp.") and name[4:] in t, name
+                    if not (name.startswith("mtp.") and name[4:] in t):
+                        raise ValueError(f"{weights}: {name} is not a tensor of the checkpoint's MTP block (tools/train_drafter.py writes them)")
                     t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
         P = "layers.0."
         self.fc = DraftLinear(t["fc.weight"])
@@ -168,8 +179,8 @@ class Mtp(nn.Module):
         lm = self.lm_head
         gs = torch.tensor(lm.gscale)
         WU = torch.empty(lm.w.shape[0], U.shape[1], device="cuda")
-        for i in range(0, lm.w.shape[0], 16384):
-            WU[i:i + 16384] = dequant_nvfp4(lm.w[i:i + 16384], lm.sf[i:i + 16384], gs, out_dtype=torch.float32) @ U
+        for i in range(0, lm.w.shape[0], DEQUANT_ROWS):
+            WU[i:i + DEQUANT_ROWS] = dequant_nvfp4(lm.w[i:i + DEQUANT_ROWS], lm.sf[i:i + DEQUANT_ROWS], gs, out_dtype=torch.float32) @ U
         gb = nvfp4_global_scale(WU)
         wb, sb = quantize(WU, gb)
         del WU
@@ -291,7 +302,6 @@ class MtpCycle:
         if self.params is None:
             pred = logits.argmax(-1)                                 # [B, k+1]
         else:  # the target's own sample at every row, keyed by position (engine/spec/accept.py): output = plain sampling
-            from engine.spec.accept import draw
             pred = draw(logits, self.params, st.pos_t + 1)           # row i predicts position pos + i + 1
         match = (pred[:, :k] == tok[:, 1:]).int()
         n = (1 + match.cumprod(-1).sum(-1)).int()                    # [B] accepted inputs, 1..k+1

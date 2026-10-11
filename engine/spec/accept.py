@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import torch
 
+from engine.kernels import ops
+
 
 def processed_probs(logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
                     log_min_p: torch.Tensor) -> torch.Tensor:
@@ -41,7 +43,6 @@ def inverse_cdf(P: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
 def draw(logits: torch.Tensor, p, pos: torch.Tensor) -> torch.Tensor:
     """logits [B, R, V] fp32: row r of slot b predicts the token at position pos[b] + r.
     p: SamplerParams for the B slots. Returns the sampled tokens [B, R] int64 (argmax for slots with temperature 0)."""
-    from engine.kernels import ops
     B, R, _ = logits.shape
     u = torch.empty(B, R, device=logits.device)
     ops().philox_uniform(p.seed, pos.long().contiguous(), u)

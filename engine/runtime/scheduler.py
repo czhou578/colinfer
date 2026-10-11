@@ -41,8 +41,9 @@ from typing import Any
 
 import torch
 
-from engine.model.fast import MAX_ROWS, DecodeGraph, FastQwen35
+from engine.model.fast import MAX_ROWS, FastQwen35
 from engine.model.prefill import CHUNK, prefill, prepare_prefill
+from engine.runtime.decode import DecodeGraph
 from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, sample
 from engine.spec.suffix import SuffixIndex
@@ -52,6 +53,7 @@ K_OPTIONS = (3, 7)  # draft lengths a cycle chooses between (capped by k)
 ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
 SUFFIX_K = MAX_ROWS - 1  # suffix-match draft length: its verify rows still fit one weight pass
 REPLY_SPLIT_MIN = 512  # last-message length from which a prompt also snapshots at the start of the reply
+SPLIT_MIN_TOKENS = 256  # a split this close to the restored history is dropped: its chunk would be a weight pass for a few tokens
 ATTN_ROWS = 48      # query rows (q heads x verify rows) per pass of the attention kernel over a slot's KV (csrc/attn_decode.cu)
 
 
@@ -305,7 +307,7 @@ class Scheduler:
             echo = best is not None and best.reply
             if bs and not echo and bs[-1] - (bs[-2] if len(bs) > 1 else 0) >= REPLY_SPLIT_MIN:
                 ps.append(bs[-1])
-            s.splits = sorted({p for p in ps if p >= len(s.tokens) + 256})
+            s.splits = sorted({p for p in ps if p >= len(s.tokens) + SPLIT_MIN_TOKENS})
         self.params.set(b, req.temperature, req.top_k, req.top_p, req.min_p, req.seed)
         if self.mtp is not None:
             ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
