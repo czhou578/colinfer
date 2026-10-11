@@ -22,7 +22,7 @@
 namespace gdn {
 using namespace cc;
 
-constexpr int C = 64, DK = 128, DV = 128, BV = 64, WARPS = 4;
+constexpr int C = 64, DK = GDN_DK, DV = GDN_DV, BV = 64, WARPS = 4;
 constexpr int KS = DK + 8, VS = BV + 8, AS = C + 1;  // padded shared rows (bf16 / bf16 / fp32)
 
 __device__ __forceinline__ uint32_t pack(float lo, float hi) {

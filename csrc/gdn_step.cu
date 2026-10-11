@@ -45,7 +45,7 @@
 namespace gdn {
 using namespace cc;
 
-constexpr int DK = 128, DV = 128, THREADS = 512, MAX_T = THREADS / 32;
+constexpr int DK = GDN_DK, DV = GDN_DV, THREADS = 512, MAX_T = THREADS / 32;
 
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }  // fast: the decode path, not bit-matched
 

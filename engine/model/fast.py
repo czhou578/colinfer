@@ -420,7 +420,13 @@ class FastQwen35(Qwen35ForCausalLM):
 
 
 def to_fast(model: Qwen35ForCausalLM) -> FastQwen35:
-    """Switch a load_fast_model() model onto the kernel decode path: kernel attention / GDN / norms, stacked projections."""
+    """Switch a load_fast_model() model onto the kernel decode path: kernel attention / GDN / norms, stacked projections.
+    The kernels are compiled for one set of head dimensions (csrc/shapes.h): a checkpoint with others is refused here."""
+    k, cfg = ops(), model.cfg
+    have = (cfg.head_dim, cfg.linear_key_head_dim, cfg.linear_value_head_dim)
+    if have != (k.HEAD_DIM, k.GDN_DK, k.GDN_DV):
+        raise ValueError(f"the kernels are compiled for head_dim {k.HEAD_DIM} and GDN key / value dims {k.GDN_DK} / {k.GDN_DV} "
+                         f"(csrc/shapes.h); this checkpoint has {have[0]} and {have[1]} / {have[2]}")
     model.__class__ = FastQwen35
     inv_freq = rope_inv_freq(model.cfg, model.embed_tokens.weight.device)
     for layer in model.layers:

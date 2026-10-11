@@ -57,10 +57,8 @@ CODE_TASKS = ["parses a CSV file and prints column averages", "merges overlappin
 
 
 def wiki_material(rng):
-    import pyarrow.parquet as pq
-    wt = os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1")
-    files = sorted(glob.glob(wt + "/train-*.parquet"))
-    lines = pq.read_table(files[0]).column("text").to_pylist()
+    from tests.perplexity import wikitext_files, wikitext_lines
+    lines = wikitext_lines(wikitext_files("train")[0])
     titles = [l.strip(" =\n") for l in lines if l.startswith(" = ") and not l.startswith(" = = ")]
     paras = [l.strip() for l in lines if len(l) > 600 and not l.startswith(" =")]
     rng.shuffle(titles)

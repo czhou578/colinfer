@@ -14,6 +14,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
+#include "shapes.h"
+
 #define CHECK_CUDA_TENSOR(t, dt) \
     TORCH_CHECK((t).is_cuda() && (t).is_contiguous() && (t).scalar_type() == (dt), #t " must be a contiguous CUDA " #dt " tensor")
 #define CHECK_LAUNCH(e) TORCH_CHECK((e) == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(e))
@@ -189,7 +191,7 @@ cudaError_t launch_attn_prologue(const void*, const void*, const void*, int, int
 static void check_kv(const torch::Tensor& k, const torch::Tensor& v) {
     CHECK_CUDA_TENSOR(k, torch::kFloat8_e4m3fn);
     CHECK_CUDA_TENSOR(v, torch::kFloat8_e4m3fn);
-    TORCH_CHECK(k.dim() == 4 && k.sizes() == v.sizes() && k.size(3) == 256, "KV caches: e4m3 [B, Hkv, Lmax, 256]");
+    TORCH_CHECK(k.dim() == 4 && k.sizes() == v.sizes() && k.size(3) == HEAD_DIM, "KV caches: e4m3 [B, Hkv, Lmax, ", HEAD_DIM, "]");
 }
 
 // Fused q/k RMSNorm + partial RoPE + KV-cache write at the device positions pos_t[b] + t.
@@ -207,8 +209,8 @@ void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::
     check_kv(k_cache, v_cache);
     const int64_t B = q_out.size(0), Hq = q_out.size(1), T = q_out.size(2), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
     auto q2 = qp.reshape({-1, qp.size(-1)}), k2 = kp.reshape({-1, kp.size(-1)}), v2 = vp.reshape({-1, vp.size(-1)});
-    TORCH_CHECK(q2.size(0) == B * T && k2.size(0) == B * T && v2.size(0) == B * T && q2.size(1) == Hq * 512 && k2.size(1) == Hkv * 256 &&
-                v2.size(1) == Hkv * 256 && q_out.size(3) == 256 && pos_t.numel() == B, "bad shapes / strides");
+    TORCH_CHECK(q2.size(0) == B * T && k2.size(0) == B * T && v2.size(0) == B * T && q2.size(1) == Hq * 2 * HEAD_DIM && k2.size(1) == Hkv * HEAD_DIM &&
+                v2.size(1) == Hkv * HEAD_DIM && q_out.size(3) == HEAD_DIM && pos_t.numel() == B, "bad shapes / strides");
     CHECK_LAUNCH(launch_attn_prologue(q2.data_ptr(), k2.data_ptr(), v2.data_ptr(), (int)q2.stride(0), (int)k2.stride(0), (int)v2.stride(0),
                                       qn_w.data_ptr(), kn_w.data_ptr(), inv_freq.data_ptr<float>(), pos_t.data_ptr<int>(), k_cache.data_ptr(),
                                       v_cache.data_ptr(), q_out.data_ptr(), B, T, Hq, Hkv, Lmax, 2 * inv_freq.numel(), (float)eps,
@@ -232,7 +234,7 @@ void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, 
         gp = gate->data_ptr();
     }
     const int64_t B = q.size(0), Hq = q.size(1), T = q.size(2), Dh = q.size(3), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
-    TORCH_CHECK(k_cache.size(0) == B && Dh == 256 && seq_lens.numel() == B, "bad shapes");
+    TORCH_CHECK(k_cache.size(0) == B && Dh == HEAD_DIM && seq_lens.numel() == B, "bad shapes");
     const int NB = attn_decode_tc_nb();
     auto part_acc = torch::empty({B * Hq * T * NB, Dh}, q.options().dtype(torch::kFloat32));
     auto part_ml = torch::empty({B * Hq * T * NB, 2}, q.options().dtype(torch::kFloat32));
@@ -275,10 +277,10 @@ void gdn_delta(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tenso
                torch::Tensor norm_w, torch::Tensor state, c10::optional<torch::Tensor> out, int64_t Hk, double eps, c10::optional<torch::Tensor> n) {
     for (auto* t : {&qkv, &A_log, &dt_bias, &norm_w}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     CHECK_CUDA_TENSOR(state, torch::kFloat32);
-    const int64_t B = state.size(0), Hv = state.size(1), C = 2 * Hk * 128 + Hv * 128, T = qkv.numel() / (B * C);
-    const int64_t ldz = row_stride(z, Hv * 128, "z"), ldba = row_stride(b, Hv, "b");
+    const int64_t B = state.size(0), Hv = state.size(1), C = 2 * Hk * GDN_DK + Hv * GDN_DV, T = qkv.numel() / (B * C);
+    const int64_t ldz = row_stride(z, Hv * GDN_DV, "z"), ldba = row_stride(b, Hv, "b");
     TORCH_CHECK(row_stride(a, Hv, "a") == ldba, "b and a must share a row stride");
-    TORCH_CHECK(state.dim() == 4 && state.size(2) == 128 && state.size(3) == 128 && qkv.numel() == B * T * C && z.numel() == B * T * Hv * 128 &&
+    TORCH_CHECK(state.dim() == 4 && state.size(2) == GDN_DK && state.size(3) == GDN_DV && qkv.numel() == B * T * C && z.numel() == B * T * Hv * GDN_DV &&
                 b.numel() == B * T * Hv && a.numel() == b.numel() && Hv % Hk == 0, "bad shapes");
     TORCH_CHECK(out || n, "gdn_delta: outputs, a commit, or both");
     void* op = nullptr;
@@ -424,9 +426,9 @@ void gate_fp8(torch::Tensor o, torch::Tensor gate, int64_t D, double scale, torc
 void gated_rmsnorm(torch::Tensor o, torch::Tensor z, torch::Tensor w, double eps, torch::Tensor out) {
     for (auto* t : {&o, &w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     TORCH_CHECK(z.is_cuda() && z.scalar_type() == torch::kBFloat16 && z.dim() == 2 && z.stride(1) == 1, "z: bf16 [T, heads*128], unit-stride rows");
-    const int64_t heads = z.size(1) / 128;
-    TORCH_CHECK(z.size(1) % 128 == 0 && o.numel() == z.size(0) * z.size(1) && out.numel() == o.numel() && w.numel() == 128, "bad shapes");
-    CHECK_LAUNCH(launch_gated_rmsnorm(o.data_ptr(), z.data_ptr(), (int)z.stride(0), (int)heads, w.data_ptr(), out.data_ptr(), o.numel() / 128,
+    const int64_t heads = z.size(1) / GDN_DV;
+    TORCH_CHECK(z.size(1) % GDN_DV == 0 && o.numel() == z.size(0) * z.size(1) && out.numel() == o.numel() && w.numel() == GDN_DV, "bad shapes");
+    CHECK_LAUNCH(launch_gated_rmsnorm(o.data_ptr(), z.data_ptr(), (int)z.stride(0), (int)heads, w.data_ptr(), out.data_ptr(), o.numel() / GDN_DV,
                                       (float)eps, stream()));
 }
 
@@ -442,8 +444,8 @@ void gdn_prefill(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tenso
     CHECK_CUDA_TENSOR(g, torch::kFloat32);
     CHECK_CUDA_TENSOR(state, torch::kFloat32);
     const int64_t T = q.size(0), Hk = q.size(1), Hv = v.size(1);
-    TORCH_CHECK(q.dim() == 3 && q.sizes() == k.sizes() && q.size(2) == 128 && v.dim() == 3 && v.size(0) == T && v.size(2) == 128 &&
-                g.numel() == T * Hv && beta.numel() == T * Hv && state.numel() == Hv * 128 * 128 && o.sizes() == v.sizes() && Hv % Hk == 0,
+    TORCH_CHECK(q.dim() == 3 && q.sizes() == k.sizes() && q.size(2) == GDN_DK && v.dim() == 3 && v.size(0) == T && v.size(2) == GDN_DV &&
+                g.numel() == T * Hv && beta.numel() == T * Hv && state.numel() == Hv * GDN_DK * GDN_DV && o.sizes() == v.sizes() && Hv % Hk == 0,
                 "bad shapes");
     auto ws = torch::empty({(int64_t)gdn_prefill_ws_bytes(T, Hv)}, q.options().dtype(torch::kUInt8));
     CHECK_LAUNCH(launch_gdn_prefill(q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr<float>(), beta.data_ptr(), state.data_ptr<float>(),
@@ -460,7 +462,7 @@ void attn_prefill_fp8(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_ca
     CHECK_CUDA_TENSOR(q, torch::kBFloat16);
     check_kv(k_cache, v_cache);
     CHECK_CUDA_TENSOR(out, torch::kBFloat16);
-    TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(3) == 256 && k_cache.size(0) == 1 && out.numel() == q.numel(), "bad shapes");
+    TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(3) == HEAD_DIM && k_cache.size(0) == 1 && out.numel() == q.numel(), "bad shapes");
     const int64_t Hq = q.size(1), T = q.size(2), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
     TORCH_CHECK(pos >= 0 && pos + T <= Lmax, "positions past the cache");
     CHECK_LAUNCH(launch_attn_prefill_fp8(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(), T, Hq, Hkv, Lmax, pos, (float)scale,
@@ -543,4 +545,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // sampling and drafting
     m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (position-keyed sampling)", py::arg("seed"), py::arg("offset"), py::arg("out"));
     m.def("rescore_nvfp4", &rescore_nvfp4, "exact logits of candidate rows of an NVFP4 matrix (low-rank draft head)", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gs"), py::arg("cand"));
+    // the model dimensions the kernels are compiled for (csrc/shapes.h): engine/model/fast.py checks a checkpoint against them
+    m.attr("HEAD_DIM") = HEAD_DIM;
+    m.attr("GDN_DK") = GDN_DK;
+    m.attr("GDN_DV") = GDN_DV;
 }

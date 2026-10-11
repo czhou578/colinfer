@@ -23,14 +23,25 @@ import time
 
 import torch
 
+WIKITEXT = "~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1"  # the HF cache of Salesforce/wikitext
+
+
+def wikitext_files(split: str) -> list[str]:
+    """The parquet shards of a split (test, validation or train) of WikiText-103 in the local HF cache, sorted."""
+    files = sorted(glob.glob(os.path.expanduser(WIKITEXT) + f"/{split}-*.parquet"))
+    if not files:
+        sys.exit(f"WikiText {split} parquet not found under {WIKITEXT}")
+    return files
+
+
+def wikitext_lines(file: str) -> list[str]:
+    """The text rows of one shard."""
+    import pyarrow.parquet as pq
+    return pq.read_table(file).column("text").to_pylist()
+
 
 def wikitext_test() -> str:
-    import pyarrow.parquet as pq
-    pat = os.path.expanduser("~/.cache/huggingface/hub/datasets--Salesforce--wikitext/snapshots/*/wikitext-103-raw-v1/test-*.parquet")
-    files = sorted(glob.glob(pat))
-    if not files:
-        sys.exit(f"WikiText test parquet not found: {pat}")
-    return "\n\n".join(pq.read_table(files[0]).column("text").to_pylist())
+    return "\n\n".join(wikitext_lines(wikitext_files("test")[0]))
 
 
 @torch.inference_mode()

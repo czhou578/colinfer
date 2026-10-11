@@ -32,7 +32,7 @@
 namespace apf {
 using namespace cc;
 
-constexpr int D = 256, WARPS = 4, BM = 16 * WARPS, VS = D + 8;
+constexpr int D = HEAD_DIM, WARPS = 4, BM = 16 * WARPS, VS = D + 8;
 constexpr int BN = 32;  // keys per KV tile: 32 (two blocks per SM) beat 64 (102-106 vs 86-87 TFLOPS)
 
 __device__ __forceinline__ void mma_fp8(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {

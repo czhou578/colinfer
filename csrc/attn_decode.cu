@@ -24,7 +24,7 @@
 namespace attn {
 using namespace cc;
 
-constexpr int D = 256;
+constexpr int D = HEAD_DIM;
 
 // e4m3 cache row writer: saturating (values beyond +-448 clip)
 struct KvFp8 {

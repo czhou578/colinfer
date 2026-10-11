@@ -14,6 +14,8 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 
+#include "shapes.h"
+
 namespace cc {
 
 // ---- shared memory and cp.async ----
