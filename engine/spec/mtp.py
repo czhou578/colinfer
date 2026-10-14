@@ -54,6 +54,7 @@ from engine.model.fast import (
 )
 from engine.model.prefill import attend_cached, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
+from engine.runtime.sampler import apply_mask
 from engine.spec.accept import draw
 from engine.weights.loader import dequant_nvfp4, weight_map
 from engine.weights.quantize import nvfp4_global_scale, quantize
@@ -281,13 +282,16 @@ class MtpCycle:
     params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts that equal the target's
     position-keyed sample, so the output is exactly plain sampling; greedy for the rest; engine/spec/accept.py);
     None -> greedy cycle. drafts: MTP drafts made for the next cycle (default k; fewer when k is a suffix-match draft
-    length, engine/spec/suffix.py, whose drafts come from the host).
+    length, engine/spec/suffix.py, whose drafts come from the host). mask (optional, int32 [B, k+1, words]): the token
+    bitmask of each verify row (constrained decoding, engine/runtime/grammar.py); the target's token at a row is chosen
+    among the masked logits, so a draft outside its row's mask is never accepted.
     After replay: out_tok [B, k+1] (first n[b] valid), n [B] int32, logits [B, k+1, V] fp32 (verify rows, raw),
     H [B, k+1, hidden] (target post-norm hidden of the verify rows)."""
 
     def __init__(self, model: FastQwen35, mtp: Mtp, state: FastState, mst: MtpState, k: int = 3, params=None,
-                 tok: torch.Tensor | None = None, stop_ids: torch.Tensor | None = None, drafts: int | None = None):
-        self.model, self.mtp, self.state, self.mst, self.k, self.params = model, mtp, state, mst, k, params
+                 tok: torch.Tensor | None = None, stop_ids: torch.Tensor | None = None, drafts: int | None = None,
+                 mask: torch.Tensor | None = None):
+        self.model, self.mtp, self.state, self.mst, self.k, self.params, self.mask = model, mtp, state, mst, k, params, mask
         self.drafts = drafts or k
         dev = state.pos_t.device
         B = state.pos_t.shape[0]
@@ -307,10 +311,11 @@ class MtpCycle:
         tok = self.tok
         B = tok.shape[0]
         logits, H = m.verify(tok, st)                                # [B, k+1, V], [B, k+1, H]
+        sel = apply_mask(logits, self.mask) if self.mask is not None else logits  # the logits stay raw for logprobs
         if self.params is None:
-            pred = logits.argmax(-1)                                 # [B, k+1]
+            pred = sel.argmax(-1)                                    # [B, k+1]
         else:  # the target's own sample at every row, keyed by position (engine/spec/accept.py): output = plain sampling
-            pred = draw(logits, self.params, st.pos_t + 1)           # row i predicts position pos + i + 1
+            pred = draw(sel, self.params, st.pos_t + 1)              # row i predicts position pos + i + 1
         match = (pred[:, :k] == tok[:, 1:]).int()
         n = (1 + match.cumprod(-1).sum(-1)).int()                    # [B] accepted inputs, 1..k+1
         bonus = pred.gather(1, (n.long() - 1)[:, None])[:, 0]        # [B]

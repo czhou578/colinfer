@@ -88,6 +88,8 @@ decision. In short:
   prompts skip a second prefill. A cache on the NVMe keeps the KV and GDN snapshots of past conversations: a
   conversation that lost its slot, or any conversation after a restart, restores from disk (a 21k-token conversation:
   0.2 s to the first token instead of 7.2 s).
+- **Constrained decoding** (llguidance): JSON schemas (`response_format`) and forced tool calls (`tool_choice`
+  required / a named tool, also on the Anthropic API) mask the logits of each verify row, so speculation stays exact.
 - **Images** run through the checkpoint's vision tower (a 27-block ViT, BF16) at prefill. Their tokens get multimodal
   RoPE positions, and the prefix caches tell images apart by a hash of their pixels, so a conversation that sends the
   same screenshot again does not encode it again.
@@ -101,7 +103,7 @@ decision. In short:
 | `engine/model/prefill.py` | the prefill path |
 | `engine/model/vision.py` | image input: the vision tower, the image tokens and their multimodal RoPE positions |
 | `engine/spec/` | the MTP drafter and the speculative cycle (`mtp.py`), suffix-match drafts (`suffix.py`), exact acceptance for sampling (`accept.py`) |
-| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the conversation cache on disk (`sessions.py`), the engine build (`build.py`), the plain decode graph (`decode.py`), the sampler, metrics |
+| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the conversation cache on disk (`sessions.py`), constrained decoding (`grammar.py`), the engine build (`build.py`), the plain decode graph (`decode.py`), the sampler, metrics |
 | `engine/server/` | the HTTP server (`api.py`), its engine thread (`worker.py`), the OpenAI formats (`openai.py`), the Anthropic Messages API (`anthropic.py`), the chat template and output parsing (`chat.py`), images in requests (`images.py`) |
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), the fake NVFP4 activation quantization that the kernel tests compare against (`quant_emul.py`) |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |

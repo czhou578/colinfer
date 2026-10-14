@@ -19,10 +19,14 @@ More checks:
      a restore from memory, and its TTFT far below a prefill from scratch.
   8. an image (engine/model/vision.py): the model reads the text drawn in it; the MTP scheduler gives the tokens of
      plain decode; turn 2 restores the prefix that holds the image and does not run the vision tower again.
-  9. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
+  9. constrained decoding (engine/runtime/grammar.py): a JSON-schema reply parses and matches its schema, and MTP
+     gives the tokens of plain decode under the same grammar; a forced tool call parses, with typed arguments; with
+     reasoning on, the JSON follows the free reasoning.
+ 10. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
 import io
+import json
 import os
 import shutil
 import sys
@@ -32,9 +36,10 @@ import time
 import torch
 
 from engine.runtime.build import build_engine
+from engine.runtime.grammar import Grammars
 from engine.runtime.scheduler import Request, Scheduler
 from engine.runtime.sessions import SessionStore
-from engine.server.chat import ChatFormat
+from engine.server.chat import ChatFormat, parse_tool_call
 from engine.server.images import ImageProcessor, expand
 from engine.weights.loader import MODEL, resolve
 
@@ -246,6 +251,50 @@ def main():
         print(f"[image] {ims[0].n} image tokens; answer {ans!r}; MTP vs plain decode {'IDENTICAL' if same else 'DIFFERENT'}; "
               f"turn 2 reused {r3.reused} of {len(p3)} with {calls[0]} vision tower runs, TTFT {r3.t_first - r3.t_submit:.3f} s "
               f"(turn 1: {ri.t_first - ri.t_submit:.3f} s)")
+
+    # 9. constrained decoding
+    gr = Grammars(fmt, spec.model.cfg.vocab_size)
+    person = {"type": "object", "properties": {"name": {"type": "string"}, "birth_year": {"type": "integer"},
+                                               "fields": {"type": "array", "items": {"type": "string"}}},
+              "required": ["name", "birth_year", "fields"], "additionalProperties": False}
+    pj = chat_ids([{"role": "user", "content": "Give a short record of Ada Lovelace: her name, birth year and fields of work."}])
+    spec.reset()
+    rj = spec.run([R(pj, max_new_tokens=300, constraint=gr.json(person, think=False))])[0]
+    rjp = ref.run([R(pj, max_new_tokens=300, constraint=gr.json(person, think=False))])[0]
+    rjf = spec.run([R(pj, max_new_tokens=300)])[0]
+    try:
+        obj = json.loads(tok.decode([t for t in rj.output if t not in EOS], skip_special_tokens=True))
+        valid = set(obj) == set(person["properties"]) and isinstance(obj["birth_year"], int) and all(isinstance(x, str) for x in obj["fields"])
+    except (ValueError, KeyError, TypeError):
+        obj, valid = None, False
+    same = rj.output == rjp.output
+    ok &= valid and same and rj.finish_reason == "stop"
+    tps = lambda r: (len(r.output) - 1) / max(r.t_done - r.t_first, 1e-9)  # noqa: E731
+    print(f"[constrained] JSON schema: {json.dumps(obj)}; {'VALID' if valid else 'INVALID'}; "
+          f"MTP vs plain decode {'IDENTICAL' if same else 'DIFFERENT'}; "
+          f"{tps(rj):.1f} tok/s (unconstrained reply: {tps(rjf):.1f} tok/s, {tok.decode(rjf.output[:12])!r}...)")
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {
+        "city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}]
+    pt = fmt.render([{"role": "user", "content": "Tell me a joke about Paris."}], tools=tools, enable_thinking=False)
+    rt = spec.run([R(pt, max_new_tokens=200, constraint=gr.tools(tools, names=["get_weather"], single=True))])[0]
+    text = tok.decode(rt.output, skip_special_tokens=False)
+    body = text.split("<tool_call>")[-1].split("</tool_call>")[0] if "<tool_call>" in text else ""
+    call = parse_tool_call(body, tools)
+    good = call is not None and call["name"] == "get_weather" and isinstance(json.loads(call["arguments"]).get("city"), str)
+    ok &= good
+    print(f"[constrained] forced tool call on a prompt that needs none: {call}; {'VALID' if good else 'INVALID'}")
+    pr = fmt.render([{"role": "user", "content": "Give a short record of Ada Lovelace: her name, birth year and fields of work."}],
+                    reasoning_effort="low")
+    rr = spec.run([R(pr, max_new_tokens=2000, constraint=gr.json(person, think=fmt.opens_in_reasoning(pr)))])[0]
+    out = tok.decode([t for t in rr.output if t not in EOS], skip_special_tokens=False)
+    try:
+        robj = json.loads(out.split("</think>")[-1])
+        rvalid = set(robj) == set(person["properties"]) and "</think>" in out
+    except ValueError:
+        robj, rvalid = None, False
+    ok &= rvalid
+    print(f"[constrained] with reasoning: {len(out.split('</think>')[0])} characters of reasoning, then {json.dumps(robj)}; "
+          f"{'VALID' if rvalid else 'INVALID'}")
 
     m = spec.metrics
     print(f"[spec] drafted {m.drafted.get():.0f}, accepted {m.accepted.get():.0f} ({m.accepted.get() / max(m.drafted.get(), 1):.2f})")

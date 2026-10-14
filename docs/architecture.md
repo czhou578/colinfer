@@ -211,6 +211,13 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   at s' + max(rows, cols). The attention prologue takes each prefill row's (t, h, w) (`rope_pos`); frequency i
   rotates by h when i % 3 == 1, by w when i % 3 == 2 and i < 30, else by t. Decode adds a per-slot delta
   (`FastState.rope_delta`) to the cache position, since a reply holds no images. The drafter rotates the same way.
+- **Constrained decoding** (`engine/runtime/grammar.py`, llguidance). A JSON schema or forced tool calls (Qwen's XML
+  format, with the function's parameter names and values typed by their schema) become a grammar, with free reasoning
+  before it when the prompt opens a `<think>` block. Every graph applies a per-slot token bitmask to the logits that
+  it selects from (all ones for other requests, so their bits do not change). Before a cycle, the host fills the mask
+  of each verify row from the matcher advanced by the drafts before that row. A draft that the grammar refuses
+  cannot equal the masked target token of its row, so acceptance stops there, and the cycle emits exactly what plain
+  constrained decoding would. The masks of a cycle take ~0.2 ms.
 - **Server.** One engine thread owns the GPU. Asyncio handlers render the chat template, tokenize and stream. The
   engine thread detokenizes and parses each token as the engine emits it: reasoning, content, Qwen XML tool calls and
   stop strings (`engine/server/chat.py`). The Anthropic Messages API (`/v1/messages`, for Claude Code) uses the same
@@ -259,7 +266,8 @@ scheduler_check.py) and stops at the first failure; `--quick` runs ruff and pyte
   still pending when its slot is reused). `test_vision.py` checks the image positions against `get_rope_index` of
   transformers, the prologue at (t, h, w) positions against the reference rotary, and the scheduler with images on the
   stub model; `test_model_small.py` checks the reference model with an image's positions and embeddings against
-  transformers. `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
+  transformers. `test_grammar.py` checks the grammars on the checkpoint's tokenizer (schemas, forced and typed tool
+  calls, the masks of the verify rows) and the scheduler under a mask. `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
   errors). `test_model_small.py` compares the reference model with the Qwen3.5 model of transformers at tiny scale.
 - `tests/golden.py` runs 21 recorded requests at once (greedy, seeded-sampled, a 20k-token prompt) on the server's engine
   (`engine/runtime/build.py`, which the server, the checks and the benchmarks share). They must reproduce
@@ -267,8 +275,9 @@ scheduler_check.py) and stops at the first failure; `--quick` runs ruff and pyte
   speculation (`check --plain`).
 - `tests/scheduler_check.py` compares the outputs of the scheduler with the uncached single-request outputs. It covers
   single and queued requests (greedy around sampled and a long prefill), multi-turn and shared-prefix requests, a
-  restore from disk after a restart (the same output as a restore from memory), and an image (the model reads the
-  text in it, MTP gives the tokens of plain decode, the next turn reuses the image).
+  restore from disk after a restart (the same output as a restore from memory), an image (the model reads the text
+  in it, MTP gives the tokens of plain decode, the next turn reuses the image) and constrained decoding (a schema-valid
+  JSON reply identical to plain decode, a forced tool call, JSON after free reasoning).
 - Other end-to-end checks: `tests/perplexity.py`, `tests/passkey.py` (long-context retrieval), `tests/server_check.py`
   (the HTTP API).
 - Benchmarks: `bench/perf.py` (the repeatable baseline: prefill, TTFT, decode, memory), `bench/decode_bench.py`,

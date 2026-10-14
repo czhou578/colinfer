@@ -399,3 +399,54 @@ def test_output_tokens_and_time_of_a_request_are_capped():
 def test_a_timeout_reads_as_a_cut_off():
     assert oai.finish_reason(types.SimpleNamespace(finish_reason="timeout")) == "length"
     assert anth.stop_reason("timeout", 0, None) == ("max_tokens", None)
+
+
+class FakeGrammars:
+    """engine/runtime/grammar.py Grammars, recording what each request asks for."""
+
+    def __init__(self, fmt, vocab):
+        pass
+
+    def json(self, schema, think):
+        return ("json", schema, think)
+
+    def tools(self, tools, names=None, single=False, think=False):
+        if names and names[0] not in [t["function"]["name"] for t in tools]:
+            raise ValueError(f"tool_choice names {names} no tool of the request's tools")
+        return ("tools", names, single, think)
+
+
+TOOL = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}]
+
+
+def test_constraints_of_both_apis(monkeypatch):
+    import engine.server.api as api
+    monkeypatch.setattr(api, "Grammars", FakeGrammars)
+    c, w = client("{}")
+    schema = {"type": "object"}
+    for body, want in (({"response_format": {"type": "json_object"}}, ("json", None, True)),
+                       ({"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": schema}}, "enable_thinking": False},
+                        ("json", schema, False)),
+                       ({"tools": TOOL, "tool_choice": "required"}, ("tools", None, False, True)),
+                       ({"tools": TOOL, "tool_choice": {"type": "function", "function": {"name": "f"}}, "parallel_tool_calls": False},
+                        ("tools", ["f"], True, True)),
+                       ({"response_format": {"type": "text"}}, None), ({"tools": TOOL, "tool_choice": "auto"}, None)):
+        assert c.post(CHAT, json={"messages": USER, **body}).status_code == 200, body
+        assert w.submitted[-1].constraint == want, body
+    assert c.post("/v1/completions", json={"prompt": "hi", "response_format": {"type": "json_object"}}).status_code == 200
+    assert w.submitted[-1].constraint == ("json", None, False)  # a raw prompt has no reasoning to skip
+    for bad in ({"response_format": {"type": "json_schema"}}, {"response_format": {"type": "yaml"}}, {"tool_choice": "required"},
+                {"tools": TOOL, "tool_choice": {"type": "function", "function": {"name": "g"}}}, {"tools": TOOL, "tool_choice": "sometimes"}):
+        r = c.post(CHAT, json={"messages": USER, **bad})
+        assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error", bad
+    anth_tool = [{"name": "f", "input_schema": {"type": "object", "properties": {}}}]
+    m = {"max_tokens": 5, "messages": USER}
+    for body, want in (({"tools": anth_tool, "tool_choice": {"type": "any"}}, ("tools", None, False, False)),
+                       ({"tools": anth_tool, "tool_choice": {"type": "tool", "name": "f", "disable_parallel_tool_use": True}},
+                        ("tools", ["f"], True, False)),
+                       ({"output_format": {"type": "json_schema", "schema": schema}}, ("json", schema, False)),
+                       ({"tools": anth_tool, "tool_choice": {"type": "auto"}}, None)):
+        assert c.post("/v1/messages", json={**m, **body}).status_code == 200, body
+        assert w.submitted[-1].constraint == want, body
+    for bad in ({"tool_choice": {"type": "any"}}, {"tools": anth_tool, "tool_choice": {"type": "tool"}}, {"output_format": {"type": "json"}}):
+        assert c.post("/v1/messages", json={**m, **bad}).status_code == 400, bad

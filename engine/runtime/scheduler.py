@@ -36,6 +36,11 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
   with the vision tower (once per image, only when they are prefilled) and gives each row its multimodal (t, h, w)
   rotary position; decode rotates by the cache position plus the slot's delta. The placeholder ids never reach the
   drafts or the draft vocabulary.
+* Constrained decoding (engine/runtime/grammar.py). A request with a constraint (a JSON schema, forced tool calls)
+  chooses each token within its grammar's mask. Every graph applies a per-slot mask buffer to the logits it selects
+  from (all ones for other requests, which leaves their bits unchanged). Before a cycle, the host fills the mask of
+  each verify row from the matcher advanced by the drafts before that row; after it, the matcher consumes the emitted
+  tokens. Thus a cycle emits what plain constrained decoding would.
 * Finish. A request ends at a stop token (eos_ids), at max_new_tokens, at the slot length, by its hook (stop
   strings, client gone), or max_seconds after its submit ("timeout", also while it still waits in the queue). The
   speculative cycle cuts the accepted length after a stop token on the GPU. Thus the history of a slot (`Slot.tokens`,
@@ -55,8 +60,9 @@ from engine.model.fast import MAX_ROWS, FastQwen35
 from engine.model.prefill import CHUNK, prefill, prepare_prefill
 from engine.model.vision import Image, VisionTower, rope_delta, rope_positions
 from engine.runtime.decode import DecodeGraph
+from engine.runtime.grammar import Constraint, mask_words
 from engine.runtime.metrics import Metrics
-from engine.runtime.sampler import SamplerParams, sample
+from engine.runtime.sampler import SamplerParams, apply_mask, sample
 from engine.runtime.sessions import Hit, SessionStore
 from engine.spec.mtp import MtpCycle, MtpState
 from engine.spec.suffix import SuffixIndex
@@ -101,6 +107,7 @@ class Request:
     max_seconds: float = 0.0        # > 0: the request ends ("timeout") this long after its submit, running or queued
     disk: bool = True               # its checkpoints may go to the disk cache (False: the client asked for no prefix reuse)
     images: list[Image] = dataclasses.field(default_factory=list)  # its images, in prompt order (engine/model/vision.py)
+    constraint: Constraint | None = None  # the grammar its tokens follow (engine/runtime/grammar.py)
     # filled in by the scheduler
     rid: int = -1
     slot: int = -1
@@ -142,6 +149,7 @@ class Slot:
         self.fresh = 0                     # drafts in the slot's pending input made for it (the rest are stale)
         self.sfx = None                    # suffix-match index of the history (suffix_min > 0)
         self.salt = None             # cache_salt of the request that produced this slot's history
+        self.masked = False          # the slot's mask buffer holds a constraint's masks (else all ones)
 
 
 class Scheduler:
@@ -160,6 +168,10 @@ class Scheduler:
         cfg = model.cfg
         self.params = SamplerParams(n_slots, cfg.vocab_size, dev)
         self.margin = (self.kmax + 1) if mtp is not None else 1  # positions one decode step writes beyond the history
+        # the token bitmask of each slot's verify rows (constrained decoding), and the host side the matcher fills
+        W = mask_words(cfg.vocab_size)
+        self.masks = torch.full((n_slots, self.margin, W), -1, dtype=torch.int32, device=dev)
+        self.mask_host = torch.full((self.margin, W), -1, dtype=torch.int32, pin_memory=True)
         # draft lengths of K_OPTIONS (capped by k) whose verify rows fit one weight pass of the skinny GEMM (MAX_ROWS =
         # 16), since a second pass streams every weight again. The pending drafts are a chain: a shorter k uses a prefix.
         self.k_opts = [kk for kk in sorted({min(kk, k) for kk in K_OPTIONS + (k,)}) if kk + 1 <= MAX_ROWS] or [MAX_ROWS - 1]
@@ -174,7 +186,7 @@ class Scheduler:
                     for sampled in (False, True):
                         self.cycles[(b, sampled, kw)] = MtpCycle(model, mtp, sv, mv, kw, params=self.params.view(b, b + 1) if sampled else None,
                                                                  tok=self.tok[b:b + 1, :kw + 1], stop_ids=self.stop_buf[b:b + 1],
-                                                                 drafts=min(kw, k))
+                                                                 drafts=min(kw, k), mask=self.masks[b:b + 1, :kw + 1])
                     if b == 0:  # cycle time per k, for choosing k (the state is garbage here and reset below)
                         g = self.cycles[(b, False, kw)]
                         g.graph.replay()
@@ -192,7 +204,8 @@ class Scheduler:
             self.ctx_draft_s = kv(self.mst.k) / 2.4e11
             self.q_per_kv = cfg.num_attention_heads // cfg.num_key_value_heads
         else:
-            self.graphs = {b: DecodeGraph(model, self.state.view(b, b + 1), self.params.view(b, b + 1)) for b in range(n_slots)}
+            self.graphs = {b: DecodeGraph(model, self.state.view(b, b + 1), self.params.view(b, b + 1), self.masks[b:b + 1, :1])
+                           for b in range(n_slots)}
         self.state.reset()
         self.slots = [Slot(i) for i in range(n_slots)]
         # checkpoint ring, allocated once
@@ -399,6 +412,9 @@ class Scheduler:
             s.splits = sorted({p for p in ps if p >= len(s.tokens) + SPLIT_MIN_TOKENS})
         self.params.set(b, req.temperature, req.top_k, req.top_p, req.min_p, req.seed)
         self.state.rope_delta[b] = rope_delta(req.images)  # the reply's rotary positions trail its cache positions by this
+        if s.masked and req.constraint is None:
+            self.masks[b].fill_(-1)
+        s.masked = req.constraint is not None
         if self.mtp is not None:
             ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
             self.stop_buf[b] = torch.tensor(ids + [-1] * (MAX_STOP_IDS - len(ids)))
@@ -466,7 +482,10 @@ class Scheduler:
             self._snapshot(s, disk=split)
         if done:
             req = s.req
-            tok = int(sample(logits, self.params.view(b, b + 1), view.pos_t))
+            sel = logits
+            if req.constraint is not None:  # the first token, within the grammar
+                sel = apply_mask(logits[:, None], self._row_masks(req, b, []))[:, 0]
+            tok = int(sample(sel, self.params.view(b, b + 1), view.pos_t))
             lp = self._logprobs(logits, [tok], req.logprobs) if req.logprobs is not None else None
             s.phase, s.y = "decode", tok
             self._emit(s, [tok], lp)
@@ -488,6 +507,8 @@ class Scheduler:
         if self.mtp is not None:
             kk = self._pick_k(s)
             g = self.cycles[(s.idx, s.req.temperature > 0, kk)]
+            if s.req.constraint is not None:  # the mask of each verify row: the grammar after the drafts before it
+                self._row_masks(s.req, s.idx, self.tok[s.idx, 1:kk + 1].tolist())
             g.graph.replay()
             self._evt.record()
             self._evt.synchronize()  # releases the GIL while the GPU works
@@ -511,6 +532,8 @@ class Scheduler:
                 self._suffix_drafts(s)
         else:
             g = self.graphs[s.idx]
+            if s.req.constraint is not None:
+                self._row_masks(s.req, s.idx, [])
             nxt = g.step(torch.tensor([s.y]).to(self.dev))
             self._evt.record()
             self._evt.synchronize()
@@ -520,6 +543,17 @@ class Scheduler:
             lp = self._logprobs(g.logits[0:1], [y], s.req.logprobs) if s.req.logprobs is not None else None
             self._emit(s, [y], lp)
         m.step_seconds.observe(time.perf_counter() - t0, kind="decode")
+
+    def _row_masks(self, req: Request, b: int, drafts: list[int]) -> torch.Tensor:
+        """Fills slot b's mask buffer for the verify rows [y, drafts...] from the request's grammar and returns those rows
+        ([1, len(drafts) + 1, words], device)."""
+        r = len(drafts) + 1
+        host = self.mask_host[:r]
+        host.fill_(-1)
+        req.constraint.masks(drafts, host.numpy())
+        self.masks[b, :r].copy_(host, non_blocking=True)
+        torch.cuda.current_stream().synchronize()  # the host buffer is reused by the next cycle
+        return self.masks[b:b + 1, :r]
 
     def _ids(self, toks: list[int], images: list[Image]) -> list[int]:
         """Input ids: image tokens as the image pad (prefill replaces their rows)."""
@@ -564,6 +598,9 @@ class Scheduler:
 
     def _emit(self, s: Slot, toks: list[int], lps):
         req = s.req
+        if req.constraint is not None and not req.constraint.advance(toks):  # never: every token was drawn under its mask
+            print(f"[scheduler] request {req.rid}: the grammar refused the emitted tokens {toks}; ending it", flush=True)
+            return self._finish(s, "stop")
         for i, t in enumerate(toks):
             if not req.output:
                 req.t_first = time.perf_counter()

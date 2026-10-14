@@ -23,6 +23,8 @@ dependencies = [
     "numpy>=2.3",
     # Image input: decoding and the Qwen2-VL resize of transformers' PIL image processor.
     "pillow>=11.3",
+    # Constrained decoding (JSON schemas, forced tool calls): token masks from a grammar.
+    "llguidance>=1.9.1",
     # Build helper for torch.utils.cpp_extension / CMake.
     "ninja>=1.11",
     "fastapi>=0.142.2",
@@ -94,3 +96,7 @@ explicit = true
 torch = { index = "pytorch-cu130" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
+
+[tool.pytest.ini_options]
+# FlashInfer's CUTLASS DSL modules use deprecated cutlass names when FlashInfer is first imported: not ours to fix.
+filterwarnings = ["ignore:cutlass\\.:DeprecationWarning", "ignore:Arch from arch.py:DeprecationWarning"]

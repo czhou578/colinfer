@@ -67,11 +67,23 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 - **Streaming:** `stream` with `stream_options.include_usage`. While a stream has no output yet (the queue, a long
   prefill), the server sends an SSE comment line every 10 s, so an idle timeout of the client or a proxy does not end
   it.
+- **Constrained decoding** (`engine/runtime/grammar.py`, with llguidance):
+  - `response_format` `{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {"schema": {...}}}`: the
+    reply is one JSON value that matches the schema (`strict` is always on). `/v1/completions` takes it too.
+  - `tool_choice` `required`, or `{"type": "function", "function": {"name": ...}}`: the reply is tool calls (to that
+    function), with the parameter names of its schema and values of their types. `parallel_tool_calls: false`: one
+    call.
+  - With thinking on, the model reasons freely first; the constraint applies after the reasoning.
+  - Speculation stays exact: each verify row is masked by the grammar after the drafts before it, so a cycle emits
+    what plain constrained decoding would. The masks cost ~0.2 ms a cycle. The first constrained request builds the
+    grammar tokenizer (~1.5 s); a schema compiles in a few ms. A schema or a tool name that the grammar cannot take
+    gets a 400.
 - **Images:** content parts `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` in user and
   tool messages (PNG, JPEG, WebP, GIF: what Pillow reads). The server accepts only base64 data URLs: it fetches
   nothing. A system message cannot hold images (the chat template rejects them with a 400).
 - **Prompt rendering:**
-  - `tools`, `tool_choice` (`none` leaves the tools out of the prompt).
+  - `tools`, `tool_choice` (`none` leaves the tools out of the prompt; `required` and a named function force tool
+    calls, see below).
   - `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...), plus top-level `enable_thinking` and
     `reasoning_effort` (`none`, `low`, `medium`, `high`).
   - The template accepts the efforts `xhigh` (its default), `medium` and `low`. The server changes the effort names of
@@ -92,7 +104,6 @@ The server accepts the `user` field and ignores it. It rejects these with a 400:
 - `n > 1`, `echo`, and a prompt longer than the slot
 - `presence_penalty` or `frequency_penalty` other than 0, and `repetition_penalty` other than 1. The sampler has no
   penalties. The neutral values pass, because they do not change the output.
-- `response_format` other than `{"type": "text"}`. The server has no constrained decoding.
 - a malformed request: a body that is not a JSON object, a field of the wrong type (a number field, `stop` other than
   strings, messages or tools that are not objects), token ids outside the vocabulary (a prompt of token ids,
   `stop_token_ids`), `min_p` outside [0, 1], `max_tokens` or `max_completion_tokens` below 1, and an error of the chat
@@ -155,7 +166,8 @@ Other endpoints:
 - **Other fields:**
   - `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences` work as on the Anthropic API.
   - `tool_choice` `none` keeps the tools in the prompt and drops the tool calls of the reply. `any` and a named tool
-    have no effect, because the server has no constrained decoding.
+    force the reply to be tool calls (to that tool), one with `disable_parallel_tool_use`, as on the chat endpoint.
+  - `output_format` (also `output_config.format`) `{"type": "json_schema", "schema": {...}}` forces a JSON reply.
   - Image blocks with a base64 source go to the model, also inside a `tool_result` (Claude Code sends screenshots and
     the images that its Read tool opens this way). An image with a `url` source gets a 400: the server fetches
     nothing. Documents (PDF) become a short text note.

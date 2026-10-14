@@ -47,6 +47,15 @@ class SamplerParams:
         self.seed[slot] = int(seed)
 
 
+def apply_mask(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """logits [B, R, V] fp32, mask [B, R, W] int32 token bitmask (token t: bit t % 32 of word t // 32; constrained
+    decoding, engine/runtime/grammar.py) -> the logits with the tokens outside the mask at -inf. An all-ones mask leaves
+    every value as it was. Graph-capturable."""
+    B, R, V = logits.shape
+    bits = (mask[..., None] >> torch.arange(32, dtype=torch.int32, device=mask.device)) & 1
+    return logits.masked_fill(bits.view(B, R, -1)[..., :V] == 0, float("-inf"))
+
+
 def sample(logits: torch.Tensor, p: SamplerParams, pos: torch.Tensor) -> torch.Tensor:
     """logits [B, V] fp32 -> token ids [B] int64. pos [B]: the position of the token being sampled (device).
     Graph-capturable (no host syncs)."""

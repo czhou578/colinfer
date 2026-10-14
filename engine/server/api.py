@@ -31,6 +31,7 @@ import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+from engine.runtime.grammar import Grammars
 from engine.runtime.scheduler import Request as EngineRequest
 from engine.server import anthropic as anth
 from engine.server import images as img
@@ -141,9 +142,6 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         for k, neutral in (("presence_penalty", 0.0), ("frequency_penalty", 0.0), ("repetition_penalty", 1.0)):
             if b.get(k) is not None and _num(b[k], float, k) != neutral:
                 raise BadRequest(f"{k} is not supported (only {neutral:g}, the neutral value)")
-        rf = b.get("response_format")
-        if rf is not None and not (isinstance(rf, dict) and rf.get("type") == "text"):
-            raise BadRequest("response_format is not supported except {\"type\": \"text\"}: the server has no constrained decoding")
         return b
 
     def token_ids(ids, name: str) -> tuple[int, ...]:
@@ -151,7 +149,70 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             raise BadRequest(f"{name} must be token ids in [0, {vocab})")
         return tuple(ids)
 
-    def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None, images=()) -> EngineRequest:
+    grammars = []  # the llguidance tokenizer, built on the first constrained request (~1.5 s)
+
+    def openai_constraint(b: dict, tools) -> tuple | None:
+        """(kind, arguments) of the constraint that an OpenAI request asks for: forced tool calls (tool_choice required or
+        a named function; parallel_tool_calls false: one call) or JSON (response_format json_object / json_schema)."""
+        tc = b.get("tool_choice")
+        if tc == "required" or isinstance(tc, dict):
+            name = None
+            if isinstance(tc, dict):
+                fn = tc.get("function") if tc.get("type") == "function" else None
+                name = fn.get("name") if isinstance(fn, dict) else None
+                if not isinstance(name, str):
+                    raise BadRequest("tool_choice must be none, auto, required or {\"type\": \"function\", \"function\": {\"name\": ...}}")
+            if not tools:
+                raise BadRequest("tool_choice required or a named function needs tools")
+            return "tools", dict(tools=tools, names=None if name is None else [name], single=b.get("parallel_tool_calls") is False)
+        if tc not in (None, "auto", "none"):
+            raise BadRequest("tool_choice must be none, auto, required or a named function")
+        rf = b.get("response_format")
+        if rf is None or (isinstance(rf, dict) and rf.get("type") == "text"):
+            return None
+        if isinstance(rf, dict) and rf.get("type") == "json_object":
+            return "json", dict(schema=None)
+        if isinstance(rf, dict) and rf.get("type") == "json_schema":
+            js = rf.get("json_schema")
+            schema = js.get("schema") if isinstance(js, dict) else None
+            if not isinstance(schema, dict):
+                raise BadRequest("response_format json_schema needs json_schema.schema, a JSON schema object")
+            return "json", dict(schema=schema)
+        raise BadRequest("response_format type must be text, json_object or json_schema")
+
+    def anthropic_constraint(b: dict, tools) -> tuple | None:
+        """The same for an Anthropic request: tool_choice any / tool (disable_parallel_tool_use: one call), or
+        output_format (also output_config.format) json_schema."""
+        tc = b.get("tool_choice")
+        if isinstance(tc, dict) and tc.get("type") in ("any", "tool"):
+            name = tc.get("name") if tc.get("type") == "tool" else None
+            if tc.get("type") == "tool" and not isinstance(name, str):
+                raise BadRequest("a tool_choice of type tool needs the tool's name")
+            if not tools:
+                raise BadRequest(f"tool_choice {tc.get('type')} needs tools")
+            return "tools", dict(tools=tools, names=None if name is None else [name], single=bool(tc.get("disable_parallel_tool_use")))
+        oc = b.get("output_config")
+        of = b.get("output_format") or (oc.get("format") if isinstance(oc, dict) else None)
+        if of is None:
+            return None
+        if not (isinstance(of, dict) and of.get("type") == "json_schema" and isinstance(of.get("schema"), dict)):
+            raise BadRequest("output_format must be {\"type\": \"json_schema\", \"schema\": {...}}")
+        return "json", dict(schema=of["schema"])
+
+    async def constraint(spec: tuple | None, prompt: list[int], chat: bool = True):
+        """The constraint of a request (engine/runtime/grammar.py), with free reasoning first when its prompt opens it.
+        A schema or a tool name that the grammar cannot take is the client's error."""
+        if spec is None:
+            return None
+        kind, kw = spec
+        try:
+            if not grammars:
+                grammars.append(await asyncio.to_thread(Grammars, fmt, vocab))
+            return await asyncio.to_thread(getattr(grammars[0], kind), think=chat and fmt.opens_in_reasoning(prompt), **kw)
+        except ValueError as e:
+            raise BadRequest(str(e)) from None
+
+    def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None, images=(), constraint=None) -> EngineRequest:
         if cfg.max_queue and worker.queued() >= cfg.max_queue:
             raise Busy(f"the server is busy: {cfg.max_queue} requests are waiting")
         if not prompt:
@@ -191,7 +252,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                              min_p=min_p, seed=seed, eos_ids=eos,
                              min_tokens=_num(b.get("min_tokens") or 0, int, "min_tokens"),
                              logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt),
-                             max_seconds=cfg.max_request_seconds, disk=keep, images=list(images))
+                             max_seconds=cfg.max_request_seconds, disk=keep, images=list(images), constraint=constraint)
 
     def stops_of(b: dict, key: str = "stop") -> list[str]:
         """The stop strings of a request: `stop` (OpenAI: a string or a list) or `stop_sequences` (Anthropic: a list)."""
@@ -312,13 +373,15 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             msgs = b.get("messages")
             tool_choice = b.get("tool_choice")
             tools = b.get("tools") if tool_choice != "none" else None
+            spec = openai_constraint(b, tools)
             prompt, images = await render(msgs, tools, kwargs_of(b))
+            cons = await constraint(spec, prompt)
             n_top = None
             if b.get("logprobs"):
                 n_top = min(_num(b.get("top_logprobs") or 0, int, "top_logprobs"), oai.MAX_TOP_LOGPROBS)
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser)
-            req = make_request(b, prompt, st, n_top, images)
+            req = make_request(b, prompt, st, n_top, images, cons)
             include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
             return _error(str(e))
@@ -409,9 +472,10 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             if b.get("echo"):
                 raise BadRequest("echo is not supported")
             n_top = None if b.get("logprobs") is None else min(_num(b["logprobs"], int, "logprobs"), oai.MAX_TOP_LOGPROBS)
+            cons = await constraint(openai_constraint(b, None), prompt, chat=False)
             parser = TextParser(tokenizer, stops_of(b))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser)
-            req = make_request(b, prompt, st, n_top)
+            req = make_request(b, prompt, st, n_top, constraint=cons)
             include_usage = include_usage_of(b)
         except BadRequest as e:
             return _error(str(e))
@@ -472,9 +536,10 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         try:
             b = await json_body(request)
             prompt, tools, images = await render_messages(b)
+            cons = await constraint(anthropic_constraint(b, tools), prompt)
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b, "stop_sequences"))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser)
-            req = make_request(b, prompt, st, None, images)
+            req = make_request(b, prompt, st, None, images, cons)
         except BadRequest as e:
             return _anth_error(str(e))
         except Busy as e:

@@ -19,7 +19,8 @@ request becomes the same message list that /v1/chat/completions renders with the
 * Server tools (tools with a `type`, for example web_search_20250305) are left out. A request with only server tools
   gets an error.
 * `tool_choice` none keeps the tools in the prompt (the prefix stays the same for the prefix cache) and drops the tool
-  calls of the reply. `any` and a named tool cannot be forced: the server has no constrained decoding.
+  calls of the reply. `any` and a named tool force the reply to be tool calls (engine/runtime/grammar.py), one with
+  `disable_parallel_tool_use`. `output_format` json_schema (also `output_config.format`) forces a JSON reply.
 * The server ignores the fields that concern only the Anthropic service: cache_control, metadata,
   context_management, service_tier, and the thinking budget and display.
 
