@@ -50,6 +50,31 @@ def test_render_thinking_and_tools(fmt):
     assert '"name": "get_weather"' in text
 
 
+def test_render_encodes_segments_like_one_encode(fmt):
+    """render() encodes the prompt per message (in parallel, with a cache of segments seen before): the ids must be those
+    of one encode of the whole rendered text, with tools, reasoning, unicode and odd whitespace, also from the cache."""
+    code = open(__file__).read()[:3000]
+    odd = ["héllo wörld — “quotes” … 日本語 🚀", "tabs\t\tand   spaces \n\n\n", "<|im_end|> <think>x</think>", " trailing ", "a\n"]
+    msgs = [{"role": "system", "content": "Be brief. " + odd[0]}]
+    for i, o in enumerate(odd):
+        msgs += [{"role": "user", "content": o + code[i * 300:(i + 1) * 300]},
+                 {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{i}", "type": "function",
+                                                                       "function": {"name": "get_weather", "arguments": {"city": o}}}]},
+                 {"role": "tool", "tool_call_id": f"c{i}", "content": code[:50] + o},
+                 {"role": "assistant", "content": "<think>\n" + o + "\n</think>\n\n" + o}]
+    msgs.append({"role": "user", "content": "last " + odd[1]})
+    for tools, thinking in ((None, True), (TOOLS, False)):
+        text = fmt.tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=False, enable_thinking=thinking)
+        want = fmt.tok.encode(text, add_special_tokens=False)
+        assert fmt.render(msgs, tools=tools, enable_thinking=thinking) == want
+        assert fmt.render(msgs, tools=tools, enable_thinking=thinking) == want  # every segment from the cache
+        assert fmt.render(msgs[:3] + msgs[-1:], tools=tools, enable_thinking=thinking) == fmt.tok.encode(
+            fmt.tok.apply_chat_template(msgs[:3] + msgs[-1:], tools=tools, add_generation_prompt=True, tokenize=False,
+                                        enable_thinking=thinking), add_special_tokens=False)  # a prefix: cached segments, then new ones
+    assert fmt.encode("") == [] and fmt.encode("plain text, no messages") == enc(fmt, "plain text, no messages")
+    assert fmt.encode("<|im_start|>x<|im_start|>") == enc(fmt, "<|im_start|>x<|im_start|>")
+
+
 def test_reasoning_then_content(fmt):
     ids = enc(fmt, "Let me think.\nOK.\n") + [fmt.think_close] + enc(fmt, "\n\nThe answer is 4.") + [fmt.eos_ids[-1]]
     out = run(OutputParser(fmt, True, None), ids)

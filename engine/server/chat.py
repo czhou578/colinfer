@@ -15,15 +15,20 @@
 from __future__ import annotations
 
 import ast
+import collections
 import json
 import re
+import threading
 import uuid
+
+import numpy as np
 
 from engine.weights.loader import MODEL, resolve
 
 _FUNC_RE = re.compile(r"<function=([^>\n]+)>")
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL)
 THINK_SCAN = 64  # tokens from the end of a prompt in which its generation prompt (<|im_start|>assistant, <think>...) lies
+SEGMENT_CACHE_TOKENS = 4_000_000  # ids of rendered message segments kept for the next turns (16 MB, plus their text)
 
 # reasoning_effort names of other APIs and templates -> the levels of the Qwen3.8 template (None: thinking off)
 EFFORTS = {"none": None, "minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
@@ -74,6 +79,10 @@ class ChatFormat:
         self.tool_open, self.tool_close = tid("<tool_call>"), tid("</tool_call>")
         self.im_start = tid("<|im_start|>")  # the message boundary (engine/runtime/scheduler.py takes checkpoints there)
         self.eos_ids = tuple(sorted({tid("<|im_end|>"), tid("<|endoftext|>")}))
+        self.im_start_str = "<|im_start|>"  # the text of the message boundary: render() encodes a prompt per message
+        self._segments: collections.OrderedDict[str, np.ndarray] = collections.OrderedDict()  # segment text -> ids, LRU
+        self._cached = 0  # ids in _segments
+        self._lock = threading.Lock()  # render() runs on the server's worker threads
 
     @classmethod
     def from_checkpoint(cls, path_or_repo: str = MODEL) -> ChatFormat:
@@ -85,7 +94,37 @@ class ChatFormat:
         msgs = [_normalize_message(m) for m in messages]
         kw = {k: v for k, v in template_kwargs.items() if v is not None}
         text = self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=True, tokenize=False, **kw)
-        return self.tok.encode(text, add_special_tokens=False)
+        return self.encode(text)
+
+    def encode(self, text: str) -> list[int]:
+        """The token ids of a rendered prompt. The text is split into its messages (each from its <|im_start|>): the
+        tokenizer encodes the new segments in parallel on its own threads, and the ids of a segment seen before come from
+        a cache, so a turn of a long conversation does not encode its history again. A special token always splits the
+        text before the BPE runs, so the ids are those of one encode of the whole text (tests/test_chat.py)."""
+        parts = text.split(self.im_start_str)
+        segs = [p for p in [parts[0]] + [self.im_start_str + p for p in parts[1:]] if p]
+        with self._lock:
+            have = [self._segments.get(x) for x in segs]
+            for x, h in zip(segs, have):
+                if h is not None:
+                    self._segments.move_to_end(x)
+        todo = [x for x, h in zip(segs, have) if h is None]
+        if todo:
+            back = getattr(self.tok, "backend_tokenizer", None)
+            if back is not None:
+                new = [np.asarray(e.ids, dtype=np.int32) for e in back.encode_batch(todo, add_special_tokens=False)]
+            else:
+                new = [np.asarray(self.tok.encode(x, add_special_tokens=False), dtype=np.int32) for x in todo]
+            with self._lock:
+                for x, ids in zip(todo, new):
+                    if x not in self._segments:
+                        self._segments[x] = ids
+                        self._cached += len(ids)
+                while self._cached > SEGMENT_CACHE_TOKENS:
+                    self._cached -= len(self._segments.popitem(last=False)[1])
+            it = iter(new)
+            have = [h if h is not None else next(it) for h in have]
+        return np.concatenate(have).tolist() if have else []
 
     def opens_in_reasoning(self, prompt: list[int]) -> bool:
         """True when the prompt ends inside an unclosed <think> (the template's thinking generation prompt)."""
