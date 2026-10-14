@@ -290,6 +290,7 @@ class SessionStore:
                 self.wstream.wait_event(job.ready)
                 self._write_job(job)
                 self.stats["saves"] += 1
+                self._evict()  # before the job leaves `pending`: flush() returns with the budget kept
             except Exception as e:  # noqa: BLE001  a disk error costs the cache, never the engine
                 self.stats["errors"] += 1
                 self.log(f"[sessions] save of {job.n} tokens failed: {type(e).__name__}: {e}")
@@ -298,7 +299,6 @@ class SessionStore:
                 with self.cv:
                     self.pending.remove(job)
                     self.cv.notify_all()
-            self._evict()
 
     def _write_job(self, j: _Job):
         B, nb = self.block, j.n // self.block
