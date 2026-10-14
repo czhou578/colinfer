@@ -244,6 +244,21 @@ def test_images_are_embedded_once_and_told_apart(make):
 
 
 @GPU
+def test_the_vision_tower_loads_on_the_first_image():
+    """Built without its weights: the patch shape and merge size come from the config; encode() loads it (not run here:
+    the real tower is exercised by tests/scheduler_check.py)."""
+    from engine.model.vision import VisionTower, vision_available
+    from engine.weights.loader import MODEL, resolve
+    try:
+        path = resolve(MODEL)
+    except Exception:  # noqa: BLE001
+        pytest.skip("needs the checkpoint in the HF cache")
+    if not vision_available(path):
+        pytest.skip("the checkpoint has no vision tower")
+    tower = VisionTower(path, load=False)
+    assert not tower.loaded and tower.patch_dim == 3 * 2 * 16 * 16 and tower.merge == 2
+
+
 def test_submit_checks_image_tokens(make):
     sched, rng = make(), random.Random(1)
     p, ims = with_image(rng, key=3)

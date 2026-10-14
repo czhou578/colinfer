@@ -643,6 +643,8 @@ def main(argv=None):
                          "or a restart); 0: off")
     ap.add_argument("--session-dir", default=D.session_dir, help="directory of the conversation cache")
     ap.add_argument("--no-vision", action="store_true", help="no image input: images become a text note, and the vision tower is not loaded")
+    ap.add_argument("--vision-preload", action="store_true",
+                    help="load the vision tower (0.92 GB) at startup and warm up the image path, instead of on the first image")
     ap.add_argument("--image-max-pixels", type=int, default=D.image_max_pixels,
                     help="resize larger images to this many pixels (one prompt token per 32 x 32 pixels)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
@@ -671,7 +673,7 @@ def main(argv=None):
                        max_queue=a.max_queue, max_output_tokens=a.max_output_tokens, max_request_seconds=a.max_request_seconds,
                        api_key=a.api_key, mem_cap_bytes=mem_cap_bytes,
                        session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, session_dir=a.session_dir,
-                       vision=not a.no_vision, image_max_pixels=a.image_max_pixels)
+                       vision=not a.no_vision, vision_preload=a.vision_preload, image_max_pixels=a.image_max_pixels)
     hf = json.load(open(os.path.join(path, "config.json")))
     hf_config = hf.get("text_config", hf)
     gen = json.load(open(os.path.join(path, "generation_config.json"))) if os.path.exists(os.path.join(path, "generation_config.json")) else {}

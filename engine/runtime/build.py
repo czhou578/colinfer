@@ -66,10 +66,12 @@ def _file_id(f: str) -> list:
 
 def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 262144, checkpoints: int = 32, spec: str = "mtp", k: int = 7,
                  drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int",
-                 boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, vision: bool = True, metrics=None, log=print):
+                 boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, vision: bool = True, vision_preload: bool = False,
+                 metrics=None, log=print):
     """The scheduler with its model, as `python -m engine.server` builds it from the same flags (the defaults are the
     server's). spec: "mtp" or "none". boundary: the message-boundary token id, "auto" (the checkpoint's) or None.
-    vision: load the checkpoint's vision tower (image input, engine/model/vision.py) when it has one.
+    vision: image input (engine/model/vision.py) when the checkpoint has a vision tower; its 0.92 GB of weights load on
+    the first image, or at startup with vision_preload.
     Returns (scheduler, the startup seconds of each phase). scheduler.fingerprint names what the cached state depends
     on (the checkpoint, the decode weights, the drafter), for the disk cache (engine/runtime/sessions.py)."""
     if spec not in ("mtp", "none"):
@@ -81,9 +83,9 @@ def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 26214
     mtp = load_drafter(m, path, drafter_weights, log) if spec == "mtp" else None
     if boundary == "auto":
         boundary = boundary_token(path)
-    tower = VisionTower(path) if vision and vision_available(path) else None
+    tower = VisionTower(path, load=vision_preload) if vision and vision_available(path) else None
     if tower is not None:
-        log("[engine] vision tower loaded: image input on")
+        log("[engine] image input on: vision tower " + ("loaded" if tower.loaded else "loads on the first image"))
     t2 = time.perf_counter()
     if selftest:
         run_selftest(verbose=True)  # refuses to start if any matmul path is numerically wrong

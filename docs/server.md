@@ -37,7 +37,8 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
 | `--session-dir` | `~/.cache/colinfer/sessions` | The directory of the conversation cache. It holds one subdirectory per engine configuration (checkpoint, decode weights, drafter); the budget covers all of them. |
 | `--image-max-pixels` | 4194304 | Larger images are resized to this many pixels (2048 x 2048). An image costs one prompt token per 32 x 32 pixels, so at most 4,096 tokens. |
-| `--no-vision` | off | Do not load the vision tower (0.93 GB). Images then become a short text note. |
+| `--no-vision` | off | No image input. Images then become a short text note. |
+| `--vision-preload` | off | Load the vision tower (0.92 GB) at startup and warm up the image path. By default it loads on the first image request, which is then ~1-2 s slower, and a server that never sees an image keeps the memory. |
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |

@@ -84,11 +84,26 @@ def rope_delta(images: list[Image]) -> int:
 
 
 class VisionTower:
-    """The checkpoint's vision tower on the GPU (BF16, 0.92 GB), as transformers runs it."""
+    """The checkpoint's vision tower on the GPU (BF16, 0.92 GB), as transformers runs it. With load=False, the weights
+    are loaded by the first encode() (on the engine thread), so a server that never sees an image keeps the memory;
+    the patch shape and the merge size come from the config at once."""
 
-    def __init__(self, path: str, device="cuda"):
+    def __init__(self, path: str, device="cuda", load: bool = True):
+        self.path, self.device, self.model = path, device, None
+        vc = json.load(open(os.path.join(path, "config.json")))["vision_config"]
+        self.merge = vc["spatial_merge_size"]
+        self.patch_dim = vc["in_channels"] * vc["temporal_patch_size"] * vc["patch_size"] ** 2
+        if load:
+            self.load()
+
+    @property
+    def loaded(self) -> bool:
+        return self.model is not None
+
+    def load(self):
         from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel, Qwen3_5VisionRotaryEmbedding
+        path, device = self.path, self.device
         c = json.load(open(os.path.join(path, "config.json")))
         vc = Qwen3_5VisionConfig(**c["vision_config"])
         vc._attn_implementation = "sdpa"
@@ -105,14 +120,14 @@ class VisionTower:
         left = [n for n, t in list(model.named_parameters()) + list(model.named_buffers()) if t.is_meta]
         if left:
             raise RuntimeError(f"vision tower: tensors left on meta: {left[:5]}")
+        assert (self.merge, self.patch_dim) == (vc.spatial_merge_size, vc.in_channels * vc.temporal_patch_size * vc.patch_size ** 2)
         self.model = model.eval()
-        self.merge = vc.spatial_merge_size
-        self.patch_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size ** 2
-        self.device = device
 
     @torch.inference_mode()
     def encode(self, im: Image) -> torch.Tensor:
         """The image's token embeddings [n, hidden] bf16, in the order of its tokens (row-major over its grid)."""
+        if self.model is None:
+            self.load()
         if im.pixels.shape != (im.grid[0] * im.grid[1] * im.grid[2], self.patch_dim):
             raise ValueError(f"image patches {tuple(im.pixels.shape)} do not match the grid {im.grid}")
         px = im.pixels.to(self.device, non_blocking=True)

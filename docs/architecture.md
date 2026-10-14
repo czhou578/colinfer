@@ -211,7 +211,8 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   does (`engine/server/images.py`), and gives it a run of placeholder ids past the vocabulary: one per 2 x 2 group of
   16-pixel patches, derived from a hash of the pixels. Thus the memory and disk caches tell images apart. A prefill
   chunk that holds image tokens embeds them as the image pad token, then replaces their rows with the output of the
-  vision tower (transformers' Qwen3_5VisionModel, BF16, run once per image and only when its tokens are prefilled).
+  vision tower (transformers' Qwen3_5VisionModel, BF16, 0.92 GB, loaded on the first image unless `--vision-preload`;
+  run once per image and only when its tokens are prefilled).
   Positions follow multimodal RoPE (`get_rope_index` of transformers): the tokens of an image that starts at s
   rotate by (t, h, w) = (s', s' + row, s' + col), with s' the rotary position of s, and the text after it continues
   at s' + max(rows, cols). The attention prologue takes each prefill row's (t, h, w) (`rope_pos`); frequency i
