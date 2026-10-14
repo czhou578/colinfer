@@ -147,7 +147,9 @@ drafts. It verifies the tokens that followed the earlier occurrence instead of t
 
 A request that decodes alone can verify 15 such drafts, because its 16 rows still fit one weight pass. The cycle then
 takes 85 ms instead of 80 ms. The drafter state depends only on accepted tokens, so either source can feed any cycle. Code-edit
-replies that repeat their input decode ~65% faster.
+replies that repeat their input decode ~65% faster. The index of the history (a chain of the positions of each 3-token
+key) grows on the host while the GPU runs each prefill chunk, and stays with the slot while its tokens are a prefix of
+the slot's history, so the next turn extends it instead of building it again.
 
 At 8k context, a k = 7 cycle takes **86 ms**. The verify takes 73.5 ms (69.5 ms of weight GEMMs), and the drafts take
 ≈11.6 ms. With the fine-tuned drafter, a k = 7 cycle accepts 3.41 tokens on average (code 5.55, prose 2.77).

@@ -167,7 +167,7 @@ class Slot:
         self.acc = {}                      # draft source -> [decayed accepted, tried] drafts (per-token acceptance estimate)
         self.src = "mtp"                   # source of the drafts in the slot's pending input: mtp | suffix
         self.fresh = 0                     # drafts in the slot's pending input made for it (the rest are stale)
-        self.sfx = None                    # suffix-match index of the history (suffix_min > 0)
+        self.sfx = None                    # suffix-match index of the history (suffix_min > 0), kept while it stays a prefix of it
         self.salt = None             # cache_salt of the request that produced this slot's history
         self.masked = False          # the slot's mask buffer holds a constraint's masks (else all ones)
 
@@ -447,7 +447,12 @@ class Scheduler:
         s.salt = req.cache_salt
         s.req, s.phase, s.todo, s.y = req, "prefill", list(P[len(s.tokens):]), None
         s.acc = {"mtp": [1.5, 2.5], "suffix": [4.0, 5.0]}  # priors 0.6 and 0.8
-        s.sfx = None
+        if self.suffix_min:  # the slot's index stays when its tokens are a prefix of this prompt (the last turn's, plus its reply)
+            x = s.sfx
+            if x is not None and (len(x.toks) > len(P) or _shared(pa, x.toks) < len(x.toks)):
+                s.sfx = None
+            if s.sfx is None:
+                s.sfx = SuffixIndex()
         s.splits = []
         if self.boundary is not None and (self.free_bufs or self.ckpts):
             # message starts: the end of the first message (a shared system prompt) and the start of the last one
@@ -513,6 +518,8 @@ class Scheduler:
             logits = prefill(self.model, ids, view, logits=last, **img)
         s.tokens += chunk
         s.todo = s.todo[len(chunk):]
+        if s.sfx is not None:  # the suffix-match index of the history grows on the host while the GPU runs the chunk
+            s.sfx.extend(s.tokens[len(s.sfx.toks):])
         if self.mtp is not None:  # drafter KV rows (x_{i+1}, h_i) for positions start-1 .. end-2
             mv = self.mst.slot(b)
             if start > 0:
@@ -545,8 +552,8 @@ class Scheduler:
                 d = self.mtp.first_drafts(torch.tensor([tok], device=self.dev), s.h_last.view(1, -1), mv, self.k)
                 self.tok[b, :self.k + 1] = torch.tensor([tok] + d)
                 s.src, s.fresh = "mtp", self.k
-                if self.suffix_min:
-                    s.sfx = SuffixIndex(s.tokens + [tok])
+                if s.sfx is not None:
+                    s.sfx.extend([tok])
                     self._suffix_drafts(s)
         torch.cuda.synchronize()
         self.metrics.step_seconds.observe(time.perf_counter() - t0, kind="prefill")
