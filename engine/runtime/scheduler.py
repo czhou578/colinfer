@@ -26,6 +26,11 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
     longest checkpoint whose tokens are a proper prefix of its prompt, in the slot of that checkpoint, and prefills
     only the rest. A request without one goes to an empty slot, else the least recently used one.
   - A checkpoint is valid while the token history of its slot still starts with the tokens of the checkpoint.
+* Disk cache (optional, `store`: engine/runtime/sessions.py). When a request ends, the scheduler queues its slot's
+  reply-end and message-boundary checkpoints (not the interval or prompt-end ones) for the disk, with the KV rows
+  before them. A new request restores from disk when the disk holds a prefix of its prompt at least `min_gain` tokens
+  longer than the best memory checkpoint: a conversation that lost its slot to others, or any conversation after a
+  restart. The restore gives the slot the bytes it held, so the output is the same as after a memory restore.
 * Finish. A request ends at a stop token (eos_ids), at max_new_tokens, at the slot length, by its hook (stop
   strings, client gone), or max_seconds after its submit ("timeout", also while it still waits in the queue). The
   speculative cycle cuts the accepted length after a stop token on the GPU. Thus the history of a slot (`Slot.tokens`,
@@ -46,6 +51,7 @@ from engine.model.prefill import CHUNK, prefill, prepare_prefill
 from engine.runtime.decode import DecodeGraph
 from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, sample
+from engine.runtime.sessions import Hit, SessionStore
 from engine.spec.mtp import MtpCycle, MtpState
 from engine.spec.suffix import SuffixIndex
 
@@ -87,6 +93,7 @@ class Request:
     hook: Hook | None = None        # optional: see Hook
     cache_salt: str | None = None   # checkpoints are shared only between requests with the same salt (vLLM semantics)
     max_seconds: float = 0.0        # > 0: the request ends ("timeout") this long after its submit, running or queued
+    disk: bool = True               # its checkpoints may go to the disk cache (False: the client asked for no prefix reuse)
     # filled in by the scheduler
     rid: int = -1
     slot: int = -1
@@ -108,6 +115,8 @@ class Checkpoint:
     buf: int        # ring index
     salt: str | None = None
     reply: bool = False  # taken at the end of a generation
+    disk: bool = False   # worth saving to the disk cache: a reply end or a message boundary
+    saved: bool = False  # queued for the disk cache already
 
 
 class Slot:
@@ -189,6 +198,7 @@ class Scheduler:
         self.ckpts: list[Checkpoint] = []  # oldest first
         self.free_bufs = list(range(n_checkpoints))
         self.queue: collections.deque[Request] = collections.deque()
+        self.store: SessionStore | None = None  # the disk cache, attached by the server after its warm-up
         self._rid = 0
         self._evt = torch.cuda.Event()
         torch.cuda.synchronize()
@@ -220,11 +230,13 @@ class Scheduler:
         self.ckpts.remove(c)
         self.free_bufs.append(c.buf)
 
-    def _snapshot(self, s: Slot, reply: bool = False):
+    def _snapshot(self, s: Slot, reply: bool = False, disk: bool = False):
         if not s.tokens or (not self.free_bufs and not self.ckpts):
             return
         key = tuple(s.tokens)
-        if any(c.slot == s.idx and c.tokens == key and c.salt == s.salt for c in self.ckpts):
+        same = next((c for c in self.ckpts if c.slot == s.idx and c.tokens == key and c.salt == s.salt), None)
+        if same is not None:
+            same.disk |= disk
             return
         if not self.free_bufs:  # evict a checkpoint that no longer matches its slot, else the oldest
             self._drop(next((c for c in self.ckpts if not self._valid(c)), self.ckpts[0]))
@@ -234,7 +246,7 @@ class Scheduler:
             self.ring_rec[i][buf].copy_(self.state.rec[i][b])
         if self.ring_h is not None:
             self.ring_h[buf].copy_(s.h_last.view(-1))
-        self.ckpts.append(Checkpoint(b, key, buf, s.salt, reply))
+        self.ckpts.append(Checkpoint(b, key, buf, s.salt, reply, disk or reply))
 
     def _restore(self, s: Slot, c: Checkpoint):
         """Back to checkpoint c in its own slot s: the KV of the slot already holds c's tokens; the GDN state comes from
@@ -246,6 +258,36 @@ class Scheduler:
         s.tokens = list(c.tokens)
         s.h_last = self.ring_h[c.buf].clone() if self.ring_h is not None else None
         self.state.pos_t[b] = L
+
+    def _restore_disk(self, hit: Hit, P: list[int]) -> Slot | None:
+        """Restores the disk checkpoint `hit` (a prefix of P): into a slot that still holds the KV of these tokens (then
+        only the GDN state is read), else into an empty slot, else the least recently used one. None if the read failed."""
+        n = hit.n
+        holder = next((x for x in self.slots if len(x.tokens) >= n and x.tokens[:n] == P[:n]), None)
+        s = holder or min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
+        b = s.idx
+        self.store.wait(b, n if holder is not None else 0)
+        h = torch.empty(self.model.cfg.hidden_size, dtype=torch.bfloat16, device=self.dev) if self.mtp is not None else None
+        if not self.store.load(hit, b, h, kv=holder is None):
+            if holder is None:
+                s.tokens = []  # its KV is partly overwritten
+            for c in [c for c in self.ckpts if c.slot == b and not self._valid(c)]:
+                self._drop(c)
+            return None
+        s.tokens, s.h_last = list(P[:n]), h
+        self.state.pos_t[b] = n
+        self.metrics.disk_tokens.inc(n)
+        return s
+
+    def _persist(self, s: Slot):
+        """Queues the checkpoints of slot s that later requests may restore (reply ends, message boundaries) for the disk
+        cache, once each."""
+        st = self.store
+        for c in self.ckpts:
+            if c.slot == s.idx and c.disk and not c.saved and len(c.tokens) >= st.min_tokens and self._valid(c):
+                c.saved = True
+                st.save(s.idx, c.tokens, c.salt, c.reply, [self.ring_conv[i][c.buf] for i in self.gdn_layers],
+                        [self.ring_rec[i][c.buf] for i in self.gdn_layers], self.ring_h[c.buf] if self.ring_h is not None else None)
 
     # ---------------------------------------------------------------- admission
     def submit(self, req: Request) -> Request:
@@ -274,9 +316,18 @@ class Scheduler:
                 return True
         return False
 
+    def _best(self, P: list[int], salt: str | None) -> Checkpoint | None:
+        """The longest valid memory checkpoint that is a proper prefix of the prompt P."""
+        best, L = None, 0
+        for c in self.ckpts:
+            n = len(c.tokens)
+            if L < n < len(P) and c.salt == salt and tuple(P[:n]) == c.tokens and self._valid(c):
+                best, L = c, n
+        return best
+
     def _admit(self):
-        """The next queued request, when no request runs: into the slot of its longest checkpoint, else an empty slot,
-        else the least recently used one."""
+        """The next queued request, when no request runs: into the slot of its longest checkpoint (in memory, or on disk
+        when that one is longer), else an empty slot, else the least recently used one."""
         if self.busy_slot() is not None:
             return
         while self.queue:  # a request whose time ran out while it waited ends without running
@@ -287,21 +338,28 @@ class Scheduler:
         else:
             return
         P = req.prompt
-        best, L = None, 0
-        for c in self.ckpts:  # longest valid checkpoint that is a proper prefix of the prompt
-            n = len(c.tokens)
-            if L < n < len(P) and c.salt == req.cache_salt and tuple(P[:n]) == c.tokens and self._valid(c):
-                best, L = c, n
-        s = self.slots[best.slot] if best is not None else min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
+        best, s, echo = self._best(P, req.cache_salt), None, False
+        if self.store is not None:
+            hit = self.store.lookup(P, req.cache_salt, (len(best.tokens) if best is not None else 0) + self.store.min_gain)
+            if hit is not None:
+                s, echo = self._restore_disk(hit, P), hit.reply
+                if s is None:  # the failed restore may have overwritten the slot of `best`
+                    best = self._best(P, req.cache_salt)
+        if s is None:
+            s = self.slots[best.slot] if best is not None else min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
+            b = s.idx
+            if self.store is not None:  # a pending save may still read the rows that this request rewrites
+                self.store.wait(b, len(best.tokens) if best is not None else 0)
+            if best is not None:
+                self._restore(s, best)
+            else:
+                for i in self.gdn_layers:
+                    self.state.conv[i][b].zero_()
+                    self.state.rec[i][b].zero_()
+                s.tokens, s.h_last = [], None
+                self.state.pos_t[b] = 0
+            echo = best is not None and best.reply
         b = s.idx
-        if best is not None:
-            self._restore(s, best)
-        else:
-            for i in self.gdn_layers:
-                self.state.conv[i][b].zero_()
-                self.state.rec[i][b].zero_()
-            s.tokens, s.h_last = [], None
-            self.state.pos_t[b] = 0
         for c in [c for c in self.ckpts if c.slot == b and not self._valid(c)]:
             self._drop(c)  # the slot's new history overwrites them
         req.slot, req.reused, req.t_admit = b, len(s.tokens), time.perf_counter()
@@ -318,7 +376,6 @@ class Scheduler:
             # (e.g. without its reasoning) misses the prompt-end snapshot by the last tokens of the generation
             # prompt, and would prefill the last message again. The split costs one more weight pass (~0.1 s), so
             # a request that restored the end of a reply (its client sends replies back token for token) skips it.
-            echo = best is not None and best.reply
             if bs and not echo and bs[-1] - (bs[-2] if len(bs) > 1 else 0) >= REPLY_SPLIT_MIN:
                 ps.append(bs[-1])
             s.splits = sorted({p for p in ps if p >= len(s.tokens) + SPLIT_MIN_TOKENS})
@@ -380,8 +437,9 @@ class Scheduler:
                 self.mtp.prefill(torch.tensor(toks, device=self.dev), hid, mv)
             s.h_last = H[-1]
         done = not s.todo
-        if done or len(s.tokens) in s.splits or len(s.tokens) // self.ckpt_interval > start // self.ckpt_interval:
-            self._snapshot(s)
+        split = len(s.tokens) in s.splits
+        if done or split or len(s.tokens) // self.ckpt_interval > start // self.ckpt_interval:
+            self._snapshot(s, disk=split)
         if done:
             req = s.req
             tok = int(sample(logits, self.params.view(b, b + 1), view.pos_t))
@@ -480,6 +538,8 @@ class Scheduler:
         req = s.req
         if s.phase == "decode" or not s.todo:
             self._snapshot(s, reply=True)  # end of generation: everything fed so far (the last output token was never fed)
+        if self.store is not None and req.disk:
+            self._persist(s)
         s.phase, s.req, s.todo = "idle", None, []
         self._close(req, reason)
         s.last_used = req.t_done
@@ -508,6 +568,8 @@ class Scheduler:
         scheduler must be idle."""
         if self.busy():
             raise RuntimeError("reset() needs an idle scheduler")
+        if self.store is not None:
+            self.store.flush()  # the writer reads the slots
         for c in list(self.ckpts):
             self._drop(c)
         self.slots = [Slot(i) for i in range(self.n_slots)]

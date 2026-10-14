@@ -33,7 +33,9 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--drafter-weights` | `auto` | MTP head weights. `auto` uses `~/.cache/colinfer/drafter/mtp_ft.safetensors` (`tools/train_drafter.py`) when it exists. `none` uses the weights of the checkpoint. You can also give a path. Drafts change the speed, never the outputs. |
 | `--decode-weights` | `int` | `int`: decode the attention / GDN projections from INT6 / INT5 copies when both files exist in `~/.cache/colinfer/requant/<snapshot>/` (`tools/int6_requant.py --bits 6 --filter self_attn` and `--bits 5 --filter linear_attn`). This gives ~9.5% faster decode, perplexity within 0.25%, and uses +5.2 GB of GPU memory. Without the files, or with `checkpoint`, decode reads the FP8 weights. |
 | `--checkpoints` | 32 | The prefix-checkpoint ring, 154 MB each. The server allocates it at startup. |
-| `--no-prefix-caching` | off | Never reuse a prompt prefix (the same as `--checkpoints 0`). Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
+| `--no-prefix-caching` | off | Never reuse a prompt prefix (the same as `--checkpoints 0 --session-cache-gb 0`). Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
+| `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
+| `--session-dir` | `~/.cache/colinfer/sessions` | The directory of the conversation cache. It holds one subdirectory per engine configuration (checkpoint, decode weights, drafter); the budget covers all of them. |
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
@@ -103,7 +105,7 @@ Responses:
   - `finish_reason` is `tool_calls`.
   - In a stream, each call arrives in one delta when it is complete.
 - **Usage:** `usage` includes `prompt_tokens_details.cached_tokens`, the prompt tokens that the server restored from a
-  checkpoint.
+  checkpoint, in memory or on disk.
 - **Timings:** a `timings` object gives the queue time, the TTFT, the prefill tokens and speed, and the decode time and
   speed.
 - **Streaming metrics:** the first content chunk of a stream carries vLLM-style `request_metrics`.
@@ -117,10 +119,12 @@ Other endpoints:
   - TTFT and queue time
   - tokens per speculative cycle
   - draft and accepted counters
-  - prompt, cached and generated token counters
+  - prompt, cached and generated token counters, and the prompt tokens restored from disk
   - queue depth and busy slots
   - allocator memory
-- `GET /v1/status`. It shows the phase and length of each slot, the checkpoints and the startup timings.
+  - the conversation cache on disk: bytes, files, saves, restores, errors
+- `GET /v1/status`. It shows the phase and length of each slot, the checkpoints, the conversation cache and the startup
+  timings.
 
 ### Anthropic Messages API
 
@@ -150,7 +154,8 @@ Other endpoints:
   - Images and documents become a short text note, because the engine reads text only.
   - A final assistant message (prefill) gets a 400 error.
   - The server ignores `cache_control`, `metadata`, `context_management`, the thinking budget and `display`.
-- **Usage:** `cache_read_input_tokens` is the prompt part that the server restored from a checkpoint, and `input_tokens`
+- **Usage:** `cache_read_input_tokens` is the prompt part that the server restored from a checkpoint (in memory or on
+  disk), and `input_tokens`
   is the rest.
 - **Stream:** the server sends `message_start` at once. Then it sends a `ping` event every 10 s until the first output,
   for example during a long prefill. Thus the stream watchdog of the client does not stop the request.
@@ -191,14 +196,24 @@ Other endpoints:
   - after the last message, if it has 512 tokens or more (`REPLY_SPLIT_MIN` in `engine/runtime/scheduler.py`)
   - every 8192 prompt tokens
 
-  If the slot of the checkpoint is busy, the server copies its KV prefix into a free slot. Thus parallel agents that
-  share a long system prompt pay for it only once.
-
   The checkpoint after the last message is for clients that send a reply back in a different form. For example, Hermes
   Agent sends it back without its reasoning. Then the next prompt differs from the end-of-prompt checkpoint in the last
   token of the generation prompt, and without this checkpoint the server prefills the last message again. This
   checkpoint costs one more weight pass (~0.1 s). Claude Code sends the reasoning back, and its next prompt restores
   the end of the reply. A request that restored the end of a reply does not take this checkpoint.
+- **Conversation cache on disk** (`engine/runtime/sessions.py`). When a request ends, the server writes its reply-end
+  and message-boundary checkpoints to the NVMe, for prefixes of 2,048 tokens or more, with the KV rows before them.
+  A background thread writes them, so the next request does not wait. A new request restores from disk when the disk
+  holds a longer prefix of its prompt than the memory checkpoints (by 256 tokens or more): a conversation that lost its
+  slot to three others, or any conversation after a restart. The restore puts back the exact bytes that the slot held,
+  so the reply is the same as after a restore from memory. Direct reads run at ~12 GB/s: a 21k-token conversation
+  restores in 0.2 s to the first token, against 7.2 s of prefill (`tests/scheduler_check.py`).
+
+  The KV rows are stored in blocks of 1,024 tokens, named by the hash of all the tokens before their end, so
+  conversations that share a system prompt share its blocks on disk. A request with `cache_prompt: false` writes
+  nothing, and requests with different `cache_salt` values share nothing. The files depend on the checkpoint, the
+  decode weights and the drafter weights: another configuration writes to its own subdirectory. A file that is
+  missing or damaged makes that request prefill instead.
 - **One request at a time.** A request that arrives while another runs waits in the queue, also behind a long
   prefill. The three slots keep the last three conversations cached: a side request goes to another slot, so the main
   conversation keeps its cache. The queue holds `--max-queue` requests; past that, requests are refused with a 503

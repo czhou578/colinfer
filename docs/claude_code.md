@@ -209,9 +209,10 @@ Know these limits:
   subagents run one after another. The three slots keep the last three conversations cached.
 - **Context length.** Claude Code compacts the conversation before it reaches 200,000 tokens. If a request is longer
   than a server slot, the server sends a `prompt is too long` error. Claude Code shows `Prompt is too long`.
-- **Long prompts without the cache.** The server keeps its prefix cache in memory only. After a server restart, the
-  first request of a long conversation reads the full prompt again. During this time, the server sends a keep-alive
-  event every 10 seconds, so Claude Code does not stop the request.
+- **Long prompts without the cache.** The server keeps the prefixes of past conversations in memory and on disk
+  (`--session-cache-gb`), so a conversation continues quickly after a server restart, or after other conversations
+  took its slot. A long prompt that is new reads in full. During this time, the server sends a keep-alive event every
+  10 seconds, so Claude Code does not stop the request.
 - **No web search.** Web search is a function of the Anthropic servers. With this configuration, the WebSearch tool
   gets an error.
 - **Text only.** The engine does not read images or PDF documents. The model gets a short note in their place.
@@ -229,5 +230,5 @@ Know these limits:
 | Each command waits 15 to 35 seconds before it runs. | Auto mode is on. | Push Shift+Tab until the mode is `acceptEdits` or `default` (section 4). |
 | Claude Code shows `Prompt is too long`. | The conversation is longer than a server slot. | Type `/compact`, or type `/clear` to start a new conversation. |
 | The WebSearch tool fails with `API Error: 400 this server does not run server tools (web_search_20250305)`. | Web search is not available (section 7). | Give the information to the model in your request. |
-| The first answer after a server restart is slow. | The server reads the full prompt again. | No action is necessary. Refer to section 7. |
+| The first answer of a long new conversation is slow. | The server reads the full prompt. | No action is necessary. Refer to section 7. |
 | The server stops with `engine failure`. | A CUDA error occurred. | Start the server again. If the server runs under systemd, the service restarts automatically. |

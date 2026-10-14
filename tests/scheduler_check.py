@@ -14,16 +14,23 @@ More checks:
   6. a client sends the reply back without its reasoning (as Hermes Agent does). Turn 2 then restores the snapshot at
      the start of turn 1's reply, not only the start of turn 1's last message. The output of turn 2 is compared with a
      run without checkpoints.
-  7. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
+  7. the disk cache (engine/runtime/sessions.py): after a restart (memory forgotten, a new store on the same directory),
+     turn 2 of a long conversation restores the end of turn 1 from disk. Its output must be the output of turn 2 after
+     a restore from memory, and its TTFT far below a prefill from scratch.
+  8. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
+import os
+import shutil
 import sys
+import tempfile
 import time
 
 import torch
 
 from engine.runtime.build import build_engine
 from engine.runtime.scheduler import Request, Scheduler
+from engine.runtime.sessions import SessionStore
 from engine.server.chat import ChatFormat
 
 CODE = '''def parse_config(path):
@@ -163,6 +170,42 @@ def main():
           f"turn 2 reused {r2.reused} (reply start {reply_start}), TTFT {r2.t_first - r2.t_submit:.3f} s vs "
           f"{r2b.t_first - r2b.t_submit:.3f} s from scratch; greedy output {'IDENTICAL' if same else 'DIFFERENT'} "
           f"to the uncached run with the same chunk boundaries ({sum(x == y for x, y in zip(r2.output, r2b.output))}/{len(r2.output)})")
+
+    # 7. the disk cache across a restart
+    d = tempfile.mkdtemp(prefix="sessions-check-", dir=os.path.expanduser("~/.cache/colinfer"))
+    try:
+        notes = {"role": "system", "content": "You are a careful assistant. Field log: " + " ".join(
+            f"day {i}: sensor {i % 7} read {(37 * i) % 101} units." for i in range(1400))}
+        m1 = [notes, {"role": "user", "content": "Which sensor appears most often? Answer in one sentence."}]
+        p1 = chat_ids(m1)
+
+        def turn2(r1):
+            ans = tok.decode([t for t in r1.output if t not in EOS], skip_special_tokens=True)
+            return chat_ids(m1 + [{"role": "assistant", "content": ans}, {"role": "user", "content": "And on which day was the highest reading?"}])
+        spec.reset()
+        spec.store = SessionStore(spec.state, spec.mst, spec.fingerprint, 20 * 10**9, d)
+        r1 = spec.run([R(p1, max_new_tokens=60)])[0]
+        spec.store.flush()
+        spec.reset()  # a restart: nothing in memory, and a new store that finds the files
+        spec.store = SessionStore(spec.state, spec.mst, spec.fingerprint, 20 * 10**9, d)
+        p2 = turn2(r1)
+        rd = spec.run([R(p2, max_new_tokens=60)])[0]
+        disk_tok = spec.metrics.disk_tokens.get()
+        spec.store.flush()
+        spec.store = None
+        spec.reset()  # the reference: the same two turns, turn 2 restored from memory
+        r1b = spec.run([R(p1, max_new_tokens=60)])[0]
+        rm = spec.run([R(turn2(r1b), max_new_tokens=60)])[0]
+        spec.reset()
+        rc = spec.run([R(p2, max_new_tokens=60)])[0]  # and from scratch, for the time
+        same = r1b.output == r1.output and rd.output == rm.output and rd.reused == rm.reused == disk_tok == len(p1) + len(r1.output) - 1
+        ok &= same
+        print(f"[disk cache] turn 1 {len(p1)} + {len(r1.output)} tok; after a restart turn 2 ({len(p2)} tok) restored {rd.reused} from disk: "
+              f"TTFT {rd.t_first - rd.t_submit:.3f} s (from memory {rm.t_first - rm.t_submit:.3f} s, from scratch {rc.t_first - rc.t_submit:.3f} s); "
+              f"output {'IDENTICAL' if rd.output == rm.output else 'DIFFERENT'} to the memory restore "
+              f"({sum(x == y for x, y in zip(rd.output, rm.output))}/{len(rm.output)})")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
     m = spec.metrics
     print(f"[spec] drafted {m.drafted.get():.0f}, accepted {m.accepted.get():.0f} ({m.accepted.get() / max(m.drafted.get(), 1):.2f})")

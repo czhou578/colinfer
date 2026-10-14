@@ -126,6 +126,7 @@ class Mtp(nn.Module):
         super().__init__()
         cfg = target.cfg
         dev = self.dev = target.embed_tokens.weight.device
+        self.weights = weights  # None: the checkpoint's
         t = {}
         for name, f in weight_map(path).items():
             if name.startswith("mtp."):

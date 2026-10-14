@@ -190,7 +190,17 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   before the last message, and one every 8,192 prompt tokens. After a last message of 512 tokens or more, it takes one
   after that message too, for clients that send the reply back changed (for example, without its reasoning). A request restores the longest checkpoint that is a proper prefix of its
   prompt, and prefills the rest. Attention KV can resume at any length, but GDN state can resume only where a snapshot
-  exists. If the slot of the checkpoint is busy, the engine copies its KV prefix to a free slot.
+  exists.
+- **Conversation cache on disk** (`engine/runtime/sessions.py`). When a request ends, a writer thread saves the slot's
+  reply-end and message-boundary checkpoints of 2,048 tokens or more to the NVMe. A *checkpoint file* holds the GDN
+  state, the drafter's input hidden state and the KV rows of the last partial block. A *block file* holds 1,024 KV rows
+  of the target and of the drafter (the drafter's rows shifted by one, since its row i reads token i + 1). The hash
+  chain of the tokens before the end of a block names it, so the bytes of a block depend only on its name, and shared
+  prefixes are stored once. A request restores from disk when the disk holds a prefix longer than the best memory
+  checkpoint: the blocks and the checkpoint go back into a slot with direct reads (~12 GB/s) and pinned copies
+  (~59 GB/s). If a slot still holds the KV of that prefix, only the checkpoint file is read. The writer reads the KV
+  from the slot itself, so admission waits for a pending save before it rewrites rows that the save still has to
+  read. A budget (64 GB) evicts the least recently used files.
 - **Server.** One engine thread owns the GPU. Asyncio handlers render the chat template, tokenize and stream. The
   engine thread detokenizes and parses each token as the engine emits it: reasoning, content, Qwen XML tool calls and
   stop strings (`engine/server/chat.py`). The Anthropic Messages API (`/v1/messages`, for Claude Code) uses the same
@@ -199,7 +209,8 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   that reaches the engine before it submits the request, and an error in the output parsing of one request fails only
   that request.
 - **Memory.** At startup, the engine uses ≈61 GB. The weights use 20.2 GB and the INT copies 5.2 GB. The KV caches use
-  3 × 262k × 32 KB = 25.8 GB. The checkpoint ring uses 4.9 GB, and the drafter KV and copies use ≈2.5 GB.
+  3 × 262k × 32 KB = 25.8 GB. The checkpoint ring uses 4.9 GB, and the drafter KV and copies use ≈2.5 GB. The
+  conversation cache uses 0.6 GB of pinned host memory for its file buffers.
 - **Startup** takes ≈25 s. The engine loads the weights and runs a numerical self-test of each matmul path
   (`engine/selftest.py`), which stops the start on a wrong kernel. Then it captures the graphs, calibrates the cycle
   times and runs a warm-up.
@@ -233,15 +244,17 @@ scheduler_check.py) and stops at the first failure; `--quick` runs ruff and pyte
 - `pytest tests/` (≈1 min) tests each kernel against the PyTorch reference or a dequantized fp32 product. It also tests
   row invariance and the bit identity of verify and sequential decode. Other tests cover the prefill ops, the sampler
   and acceptance statistics, chat parsing and the unroll of the drafter trainer. `test_scheduler.py` runs the scheduler
-  on a stub model whose next token depends on the whole history in its state (checkpoints, KV prefix copies, eviction,
-  aborts), and `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
+  on a stub model whose next token depends on the whole history in its state (checkpoints, eviction, aborts), and
+  `test_sessions.py` runs it with the disk cache (eviction, restart, shared blocks, the budget, damaged files, a save
+  still pending when its slot is reused). `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
   errors). `test_model_small.py` compares the reference model with the Qwen3.5 model of transformers at tiny scale.
 - `tests/golden.py` runs 21 recorded requests at once (greedy, seeded-sampled, a 20k-token prompt) on the server's engine
   (`engine/runtime/build.py`, which the server, the checks and the benchmarks share). They must reproduce
   their tokens and per-token logprobs bit for bit: with suffix-match drafts, without them (`--suffix 0`) and without
   speculation (`check --plain`).
 - `tests/scheduler_check.py` compares the outputs of the scheduler with the uncached single-request outputs. It covers
-  single and queued requests (greedy around sampled and a long prefill), multi-turn and shared-prefix requests.
+  single and queued requests (greedy around sampled and a long prefill), multi-turn and shared-prefix requests, and a
+  restore from disk after a restart (the same output as a restore from memory).
 - Other end-to-end checks: `tests/perplexity.py`, `tests/passkey.py` (long-context retrieval), `tests/server_check.py`
   (the HTTP API).
 - Benchmarks: `bench/perf.py` (the repeatable baseline: prefill, TTFT, decode, memory), `bench/decode_bench.py`,

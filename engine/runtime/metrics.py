@@ -86,6 +86,9 @@ class Metrics:
         self.requests = Counter("colinfer_requests_total", "finished requests by finish reason")
         self.prompt_tokens = Counter("colinfer_prompt_tokens_total", "prompt tokens of admitted requests")
         self.cached_tokens = Counter("colinfer_cached_prompt_tokens_total", "prompt tokens served from a prefix checkpoint")
+        self.disk_tokens = Counter("colinfer_disk_restored_tokens_total", "prompt tokens restored from the disk cache (part of the cached tokens)")
+        self.session_cache = Gauge("colinfer_session_cache", "disk cache: bytes, files, budget, pending saves, and the totals of "
+                                   "restores, saves, written bytes and errors")
         self.generated_tokens = Counter("colinfer_generation_tokens_total", "generated tokens")
         self.drafted = Counter("colinfer_spec_draft_tokens_total", "draft tokens proposed")
         self.accepted = Counter("colinfer_spec_accepted_tokens_total", "draft tokens accepted")

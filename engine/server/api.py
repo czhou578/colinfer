@@ -181,14 +181,14 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         min_p = _num(b.get("min_p") or 0.0, float, "min_p")
         if not (0.0 <= temp <= 100.0) or not (0.0 < top_p <= 1.0) or not (0.0 <= min_p <= 1.0):
             raise BadRequest("temperature must be in [0, 100], top_p in (0, 1] and min_p in [0, 1]")
-        salt = b.get("cache_salt")
+        salt, keep = b.get("cache_salt"), True
         if b.get("cache_prompt") is False:  # llama.cpp's switch: no prefix reuse for this request
-            salt = uuid.uuid4().hex
+            salt, keep = uuid.uuid4().hex, False
         return EngineRequest(prompt, max_new_tokens=mt, temperature=temp, top_k=max(top_k, 0), top_p=top_p,
                              min_p=min_p, seed=seed, eos_ids=eos,
                              min_tokens=_num(b.get("min_tokens") or 0, int, "min_tokens"),
                              logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt),
-                             max_seconds=cfg.max_request_seconds)
+                             max_seconds=cfg.max_request_seconds, disk=keep)
 
     def stops_of(b: dict, key: str = "stop") -> list[str]:
         """The stop strings of a request: `stop` (OpenAI: a string or a list) or `stop_sequences` (Anthropic: a list)."""
@@ -523,6 +523,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return {"slots": [{"slot": s.idx, "phase": s.phase, "tokens": len(s.tokens), "request": s.req.rid if s.req else None,
                            "checkpoints": sorted(len(c.tokens) for c in sc.ckpts if c.slot == s.idx)} for s in sc.slots],
                 "queue": len(sc.queue), "checkpoints": len(sc.ckpts), "startup": worker.startup,
+                "session_cache": sc.store.status() if sc.store is not None else None,
                 "memory_gb": {"allocated": round(torch.cuda.memory_allocated() / 1e9, 2), "reserved": round(torch.cuda.memory_reserved() / 1e9, 2)}}
 
     return app
@@ -555,7 +556,12 @@ def main(argv=None):
     ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default=D.decode_weights,
                     help="int: decode the attention / GDN projections from INT6 / INT5 copies (tools/int6_requant.py; ~9.5%% faster, "
                          "perplexity within 0.25%%) when their files exist; checkpoint: from the FP8 weights")
-    ap.add_argument("--no-prefix-caching", action="store_true", help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0)")
+    ap.add_argument("--no-prefix-caching", action="store_true",
+                    help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0 --session-cache-gb 0)")
+    ap.add_argument("--session-cache-gb", type=float, default=D.session_cache_gb,
+                    help="disk budget of the conversation cache (KV and GDN state of past conversations, restored after an eviction "
+                         "or a restart); 0: off")
+    ap.add_argument("--session-dir", default=D.session_dir, help="directory of the conversation cache")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
@@ -580,7 +586,8 @@ def main(argv=None):
                        spec=a.spec, k=a.k, drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
                        boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
                        max_queue=a.max_queue, max_output_tokens=a.max_output_tokens, max_request_seconds=a.max_request_seconds,
-                       api_key=a.api_key, mem_cap_bytes=mem_cap_bytes)
+                       api_key=a.api_key, mem_cap_bytes=mem_cap_bytes,
+                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, session_dir=a.session_dir)
     hf = json.load(open(os.path.join(path, "config.json")))
     hf_config = hf.get("text_config", hf)
     gen = json.load(open(os.path.join(path, "generation_config.json"))) if os.path.exists(os.path.join(path, "generation_config.json")) else {}

@@ -56,12 +56,19 @@ def boundary_token(path: str) -> int:
     return AutoTokenizer.from_pretrained(path).convert_tokens_to_ids("<|im_start|>")
 
 
+def _file_id(f: str) -> list:
+    """A weights file as the disk cache's fingerprint names it: a changed file gives new KV bytes."""
+    st = os.stat(f)
+    return [os.path.basename(f), st.st_size, int(st.st_mtime)]
+
+
 def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 262144, checkpoints: int = 32, spec: str = "mtp", k: int = 7,
                  drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int",
                  boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, metrics=None, log=print):
     """The scheduler with its model, as `python -m engine.server` builds it from the same flags (the defaults are the
     server's). spec: "mtp" or "none". boundary: the message-boundary token id, "auto" (the checkpoint's) or None.
-    Returns (scheduler, the startup seconds of each phase)."""
+    Returns (scheduler, the startup seconds of each phase). scheduler.fingerprint names what the cached state depends
+    on (the checkpoint, the decode weights, the drafter), for the disk cache (engine/runtime/sessions.py)."""
     if spec not in ("mtp", "none"):
         raise ValueError(f"spec: mtp or none, not {spec!r}")
     t0 = time.perf_counter()
@@ -76,5 +83,9 @@ def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 26214
         run_selftest(verbose=True)  # refuses to start if any matmul path is numerically wrong
     sched = Scheduler(m, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=k, metrics=metrics,
                       boundary_token=boundary, suffix_min=suffix_drafts)
+    copies = decode_copies_paths(path)
+    int_copies = decode_weights == "int" and all(os.path.exists(f) for f in copies)
+    sched.fingerprint = dict(model=os.path.basename(path), decode=[_file_id(f) for f in copies] if int_copies else "checkpoint",
+                             drafter=None if mtp is None else (_file_id(mtp.weights) if mtp.weights else "checkpoint"))
     t3 = time.perf_counter()
     return sched, dict(kernels_s=round(t1 - t0, 1), weights_s=round(t2 - t1, 1), graphs_selftest_s=round(t3 - t2, 1))

@@ -22,6 +22,8 @@ import torch
 from engine.runtime.build import MODEL, build_engine
 from engine.runtime.metrics import Metrics
 from engine.runtime.scheduler import Request as EngineRequest
+from engine.runtime.sessions import ROOT as SESSION_ROOT
+from engine.runtime.sessions import SessionStore
 from engine.spec.suffix import MIN_MATCH
 
 WARMUP_IDS = (1000, 150000)  # ordinary text tokens for the warm-up prompts: past the control tokens, before the rare tail
@@ -48,6 +50,8 @@ class ServerConfig:
     max_request_seconds: float = 1800.0
     api_key: str | None = None
     mem_cap_bytes: int = 0
+    session_cache_gb: float = 64.0  # the disk cache of conversations (engine/runtime/sessions.py); 0: off
+    session_dir: str = SESSION_ROOT
 
 
 class Worker(threading.Thread):
@@ -80,6 +84,9 @@ class Worker(threading.Thread):
         t3 = time.perf_counter()
         if c.warmup:
             self._warmup(sched, sched.model.cfg.vocab_size)
+        if c.session_cache_gb > 0:  # after the warm-up, whose requests are not worth keeping
+            sched.store = SessionStore(sched.state, getattr(sched, "mst", None), sched.fingerprint, int(c.session_cache_gb * 1e9),
+                                       c.session_dir, log=log)
         t4 = time.perf_counter()
         self.sched = sched
         self.startup.update(warmup_s=round(t4 - t3, 1), total_s=round(t4 - t0, 1))
@@ -144,6 +151,10 @@ class Worker(threading.Thread):
                 m.memory.set(torch.cuda.memory_allocated(), kind="allocated")
                 m.memory.set(torch.cuda.memory_reserved(), kind="reserved")
                 m.memory.set(cap, kind="cap")
+                if sched.store is not None:
+                    for k, v in sched.store.status().items():
+                        if k != "dir":
+                            m.session_cache.set(v, kind=k)
             except BaseException:  # noqa: BLE001  a CUDA error poisons the context: fail everything and exit
                 traceback.print_exc()
                 for s in sched.slots:

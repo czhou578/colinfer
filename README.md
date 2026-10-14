@@ -36,6 +36,7 @@ perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
   need the BF16 checkpoint `Qwen/Qwen3.8-27B` (55.6 GB).
 - About 65 GB of free unified memory while the server runs. Stop other GPU work first: an over-commit of the shared
   memory can power off the machine instead of an out-of-memory error.
+- Up to 64 GB of disk for the conversation cache (`--session-cache-gb`, under `~/.cache/colinfer/sessions`).
 
 ## Quick start
 
@@ -83,7 +84,9 @@ decision. In short:
   kernel for the chunked delta rule, and FlashInfer or FP8 attention.
 - **Serving** runs one request at a time and keeps three fixed slots with contiguous KV caches: the last three
   conversations stay cached. A ring of prefix checkpoints (GDN state snapshots) lets multi-turn chats and shared system
-  prompts skip a second prefill.
+  prompts skip a second prefill. A cache on the NVMe keeps the KV and GDN snapshots of past conversations: a
+  conversation that lost its slot, or any conversation after a restart, restores from disk (a 21k-token conversation:
+  0.2 s to the first token instead of 7.2 s).
 
 ## Repository
 
@@ -93,7 +96,7 @@ decision. In short:
 | `engine/model/fast.py` | the decode path: kernel modules, decode state, the INT decode copies |
 | `engine/model/prefill.py` | the prefill path |
 | `engine/spec/` | the MTP drafter and the speculative cycle (`mtp.py`), suffix-match drafts (`suffix.py`), exact acceptance for sampling (`accept.py`) |
-| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the engine build (`build.py`), the plain decode graph (`decode.py`), the sampler, metrics |
+| `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the conversation cache on disk (`sessions.py`), the engine build (`build.py`), the plain decode graph (`decode.py`), the sampler, metrics |
 | `engine/server/` | the HTTP server (`api.py`), its engine thread (`worker.py`), the OpenAI formats (`openai.py`), the Anthropic Messages API (`anthropic.py`), the chat template and output parsing (`chat.py`) |
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), the fake NVFP4 activation quantization that the kernel tests compare against (`quant_emul.py`) |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |
