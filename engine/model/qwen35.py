@@ -139,9 +139,11 @@ class ModelState:
                 self.k[i] = torch.zeros(batch, cfg.num_key_value_heads, max_seq_len, cfg.head_dim, device=device, dtype=kv_dtype or dtype)
                 self.v[i] = torch.zeros_like(self.k[i])
 
-    def reset(self):
+    def reset(self, kv: bool = True):
+        """Position 0 and a zero GDN state; kv=False leaves the KV cache as it is (its rows past the position are
+        never read, and zeroing a slot's cache is 8.6 GB at the full context)."""
         self.pos = 0
-        for d in (self.conv, self.rec, self.k, self.v):
+        for d in (self.conv, self.rec) + ((self.k, self.v) if kv else ()):
             for t in d.values():
                 t.zero_()
 

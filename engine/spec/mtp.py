@@ -305,9 +305,9 @@ class MtpCycle:
         self.idx = torch.arange(k + 1, device=dev)
         self._side = torch.cuda.Stream()  # the GDN commit's branch
         self.skip = torch.zeros(1, dtype=torch.int32, device=dev)  # draft early exit flag (skinny_skip)
-        state.reset()
+        state.reset(kv=False)  # the capture's warm-up runs write the first rows; the rest of the KV is never read
         self.graph, (self.out_tok, self.n, self.logits, self.H) = capture(self._body)
-        state.reset()
+        state.reset(kv=False)
         mst.pos_t.zero_()
 
     def _body(self):

@@ -250,8 +250,8 @@ class FastState(ModelState):
         self.rope_delta = torch.zeros(batch, dtype=torch.int32, device=device)
         self.spec = False
 
-    def reset(self):
-        super().reset()
+    def reset(self, kv: bool = True):
+        super().reset(kv)
         self.pos_t.zero_()
         self.rope_delta.zero_()
 

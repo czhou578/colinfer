@@ -30,9 +30,9 @@ class DecodeGraph:
             logits = model(self.tok, state)
             sel = apply_mask(logits[:, None], mask)[:, 0] if mask is not None else logits
             return logits, sample(sel, self.params, state.pos_t)  # pos_t now holds the predicted token's position
-        state.reset()
+        state.reset(kv=False)  # the capture's warm-up runs write the first rows; the rest of the KV is never read
         self.graph, (self.logits, self.next) = capture(body)
-        state.reset()
+        state.reset(kv=False)
 
     def step(self, tokens: torch.Tensor) -> torch.Tensor:
         """tokens: [B] long on the device. Returns sampled ids [B] (device; greedy for slots with temperature 0)."""
