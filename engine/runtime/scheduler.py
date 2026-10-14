@@ -671,10 +671,10 @@ class Scheduler:
         req = s.req
         if s.phase == "decode" or not s.todo:
             self._snapshot(s, reply=True)  # end of generation: everything fed so far (the last output token was never fed)
+        s.phase, s.req, s.todo = "idle", None, []
+        self._close(req, reason)  # the client gets its finish event before the disk saves are queued (hashing, ~10-30 ms at 90k)
         if self.store is not None and req.disk:
             self._persist(s)
-        s.phase, s.req, s.todo = "idle", None, []
-        self._close(req, reason)
         s.last_used = req.t_done
 
     def _close(self, req: Request, reason: str):
