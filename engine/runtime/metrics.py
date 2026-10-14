@@ -26,6 +26,10 @@ class Counter:
     def get(self, **lab):
         return self.v.get(tuple(sorted(lab.items())), 0.0)
 
+    def total(self):
+        """The sum over all label values."""
+        return sum(self.v.values())
+
     def clear(self):
         self.v = {}
 
@@ -82,7 +86,8 @@ class Metrics:
                                       STEP_BUCKETS)
         self.ttft_seconds = Histogram("colinfer_ttft_seconds", "submit to first token, per request", TTFT_BUCKETS)
         self.queue_seconds = Histogram("colinfer_queue_seconds", "submit to slot admission, per request", TTFT_BUCKETS)
-        self.tokens_per_cycle = Histogram("colinfer_tokens_per_cycle", "tokens emitted per speculative cycle per slot", COUNT_BUCKETS)
+        self.tokens_per_cycle = Histogram("colinfer_tokens_per_cycle", "tokens emitted per speculative cycle, by draft source (mtp, suffix)",
+                                          COUNT_BUCKETS)
         self.requests = Counter("colinfer_requests_total", "finished requests by finish reason")
         self.prompt_tokens = Counter("colinfer_prompt_tokens_total", "prompt tokens of admitted requests")
         self.cached_tokens = Counter("colinfer_cached_prompt_tokens_total", "prompt tokens served from a prefix checkpoint")
@@ -90,8 +95,8 @@ class Metrics:
         self.session_cache = Gauge("colinfer_session_cache", "disk cache: bytes, files, budget, pending saves, and the totals of "
                                    "restores, saves, written bytes and errors")
         self.generated_tokens = Counter("colinfer_generation_tokens_total", "generated tokens")
-        self.drafted = Counter("colinfer_spec_draft_tokens_total", "draft tokens proposed")
-        self.accepted = Counter("colinfer_spec_accepted_tokens_total", "draft tokens accepted")
+        self.drafted = Counter("colinfer_spec_draft_tokens_total", "draft tokens verified, by draft source (mtp, suffix)")
+        self.accepted = Counter("colinfer_spec_accepted_tokens_total", "draft tokens accepted, by draft source (mtp, suffix)")
         self.queue_depth = Gauge("colinfer_queue_depth", "requests waiting for the running one to finish")
         self.slots_busy = Gauge("colinfer_slots_busy", "slots holding a request, by phase")
         self.memory = Gauge("colinfer_gpu_memory_bytes", "torch allocator: allocated / reserved / cap")

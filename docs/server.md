@@ -133,8 +133,10 @@ Other endpoints:
 - `GET /metrics` (Prometheus), with:
   - step time by kind (prefill chunk, or decode cycle)
   - TTFT and queue time
-  - tokens per speculative cycle
-  - draft and accepted counters
+  - tokens per speculative cycle, and the draft and accepted token counters, by draft source (`source="mtp"`: the
+    MTP head; `source="suffix"`: copies of earlier text). The acceptance rate of each drafter is
+    `rate(colinfer_spec_accepted_tokens_total[5m]) / rate(colinfer_spec_draft_tokens_total[5m])` per source; a drop in
+    the `mtp` rate shows the drafter doing worse on the current kind of work.
   - prompt, cached and generated token counters, and the prompt tokens restored from disk
   - queue depth and busy slots
   - allocator memory

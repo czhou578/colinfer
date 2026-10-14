@@ -553,13 +553,13 @@ class Scheduler:
             s.tokens += o[:-1]
             s.y, s.h_last = o[-1], g.H[0, nb - 1]
             kf = min(kk, s.fresh)  # stale drafts say nothing about acceptance
-            st = s.acc[s.src]
+            src, st = s.src, s.acc[s.src]
             st[0] = ACC_DECAY * st[0] + min(nb - 1, kf)
             st[1] = ACC_DECAY * st[1] + min(nb - 1, kf) + (1 if nb - 1 < kf else 0)
             s.src, s.fresh = "mtp", min(kk, self.k)
-            m.drafted.inc(kk)
-            m.accepted.inc(nb - 1)
-            m.tokens_per_cycle.observe(nb)
+            m.drafted.inc(kk, source=src)  # per source: the MTP head, or the copy of an earlier match (suffix)
+            m.accepted.inc(nb - 1, source=src)
+            m.tokens_per_cycle.observe(nb, source=src)
             lp = self._logprobs(g.logits[0, :nb], o, s.req.logprobs) if s.req.logprobs is not None else None
             self._emit(s, o, lp)
             if s.sfx is not None and s.phase == "decode":

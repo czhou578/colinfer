@@ -301,7 +301,9 @@ def main():
           f"{'VALID' if rvalid else 'INVALID'}")
 
     m = spec.metrics
-    print(f"[spec] drafted {m.drafted.get():.0f}, accepted {m.accepted.get():.0f} ({m.accepted.get() / max(m.drafted.get(), 1):.2f})")
+    print(f"[spec] drafted {m.drafted.total():.0f}, accepted {m.accepted.total():.0f} ({m.accepted.total() / max(m.drafted.total(), 1):.2f}); "
+          + ", ".join(f"{src}: {m.accepted.get(source=src) / max(m.drafted.get(source=src), 1):.2f} of {m.drafted.get(source=src):.0f}"
+                      for src in ("mtp", "suffix") if m.drafted.get(source=src)))
     print("SCHEDULER CHECK", "PASSED" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

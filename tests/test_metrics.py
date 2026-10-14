@@ -25,7 +25,7 @@ def test_counter_and_gauge_render_with_sorted_labels():
     c.inc(2, reason="stop")
     c.inc()
     assert c.render() == ["# HELP req_total requests", "# TYPE req_total counter", "req_total 1", 'req_total{reason="stop"} 3']
-    assert c.get(reason="stop") == 3 and c.get() == 1
+    assert c.get(reason="stop") == 3 and c.get() == 1 and c.total() == 4
     g = Gauge("busy", "slots")
     g.set(2, phase="decode", kind="x")
     g.set(0, phase="decode", kind="x")  # a gauge is set, not summed
