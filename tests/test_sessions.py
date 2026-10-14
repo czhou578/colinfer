@@ -4,6 +4,7 @@ store writes and reads back. Thus an output equals the reference continuation on
 the state of its prefix."""
 import os
 import random
+import threading
 import time
 
 import pytest
@@ -124,6 +125,28 @@ def test_a_pending_save_holds_back_a_rewrite_of_its_rows(make, monkeypatch):
     run(sched, prompt(rng, 200))  # overwrites the slot while the writer is still busy with p1
     r2 = run(sched, p1 + r1.output + prompt(rng, 10))
     assert r2.reused == len(p1) + len(r1.output) - 1
+
+
+def test_the_next_turn_does_not_wait_for_the_write_of_the_last_reply(make, monkeypatch):
+    """The client sends the reply back changed: turn 2 restores the prompt end of turn 1 and rewrites the slot from
+    there, over rows of the reply-end checkpoint that the writer has not read yet. Those rows are in its partial block,
+    copied when the save was queued, so turn 2 starts at once, and the checkpoint on disk still restores exactly."""
+    gate, write = threading.Event(), SessionStore._write
+
+    def gated_write(self, *a):
+        gate.wait(5)
+        return write(self, *a)
+    monkeypatch.setattr(SessionStore, "_write", gated_write)
+    sched, rng = make(n_slots=1), random.Random(10)
+    p1 = prompt(rng, 300)
+    r1 = run(sched, p1)
+    t0 = time.perf_counter()
+    r2 = run(sched, p1 + r1.output[:-5] + prompt(rng, 10))
+    waited = time.perf_counter() - t0
+    gate.set()
+    assert r2.reused == len(p1) and waited < 2.5
+    p3 = p1 + r1.output + prompt(rng, 10)
+    assert run(make(), p3).reused == len(p1) + len(r1.output) - 1  # a new engine: from disk
 
 
 def test_a_slot_that_still_holds_the_rows_reads_only_the_gdn_state(make, monkeypatch):
