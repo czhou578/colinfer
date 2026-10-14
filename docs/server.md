@@ -36,6 +36,8 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--no-prefix-caching` | off | Never reuse a prompt prefix (the same as `--checkpoints 0 --session-cache-gb 0`). Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
 | `--session-dir` | `~/.cache/colinfer/sessions` | The directory of the conversation cache. It holds one subdirectory per engine configuration (checkpoint, decode weights, drafter); the budget covers all of them. |
+| `--image-max-pixels` | 4194304 | Larger images are resized to this many pixels (2048 x 2048). An image costs one prompt token per 32 x 32 pixels, so at most 4,096 tokens. |
+| `--no-vision` | off | Do not load the vision tower (0.93 GB). Images then become a short text note. |
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
@@ -65,6 +67,9 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 - **Streaming:** `stream` with `stream_options.include_usage`. While a stream has no output yet (the queue, a long
   prefill), the server sends an SSE comment line every 10 s, so an idle timeout of the client or a proxy does not end
   it.
+- **Images:** content parts `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` in user and
+  tool messages (PNG, JPEG, WebP, GIF: what Pillow reads). The server accepts only base64 data URLs: it fetches
+  nothing. A system message cannot hold images (the chat template rejects them with a 400).
 - **Prompt rendering:**
   - `tools`, `tool_choice` (`none` leaves the tools out of the prompt).
   - `chat_template_kwargs` (`enable_thinking`, `reasoning_effort`, ...), plus top-level `enable_thinking` and
@@ -151,7 +156,9 @@ Other endpoints:
   - `max_tokens`, `temperature`, `top_p`, `top_k` and `stop_sequences` work as on the Anthropic API.
   - `tool_choice` `none` keeps the tools in the prompt and drops the tool calls of the reply. `any` and a named tool
     have no effect, because the server has no constrained decoding.
-  - Images and documents become a short text note, because the engine reads text only.
+  - Image blocks with a base64 source go to the model, also inside a `tool_result` (Claude Code sends screenshots and
+    the images that its Read tool opens this way). An image with a `url` source gets a 400: the server fetches
+    nothing. Documents (PDF) become a short text note.
   - A final assistant message (prefill) gets a 400 error.
   - The server ignores `cache_control`, `metadata`, `context_management`, the thinking budget and `display`.
 - **Usage:** `cache_read_input_tokens` is the prompt part that the server restored from a checkpoint (in memory or on
@@ -214,6 +221,16 @@ Other endpoints:
   nothing, and requests with different `cache_salt` values share nothing. The files depend on the checkpoint, the
   decode weights and the drafter weights: another configuration writes to its own subdirectory. A file that is
   missing or damaged makes that request prefill instead.
+- **Images** (`engine/model/vision.py`, `engine/server/images.py`). The server resizes an image as the checkpoint's
+  image processor does, to multiples of 32 pixels between 65,536 pixels and `--image-max-pixels`, and gives it one
+  prompt token per 32 x 32 pixels: a 1920 x 1080 screenshot is 2,040 tokens. The vision tower runs during the prefill
+  of those tokens, 0.4 s for a 1080p screenshot. A conversation that sends the same image again restores it from the
+  prefix caches without running the vision tower again.
+
+  The checkpoint's static activation scales were calibrated on text. Measured against the BF16 model of transformers
+  on four test images, the engine's answer tokens differ more in log-probability on images (0.18 on average) than on
+  the same content given as text (0.005); most of this comes with the NVFP4 / FP8 weights themselves. NVIDIA reports
+  MMMU-Pro 74.86 for this checkpoint against 75.14 in BF16. Text that is small in the image can be misread.
 - **One request at a time.** A request that arrives while another runs waits in the queue, also behind a long
   prefill. The three slots keep the last three conversations cached: a side request goes to another slot, so the main
   conversation keeps its cache. The queue holds `--max-queue` requests; past that, requests are refused with a 503

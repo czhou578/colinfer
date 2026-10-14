@@ -238,18 +238,22 @@ def load_fast_model(path_or_repo: str, device="cuda") -> Qwen35ForCausalLM:
 class FastState(ModelState):
     """ModelState with an fp8 KV cache and the device-side per-slot positions `pos_t` (int32 [B]) that graph replays
     advance. active (int32 [B]): decode updates only slots with active == 1 (all 1 by default; the graphs of the
-    scheduler cover one slot each). spec: True while FastQwen35.verify runs (the GDN layers then leave their state for commit()).
-    view(lo, hi) shares the tensors of slots [lo, hi)."""
+    scheduler cover one slot each). rope_delta (int32 [B]): the rotary position of a new row is its cache position plus
+    this (multimodal RoPE: after an image, the text positions run behind the cache rows; engine/model/vision.py). spec:
+    True while FastQwen35.verify runs (the GDN layers then leave their state for commit()). view(lo, hi) shares the
+    tensors of slots [lo, hi)."""
 
     def __init__(self, cfg, batch, max_seq_len, device):
         super().__init__(cfg, batch, max_seq_len, device, torch.bfloat16, kv_dtype=torch.float8_e4m3fn)
         self.pos_t = torch.zeros(batch, dtype=torch.int32, device=device)
         self.active = torch.ones(batch, dtype=torch.int32, device=device)
+        self.rope_delta = torch.zeros(batch, dtype=torch.int32, device=device)
         self.spec = False
 
     def reset(self):
         super().reset()
         self.pos_t.zero_()
+        self.rope_delta.zero_()
 
     def view(self, lo: int, hi: int) -> "FastState":
         v = copy.copy(self)  # every field (and the subclass); then the per-slot tensors become slices
@@ -257,7 +261,7 @@ class FastState(ModelState):
         v.rec = {i: t[lo:hi] for i, t in self.rec.items()}
         v.k = {i: t[lo:hi] for i, t in self.k.items()}
         v.v = {i: t[lo:hi] for i, t in self.v.items()}
-        v.pos_t, v.active = self.pos_t[lo:hi], self.active[lo:hi]
+        v.pos_t, v.active, v.rope_delta = self.pos_t[lo:hi], self.active[lo:hi], self.rope_delta[lo:hi]
         return v
 
 
@@ -268,13 +272,20 @@ class KernelAttention(Attention):
     output gate fused, o_proj with the residual."""
     qkv: nn.Module          # q / k / v in one call: StackedFp8Linear (the target) or LinearGroup (the MTP drafter)
     inv_freq: torch.Tensor  # the RoPE frequencies (rope_inv_freq)
+    mrope: tuple[int, int]  # the h / w sections of interleaved multimodal RoPE (the kernel's sec_h, sec_w)
 
     @classmethod
-    def adopt(cls, attn: Attention, qkv: nn.Module, inv_freq: torch.Tensor) -> "KernelAttention":
+    def adopt(cls, attn: Attention, qkv: nn.Module, inv_freq: torch.Tensor, mrope=(11, 10)) -> "KernelAttention":
         """Moves a reference Attention, with its weights, onto the kernels (in place)."""
         attn.__class__ = cls
-        attn.qkv, attn.inv_freq = qkv, inv_freq
+        attn.qkv, attn.inv_freq, attn.mrope = qkv, inv_freq, tuple(mrope)
         return attn
+
+    def prologue(self, qp, kp, vp, state: FastState, kc, vc, q, active=None, rope_pos=None):
+        """q / k norm, RoPE (at the rows' rope_pos [T, 3] if given, else their cache position + state.rope_delta) and
+        the fp8 KV write at state.pos_t."""
+        ops().attn_prologue(qp, kp, vp, self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t, kc, vc, q, self.q_norm.eps,
+                            active, state.rope_delta, rope_pos, *self.mrope)
 
     def forward(self, x, cos, sin, state: FastState, layer_idx: int, residual=None):
         B, T, _ = x.shape
@@ -282,8 +293,7 @@ class KernelAttention(Attention):
         kc, vc = state.k[layer_idx], state.v[layer_idx]
         qp = qp.reshape(B, T, -1)
         q = torch.empty(B, self.num_heads, T, self.head_dim, device=x.device, dtype=torch.bfloat16)
-        ops().attn_prologue(qp, kp, vp, self.q_norm.weight, self.k_norm.weight, self.inv_freq, state.pos_t, kc, vc, q, self.q_norm.eps,
-                            state.active)
+        self.prologue(qp, kp, vp, state, kc, vc, q, state.active)
         attn = torch.empty(B, T, self.num_heads * self.head_dim, device=x.device, dtype=torch.bfloat16)
         ops().attn_decode(q, kc, vc, state.pos_t + T, attn, self.head_dim ** -0.5, qp.contiguous())
         return self.o_proj(attn, residual)
@@ -432,7 +442,7 @@ def to_fast(model: Qwen35ForCausalLM) -> FastQwen35:
     for layer in model.layers:
         if layer.block_type == "full_attention":
             a = layer.self_attn
-            KernelAttention.adopt(a, StackedFp8Linear([a.q_proj, a.k_proj, a.v_proj]), inv_freq)  # one weight pass for q, k, v
+            KernelAttention.adopt(a, StackedFp8Linear([a.q_proj, a.k_proj, a.v_proj]), inv_freq, cfg.mrope_section[1:])  # one weight pass for q, k, v
         else:
             KernelGDN.adopt(layer.linear_attn)
         layer.input_layernorm = KernelRMSNorm(layer.input_layernorm)

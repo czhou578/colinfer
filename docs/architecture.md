@@ -201,6 +201,16 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   (~59 GB/s). If a slot still holds the KV of that prefix, only the checkpoint file is read. The writer reads the KV
   from the slot itself, so admission waits for a pending save before it rewrites rows that the save still has to
   read. A budget (64 GB) evicts the least recently used files.
+- **Images** (`engine/model/vision.py`). The server resizes and patches each image as the checkpoint's image processor
+  does (`engine/server/images.py`), and gives it a run of placeholder ids past the vocabulary: one per 2 x 2 group of
+  16-pixel patches, derived from a hash of the pixels. Thus the memory and disk caches tell images apart. A prefill
+  chunk that holds image tokens embeds them as the image pad token, then replaces their rows with the output of the
+  vision tower (transformers' Qwen3_5VisionModel, BF16, run once per image and only when its tokens are prefilled).
+  Positions follow multimodal RoPE (`get_rope_index` of transformers): the tokens of an image that starts at s
+  rotate by (t, h, w) = (s', s' + row, s' + col), with s' the rotary position of s, and the text after it continues
+  at s' + max(rows, cols). The attention prologue takes each prefill row's (t, h, w) (`rope_pos`); frequency i
+  rotates by h when i % 3 == 1, by w when i % 3 == 2 and i < 30, else by t. Decode adds a per-slot delta
+  (`FastState.rope_delta`) to the cache position, since a reply holds no images. The drafter rotates the same way.
 - **Server.** One engine thread owns the GPU. Asyncio handlers render the chat template, tokenize and stream. The
   engine thread detokenizes and parses each token as the engine emits it: reasoning, content, Qwen XML tool calls and
   stop strings (`engine/server/chat.py`). The Anthropic Messages API (`/v1/messages`, for Claude Code) uses the same
@@ -246,15 +256,19 @@ scheduler_check.py) and stops at the first failure; `--quick` runs ruff and pyte
   and acceptance statistics, chat parsing and the unroll of the drafter trainer. `test_scheduler.py` runs the scheduler
   on a stub model whose next token depends on the whole history in its state (checkpoints, eviction, aborts), and
   `test_sessions.py` runs it with the disk cache (eviction, restart, shared blocks, the budget, damaged files, a save
-  still pending when its slot is reused). `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
+  still pending when its slot is reused). `test_vision.py` checks the image positions against `get_rope_index` of
+  transformers, the prologue at (t, h, w) positions against the reference rotary, and the scheduler with images on the
+  stub model; `test_model_small.py` checks the reference model with an image's positions and embeddings against
+  transformers. `test_api.py` runs the HTTP endpoints on a fake engine thread (validation, streamed vs whole replies,
   errors). `test_model_small.py` compares the reference model with the Qwen3.5 model of transformers at tiny scale.
 - `tests/golden.py` runs 21 recorded requests at once (greedy, seeded-sampled, a 20k-token prompt) on the server's engine
   (`engine/runtime/build.py`, which the server, the checks and the benchmarks share). They must reproduce
   their tokens and per-token logprobs bit for bit: with suffix-match drafts, without them (`--suffix 0`) and without
   speculation (`check --plain`).
 - `tests/scheduler_check.py` compares the outputs of the scheduler with the uncached single-request outputs. It covers
-  single and queued requests (greedy around sampled and a long prefill), multi-turn and shared-prefix requests, and a
-  restore from disk after a restart (the same output as a restore from memory).
+  single and queued requests (greedy around sampled and a long prefill), multi-turn and shared-prefix requests, a
+  restore from disk after a restart (the same output as a restore from memory), and an image (the model reads the
+  text in it, MTP gives the tokens of plain decode, the next turn reuses the image).
 - Other end-to-end checks: `tests/perplexity.py`, `tests/passkey.py` (long-context retrieval), `tests/server_check.py`
   (the HTTP API).
 - Benchmarks: `bench/perf.py` (the repeatable baseline: prefill, TTFT, decode, memory), `bench/decode_bench.py`,

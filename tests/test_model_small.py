@@ -2,7 +2,8 @@
 - prefill continuation (T > 1 with existing state)
 - the 64-token chunk boundary of the delta rule
 - stepwise decode vs one-shot prefill
-- agreement with Qwen3_5ForCausalLM of HF transformers at tiny scale
+- agreement with Qwen3_5ForCausalLM of HF transformers at tiny scale, also with an image's multimodal positions and
+  input embeddings
 Run: uv run pytest tests/test_model_small.py -q
 """
 import pytest
@@ -19,7 +20,8 @@ def tiny_cfg():
                         layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
                         num_attention_heads=4, num_key_value_heads=2, head_dim=32, partial_rotary_factor=0.25,
                         rope_theta=1e4, linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=16,
-                        linear_value_head_dim=16, linear_conv_kernel_dim=4, rms_norm_eps=1e-6, vocab_size=101)
+                        linear_value_head_dim=16, linear_conv_kernel_dim=4, rms_norm_eps=1e-6, vocab_size=101,
+                        mrope_section=[1, 1, 2], mrope_interleaved=True)
 
 
 @pytest.fixture(scope="module")
@@ -63,8 +65,8 @@ def test_split_prefill_matches_one_shot(model, ids, split):
     torch.testing.assert_close(torch.cat([a, b], 1), full, rtol=1e-4, atol=1e-4)
 
 
-@torch.inference_mode()
-def test_matches_hf_tiny(model, ids):
+def hf_tiny(model):
+    """transformers' Qwen3_5ForCausalLM with the weights of the tiny reference model."""
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
     from tests.hf_fallback import force_hf_torch_fallbacks
@@ -79,15 +81,37 @@ def test_matches_hf_tiny(model, ids):
                              rms_norm_eps=c.rms_norm_eps, vocab_size=c.vocab_size, tie_word_embeddings=False,
                              rope_parameters={"rope_type": "default", "rope_theta": c.rope_theta,
                                               "partial_rotary_factor": c.partial_rotary_factor,
-                                              "mrope_section": [1, 1, 2], "mrope_interleaved": True})
+                                              "mrope_section": c.mrope_section, "mrope_interleaved": True})
     hcfg._attn_implementation = "sdpa"
     hf = Qwen3_5ForCausalLM(hcfg).to(DT).eval()
     sd = {("lm_head.weight" if k == "lm_head.weight" else "model." + k): v for k, v in model.state_dict().items()}
     missing, unexpected = hf.load_state_dict(sd, strict=False)
     assert not unexpected and not [m for m in missing if "rotary" not in m], (missing, unexpected)
-    ref = hf(input_ids=ids, use_cache=False).logits
+    return hf
+
+
+@torch.inference_mode()
+def test_matches_hf_tiny(model, ids):
+    ref = hf_tiny(model)(input_ids=ids, use_cache=False).logits
     ours = model(ids, None)
     torch.testing.assert_close(ours, ref, rtol=1e-4, atol=1e-4)
+
+
+@torch.inference_mode()
+def test_matches_hf_tiny_with_an_image(model, ids):
+    """Rows 10 .. 33 are an image (a 4 x 6 token grid): input embeddings of their own, and the (t, h, w) positions of
+    engine/model/vision.py, as transformers' Qwen3.5 takes them."""
+    from engine.model.vision import Image, rope_positions
+    im = Image(torch.empty(0), (1, 8, 12), key=0, start=10)
+    torch.manual_seed(2)
+    emb = model.embed_tokens(ids).clone()
+    emb[0, 10:10 + im.n] = torch.randn(im.n, model.cfg.hidden_size) * 0.5
+    pos = torch.from_numpy(rope_positions([im], 0, ids.shape[1])).long()
+    assert pos[40, 0] == 40 + max(im.hw) - im.n  # the text after the image runs behind its index
+    ref = hf_tiny(model)(inputs_embeds=emb, position_ids=pos.T[:, None, :], use_cache=False).logits
+    ours = model(ids, None, positions=pos, embeds=emb)
+    torch.testing.assert_close(ours, ref, rtol=1e-4, atol=1e-4)
+    assert not torch.allclose(ours, model(ids, None, embeds=emb), atol=1e-3)  # the positions matter
 
 
 def test_nvfp4_dequant_nibble_order_and_scales():

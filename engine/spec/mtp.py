@@ -102,12 +102,15 @@ class DraftMLP(nn.Module):
 
 class MtpState(FastState):
     """The fp8 KV cache of the single MTP attention layer (index 0) for `batch` slots plus their device positions.
-    active: shares the target state's mask, so a graph step never writes the MTP cache of an inactive slot."""
+    active: shares the target state's mask, so a graph step never writes the MTP cache of an inactive slot. rope_delta:
+    shares the target state's (the drafter's rows rotate as the target's at the same positions)."""
 
-    def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None):
+    def __init__(self, cfg, max_seq_len, device, batch: int = 1, active: torch.Tensor | None = None, rope_delta: torch.Tensor | None = None):
         super().__init__(dataclasses.replace(cfg, layer_types=["full_attention"], num_hidden_layers=1), batch, max_seq_len, device)
         if active is not None:
             self.active = active
+        if rope_delta is not None:
+            self.rope_delta = rope_delta
 
     def slot(self, b: int) -> FastState:
         """Single-slot view with its own all-ones mask, for eager (non-graph) MTP work on one slot."""
@@ -154,7 +157,8 @@ class Mtp(nn.Module):
         with torch.no_grad():
             a.q_norm.weight = nn.Parameter(t[P + "self_attn.q_norm.weight"], requires_grad=False)
             a.k_norm.weight = nn.Parameter(t[P + "self_attn.k_norm.weight"], requires_grad=False)
-        KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]), rope_inv_freq(cfg, dev))  # separate: own NVFP4 scales
+        # q / k / v separate: each keeps its own NVFP4 scales
+        KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]), rope_inv_freq(cfg, dev), cfg.mrope_section[1:])
         layer.mlp = DraftMLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
         layer.__class__ = FastDecoderLayer
         self.layer = layer
@@ -232,9 +236,11 @@ class Mtp(nn.Module):
         return self.norm(self.layer(x, None, None, st))
 
     @torch.inference_mode()
-    def prefill(self, tokens: torch.Tensor, hidden: torch.Tensor, st: MtpState, chunk: int = 2048) -> torch.Tensor:
+    def prefill(self, tokens: torch.Tensor, hidden: torch.Tensor, st: MtpState, chunk: int = 2048,
+                rope_pos: torch.Tensor | None = None) -> torch.Tensor:
         """MTP rows for a prompt (tokens [T], hidden [T, H]) from position st.pos_t of a single-slot view, writing the
-        drafter's KV; returns the normed output of the last row [1, H]. Attention as in the target's prefill."""
+        drafter's KV; returns the normed output of the last row [1, H]. Attention as in the target's prefill. rope_pos:
+        the rows' (t, h, w) rotary positions [T, 3] (images), else their cache position + st.rope_delta."""
         a, layer = self.layer.self_attn, self.layer
         g = None
         for c0 in range(0, tokens.shape[0], chunk):
@@ -244,7 +250,7 @@ class Mtp(nn.Module):
             h = layer.input_layernorm(x)
             qp, kp, vp = a.q_proj(h), a.k_proj(h), a.v_proj(h)
             q = torch.empty(1, a.num_heads, T, a.head_dim, device=x.device, dtype=torch.bfloat16)
-            ops().attn_prologue(qp, kp, vp, a.q_norm.weight, a.k_norm.weight, a.inv_freq, st.pos_t, st.k[0], st.v[0], q, a.q_norm.eps)
+            a.prologue(qp, kp, vp, st, st.k[0], st.v[0], q, rope_pos=rope_pos[c0:c0 + T] if rope_pos is not None else None)
             o = attend_cached(q, st.k[0], st.v[0], int(st.pos_t), a.head_dim ** -0.5).view(T, a.num_heads, a.head_dim)
             gate = qp.view(T, a.num_heads, 2 * a.head_dim)[:, :, a.head_dim:]
             x = a.o_proj((o * torch.sigmoid(gate)).reshape(T, -1), x)
@@ -363,7 +369,7 @@ class MtpGenerator:
         self.mtp = Mtp(model, path, weights=weights, **mtp_kw)
         self.dev = self.mtp.dev
         self.state = model.new_state(1, max_seq_len)
-        self.mst = MtpState(model.cfg, max_seq_len, self.dev, active=self.state.active)
+        self.mst = MtpState(model.cfg, max_seq_len, self.dev, active=self.state.active, rope_delta=self.state.rope_delta)
         self.cycle = MtpCycle(model, self.mtp, self.state, self.mst, k)
         self.stats = dict(steps=0, tokens=0, drafted=0, accepted=0)
 

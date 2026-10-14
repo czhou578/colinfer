@@ -7,12 +7,14 @@ configuration runs exactly that configuration.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Literal
 
 from engine.kernels import ops
 from engine.model.fast import attach_decode_copies, decode_copies_paths, load_fast_model, to_fast
+from engine.model.vision import VisionTower, vision_available
 from engine.runtime.scheduler import Scheduler
 from engine.selftest import run_selftest
 from engine.spec.mtp import DRAFT_DIR, Mtp
@@ -64,9 +66,10 @@ def _file_id(f: str) -> list:
 
 def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 262144, checkpoints: int = 32, spec: str = "mtp", k: int = 7,
                  drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int",
-                 boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, metrics=None, log=print):
+                 boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, vision: bool = True, metrics=None, log=print):
     """The scheduler with its model, as `python -m engine.server` builds it from the same flags (the defaults are the
     server's). spec: "mtp" or "none". boundary: the message-boundary token id, "auto" (the checkpoint's) or None.
+    vision: load the checkpoint's vision tower (image input, engine/model/vision.py) when it has one.
     Returns (scheduler, the startup seconds of each phase). scheduler.fingerprint names what the cached state depends
     on (the checkpoint, the decode weights, the drafter), for the disk cache (engine/runtime/sessions.py)."""
     if spec not in ("mtp", "none"):
@@ -78,11 +81,16 @@ def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 26214
     mtp = load_drafter(m, path, drafter_weights, log) if spec == "mtp" else None
     if boundary == "auto":
         boundary = boundary_token(path)
+    tower = VisionTower(path) if vision and vision_available(path) else None
+    if tower is not None:
+        log("[engine] vision tower loaded: image input on")
     t2 = time.perf_counter()
     if selftest:
         run_selftest(verbose=True)  # refuses to start if any matmul path is numerically wrong
     sched = Scheduler(m, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=k, metrics=metrics,
                       boundary_token=boundary, suffix_min=suffix_drafts)
+    if tower is not None:
+        sched.vision, sched.image_pad = tower, json.load(open(os.path.join(path, "config.json")))["image_token_id"]
     copies = decode_copies_paths(path)
     int_copies = decode_weights == "int" and all(os.path.exists(f) for f in copies)
     sched.fingerprint = dict(model=os.path.basename(path), decode=[_file_id(f) for f in copies] if int_copies else "checkpoint",

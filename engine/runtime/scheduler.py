@@ -31,6 +31,11 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
   before them. A new request restores from disk when the disk holds a prefix of its prompt at least `min_gain` tokens
   longer than the best memory checkpoint: a conversation that lost its slot to others, or any conversation after a
   restart. The restore gives the slot the bytes it held, so the output is the same as after a memory restore.
+* Images (engine/model/vision.py). A request's images are runs of placeholder ids past the vocabulary in its prompt,
+  derived from the pixels, so the checkpoints tell images apart. A prefill chunk that holds image tokens embeds them
+  with the vision tower (once per image, only when they are prefilled) and gives each row its multimodal (t, h, w)
+  rotary position; decode rotates by the cache position plus the slot's delta. The placeholder ids never reach the
+  drafts or the draft vocabulary.
 * Finish. A request ends at a stop token (eos_ids), at max_new_tokens, at the slot length, by its hook (stop
   strings, client gone), or max_seconds after its submit ("timeout", also while it still waits in the queue). The
   speculative cycle cuts the accepted length after a stop token on the GPU. Thus the history of a slot (`Slot.tokens`,
@@ -48,6 +53,7 @@ import torch
 
 from engine.model.fast import MAX_ROWS, FastQwen35
 from engine.model.prefill import CHUNK, prefill, prepare_prefill
+from engine.model.vision import Image, VisionTower, rope_delta, rope_positions
 from engine.runtime.decode import DecodeGraph
 from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, sample
@@ -94,6 +100,7 @@ class Request:
     cache_salt: str | None = None   # checkpoints are shared only between requests with the same salt (vLLM semantics)
     max_seconds: float = 0.0        # > 0: the request ends ("timeout") this long after its submit, running or queued
     disk: bool = True               # its checkpoints may go to the disk cache (False: the client asked for no prefix reuse)
+    images: list[Image] = dataclasses.field(default_factory=list)  # its images, in prompt order (engine/model/vision.py)
     # filled in by the scheduler
     rid: int = -1
     slot: int = -1
@@ -157,7 +164,7 @@ class Scheduler:
         # 16), since a second pass streams every weight again. The pending drafts are a chain: a shorter k uses a prefix.
         self.k_opts = [kk for kk in sorted({min(kk, k) for kk in K_OPTIONS + (k,)}) if kk + 1 <= MAX_ROWS] or [MAX_ROWS - 1]
         if mtp is not None:
-            self.mst = MtpState(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active)
+            self.mst = MtpState(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active, rope_delta=self.state.rope_delta)
             self.tok = torch.zeros(n_slots, self.kmax + 1, dtype=torch.long, device=dev)
             self.stop_buf = torch.full((n_slots, MAX_STOP_IDS), -1, dtype=torch.long, device=dev)
             self.cycles, self.cycle_s = {}, {}
@@ -199,6 +206,8 @@ class Scheduler:
         self.free_bufs = list(range(n_checkpoints))
         self.queue: collections.deque[Request] = collections.deque()
         self.store: SessionStore | None = None  # the disk cache, attached by the server after its warm-up
+        self.vision: VisionTower | None = None  # image input (engine/runtime/build.py)
+        self.image_pad: int | None = None       # the token that image rows are embedded as before the vision tower's rows replace them
         self._rid = 0
         self._evt = torch.cuda.Event()
         torch.cuda.synchronize()
@@ -296,7 +305,16 @@ class Scheduler:
         if len(req.prompt) + self.margin > self.max_seq_len:
             raise ValueError(f"prompt of {len(req.prompt)} tokens exceeds the slot length {self.max_seq_len}")
         V = self.model.cfg.vocab_size  # an id past the embedding is a device-side assert, which ends the engine
-        if min(req.prompt) < 0 or max(req.prompt) >= V or not all(0 <= t < V for t in req.eos_ids):
+        ids = req.prompt
+        if req.images:  # the image runs are the only ids past the vocabulary
+            if self.vision is None:
+                raise ValueError("this server does not read images")
+            ids = list(ids)
+            for im in req.images:
+                if not 0 <= im.start <= len(ids) - im.n or ids[im.start:im.start + im.n] != im.ids(V):
+                    raise ValueError("the image tokens of the prompt do not match its images")
+                ids[im.start:im.start + im.n] = [0] * im.n
+        if min(ids) < 0 or max(ids) >= V or not all(0 <= t < V for t in req.eos_ids):
             raise ValueError(f"token ids must be in [0, {V})")
         req.rid, self._rid = self._rid, self._rid + 1
         req.t_submit = time.perf_counter()
@@ -380,10 +398,12 @@ class Scheduler:
                 ps.append(bs[-1])
             s.splits = sorted({p for p in ps if p >= len(s.tokens) + SPLIT_MIN_TOKENS})
         self.params.set(b, req.temperature, req.top_k, req.top_p, req.min_p, req.seed)
+        self.state.rope_delta[b] = rope_delta(req.images)  # the reply's rotary positions trail its cache positions by this
         if self.mtp is not None:
             ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
             self.stop_buf[b] = torch.tensor(ids + [-1] * (MAX_STOP_IDS - len(ids)))
-            self.mtp.set_prompt_vocab(list(P))  # the draft vocabulary gets this prompt's tokens
+            V = self.model.cfg.vocab_size
+            self.mtp.set_prompt_vocab([t for t in P if t < V] if req.images else list(P))  # the draft vocabulary gets this prompt's tokens
         m = self.metrics
         m.prompt_tokens.inc(len(P))
         m.cached_tokens.inc(req.reused)
@@ -418,11 +438,13 @@ class Scheduler:
         chunk = s.todo[:n]
         view = self.state.view(b, b + 1)
         view.pos = start
-        ids = torch.tensor([chunk], device=self.dev)
+        images = s.req.images
+        img = dict(embeds=self._image_embeds(images, start, start + n), rope_pos=self._rope(images, start, start + n)) if images else {}
+        ids = torch.tensor([self._ids(chunk, images)], device=self.dev)
         if self.mtp is not None:
-            logits, H = prefill(self.model, ids, view, return_hidden=True)
+            logits, H = prefill(self.model, ids, view, return_hidden=True, **img)
         else:
-            logits = prefill(self.model, ids, view)
+            logits = prefill(self.model, ids, view, **img)
         s.tokens += chunk
         s.todo = s.todo[len(chunk):]
         if self.mtp is not None:  # drafter KV rows (x_{i+1}, h_i) for positions start-1 .. end-2
@@ -434,7 +456,9 @@ class Scheduler:
                 mv.pos_t.fill_(0)
                 toks, hid = chunk[1:], H[:-1]
             if toks:
-                self.mtp.prefill(torch.tensor(toks, device=self.dev), hid, mv)
+                p0 = max(start - 1, 0)
+                self.mtp.prefill(torch.tensor(self._ids(toks, images), device=self.dev), hid, mv,
+                                 rope_pos=self._rope(images, p0, p0 + len(toks)) if images else None)
             s.h_last = H[-1]
         done = not s.todo
         split = len(s.tokens) in s.splits
@@ -497,11 +521,33 @@ class Scheduler:
             self._emit(s, [y], lp)
         m.step_seconds.observe(time.perf_counter() - t0, kind="decode")
 
+    def _ids(self, toks: list[int], images: list[Image]) -> list[int]:
+        """Input ids: image tokens as the image pad (prefill replaces their rows)."""
+        if not images:
+            return toks
+        V = self.model.cfg.vocab_size
+        return [t if t < V else self.image_pad for t in toks]
+
+    def _rope(self, images: list[Image], lo: int, hi: int) -> torch.Tensor:
+        return torch.from_numpy(rope_positions(images, lo, hi)).to(self.dev)
+
+    def _image_embeds(self, images: list[Image], lo: int, hi: int) -> list:
+        """[(offset from lo, the vision tower's rows)] of the images with tokens in [lo, hi); each runs the tower once."""
+        out = []
+        for im in images:
+            if im.start < hi and im.start + im.n > lo:
+                if im.embeds is None:
+                    im.embeds = self.vision.encode(im)
+                out.append((im.start - lo, im.embeds))
+        return out
+
     def _suffix_drafts(self, s: Slot):
         """Replace the slot's pending MTP drafts with the continuation of the longest earlier occurrence of its history's
         suffix, when that match is at least suffix_min tokens long (engine/spec/suffix.py). The drafter's state does not
         depend on the drafts, only on accepted tokens, so either source can feed any cycle."""
         n, cont = s.sfx.draft(self.kmax)
+        V = self.model.cfg.vocab_size
+        cont = cont[:next((i for i, t in enumerate(cont) if t >= V), len(cont))]  # never an image token
         if n >= self.suffix_min and cont:
             self.tok[s.idx, 1:1 + len(cont)] = torch.tensor(cont)
             s.src, s.fresh = "suffix", len(cont)
@@ -547,6 +593,8 @@ class Scheduler:
     def _close(self, req: Request, reason: str):
         """The end of a request, in a slot or still queued: its fields, the metrics, the hook."""
         req.done, req.finish_reason, req.t_done = True, reason, time.perf_counter()
+        for im in req.images:
+            im.embeds = None
         self.metrics.requests.inc(reason=reason)
         self.metrics.generated_tokens.inc(len(req.output))
         if req.hook is not None:

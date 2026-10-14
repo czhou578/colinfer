@@ -186,7 +186,7 @@ int attn_decode_tc_nb();
 cudaError_t launch_attn_decode_tc(const void*, const void*, const void*, const int*, void*, float*, void*, int, int, int, int, int, int, float,
                                   const void*, cudaStream_t);
 cudaError_t launch_attn_prologue(const void*, const void*, const void*, int, int, int, const void*, const void*, const float*, const int*, void*,
-                                 void*, void*, int, int, int, int, int, int, float, const int*, cudaStream_t);
+                                 void*, void*, int, int, int, int, int, int, float, const int*, const int*, const int*, int, int, cudaStream_t);
 
 static void check_kv(const torch::Tensor& k, const torch::Tensor& v) {
     CHECK_CUDA_TENSOR(k, torch::kFloat8_e4m3fn);
@@ -198,9 +198,13 @@ static void check_kv(const torch::Tensor& k, const torch::Tensor& v) {
 // qp, kp, vp: bf16 [.., features] views with unit-stride rows (e.g. column slices of one stacked q|k|v GEMM output).
 // The qp rows hold [Hq, 512] (q | gate per head), and the kp / vp rows [Hkv, 256]. inv_freq: fp32 [R/2]. q_out:
 // [B, Hq, T, 256]. active (optional): int32 [B]. Slots with 0 do not write KV.
+// The rotary position of a row (multimodal RoPE): rope_pos (optional, int32 [B * T, 3]) gives its (t, h, w) positions,
+// with mrope sections sec_h / sec_w for the interleaved frequencies; else rope_delta (optional, int32 [B]) offsets
+// pos_t; else it is the cache position pos_t[b] + t.
 void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::Tensor qn_w, torch::Tensor kn_w, torch::Tensor inv_freq,
                    torch::Tensor pos_t, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor q_out, double eps,
-                   c10::optional<torch::Tensor> active) {
+                   c10::optional<torch::Tensor> active, c10::optional<torch::Tensor> rope_delta, c10::optional<torch::Tensor> rope_pos,
+                   int64_t sec_h, int64_t sec_w) {
     for (auto* t : {&qp, &kp, &vp})
         TORCH_CHECK(t->is_cuda() && t->scalar_type() == torch::kBFloat16 && t->stride(-1) == 1, "q/k/v rows must be unit-stride bf16");
     for (auto* t : {&qn_w, &kn_w, &q_out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
@@ -211,10 +215,17 @@ void attn_prologue(torch::Tensor qp, torch::Tensor kp, torch::Tensor vp, torch::
     auto q2 = qp.reshape({-1, qp.size(-1)}), k2 = kp.reshape({-1, kp.size(-1)}), v2 = vp.reshape({-1, vp.size(-1)});
     TORCH_CHECK(q2.size(0) == B * T && k2.size(0) == B * T && v2.size(0) == B * T && q2.size(1) == Hq * 2 * HEAD_DIM && k2.size(1) == Hkv * HEAD_DIM &&
                 v2.size(1) == Hkv * HEAD_DIM && q_out.size(3) == HEAD_DIM && pos_t.numel() == B, "bad shapes / strides");
+    const int* rpos = nullptr;
+    if (rope_pos.has_value()) {
+        CHECK_CUDA_TENSOR(*rope_pos, torch::kInt32);
+        TORCH_CHECK(rope_pos->numel() == B * T * 3, "rope_pos: int32 [B * T, 3]");
+        rpos = rope_pos->data_ptr<int>();
+    }
     CHECK_LAUNCH(launch_attn_prologue(q2.data_ptr(), k2.data_ptr(), v2.data_ptr(), (int)q2.stride(0), (int)k2.stride(0), (int)v2.stride(0),
                                       qn_w.data_ptr(), kn_w.data_ptr(), inv_freq.data_ptr<float>(), pos_t.data_ptr<int>(), k_cache.data_ptr(),
                                       v_cache.data_ptr(), q_out.data_ptr(), B, T, Hq, Hkv, Lmax, 2 * inv_freq.numel(), (float)eps,
-                                      opt_i32(active, B, "active"), stream()));
+                                      opt_i32(active, B, "active"), opt_i32(rope_delta, B, "rope_delta"), rpos, (int)sec_h, (int)sec_w,
+                                      stream()));
 }
 
 // out[b, h, t] = softmax(q k^T * scale) v over the first seq_lens[b] - (T-1-t) cached positions, with one KV pass for all
@@ -512,7 +523,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // decode attention
     m.def("attn_prologue", &attn_prologue, "fused q/k norm + partial RoPE + fp8 KV write", py::arg("qp"), py::arg("kp"), py::arg("vp"),
           py::arg("qn_w"), py::arg("kn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("k_cache"), py::arg("v_cache"), py::arg("q_out"),
-          py::arg("eps"), py::arg("active") = py::none());
+          py::arg("eps"), py::arg("active") = py::none(), py::arg("rope_delta") = py::none(), py::arg("rope_pos") = py::none(),
+          py::arg("sec_h") = 11, py::arg("sec_w") = 10);
     m.def("attn_decode", &attn_decode, "tensor-core multi-row GQA decode attention over an fp8 KV cache", py::arg("q"), py::arg("k_cache"),
           py::arg("v_cache"), py::arg("seq_lens"), py::arg("out"), py::arg("scale"), py::arg("gate") = py::none());
     // Gated DeltaNet decode / verify / commit

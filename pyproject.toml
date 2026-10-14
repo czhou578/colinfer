@@ -21,6 +21,8 @@ dependencies = [
     "safetensors>=0.8.0",
     "tokenizers>=0.23.0",
     "numpy>=2.3",
+    # Image input: decoding and the Qwen2-VL resize of transformers' PIL image processor.
+    "pillow>=11.3",
     # Build helper for torch.utils.cpp_extension / CMake.
     "ninja>=1.11",
     "fastapi>=0.142.2",

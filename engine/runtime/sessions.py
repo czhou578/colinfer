@@ -48,7 +48,7 @@ MIN_GAIN = 256      # a disk checkpoint must beat the best memory checkpoint by 
 MAX_PENDING = 4     # saves that wait for the writer before save() blocks: each holds a copy of the GDN state on the GPU
 ALIGN = 4096        # direct I/O: buffer addresses, file offsets and lengths
 HEADER = 4096       # a JSON header at the start of each file, padded with spaces
-VERSION = 1         # of the file layout
+VERSION = 2         # of the file layout and the token hashing
 
 
 def _open(path: str, flags: int) -> int:
@@ -248,7 +248,7 @@ class SessionStore:
         """Queues the checkpoint of the prefix `tokens` of slot b. conv / rec: its GDN state per layer (device tensors,
         copied now), h: the drafter's input hidden state or None. The writer reads the KV rows [0, n) from the slot
         later (see wait())."""
-        toks = np.asarray(tokens, dtype=np.int32)
+        toks = np.asarray(tokens, dtype=np.int64)  # image tokens are ids past 2^31 (engine/model/vision.py)
         n = len(toks)
         chain = self._chain(toks, salt, n // self.block)
         key = self._ckey(chain, toks, n)
@@ -346,7 +346,7 @@ class SessionStore:
         """The longest checkpoint on disk, longer than min_len, that is a proper prefix of the prompt and has all of its
         blocks."""
         P = len(prompt)
-        toks = np.asarray(prompt, dtype=np.int32)
+        toks = np.asarray(prompt, dtype=np.int64)
         with self.lock:
             pend = [j for j in self.pending if min_len < j.n < P]
         if pend:  # a save of this prompt's prefix is still being written: wait for it

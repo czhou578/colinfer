@@ -19,6 +19,7 @@ from typing import Literal
 
 import torch
 
+from engine.model.vision import Image
 from engine.runtime.build import MODEL, build_engine
 from engine.runtime.metrics import Metrics
 from engine.runtime.scheduler import Request as EngineRequest
@@ -52,6 +53,8 @@ class ServerConfig:
     mem_cap_bytes: int = 0
     session_cache_gb: float = 64.0  # the disk cache of conversations (engine/runtime/sessions.py); 0: off
     session_dir: str = SESSION_ROOT
+    vision: bool = True             # image input, when the checkpoint has a vision tower (engine/model/vision.py)
+    image_max_pixels: int = 2048 * 2048  # images are resized to at most this many pixels (one token per 32 x 32)
 
 
 class Worker(threading.Thread):
@@ -80,7 +83,7 @@ class Worker(threading.Thread):
         c, log, t0 = self.cfg, self.log, time.perf_counter()
         sched, self.startup = build_engine(c.model, slots=c.slots, max_seq_len=c.max_seq_len, checkpoints=c.checkpoints, spec=c.spec, k=c.k,
                                            drafter_weights=c.drafter_weights, suffix_drafts=c.suffix_drafts, decode_weights=c.decode_weights,
-                                           boundary=c.boundary_token, selftest=c.selftest, metrics=self.metrics, log=log)
+                                           boundary=c.boundary_token, selftest=c.selftest, vision=c.vision, metrics=self.metrics, log=log)
         t3 = time.perf_counter()
         if c.warmup:
             self._warmup(sched, sched.model.cfg.vocab_size)
@@ -107,6 +110,11 @@ class Worker(threading.Thread):
         sched.run(reqs[:1])
         sched.run(reqs[1:])
         sched.run([EngineRequest(rnd(20 + i), max_new_tokens=8, temperature=0.5 * (i % 2)) for i in range(sched.n_slots)])
+        if sched.vision is not None:  # the image path: the vision tower, multimodal positions
+            im = Image(torch.zeros(256, sched.vision.patch_dim), (1, 16, 16), key=1, merge=sched.vision.merge)
+            head = rnd(30)
+            im.start = len(head)
+            sched.run([EngineRequest(head + im.ids(vocab) + rnd(10), max_new_tokens=6, images=[im])])
         sched.reset()
         torch.cuda.synchronize()
 

@@ -49,6 +49,8 @@ class Qwen35Config:
     vocab_size: int = 248320
     max_position_embeddings: int = 262144
     tie_word_embeddings: bool = False
+    mrope_section: list[int] = field(default_factory=lambda: [11, 11, 10])  # rotary frequencies per (t, h, w) axis (multimodal RoPE)
+    mrope_interleaved: bool = True  # the axes alternate over the frequencies (Qwen3-VL / 3.5) instead of taking a run each
 
     @classmethod
     def from_checkpoint(cls, path: str) -> "Qwen35Config":
@@ -74,6 +76,8 @@ class Qwen35Config:
             vocab_size=t["vocab_size"],
             max_position_embeddings=t.get("max_position_embeddings", 262144),
             tie_word_embeddings=t.get("tie_word_embeddings", c.get("tie_word_embeddings", False)),
+            mrope_section=list(rp.get("mrope_section", [11, 11, 10])),
+            mrope_interleaved=bool(rp.get("mrope_interleaved", False)),
         )
 
     @property
@@ -85,6 +89,29 @@ def rope_inv_freq(cfg: Qwen35Config, device=None) -> torch.Tensor:
     """The RoPE frequencies of the rotary dims (fp32), as the reference computes them; every attention path uses these."""
     d = cfg.rotary_dim
     return 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=device) / d))
+
+
+def mrope_axes(cfg: Qwen35Config, device=None) -> torch.Tensor:
+    """The position axis (0 = t, 1 = h, 2 = w) of each rotary frequency under interleaved multimodal RoPE, as
+    transformers' Qwen3.5 recomposes them: frequency i takes h if i % 3 == 1 and i < 3 * sections[1], w if i % 3 == 2
+    and i < 3 * sections[2], else t."""
+    if not cfg.mrope_interleaved:
+        raise NotImplementedError("multimodal RoPE: only the interleaved layout is implemented")
+    i = torch.arange(cfg.rotary_dim // 2, device=device)
+    s = cfg.mrope_section
+    return torch.where((i % 3 == 1) & (i < 3 * s[1]), 1, torch.where((i % 3 == 2) & (i < 3 * s[2]), 2, 0))
+
+
+def rotary(cfg: Qwen35Config, positions: torch.Tensor, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin [1, T, rotary_dim] in dtype, computed in fp32 like the reference. positions: [T], or [T, 3] (t, h, w)
+    positions under multimodal RoPE, where each frequency rotates by the position of its axis (mrope_axes)."""
+    inv_freq = rope_inv_freq(cfg, positions.device)
+    if positions.dim() == 2:
+        freqs = positions[:, mrope_axes(cfg, positions.device)].float() * inv_freq[None, :]
+    else:
+        freqs = positions.float()[:, None] * inv_freq[None, :]
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -404,26 +431,23 @@ class Qwen35ForCausalLM(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        self._inv_freq = None
 
     def rotary(self, positions: torch.Tensor, dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        """cos/sin [1, T, rotary_dim] in the model dtype, computed in fp32 like the reference."""
-        if self._inv_freq is None or self._inv_freq.device != positions.device:
-            self._inv_freq = rope_inv_freq(self.cfg, positions.device)
-        freqs = positions.float()[:, None] * self._inv_freq[None, :]
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]
+        return rotary(self.cfg, positions, dtype)
 
     def new_state(self, batch: int, max_seq_len: int) -> ModelState:
         p = self.embed_tokens.weight  # the embedding is never quantized; lm_head may be a kernel module
         return ModelState(self.cfg, batch, max_seq_len, p.device, p.dtype)
 
-    def forward(self, input_ids: torch.Tensor, state: ModelState | None = None, last_only: bool = False) -> torch.Tensor:
-        """input_ids [B, T] -> logits [B, T or 1, vocab] (fp32). Advances state.pos by T."""
+    def forward(self, input_ids: torch.Tensor, state: ModelState | None = None, last_only: bool = False,
+                positions: torch.Tensor | None = None, embeds: torch.Tensor | None = None) -> torch.Tensor:
+        """input_ids [B, T] -> logits [B, T or 1, vocab] (fp32). Advances state.pos by T. positions: the rotary positions
+        [T] or [T, 3] (default: the cache positions); embeds: input embeddings [B, T, H] instead of input_ids' (images)."""
         B, T = input_ids.shape
         pos = state.pos if state is not None else 0
-        x = self.embed_tokens(input_ids)
-        positions = torch.arange(pos, pos + T, device=x.device)
+        x = self.embed_tokens(input_ids) if embeds is None else embeds
+        if positions is None:
+            positions = torch.arange(pos, pos + T, device=x.device)
         cos, sin = self.rotary(positions, x.dtype)
         cos, sin = cos.expand(B, -1, -1), sin.expand(B, -1, -1)
         for layer in self.layers:

@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from engine.runtime.scheduler import Request as EngineRequest
 from engine.server import anthropic as anth
+from engine.server import images as img
 from engine.server import openai as oai
 from engine.server.chat import ChatFormat, OutputParser, TextParser, check_messages, template_kwargs
 from engine.server.worker import ServerConfig, Stream, Worker
@@ -113,6 +114,8 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         app.add_middleware(ApiKey, key=cfg.api_key)
     max_len, margin = cfg.max_seq_len, worker.sched.margin
     vocab = hf_config["vocab_size"]  # rows of the embedding: a token id beyond it is a device-side assert, fatal to the engine
+    vision = getattr(worker.sched, "vision", None) is not None  # image input (engine/server/images.py)
+    improc = img.ImageProcessor(resolve(cfg.model), cfg.image_max_pixels) if vision else None
     created = int(time.time())
 
     # apply_chat_template's own arguments: a chat_template_kwargs key with one of these names would collide with them
@@ -148,12 +151,12 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             raise BadRequest(f"{name} must be token ids in [0, {vocab})")
         return tuple(ids)
 
-    def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None) -> EngineRequest:
+    def make_request(b: dict, prompt: list[int], hook, logprobs: int | None = None, images=()) -> EngineRequest:
         if cfg.max_queue and worker.queued() >= cfg.max_queue:
             raise Busy(f"the server is busy: {cfg.max_queue} requests are waiting")
         if not prompt:
             raise BadRequest("the prompt is empty")
-        token_ids(prompt, "prompt")
+        token_ids([t for t in prompt if t < vocab] if images else prompt, "prompt")  # image tokens: ids past the vocabulary
         if len(prompt) + margin > max_len:  # the wording of the Anthropic API, which Claude Code recognizes
             raise BadRequest(f"prompt is too long: {len(prompt)} tokens > {max_len - margin} maximum")
         mt = b.get("max_completion_tokens")
@@ -188,7 +191,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                              min_p=min_p, seed=seed, eos_ids=eos,
                              min_tokens=_num(b.get("min_tokens") or 0, int, "min_tokens"),
                              logprobs=logprobs, hook=hook, cache_salt=None if salt is None else str(salt),
-                             max_seconds=cfg.max_request_seconds, disk=keep)
+                             max_seconds=cfg.max_request_seconds, disk=keep, images=list(images))
 
     def stops_of(b: dict, key: str = "stop") -> list[str]:
         """The stop strings of a request: `stop` (OpenAI: a string or a list) or `stop_sequences` (Anthropic: a list)."""
@@ -210,19 +213,30 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         except ValueError as e:
             raise BadRequest(str(e)) from None
 
-    async def render(msgs, tools, kw: dict) -> list[int]:
-        """The prompt of a chat. Malformed messages and the template's own checks (no user message, an unknown role) are
-        the client's errors; any other exception propagates as a bug of the server."""
+    async def render(msgs, tools, kw: dict) -> tuple[list[int], list]:
+        """(the prompt of a chat, its images). Malformed messages, unreadable images and the template's own checks (no
+        user message, an unknown role) are the client's errors; any other exception propagates as a bug of the server."""
         try:
             check_messages(msgs, tools)
+            msgs, blobs = img.extract(msgs, vision)
         except ValueError as e:
             raise BadRequest(str(e)) from None
         if reserved_kwargs & set(kw):
             raise BadRequest(f"chat_template_kwargs cannot set {sorted(reserved_kwargs & set(kw))}")
         try:
-            return await asyncio.to_thread(fmt.render, msgs, tools, **kw)
+            images = [await asyncio.to_thread(improc.load, x) for x in blobs]
+        except ValueError as e:
+            raise BadRequest(str(e)) from None
+        try:
+            prompt = await asyncio.to_thread(fmt.render, msgs, tools, **kw)
         except jinja2.TemplateError as e:
             raise BadRequest(f"chat template: {e}") from None
+        if images:
+            try:
+                prompt = img.expand(prompt, images, worker.sched.image_pad, vocab)
+            except ValueError as e:
+                raise BadRequest(str(e)) from None
+        return prompt, images
 
     def log_done(req: EngineRequest, kind: str):
         t = oai.timings(req)
@@ -298,13 +312,13 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             msgs = b.get("messages")
             tool_choice = b.get("tool_choice")
             tools = b.get("tools") if tool_choice != "none" else None
-            prompt = await render(msgs, tools, kwargs_of(b))
+            prompt, images = await render(msgs, tools, kwargs_of(b))
             n_top = None
             if b.get("logprobs"):
                 n_top = min(_num(b.get("top_logprobs") or 0, int, "top_logprobs"), oai.MAX_TOP_LOGPROBS)
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser)
-            req = make_request(b, prompt, st, n_top)
+            req = make_request(b, prompt, st, n_top, images)
             include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
             return _error(str(e))
@@ -436,18 +450,19 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
 
     # -------------------------------------------------------------------------------------- Anthropic messages
     async def render_messages(b: dict):
-        """Anthropic request body -> (prompt token ids, OpenAI-style tools)."""
+        """Anthropic request body -> (prompt token ids, OpenAI-style tools, images)."""
         try:
-            msgs, tools = anth.to_messages(b), anth.to_tools(b)
+            msgs, tools = anth.to_messages(b, vision), anth.to_tools(b)
             kw = anth.template_kwargs(b, default_thinking, default_effort)
         except ValueError as e:  # the conversion's checks of the request
             raise BadRequest(str(e)) from None
-        return await render(msgs, tools, kw), tools
+        prompt, images = await render(msgs, tools, kw)
+        return prompt, tools, images
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request):
         try:
-            prompt, _ = await render_messages(await json_body(request))
+            prompt, _, _ = await render_messages(await json_body(request))
         except BadRequest as e:
             return _anth_error(str(e))
         return {"input_tokens": len(prompt)}
@@ -456,10 +471,10 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     async def messages(request: Request):
         try:
             b = await json_body(request)
-            prompt, tools = await render_messages(b)
+            prompt, tools, images = await render_messages(b)
             parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b, "stop_sequences"))
             st = Stream(asyncio.get_running_loop(), tokenizer, parser)
-            req = make_request(b, prompt, st)
+            req = make_request(b, prompt, st, None, images)
         except BadRequest as e:
             return _anth_error(str(e))
         except Busy as e:
@@ -562,6 +577,9 @@ def main(argv=None):
                     help="disk budget of the conversation cache (KV and GDN state of past conversations, restored after an eviction "
                          "or a restart); 0: off")
     ap.add_argument("--session-dir", default=D.session_dir, help="directory of the conversation cache")
+    ap.add_argument("--no-vision", action="store_true", help="no image input: images become a text note, and the vision tower is not loaded")
+    ap.add_argument("--image-max-pixels", type=int, default=D.image_max_pixels,
+                    help="resize larger images to this many pixels (one prompt token per 32 x 32 pixels)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
@@ -587,7 +605,8 @@ def main(argv=None):
                        boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
                        max_queue=a.max_queue, max_output_tokens=a.max_output_tokens, max_request_seconds=a.max_request_seconds,
                        api_key=a.api_key, mem_cap_bytes=mem_cap_bytes,
-                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, session_dir=a.session_dir)
+                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, session_dir=a.session_dir,
+                       vision=not a.no_vision, image_max_pixels=a.image_max_pixels)
     hf = json.load(open(os.path.join(path, "config.json")))
     hf_config = hf.get("text_config", hf)
     gen = json.load(open(os.path.join(path, "generation_config.json"))) if os.path.exists(os.path.join(path, "generation_config.json")) else {}

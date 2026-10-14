@@ -215,7 +215,8 @@ Know these limits:
   10 seconds, so Claude Code does not stop the request.
 - **No web search.** Web search is a function of the Anthropic servers. With this configuration, the WebSearch tool
   gets an error.
-- **Text only.** The engine does not read images or PDF documents. The model gets a short note in their place.
+- **Images, not PDFs.** The model sees screenshots and image files (a pasted screenshot, or an image that the Read
+  tool opens). Small text in an image can be misread. PDF documents become a short note.
 - **Reasoning.** Claude Code turns on the reasoning mode of the model for the main conversation. Claude Code shows the
   reasoning as thinking blocks.
 - **Quality.** Qwen3.8-27B is smaller than Claude. Give it small and clear tasks. Examine each change before you keep

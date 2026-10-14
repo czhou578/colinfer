@@ -14,7 +14,8 @@ request becomes the same message list that /v1/chat/completions renders with the
   `thinking` runs without reasoning, as on the Anthropic API, unless the server runs with --thinking on.
   `output_config.effort` is the reasoning_effort of the chat endpoint: low / medium as they are, higher ones the
   template's default (engine/server/chat.py template_kwargs resolves both APIs).
-* Image and document blocks become a short text note, because the engine reads text only.
+* Image blocks (base64), also inside tool results, become image parts that the model sees (engine/server/images.py),
+  when the server runs the vision tower; otherwise, and for document blocks, a short text note.
 * Server tools (tools with a `type`, for example web_search_20250305) are left out. A request with only server tools
   gets an error.
 * `tool_choice` none keeps the tools in the prompt (the prefix stays the same for the prefix cache) and drops the tool
@@ -70,13 +71,39 @@ def text_of(content) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def _image_url(b: dict) -> str:
+    src = b.get("source")
+    if not isinstance(src, dict) or src.get("type") != "base64" or not isinstance(src.get("data"), str):
+        raise ValueError("an image block needs a base64 source: the server fetches nothing")
+    return f"data:{src.get('media_type') or 'image/png'};base64,{src['data']}"
+
+
+def content_of(content, images: bool):
+    """A content field as the content of a chat message: its text (text_of), or, when it holds images and images is
+    True, a list of text and image_url parts in block order."""
+    parts = []
+    for b in _blocks(content):
+        if b.get("type") == "image" and images:
+            parts.append({"type": "image_url", "image_url": {"url": _image_url(b)}})
+            continue
+        s = text_of([b])
+        if s and parts and parts[-1]["type"] == "text":
+            parts[-1]["text"] += "\n\n" + s
+        elif s:
+            parts.append({"type": "text", "text": s})
+    if not any(p["type"] == "image_url" for p in parts):
+        return "\n\n".join(p["text"] for p in parts)
+    return parts
+
+
 def _reminder(text: str) -> str:
     text = text.strip()
     return text if text.startswith("<system-reminder>") else f"<system-reminder>\n{text}\n</system-reminder>"
 
 
-def to_messages(body: dict) -> list[dict]:
-    """Anthropic `system` + `messages` -> the OpenAI-style message list of engine/server/chat.py ChatFormat.render."""
+def to_messages(body: dict, images: bool = False) -> list[dict]:
+    """Anthropic `system` + `messages` -> the OpenAI-style message list of engine/server/chat.py ChatFormat.render.
+    images: the image blocks of user turns and tool results become image parts (else text notes)."""
     raw = body.get("messages")
     if not isinstance(raw, list) or not raw or not all(isinstance(m, dict) for m in raw):
         raise ValueError("messages must be a non-empty list of objects")
@@ -93,22 +120,24 @@ def to_messages(body: dict) -> list[dict]:
             if text:
                 out.append({"role": "user", "content": _reminder(text)})
         elif role == "user":
-            text = []
+            pending = []
             for b in _blocks(m.get("content")):
                 if b.get("type") == "tool_result":
-                    if text:
-                        out.append({"role": "user", "content": "\n\n".join(text)})
-                        text = []
-                    result = text_of(b.get("content"))
-                    if b.get("is_error"):
+                    c = content_of(pending, images)
+                    if c:
+                        out.append({"role": "user", "content": c})
+                    pending = []
+                    result = content_of(b.get("content"), images)
+                    if b.get("is_error") and isinstance(result, list):
+                        result = [{"type": "text", "text": TOOL_ERROR + "\n"}] + result
+                    elif b.get("is_error"):
                         result = f"{TOOL_ERROR}\n{result}" if result else TOOL_ERROR
                     out.append({"role": "tool", "tool_call_id": b.get("tool_use_id"), "content": result})
                 else:
-                    s = text_of([b])
-                    if s:
-                        text.append(s)
-            if text:
-                out.append({"role": "user", "content": "\n\n".join(text)})
+                    pending.append(b)
+            c = content_of(pending, images)
+            if c:
+                out.append({"role": "user", "content": c})
         elif role == "assistant":
             reasoning, text, calls = [], [], []
             for b in _blocks(m.get("content")):

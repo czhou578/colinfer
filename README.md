@@ -2,7 +2,8 @@
 
 colinfer is a single-user inference engine for **Qwen3.8-27B** (`nvidia/Qwen3.8-27B-NVFP4`) on one **DGX Spark** (GB10,
 sm_121). It serves the model through an OpenAI-compatible and an Anthropic-compatible HTTP API, so Claude Code can use
-it directly. It is for one person, and it runs one request at a time.
+it directly, and it reads images (screenshots, diagrams) with the checkpoint's own vision tower. It is for one person,
+and it runs one request at a time.
 
 This is a research engine for one machine and one model, not a general inference server. It has no paged KV cache, no
 multi-GPU support and no other models. The kernels compile for sm_121a only. The design notes and the dated logs in
@@ -87,6 +88,9 @@ decision. In short:
   prompts skip a second prefill. A cache on the NVMe keeps the KV and GDN snapshots of past conversations: a
   conversation that lost its slot, or any conversation after a restart, restores from disk (a 21k-token conversation:
   0.2 s to the first token instead of 7.2 s).
+- **Images** run through the checkpoint's vision tower (a 27-block ViT, BF16) at prefill. Their tokens get multimodal
+  RoPE positions, and the prefix caches tell images apart by a hash of their pixels, so a conversation that sends the
+  same screenshot again does not encode it again.
 
 ## Repository
 
@@ -95,9 +99,10 @@ decision. In short:
 | `engine/model/qwen35.py` | the model in plain PyTorch: the correctness reference for all kernel tests |
 | `engine/model/fast.py` | the decode path: kernel modules, decode state, the INT decode copies |
 | `engine/model/prefill.py` | the prefill path |
+| `engine/model/vision.py` | image input: the vision tower, the image tokens and their multimodal RoPE positions |
 | `engine/spec/` | the MTP drafter and the speculative cycle (`mtp.py`), suffix-match drafts (`suffix.py`), exact acceptance for sampling (`accept.py`) |
 | `engine/runtime/` | the request scheduler (slots, checkpoints, draft length), the conversation cache on disk (`sessions.py`), the engine build (`build.py`), the plain decode graph (`decode.py`), the sampler, metrics |
-| `engine/server/` | the HTTP server (`api.py`), its engine thread (`worker.py`), the OpenAI formats (`openai.py`), the Anthropic Messages API (`anthropic.py`), the chat template and output parsing (`chat.py`) |
+| `engine/server/` | the HTTP server (`api.py`), its engine thread (`worker.py`), the OpenAI formats (`openai.py`), the Anthropic Messages API (`anthropic.py`), the chat template and output parsing (`chat.py`), images in requests (`images.py`) |
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), the fake NVFP4 activation quantization that the kernel tests compare against (`quant_emul.py`) |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |

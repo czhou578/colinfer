@@ -72,10 +72,16 @@ __global__ void k_combine(const float* __restrict__ part_acc, const float2* __re
 //   k:  RMSNorm (k_norm) + RoPE, written to k_cache[b, h, pos_t[b] + t]   (saturating e4m3)
 //   v:  written to v_cache[b, h, pos_t[b] + t]
 // qp: q_proj output [B, T, Hq, 2D] (q in the first D of each head). kp, vp: [B, T, Hkv, D].
+// RoPE position (multimodal RoPE: the cache row and the rotary position differ after an image):
+//   rope_pos (optional, [B * T, 3]): the (t, h, w) positions of each row. Frequency i rotates by h when i % 3 == 1 and
+//     i < 3 * sec_h, by w when i % 3 == 2 and i < 3 * sec_w, else by t (the interleaved layout of Qwen3-VL / 3.5).
+//   else rope_delta (optional, [B]): every frequency rotates by pos_t[b] + t + rope_delta[b].
+//   else pos_t[b] + t.
 __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bfloat16* __restrict__ kp, const __nv_bfloat16* __restrict__ vp, int ldq, int ldk, int ldv,
                            const __nv_bfloat16* __restrict__ qn_w, const __nv_bfloat16* __restrict__ kn_w, const float* __restrict__ inv_freq,
                            const int* __restrict__ pos_t, uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
-                           __nv_bfloat16* __restrict__ q_out, int Hq, int Hkv, int T, int Lmax, int R, float eps, const int* __restrict__ active) {
+                           __nv_bfloat16* __restrict__ q_out, int Hq, int Hkv, int T, int Lmax, int R, float eps, const int* __restrict__ active,
+                           const int* __restrict__ rope_delta, const int* __restrict__ rope_pos, int sec_h, int sec_w) {
     PDL_TRIGGER();
     const int bt = blockIdx.x, b = bt / T, t = bt % T, hh = blockIdx.y, d = threadIdx.x;
     const bool upd = active == nullptr || active[b] != 0;  // inactive slots: no KV write
@@ -106,7 +112,12 @@ __global__ void k_prologue(const __nv_bfloat16* __restrict__ qp, const __nv_bflo
     float y = xn;
     if (d < R) {
         const int half = R / 2, i = d % half;
-        const float ang = (float)pos * inv_freq[i];
+        int rp = rope_delta != nullptr ? pos + rope_delta[b] : pos;
+        if (rope_pos != nullptr) {
+            const int axis = (i % 3 == 1 && i < 3 * sec_h) ? 1 : (i % 3 == 2 && i < 3 * sec_w) ? 2 : 0;
+            rp = rope_pos[((size_t)b * T + t) * 3 + axis];
+        }
+        const float ang = (float)rp * inv_freq[i];
         float sn, cs;
         sincosf(ang, &sn, &cs);
         y = d < half ? xn * cs - xs[d + half] * sn : xn * cs + xs[d - half] * sn;
@@ -406,10 +417,11 @@ cudaError_t launch_attn_decode_tc(const void* q, const void* kc, const void* vc,
 
 cudaError_t launch_attn_prologue(const void* qp, const void* kp, const void* vp, int ldq, int ldk, int ldv, const void* qn_w, const void* kn_w,
                                  const float* inv_freq, const int* pos_t, void* kc, void* vc, void* q_out, int B, int T, int Hq, int Hkv, int Lmax,
-                                 int R, float eps, const int* active, cudaStream_t st) {
+                                 int R, float eps, const int* active, const int* rope_delta, const int* rope_pos, int sec_h, int sec_w,
+                                 cudaStream_t st) {
     attn::k_prologue<<<dim3(B * T, Hq + 2 * Hkv), attn::D, 0, st>>>((const __nv_bfloat16*)qp, (const __nv_bfloat16*)kp, (const __nv_bfloat16*)vp,
                                                                     ldq, ldk, ldv, (const __nv_bfloat16*)qn_w, (const __nv_bfloat16*)kn_w, inv_freq,
                                                                     pos_t, (uint8_t*)kc, (uint8_t*)vc, (__nv_bfloat16*)q_out, Hq, Hkv, T, Lmax, R,
-                                                                    eps, active);
+                                                                    eps, active, rope_delta, rope_pos, sec_h, sec_w);
     return cudaGetLastError();
 }

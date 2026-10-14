@@ -138,13 +138,13 @@ def attend_cached(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos: int,
     return flashinfer.single_prefill_with_kv_cache(q[0].transpose(0, 1), kk, vv, causal=True, kv_layout="HND", sm_scale=scale).reshape(T, -1)
 
 
-def _attention(attn, q8, state: FastState, li: int):
-    """Mixer output (no residual) of a full-attention layer."""
+def _attention(attn, q8, state: FastState, li: int, rope_pos=None):
+    """Mixer output (no residual) of a full-attention layer. rope_pos: the rows' (t, h, w) positions [T, 3] (images)."""
     T = q8.shape[0]
     qp, kp, vp = _fp8_gemm(q8, attn.qkv).split(attn.qkv.sizes, dim=-1)  # strided column views, read in place
     kc, vc = state.k[li], state.v[li]
     q = torch.empty(1, attn.num_heads, T, attn.head_dim, device=q8.device, dtype=torch.bfloat16)
-    ops().attn_prologue(qp, kp, vp, attn.q_norm.weight, attn.k_norm.weight, attn.inv_freq, state.pos_t, kc, vc, q, attn.q_norm.eps)
+    attn.prologue(qp, kp, vp, state, kc, vc, q, rope_pos=rope_pos)
     o = attend_cached(q, kc, vc, state.pos, attn.head_dim ** -0.5)
     o8 = torch.empty(T, attn.num_heads * attn.head_dim, dtype=torch.float8_e4m3fn, device=q8.device)
     ops().gate_fp8(o, qp, attn.head_dim, attn.o_proj.in_scale, o8)
@@ -180,12 +180,27 @@ def _gdn(g, n, q8, state: FastState, li: int):
     return _fp8_gemm(o8, g.out_proj)
 
 
+def embed(model, ids: torch.Tensor, c0: int, embeds) -> torch.Tensor:
+    """The input rows of the tokens ids (at offset c0 of the prompt part): the embeddings, with the rows that `embeds`
+    covers replaced. embeds: [(offset, rows [n, H])] (an image's vision tower output at its offset; it may begin before
+    c0 or end after these tokens)."""
+    x = model.embed_tokens(ids)
+    for off, e in embeds or ():
+        a, b = max(off, c0), min(off + e.shape[0], c0 + ids.numel())
+        if a < b:
+            x[a - c0:b - c0] = e[a - off:b - off]
+    return x
+
+
 @torch.inference_mode()
 def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk: int = CHUNK, all_logits: bool = False,
-            return_hidden: bool = False):
+            return_hidden: bool = False, embeds=None, rope_pos: torch.Tensor | None = None):
     """input_ids [1, T] from position state.pos of a single-slot state. Returns the fp32 logits of the last token
     [1, vocab], or with all_logits the bf16 logits of every token [T, vocab] (lm_head as a W4A4 GEMM; for perplexity).
-    return_hidden: also the post-final-norm hidden state of every prompt position [T, H] (the MTP drafter's input)."""
+    return_hidden: also the post-final-norm hidden state of every prompt position [T, H] (the MTP drafter's input).
+    Images (engine/model/vision.py): embeds [(offset in input_ids, rows)] replace input rows; rope_pos (int32 [T, 3],
+    device) gives every row's (t, h, w) rotary position. Without rope_pos, a row rotates by its cache position plus
+    state.rope_delta."""
     assert input_ids.shape[0] == 1, "one slot at a time"
     prepare_prefill(model)
     T_all = input_ids.shape[1]
@@ -195,11 +210,12 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
     for c0 in range(0, T_all, chunk):
         ids = input_ids[0, c0:c0 + chunk]
         T = ids.numel()
-        x = model.embed_tokens(ids)  # [T, H] bf16
+        x = embed(model, ids, c0, embeds)  # [T, H] bf16
+        rp = rope_pos[c0:c0 + T] if rope_pos is not None else None
         for li, layer in enumerate(model.layers):
             gdn = layer.block_type == "linear_attention"
             n, q8 = _norm_in(layer, x, need_bf16=gdn)
-            y = _gdn(layer.linear_attn, n, q8, state, li) if gdn else _attention(layer.self_attn, q8, state, li)
+            y = _gdn(layer.linear_attn, n, q8, state, li) if gdn else _attention(layer.self_attn, q8, state, li, rp)
             x = _mlp(layer, x, y)
         state.pos += T
         state.pos_t += T

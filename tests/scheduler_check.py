@@ -17,9 +17,12 @@ More checks:
   7. the disk cache (engine/runtime/sessions.py): after a restart (memory forgotten, a new store on the same directory),
      turn 2 of a long conversation restores the end of turn 1 from disk. Its output must be the output of turn 2 after
      a restore from memory, and its TTFT far below a prefill from scratch.
-  8. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
+  8. an image (engine/model/vision.py): the model reads the text drawn in it; the MTP scheduler gives the tokens of
+     plain decode; turn 2 restores the prefix that holds the image and does not run the vision tower again.
+  9. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
    uv run python tests/scheduler_check.py
 """
+import io
 import os
 import shutil
 import sys
@@ -32,6 +35,8 @@ from engine.runtime.build import build_engine
 from engine.runtime.scheduler import Request, Scheduler
 from engine.runtime.sessions import SessionStore
 from engine.server.chat import ChatFormat
+from engine.server.images import ImageProcessor, expand
+from engine.weights.loader import MODEL, resolve
 
 CODE = '''def parse_config(path):
     with open(path) as f:
@@ -206,6 +211,41 @@ def main():
               f"({sum(x == y for x, y in zip(rd.output, rm.output))}/{len(rm.output)})")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+    # 8. an image
+    if spec.vision is not None:
+        from PIL import Image as PILImage
+        from PIL import ImageDraw, ImageFont
+        pic, lines = PILImage.new("RGB", (1024, 768), "white"), ["Quarterly report", "Revenue: 4,210", "Costs: 3,005", "Margin: 28.6%"]
+        for i, line in enumerate(lines):
+            ImageDraw.Draw(pic).text((60, 60 + 110 * i), line, fill="black", font=ImageFont.load_default(size=40))
+        buf = io.BytesIO()
+        pic.save(buf, "PNG")
+        proc = ImageProcessor(resolve(MODEL))
+        ref.vision, ref.image_pad = spec.vision, spec.image_pad
+        V = spec.model.cfg.vocab_size
+
+        def image_turn(msgs):
+            im = proc.load(buf.getvalue())
+            return expand(fmt.render(msgs, enable_thinking=False), [im], spec.image_pad, V), [im]
+        m1 = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Transcribe every line of the image."}]}]
+        pi, ims = image_turn(m1)
+        spec.reset()
+        ri = spec.run([R(pi, max_new_tokens=60, images=ims)])[0]
+        pi2, ims2 = image_turn(m1)
+        rp = ref.run([R(pi2, max_new_tokens=60, images=ims2)])[0]
+        ans = tok.decode([t for t in ri.output if t not in EOS], skip_special_tokens=True)
+        calls = [0]
+        encode = spec.vision.encode
+        spec.vision.encode = lambda im: calls.__setitem__(0, calls[0] + 1) or encode(im)
+        p3, ims3 = image_turn(m1 + [{"role": "assistant", "content": ans}, {"role": "user", "content": "What is the margin?"}])
+        r3 = spec.run([R(p3, max_new_tokens=20, images=ims3)])[0]
+        spec.vision.encode = encode
+        same = ri.output == rp.output
+        ok &= same and all(line in ans for line in lines) and r3.reused == len(pi) + len(ri.output) - 1 and calls[0] == 0
+        print(f"[image] {ims[0].n} image tokens; answer {ans!r}; MTP vs plain decode {'IDENTICAL' if same else 'DIFFERENT'}; "
+              f"turn 2 reused {r3.reused} of {len(p3)} with {calls[0]} vision tower runs, TTFT {r3.t_first - r3.t_submit:.3f} s "
+              f"(turn 1: {ri.t_first - ri.t_submit:.3f} s)")
 
     m = spec.metrics
     print(f"[spec] drafted {m.drafted.get():.0f}, accepted {m.accepted.get():.0f} ({m.accepted.get() / max(m.drafted.get(), 1):.2f})")
