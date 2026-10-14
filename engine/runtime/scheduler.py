@@ -26,6 +26,10 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
     longest checkpoint whose tokens are a proper prefix of its prompt, in the slot of that checkpoint, and prefills
     only the rest. A request without one goes to an empty slot, else the least recently used one.
   - A checkpoint is valid while the token history of its slot still starts with the tokens of the checkpoint.
+  - A request that shares only a prefix with a slot's history (a side request with the system prompt of the main
+    conversation) would overwrite the rest of that history. When that rest is COPY_MIN_TAIL tokens or more, and
+    longer than the history of another slot (an empty one, else the least recently used), the request runs in that
+    other slot: the KV prefix is copied there on the GPU, and the main conversation keeps its cache.
 * Disk cache (optional, `store`: engine/runtime/sessions.py). When a request ends, the scheduler queues its slot's
   reply-end and message-boundary checkpoints (not the interval or prompt-end ones) for the disk, with the KV rows
   before them. A new request restores from disk when the disk holds a prefix of its prompt at least `min_gain` tokens
@@ -54,6 +58,7 @@ import dataclasses
 import time
 from typing import Protocol
 
+import numpy as np
 import torch
 
 from engine.model.fast import MAX_ROWS, FastQwen35
@@ -73,6 +78,7 @@ ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
 SUFFIX_K = MAX_ROWS - 1  # suffix-match draft length: its verify rows still fit one weight pass
 REPLY_SPLIT_MIN = 512  # last-message length from which a prompt also snapshots at the start of the reply
 SPLIT_MIN_TOKENS = 256  # a split this close to the restored history is dropped: its chunk would be a weight pass for a few tokens
+COPY_MIN_TAIL = 1024   # a request runs in another slot, with a copy of the KV prefix, rather than overwrite this much of a slot's history
 ATTN_ROWS = 48      # query rows (q heads x verify rows) per pass of the attention kernel over a slot's KV (csrc/attn_decode.cu)
 
 
@@ -270,10 +276,33 @@ class Scheduler:
             self.ring_h[buf].copy_(s.h_last.view(-1))
         self.ckpts.append(Checkpoint(b, key, buf, s.salt, reply, disk or reply))
 
+    def _copy_kv(self, src: int, dst: int, L: int):
+        """The KV rows [0, L) of slot src into slot dst (the target's and the drafter's), on the GPU."""
+        for d in (self.state.k, self.state.v):
+            for t in d.values():
+                t[dst, :, :L].copy_(t[src, :, :L])
+        if self.mtp is not None:
+            for d in (self.mst.k, self.mst.v):
+                d[0][dst, :, :L].copy_(d[0][src, :, :L])
+
+    def _target(self, holder: Slot, P: list[int]) -> Slot:
+        """The slot for a request that restores a prefix of P held in `holder`: the holder itself, unless that would
+        overwrite COPY_MIN_TAIL or more tokens of its history (past the prefix it shares with P), and more than another
+        slot (an empty one, else the least recently used) holds. Then that other slot, which gets a copy of the prefix."""
+        m = min(len(holder.tokens), len(P))
+        diff = np.flatnonzero(np.asarray(holder.tokens[:m], dtype=np.int64) != np.asarray(P[:m], dtype=np.int64))
+        tail = len(holder.tokens) - (int(diff[0]) if diff.size else m)
+        if tail < COPY_MIN_TAIL:
+            return holder
+        other = min((x for x in self.slots if x is not holder), key=lambda x: (len(x.tokens) > 0, x.last_used), default=None)
+        return other if other is not None and tail > len(other.tokens) else holder
+
     def _restore(self, s: Slot, c: Checkpoint):
-        """Back to checkpoint c in its own slot s: the KV of the slot already holds c's tokens; the GDN state comes from
-        the ring."""
+        """Checkpoint c into slot s: the KV of c's tokens is in c's slot (copied into s if that is another slot); the
+        GDN state comes from the ring."""
         b, L = s.idx, len(c.tokens)
+        if c.slot != b:
+            self._copy_kv(c.slot, b, L)
         for i in self.gdn_layers:
             self.state.conv[i][b].copy_(self.ring_conv[i][c.buf])
             self.state.rec[i][b].copy_(self.ring_rec[i][c.buf])
@@ -282,16 +311,19 @@ class Scheduler:
         self.state.pos_t[b] = L
 
     def _restore_disk(self, hit: Hit, P: list[int]) -> Slot | None:
-        """Restores the disk checkpoint `hit` (a prefix of P): into a slot that still holds the KV of these tokens (then
-        only the GDN state is read), else into an empty slot, else the least recently used one. None if the read failed."""
+        """Restores the disk checkpoint `hit` (a prefix of P). When a slot still holds the KV of these tokens, only the
+        GDN state is read: into that slot, or into another one with a copy of the KV prefix (_target). Else into an
+        empty slot, else the least recently used one. None if the read failed."""
         n = hit.n
         holder = next((x for x in self.slots if len(x.tokens) >= n and x.tokens[:n] == P[:n]), None)
-        s = holder or min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
+        s = self._target(holder, P) if holder is not None else min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
         b = s.idx
-        self.store.wait(b, n if holder is not None else 0)
+        self.store.wait(b, n if s is holder else 0)
+        if holder is not None and s is not holder:
+            self._copy_kv(holder.idx, b, n)
         h = torch.empty(self.model.cfg.hidden_size, dtype=torch.bfloat16, device=self.dev) if self.mtp is not None else None
         if not self.store.load(hit, b, h, kv=holder is None):
-            if holder is None:
+            if s is not holder:
                 s.tokens = []  # its KV is partly overwritten
             for c in [c for c in self.ckpts if c.slot == b and not self._valid(c)]:
                 self._drop(c)
@@ -377,10 +409,13 @@ class Scheduler:
                 if s is None:  # the failed restore may have overwritten the slot of `best`
                     best = self._best(P, req.cache_salt)
         if s is None:
-            s = self.slots[best.slot] if best is not None else min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
+            if best is not None:
+                s = self._target(self.slots[best.slot], P)
+            else:
+                s = min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
             b = s.idx
             if self.store is not None:  # a pending save may still read the rows that this request rewrites
-                self.store.wait(b, len(best.tokens) if best is not None else 0)
+                self.store.wait(b, len(best.tokens) if best is not None and best.slot == b else 0)
             if best is not None:
                 self._restore(s, best)
             else:

@@ -158,6 +158,20 @@ def test_reply_sent_back_in_another_form_restores_the_reply_start(make):
     r2 = sched.run([S.Request(p2, max_new_tokens=20)])[0]
     assert r2.reused == reply_start and r2.output == reference(p2, 20)
     assert r1.output == reference(p1, 20)
+    assert r2.slot == r1.slot  # the overwritten rest of turn 1 (its reply) is short: no copy into another slot
+
+
+def test_a_side_request_with_the_same_system_prompt_keeps_the_conversation_cached(make):
+    sched, rng = make(ckpt_interval=10**6), random.Random(10)
+    system = prompt(rng, 300)
+    main = chat(rng, system, prompt(rng, 1200))
+    r1 = sched.run([S.Request(main, max_new_tokens=20)])[0]
+    side = chat(rng, system, prompt(rng, 40))  # e.g. a title request with the main conversation's system prompt
+    r2 = sched.run([S.Request(side, max_new_tokens=10)])[0]
+    assert r2.slot != r1.slot and r2.reused == 301 and r2.output == reference(side, 10)  # its prefix, copied into another slot
+    p3 = main + r1.output + prompt(rng, 30)
+    r3 = sched.run([S.Request(p3, max_new_tokens=20)])[0]
+    assert r3.slot == r1.slot and r3.reused == len(main) + len(r1.output) - 1 and r3.output == reference(p3, 20)
 
 
 def test_reply_sent_back_unchanged_skips_the_reply_start_snapshot(make):

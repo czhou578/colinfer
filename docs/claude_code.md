@@ -206,7 +206,8 @@ We measured these values on a DGX Spark with the default server settings and a s
 Know these limits:
 
 - **One request at a time.** Subagents and background tasks wait in a queue while another request runs, so parallel
-  subagents run one after another. The three slots keep the last three conversations cached.
+  subagents run one after another. The three slots keep the last three conversations cached; a side request with the
+  same system prompt runs in another slot, so the main conversation keeps its cache.
 - **Context length.** Claude Code compacts the conversation before it reaches 200,000 tokens. If a request is longer
   than a server slot, the server sends a `prompt is too long` error. Claude Code shows `Prompt is too long`.
 - **Long prompts without the cache.** The server keeps the prefixes of past conversations in memory and on disk

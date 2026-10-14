@@ -144,3 +144,20 @@ def test_requests_without_prefix_reuse_are_not_saved(make):
     run(sched, prompt(rng, 300), disk=False)
     sched.store.flush()
     assert sched.store.status()["files"] == 0
+
+
+def test_a_disk_restore_for_a_side_request_copies_the_prefix_into_another_slot(make):
+    """The system-prompt checkpoint of the main conversation left the ring but is on disk, and the main conversation's
+    slot still holds its KV: a side request reads only the GDN state, in another slot with a copy of the KV prefix."""
+    sched, rng = make(n_checkpoints=4), random.Random(9)
+    system = prompt(rng, 300)
+    main = chat(rng, system, prompt(rng, 1200))
+    r1 = run(sched, main)
+    run(sched, prompt(rng, 200))  # another conversation: its snapshots push the main one's system-prompt checkpoint out of the ring
+    sched.store.flush()
+    assert not any(len(c.tokens) == 301 for c in sched.ckpts)
+    r2 = run(sched, chat(rng, system, prompt(rng, 40)), 10)
+    assert r2.slot != r1.slot and r2.reused == 301 and sched.store.stats["restores"] == 1
+    p3 = main + r1.output + prompt(rng, 30)
+    r3 = run(sched, p3)
+    assert r3.slot == r1.slot and r3.reused == len(main) + len(r1.output) - 1  # the main conversation, still in memory

@@ -220,6 +220,12 @@ Other endpoints:
   token of the generation prompt, and without this checkpoint the server prefills the last message again. This
   checkpoint costs one more weight pass (~0.1 s). Claude Code sends the reasoning back, and its next prompt restores
   the end of the reply. A request that restored the end of a reply does not take this checkpoint.
+
+  A request that shares only a prefix with a cached conversation (a title request or a subagent with the same system
+  prompt) would overwrite the rest of that conversation in its slot. When that rest is 1,024 tokens or more
+  (`COPY_MIN_TAIL`) and longer than what another slot holds, the request runs in that other slot instead, with a GPU
+  copy of the shared prefix (milliseconds). Thus the main conversation keeps its cache. A shorter rest, such as the
+  reply that Hermes Agent sends back changed, is overwritten where it is.
 - **Conversation cache on disk** (`engine/runtime/sessions.py`). When a request ends, the server writes its reply-end
   and message-boundary checkpoints to the NVMe, for prefixes of 2,048 tokens or more, with the KV rows before them.
   A background thread writes them, so the next request does not wait. A new request restores from disk when the disk

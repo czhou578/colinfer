@@ -190,7 +190,9 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   before the last message, and one every 8,192 prompt tokens. After a last message of 512 tokens or more, it takes one
   after that message too, for clients that send the reply back changed (for example, without its reasoning). A request restores the longest checkpoint that is a proper prefix of its
   prompt, and prefills the rest. Attention KV can resume at any length, but GDN state can resume only where a snapshot
-  exists.
+  exists. If the request shares only that prefix with its slot's history, and the rest of that history is 1,024 tokens
+  or more and longer than another slot's, the request runs in that other slot with a copy of the KV prefix, so the
+  longer conversation stays cached.
 - **Conversation cache on disk** (`engine/runtime/sessions.py`). When a request ends, a writer thread saves the slot's
   reply-end and message-boundary checkpoints of 2,048 tokens or more to the NVMe. A *checkpoint file* holds the GDN
   state, the drafter's input hidden state and the KV rows of the last partial block. A *block file* holds 1,024 KV rows

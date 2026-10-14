@@ -10,7 +10,8 @@ More checks:
      other requests (position-keyed draws, engine/spec/accept.py)
   4. multi-turn: turn 2 restores the end-of-turn-1 checkpoint (the stop-token cut keeps it a prefix)
   5. a second conversation with the same long system prompt, queued while the first one decodes, restores the
-     system-prompt checkpoint. Its greedy output matches a run without checkpoints.
+     system-prompt checkpoint. Its greedy output matches a run without checkpoints. It runs in another slot, with a
+     copy of the KV prefix, so the first conversation (its long last message and its reply) stays cached.
   6. a client sends the reply back without its reasoning (as Hermes Agent does). Turn 2 then restores the snapshot at
      the start of turn 1's reply, not only the start of turn 1's last message. The output of turn 2 is compared with a
      run without checkpoints.
@@ -134,7 +135,8 @@ def main():
 
     # 5. shared system prompt: a second conversation, queued while the first one decodes
     sys2 = {"role": "system", "content": "You are an agent. Tool manual: " + " ".join(f"rule {i}: be precise." for i in range(900))}
-    pa = chat_ids([sys2, {"role": "user", "content": "Write a long essay about rivers."}])
+    notes = " ".join(f"River {i} is {40 + 7 * i} km long and crosses {i % 5 + 1} towns." for i in range(90))
+    pa = chat_ids([sys2, {"role": "user", "content": "Write a long essay about rivers. Notes: " + notes}])
     pb = chat_ids([sys2, {"role": "user", "content": "List three prime numbers."}])
     ra = spec.submit(R(pa, max_new_tokens=300))
     while not ra.output:
@@ -149,10 +151,12 @@ def main():
     spec.ckpts, spec.free_bufs = saved, [i for i in range(len(spec.ring_h)) if i not in {c.buf for c in saved}]
     sysn = next(i for i in range(1, len(pb)) if pb[i] == IM_START)
     same = rb.output == rb2.output
-    ok &= rb.reused == sysn
+    kept = rb.slot != ra.slot and spec.slots[ra.slot].tokens[:len(pa)] == pa
+    ok &= rb.reused == sysn and kept
     print(f"[shared system prompt] B (queued while A decoded) reused {rb.reused} (system prompt {sysn}); "
           f"admission to first token {rb.t_first - rb.t_admit:.3f} s vs {rb2.t_first - rb2.t_admit:.3f} s from scratch; greedy output "
-          f"{'IDENTICAL' if same else 'DIFFERENT'} to the uncached run ({sum(x == y for x, y in zip(rb.output, rb2.output))}/{len(rb.output)})")
+          f"{'IDENTICAL' if same else 'DIFFERENT'} to the uncached run ({sum(x == y for x, y in zip(rb.output, rb2.output))}/{len(rb.output)}); "
+          f"A ({len(pa)} + {len(ra.output)} tok) {'stays cached in its slot' if kept else 'LOST ITS SLOT'}")
 
     # 6. the reply comes back without its reasoning: turn 2 restores the start of turn 1's reply
     def think_ids(msgs):
