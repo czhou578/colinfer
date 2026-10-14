@@ -501,16 +501,16 @@ class Scheduler:
             if start < p < start + n:
                 n = p - start
                 break
-        chunk = s.todo[:n]
+        chunk, last = s.todo[:n], n == len(s.todo)
         view = self.state.view(b, b + 1)
         view.pos = start
         images = s.req.images
         img = dict(embeds=self._image_embeds(images, start, start + n), rope_pos=self._rope(images, start, start + n)) if images else {}
         ids = torch.tensor([self._ids(chunk, images)], device=self.dev)
-        if self.mtp is not None:
-            logits, H = prefill(self.model, ids, view, return_hidden=True, **img)
+        if self.mtp is not None:  # only the last chunk's logits are read (the first token)
+            logits, H = prefill(self.model, ids, view, return_hidden=True, logits=last, **img)
         else:
-            logits = prefill(self.model, ids, view, **img)
+            logits = prefill(self.model, ids, view, logits=last, **img)
         s.tokens += chunk
         s.todo = s.todo[len(chunk):]
         if self.mtp is not None:  # drafter KV rows (x_{i+1}, h_i) for positions start-1 .. end-2

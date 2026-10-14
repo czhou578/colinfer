@@ -194,9 +194,11 @@ def embed(model, ids: torch.Tensor, c0: int, embeds) -> torch.Tensor:
 
 @torch.inference_mode()
 def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk: int = CHUNK, all_logits: bool = False,
-            return_hidden: bool = False, embeds=None, rope_pos: torch.Tensor | None = None):
+            return_hidden: bool = False, embeds=None, rope_pos: torch.Tensor | None = None, logits: bool = True):
     """input_ids [1, T] from position state.pos of a single-slot state. Returns the fp32 logits of the last token
-    [1, vocab], or with all_logits the bf16 logits of every token [T, vocab] (lm_head as a W4A4 GEMM; for perplexity).
+    [1, vocab], or with all_logits the bf16 logits of every token [T, vocab] (lm_head as a W4A4 GEMM; for perplexity),
+    or None with logits=False (a chunk before the end of a prompt: its logits are never read, and the lm_head GEMM
+    streams 0.7 GB).
     return_hidden: also the post-final-norm hidden state of every prompt position [T, H] (the MTP drafter's input).
     Images (engine/model/vision.py): embeds [(offset in input_ids, rows)] replace input rows; rope_pos (int32 [T, 3],
     device) gives every row's (t, h, w) rotary position. Without rope_pos, a row rotates by its cache position plus
@@ -227,5 +229,5 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
             xsf = torch.empty(ops().nvfp4_sf_size(T, x.shape[1]), dtype=torch.uint8, device=x.device)
             ops().add_rmsnorm(x, None, model.norm.weight, model.norm.eps, q4=xq, sf4=xsf, in_scale4=model.p_lm["in_scale"])
             outs.append(_gemm_nvfp4(xq, xsf, model.p_lm))
-    out = torch.cat(outs) if all_logits else model.lm_head(model.norm(x_last)).float()
+    out = torch.cat(outs) if all_logits else model.lm_head(model.norm(x_last)).float() if logits else None
     return (out, torch.cat(hid)) if return_hidden else out

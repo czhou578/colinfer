@@ -192,13 +192,13 @@ class StubVision:
         return v[:, None].expand(-1, CFG.hidden_size).to(torch.bfloat16)
 
 
-def stub_prefill_img(model, ids, state, return_hidden=False, embeds=None, rope_pos=None):
+def stub_prefill_img(model, ids, state, return_hidden=False, embeds=None, rope_pos=None, logits=True):
     toks = ids[0].tolist()
     assert all(t < V for t in toks) and (rope_pos is None or rope_pos.shape == (len(toks), 3))
     for off, e in embeds or ():
         for r in range(max(off, 0), min(off + e.shape[0], len(toks))):
             toks[r] = int(e[r - off, 0])
-    return stub_prefill(model, torch.tensor([toks]), state, return_hidden)
+    return stub_prefill(model, torch.tensor([toks]), state, return_hidden, logits)
 
 
 def effective(p, images):

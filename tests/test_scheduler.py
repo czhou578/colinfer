@@ -63,8 +63,9 @@ class StubModel:
         return torch.zeros(kb.shape[0], V, device="cuda").scatter_(1, nxt[:, None], 10.0)
 
 
-def stub_prefill(model, ids, state, return_hidden=False):
-    """engine/model/prefill.py's contract on a single-slot view: feed ids from state.pos, return the next logits."""
+def stub_prefill(model, ids, state, return_hidden=False, logits=True):
+    """engine/model/prefill.py's contract on a single-slot view: feed ids from state.pos, return the next logits (None
+    with logits=False: a chunk before the end of the prompt)."""
     toks, p0 = ids[0].tolist(), state.pos
     h = float(state.rec[0][0, 0, 0, 0])
     for t in toks:
@@ -74,6 +75,8 @@ def stub_prefill(model, ids, state, return_hidden=False):
     kb[p0:p0 + len(toks)] = torch.tensor(toks, dtype=torch.uint8, device="cuda")
     state.pos += len(toks)
     state.pos_t += len(toks)
+    if not logits:
+        return None
     logits = torch.zeros(1, V, device="cuda")
     logits[0, (int(h) + int(kb[:state.pos].int().sum())) % V] = 10.0
     return logits
