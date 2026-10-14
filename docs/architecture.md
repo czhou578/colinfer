@@ -192,7 +192,9 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   prompt, and prefills the rest. Attention KV can resume at any length, but GDN state can resume only where a snapshot
   exists. If the request shares only that prefix with its slot's history, and the rest of that history is 1,024 tokens
   or more and longer than another slot's, the request runs in that other slot with a copy of the KV prefix, so the
-  longer conversation stays cached.
+  longer conversation stays cached. Each checkpoint stays a prefix of its slot's history: a request that rewrites a
+  slot drops the checkpoints past the part it keeps. Thus admission compares the prompt once with each slot's history
+  (vectorized), not with each checkpoint: ~10 ms at 90k tokens instead of ~35 ms.
 - **Conversation cache on disk** (`engine/runtime/sessions.py`). When a request ends, a writer thread saves the slot's
   reply-end and message-boundary checkpoints of 2,048 tokens or more to the NVMe. A *checkpoint file* holds the GDN
   state, the drafter's input hidden state and the KV rows of the last partial block. A *block file* holds 1,024 KV rows
@@ -201,8 +203,10 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   prefixes are stored once. A request restores from disk when the disk holds a prefix longer than the best memory
   checkpoint: the blocks and the checkpoint go back into a slot with direct reads (~12 GB/s) and pinned copies
   (~59 GB/s). If a slot still holds the KV of that prefix, only the checkpoint file is read. The writer reads the KV
-  from the slot itself, so admission waits for a pending save before it rewrites rows that the save still has to
-  read. A budget (64 GB) evicts the least recently used files.
+  of the full blocks from the slot itself, so admission waits for a pending save before it rewrites rows that the save
+  still has to read. A save copies its partial block when it is queued, so the next turn of the conversation, which
+  keeps the history up to the last full block, does not wait for the write. A budget (64 GB) evicts the least
+  recently used files.
 - **Images** (`engine/model/vision.py`). The server resizes and patches each image as the checkpoint's image processor
   does (`engine/server/images.py`), and gives it a run of placeholder ids past the vocabulary: one per 2 x 2 group of
   16-pixel patches, derived from a hash of the pixels. Thus the memory and disk caches tell images apart. A prefill

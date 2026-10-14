@@ -167,7 +167,8 @@ class Mtp(nn.Module):
         # draft head: the static frequent tokens, then PROMPT_SLOTS rows rewritten per request (set_prompt_vocab)
         ids = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "draft_vocab.npy"))[:DRAFT_VOCAB]
         self.n_static = len(ids)
-        self.static_set = set(int(i) for i in ids)
+        self.static = np.zeros(cfg.vocab_size, dtype=bool)  # token id -> in the static set
+        self.static[ids] = True
         allids = np.concatenate([ids, np.full(PROMPT_SLOTS, ids[0], dtype=ids.dtype)]).astype(np.int64)
         self.vocab_ids = torch.tensor(allids, device=dev)
         lm = target.lm_head
@@ -197,10 +198,13 @@ class Mtp(nn.Module):
         self.lr_full = (wb, sb)                                                   # [V_target, r]
         self.lr_B = Nvfp4Linear(wb[self.vocab_ids].contiguous(), sb[self.vocab_ids].contiguous(), gb, out_fp32=True)
 
-    def set_prompt_vocab(self, prompt: list[int]):
-        """Fill the per-request draft-head rows with prompt tokens missing from the static set."""
+    def set_prompt_vocab(self, prompt):
+        """Fill the per-request draft-head rows with prompt tokens missing from the static set, in order of first
+        occurrence. prompt: token ids (a list or an int64 array)."""
         slots = self.vocab_ids.numel() - self.n_static
-        extra = [t for t in dict.fromkeys(prompt) if t not in self.static_set][:slots]
+        p = np.asarray(prompt, dtype=np.int64)
+        u, first = np.unique(p[~self.static[p]], return_index=True)
+        extra = u[np.argsort(first)][:slots].tolist()
         extra += [int(self.vocab_ids[0])] * (slots - len(extra))
         ids = torch.tensor(extra, dtype=torch.long, device=self.dev)
         self.vocab_ids[self.n_static:] = ids

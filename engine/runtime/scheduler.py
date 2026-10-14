@@ -25,7 +25,9 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
   - Attention KV can resume at any length, but GDN state only where a snapshot exists. A new request restores the
     longest checkpoint whose tokens are a proper prefix of its prompt, in the slot of that checkpoint, and prefills
     only the rest. A request without one goes to an empty slot, else the least recently used one.
-  - A checkpoint is valid while the token history of its slot still starts with the tokens of the checkpoint.
+  - Every checkpoint is a prefix of its slot's history: when a request rewrites a slot's history, the checkpoints
+    past the part it keeps go (_set_history). Thus finding a request's checkpoint takes one comparison of its prompt
+    with each slot's history, whatever the number of checkpoints.
   - A request that shares only a prefix with a slot's history (a side request with the system prompt of the main
     conversation) would overwrite the rest of that history. When that rest is COPY_MIN_TAIL tokens or more, and
     longer than the history of another slot (an empty one, else the least recently used), the request runs in that
@@ -80,6 +82,18 @@ REPLY_SPLIT_MIN = 512  # last-message length from which a prompt also snapshots 
 SPLIT_MIN_TOKENS = 256  # a split this close to the restored history is dropped: its chunk would be a weight pass for a few tokens
 COPY_MIN_TAIL = 1024   # a request runs in another slot, with a copy of the KV prefix, rather than overwrite this much of a slot's history
 ATTN_ROWS = 48      # query rows (q heads x verify rows) per pass of the attention kernel over a slot's KV (csrc/attn_decode.cu)
+
+
+def _array(toks) -> np.ndarray:
+    """Token ids as int64 (image tokens are ids past 2^31, engine/model/vision.py)."""
+    return np.fromiter(toks, dtype=np.int64, count=len(toks))
+
+
+def _shared(a: np.ndarray, toks: list[int]) -> int:
+    """The length of the common prefix of the ids a and the list toks."""
+    m = min(len(a), len(toks))
+    d = np.flatnonzero(a[:m] != np.fromiter(toks, dtype=np.int64, count=m))
+    return int(d[0]) if d.size else m
 
 
 class Hook(Protocol):
@@ -250,9 +264,12 @@ class Scheduler:
         return max(opts, key=tokens_per_s)
 
     # ---------------------------------------------------------------- checkpoints
-    def _valid(self, c: Checkpoint) -> bool:
-        t = self.slots[c.slot].tokens
-        return len(t) >= len(c.tokens) and tuple(t[: len(c.tokens)]) == c.tokens
+    def _set_history(self, s: Slot, tokens: list[int], keep: int):
+        """Slot s's history becomes `tokens`, which shares exactly its first `keep` tokens with the old one. The
+        slot's checkpoints past those go: every checkpoint stays a prefix of its slot's history."""
+        s.tokens = tokens
+        for c in [c for c in self.ckpts if c.slot == s.idx and len(c.tokens) > keep]:
+            self._drop(c)
 
     def _drop(self, c: Checkpoint):
         self.ckpts.remove(c)
@@ -266,8 +283,8 @@ class Scheduler:
         if same is not None:
             same.disk |= disk
             return
-        if not self.free_bufs:  # evict a checkpoint that no longer matches its slot, else the oldest
-            self._drop(next((c for c in self.ckpts if not self._valid(c)), self.ckpts[0]))
+        if not self.free_bufs:  # evict the oldest
+            self._drop(self.ckpts[0])
         buf, b = self.free_bufs.pop(), s.idx
         for i in self.gdn_layers:
             self.ring_conv[i][buf].copy_(self.state.conv[i][b])
@@ -285,38 +302,38 @@ class Scheduler:
             for d in (self.mst.k, self.mst.v):
                 d[0][dst, :, :L].copy_(d[0][src, :, :L])
 
-    def _target(self, holder: Slot, P: list[int]) -> Slot:
-        """The slot for a request that restores a prefix of P held in `holder`: the holder itself, unless that would
-        overwrite COPY_MIN_TAIL or more tokens of its history (past the prefix it shares with P), and more than another
-        slot (an empty one, else the least recently used) holds. Then that other slot, which gets a copy of the prefix."""
-        m = min(len(holder.tokens), len(P))
-        diff = np.flatnonzero(np.asarray(holder.tokens[:m], dtype=np.int64) != np.asarray(P[:m], dtype=np.int64))
-        tail = len(holder.tokens) - (int(diff[0]) if diff.size else m)
+    def _target(self, holder: Slot, shared: int) -> Slot:
+        """The slot for a request that restores a prefix of its prompt held in `holder`, whose history shares `shared`
+        tokens with the prompt: the holder itself, unless that would overwrite COPY_MIN_TAIL or more tokens of its
+        history (past the shared prefix), and more than another slot (an empty one, else the least recently used)
+        holds. Then that other slot, which gets a copy of the prefix."""
+        tail = len(holder.tokens) - shared
         if tail < COPY_MIN_TAIL:
             return holder
         other = min((x for x in self.slots if x is not holder), key=lambda x: (len(x.tokens) > 0, x.last_used), default=None)
         return other if other is not None and tail > len(other.tokens) else holder
 
-    def _restore(self, s: Slot, c: Checkpoint):
-        """Checkpoint c into slot s: the KV of c's tokens is in c's slot (copied into s if that is another slot); the
-        GDN state comes from the ring."""
+    def _restore(self, s: Slot, c: Checkpoint, shared: int):
+        """Checkpoint c (a prefix of the prompt) into slot s, whose history shares `shared` tokens with the prompt: the
+        KV of c's tokens is in c's slot (copied into s if that is another slot); the GDN state comes from the ring."""
         b, L = s.idx, len(c.tokens)
         if c.slot != b:
             self._copy_kv(c.slot, b, L)
         for i in self.gdn_layers:
             self.state.conv[i][b].copy_(self.ring_conv[i][c.buf])
             self.state.rec[i][b].copy_(self.ring_rec[i][c.buf])
-        s.tokens = list(c.tokens)
+        self._set_history(s, list(c.tokens), min(shared, L))
         s.h_last = self.ring_h[c.buf].clone() if self.ring_h is not None else None
         self.state.pos_t[b] = L
 
-    def _restore_disk(self, hit: Hit, P: list[int]) -> Slot | None:
-        """Restores the disk checkpoint `hit` (a prefix of P). When a slot still holds the KV of these tokens, only the
-        GDN state is read: into that slot, or into another one with a copy of the KV prefix (_target). Else into an
-        empty slot, else the least recently used one. None if the read failed."""
+    def _restore_disk(self, hit: Hit, P: list[int], shared: list[int]) -> Slot | None:
+        """Restores the disk checkpoint `hit` (a prefix of P; shared: the tokens each slot's history shares with P).
+        When a slot still holds the KV of these tokens, only the GDN state is read: into that slot, or into another one
+        with a copy of the KV prefix (_target). Else into an empty slot, else the least recently used one. None if the
+        read failed."""
         n = hit.n
-        holder = next((x for x in self.slots if len(x.tokens) >= n and x.tokens[:n] == P[:n]), None)
-        s = self._target(holder, P) if holder is not None else min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
+        holder = next((x for x in self.slots if shared[x.idx] >= n), None)
+        s = self._target(holder, shared[holder.idx]) if holder is not None else min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
         b = s.idx
         self.store.wait(b, n if s is holder else 0)
         if holder is not None and s is not holder:
@@ -324,11 +341,10 @@ class Scheduler:
         h = torch.empty(self.model.cfg.hidden_size, dtype=torch.bfloat16, device=self.dev) if self.mtp is not None else None
         if not self.store.load(hit, b, h, kv=holder is None):
             if s is not holder:
-                s.tokens = []  # its KV is partly overwritten
-            for c in [c for c in self.ckpts if c.slot == b and not self._valid(c)]:
-                self._drop(c)
+                self._set_history(s, [], 0)  # its KV is partly overwritten
             return None
-        s.tokens, s.h_last = list(P[:n]), h
+        self._set_history(s, list(P[:n]), min(shared[b], n))
+        s.h_last = h
         self.state.pos_t[b] = n
         self.metrics.disk_tokens.inc(n)
         return s
@@ -338,7 +354,7 @@ class Scheduler:
         cache, once each."""
         st = self.store
         for c in self.ckpts:
-            if c.slot == s.idx and c.disk and not c.saved and len(c.tokens) >= st.min_tokens and self._valid(c):
+            if c.slot == s.idx and c.disk and not c.saved and len(c.tokens) >= st.min_tokens:
                 c.saved = True
                 st.save(s.idx, c.tokens, c.salt, c.reply, [self.ring_conv[i][c.buf] for i in self.gdn_layers],
                         [self.ring_rec[i][c.buf] for i in self.gdn_layers], self.ring_h[c.buf] if self.ring_h is not None else None)
@@ -379,14 +395,11 @@ class Scheduler:
                 return True
         return False
 
-    def _best(self, P: list[int], salt: str | None) -> Checkpoint | None:
-        """The longest valid memory checkpoint that is a proper prefix of the prompt P."""
-        best, L = None, 0
-        for c in self.ckpts:
-            n = len(c.tokens)
-            if L < n < len(P) and c.salt == salt and tuple(P[:n]) == c.tokens and self._valid(c):
-                best, L = c, n
-        return best
+    def _best(self, P: list[int], salt: str | None, shared: list[int]) -> Checkpoint | None:
+        """The longest memory checkpoint that is a proper prefix of the prompt P (the oldest of equals). shared: the
+        tokens each slot's history shares with P; a checkpoint is a prefix of its slot's history."""
+        return max((c for c in self.ckpts if len(c.tokens) <= shared[c.slot] and len(c.tokens) < len(P) and c.salt == salt),
+                   key=lambda c: len(c.tokens), default=None)
 
     def _admit(self):
         """The next queued request, when no request runs: into the slot of its longest checkpoint (in memory, or on disk
@@ -401,33 +414,35 @@ class Scheduler:
         else:
             return
         P = req.prompt
-        best, s, echo = self._best(P, req.cache_salt), None, False
+        pa = _array(P)  # one conversion of the prompt for the comparisons below
+        shared = [_shared(pa, x.tokens) for x in self.slots]
+        best, s, echo = self._best(P, req.cache_salt, shared), None, False
         if self.store is not None:
-            hit = self.store.lookup(P, req.cache_salt, (len(best.tokens) if best is not None else 0) + self.store.min_gain)
+            hit = self.store.lookup(pa, req.cache_salt, (len(best.tokens) if best is not None else 0) + self.store.min_gain)
             if hit is not None:
-                s, echo = self._restore_disk(hit, P), hit.reply
+                s, echo = self._restore_disk(hit, P, shared), hit.reply
                 if s is None:  # the failed restore may have overwritten the slot of `best`
-                    best = self._best(P, req.cache_salt)
+                    shared = [_shared(pa, x.tokens) for x in self.slots]
+                    best = self._best(P, req.cache_salt, shared)
         if s is None:
             if best is not None:
-                s = self._target(self.slots[best.slot], P)
+                s = self._target(self.slots[best.slot], shared[best.slot])
             else:
                 s = min(self.slots, key=lambda x: (len(x.tokens) > 0, x.last_used))
             b = s.idx
             if self.store is not None:  # a pending save may still read the rows that this request rewrites
                 self.store.wait(b, len(best.tokens) if best is not None and best.slot == b else 0)
             if best is not None:
-                self._restore(s, best)
+                self._restore(s, best, shared[b])
             else:
                 for i in self.gdn_layers:
                     self.state.conv[i][b].zero_()
                     self.state.rec[i][b].zero_()
-                s.tokens, s.h_last = [], None
+                self._set_history(s, [], 0)
+                s.h_last = None
                 self.state.pos_t[b] = 0
             echo = best is not None and best.reply
         b = s.idx
-        for c in [c for c in self.ckpts if c.slot == b and not self._valid(c)]:
-            self._drop(c)  # the slot's new history overwrites them
         req.slot, req.reused, req.t_admit = b, len(s.tokens), time.perf_counter()
         s.salt = req.cache_salt
         s.req, s.phase, s.todo, s.y = req, "prefill", list(P[len(s.tokens):]), None
@@ -436,7 +451,7 @@ class Scheduler:
         s.splits = []
         if self.boundary is not None and (self.free_bufs or self.ckpts):
             # message starts: the end of the first message (a shared system prompt) and the start of the last one
-            bs = [i for i, t in enumerate(P) if t == self.boundary and i > 0]
+            bs = (np.flatnonzero(pa[1:] == self.boundary) + 1).tolist()
             ps = bs[:-1][:1] + bs[:-1][-1:]
             # the start of the reply, after a long last message. A client that sends the reply back in another form
             # (e.g. without its reasoning) misses the prompt-end snapshot by the last tokens of the generation
@@ -454,7 +469,7 @@ class Scheduler:
             ids = list(req.eos_ids)[:MAX_STOP_IDS] if req.min_tokens <= 1 else []  # the GPU cut cannot count to min_tokens
             self.stop_buf[b] = torch.tensor(ids + [-1] * (MAX_STOP_IDS - len(ids)))
             V = self.model.cfg.vocab_size
-            self.mtp.set_prompt_vocab([t for t in P if t < V] if req.images else list(P))  # the draft vocabulary gets this prompt's tokens
+            self.mtp.set_prompt_vocab(pa[pa < V] if req.images else pa)  # the draft vocabulary gets this prompt's tokens
         m = self.metrics
         m.prompt_tokens.inc(len(P))
         m.cached_tokens.inc(req.reused)

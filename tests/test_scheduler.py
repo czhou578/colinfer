@@ -79,13 +79,24 @@ def stub_prefill(model, ids, state, return_hidden=False):
     return logits
 
 
+class Checked(S.Scheduler):
+    """The scheduler, whose every step is followed by a check of its invariant: each checkpoint is a prefix of its slot's
+    history (the scheduler relies on it rather than compare them). A subclass, not a wrapper of step: a reference cycle
+    would leave old schedulers to the garbage collector, which may free their CUDA graphs during a new one's capture."""
+
+    def step(self):
+        super().step()
+        for c in self.ckpts:
+            assert tuple(self.slots[c.slot].tokens[:len(c.tokens)]) == c.tokens, "a checkpoint is not a prefix of its slot's history"
+
+
 @pytest.fixture
 def make(monkeypatch):
     monkeypatch.setattr(S, "prefill", stub_prefill)
 
     def make(**kw):
         kw = dict(n_slots=3, max_seq_len=L, n_checkpoints=8, prefill_chunk=64, ckpt_interval=128, boundary_token=BND) | kw
-        return S.Scheduler(StubModel(), **kw)
+        return Checked(StubModel(), **kw)
     return make
 
 
@@ -174,6 +185,22 @@ def test_a_side_request_with_the_same_system_prompt_keeps_the_conversation_cache
     assert r3.slot == r1.slot and r3.reused == len(main) + len(r1.output) - 1 and r3.output == reference(p3, 20)
 
 
+def test_a_copy_into_another_slot_drops_the_checkpoints_there(make):
+    """The side request's slot held another conversation, with checkpoints shorter than the copied prefix: they go,
+    since they are no prefix of the slot's new history (a disk save of one would pair its tokens with the new KV)."""
+    sched, rng = make(n_slots=2, ckpt_interval=10**6), random.Random(11)
+    system = prompt(rng, 300)
+    main = chat(rng, system, prompt(rng, 1200))
+    r1 = sched.run([S.Request(main, max_new_tokens=20)])[0]
+    other = prompt(rng, 200)
+    r0 = sched.run([S.Request(other, max_new_tokens=10)])[0]
+    assert r0.slot != r1.slot and any(c.slot == r0.slot and len(c.tokens) < 301 for c in sched.ckpts)
+    side = chat(rng, system, prompt(rng, 40))
+    r2 = sched.run([S.Request(side, max_new_tokens=10)])[0]
+    assert r2.slot == r0.slot and r2.reused == 301 and r2.output == reference(side, 10)
+    assert not any(c.slot == r0.slot and len(c.tokens) < 301 for c in sched.ckpts)
+
+
 def test_reply_sent_back_unchanged_skips_the_reply_start_snapshot(make):
     sched, rng = make(ckpt_interval=10**6), random.Random(8)
     p1 = chat(rng, prompt(rng, 300), prompt(rng, 40))  # a short last message: no reply-start snapshot
@@ -194,6 +221,27 @@ def test_outputs_stay_exact_as_checkpoints_are_evicted(make):
         r = sched.run([S.Request(p, max_new_tokens=10)])[0]
         assert r.output == reference(p, 10)
     assert len(sched.ckpts) <= 4
+
+
+@pytest.mark.parametrize("slots,ring,tail", [(3, 6, 64), (2, 3, 64), (3, 8, S.COPY_MIN_TAIL), (1, 4, S.COPY_MIN_TAIL)])
+def test_random_conversations_stay_exact(make, monkeypatch, slots, ring, tail):
+    """Turns that send the reply back unchanged or changed, side requests with a shared system prompt, branches from
+    an earlier point, new conversations: whatever the scheduler restores, copies or evicts, each output is exact. A low
+    COPY_MIN_TAIL sends many requests to another slot with a copy of their prefix."""
+    monkeypatch.setattr(S, "COPY_MIN_TAIL", tail)
+    sched, rng = make(n_slots=slots, n_checkpoints=ring, ckpt_interval=64), random.Random(slots * 10 + ring)
+    systems, done = [prompt(rng, 300), prompt(rng, 40)], []
+    for _ in range(40):
+        kind = rng.choice(["new", "turn", "turn", "changed", "side", "branch"]) if done else "new"
+        p, out = rng.choice(done) if done else ([], [])
+        user = prompt(rng, rng.choice((5, 60, 200)))
+        p = {"new": lambda: chat(rng, rng.choice(systems), user), "turn": lambda: p + out + [BND] + user + [BND] + prompt(rng, 2),
+             "changed": lambda: p[:-3] + prompt(rng, 5) + [BND] + user, "side": lambda: chat(rng, systems[0], user),
+             "branch": lambda: p[:rng.randrange(1, len(p))] + user}[kind]()
+        p = p if len(p) < L - 64 else p[-(L // 2):]  # a conversation at the slot length starts over
+        r = sched.run([S.Request(p, max_new_tokens=rng.choice((3, 20)))])[0]
+        assert r.output == reference(p, r.max_new_tokens), kind
+        done.append((p, r.output))
 
 
 def test_aborts_queued_and_running(make):

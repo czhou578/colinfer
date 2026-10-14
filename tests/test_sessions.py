@@ -12,7 +12,7 @@ import torch
 
 import engine.runtime.scheduler as S
 from engine.runtime.sessions import SessionStore
-from tests.test_scheduler import BND, L, StubModel, chat, prompt, reference, stub_prefill
+from tests.test_scheduler import BND, Checked, L, StubModel, chat, prompt, reference, stub_prefill
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 BLOCK = 64
@@ -30,7 +30,7 @@ def make(monkeypatch, tmp_path):
         for st in stores:
             st.flush()
         kw = dict(n_slots=3, max_seq_len=L, n_checkpoints=8, prefill_chunk=64, ckpt_interval=10**6, boundary_token=BND) | kw
-        sched = S.Scheduler(StubModel(), **kw)
+        sched = Checked(StubModel(), **kw)
         with torch.inference_mode():  # as the server's engine thread builds it
             sched.store = SessionStore(sched.state, None, {"model": "stub"}, budget, str(tmp_path), block=BLOCK, min_tokens=BLOCK,
                                        log=lambda *a: None)
