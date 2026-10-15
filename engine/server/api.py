@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from engine.runtime.grammar import Grammars
 from engine.runtime.scheduler import Request as EngineRequest
 from engine.server import anthropic as anth
+from engine.server import committee as cm
 from engine.server import images as img
 from engine.server import openai as oai
 from engine.server.chat import ChatFormat, OutputParser, TextParser, check_messages, template_kwargs
@@ -107,10 +108,14 @@ def _num(v, kind, name: str):
 
 # ------------------------------------------------------------------------------------------------ app
 def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, hf_config: dict, default_thinking,
-              default_effort: str | None = None):
+              default_effort: str | None = None, committee: cm.Committee | None = None):
+    """committee: the roles of committee mode (engine/server/committee.py); None: from the config (--committee-size,
+    --committee-roles), which can turn the mode off."""
     app = FastAPI(title="colin-inference-engine")
     fmt = ChatFormat(tokenizer)
     cfg = worker.cfg
+    if committee is None:
+        committee = cm.Committee.from_config(cfg.committee_size, cfg.committee_roles)
     if cfg.api_key:
         app.add_middleware(ApiKey, key=cfg.api_key)
     max_len, margin = cfg.max_seq_len, worker.sched.margin
@@ -319,6 +324,9 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                     worker.abort(req)
                     raise Failed("client disconnected", 499)
                 continue
+            except asyncio.CancelledError:  # the stream that waits for this request was closed (a committee's members)
+                worker.abort(req)
+                raise
             if item[0] == "error":
                 raise Failed(item[1], item[2])
             if item[0] == "done":
@@ -326,16 +334,34 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 return events, item[1]
             events.append(item)
 
-    def sse_response(st: Stream, req: EngineRequest, kind: str, on_delta, on_done, on_error, head=(), ping=""):
+    def sse_response(start, kind: str, on_delta, on_done, on_error, head=(), ping="", busy_code=503):
         """Streams a request: the events of `head`, on_delta(event) for each output event, then on_done(request) or
-        on_error(message, code). Each returns a list of SSE strings. ping: the text sent every PING_S seconds while no
-        output arrives (the queue, a long prefill), so that an idle timeout of the client or a proxy does not end the
-        stream. Aborts the request when the client goes away before the end."""
+        on_error(message, code). Each returns a list of SSE strings. start: an awaitable that gives (the Stream, the
+        submitted request); a committee's members run inside it (run_committee). While it runs, and then while no output
+        arrives (the queue, a long prefill), `ping` goes out every PING_S seconds, so that an idle timeout of the client
+        or a proxy does not end the stream. Aborts the request when the client goes away before the end."""
         async def gen():
-            finished = False
+            req, finished = None, False
+            task = asyncio.ensure_future(start)
             try:
                 for x in head:
                     yield x
+                while True:
+                    try:
+                        st, req = await asyncio.wait_for(asyncio.shield(task), timeout=PING_S)
+                        break
+                    except asyncio.TimeoutError:
+                        yield ping
+                    except Failed as e:
+                        finished = True
+                        for x in on_error(e.msg, e.code):
+                            yield x
+                        return
+                    except (BadRequest, Busy) as e:
+                        finished = True
+                        for x in on_error(str(e), busy_code if isinstance(e, Busy) else 400):
+                            yield x
+                        return
                 while True:
                     try:
                         item = await asyncio.wait_for(st.q.get(), timeout=PING_S)
@@ -356,9 +382,34 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                         log_done(item[1], kind)
                     return
             finally:
-                if not finished:
+                if not task.done():
+                    task.cancel()  # the client went away during a committee's members: result() aborts the running one
+                elif req is not None and not finished:
                     worker.abort(req)  # the client went away
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def ready(st: Stream, req: EngineRequest):
+        """The `start` of sse_response for a request that is submitted already."""
+        return st, req
+
+    async def run_committee(request, b: dict, msgs, tools, kw: dict, stops: list, roles, kind: str) -> list[str]:
+        """The members of a committee (engine/server/committee.py), one after another: their answers as text. Each is the
+        conversation with a role appended, rendered as the request was, run without a stream and without the request's
+        constraint or logprobs. With a seed, member i gets seed + i. A failure of a member fails the request."""
+        answers = []
+        seed = b.get("seed")
+        for i, role in enumerate(roles):
+            bi = dict(b)
+            if seed is not None:
+                bi["seed"] = _num(seed, int, "seed") + i
+            prompt, images = await render(cm.member_messages(msgs, role), tools, kw)
+            parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops)
+            st = Stream(asyncio.get_running_loop(), tokenizer, parser)
+            req = make_request(bi, prompt, st, None, images)
+            worker.submit(req)
+            events, _ = await result(request, st, req, f"{kind} member {i + 1}/{len(roles)}")
+            answers.append(cm.answer_text(oai.chat_message(events)[0]))
+        return answers
 
     def sse_error(msg: str, code: int) -> list[str]:
         return [oai.sse(oai.error_body(msg, code))]
@@ -374,22 +425,39 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             tool_choice = b.get("tool_choice")
             tools = b.get("tools") if tool_choice != "none" else None
             spec = openai_constraint(b, tools)
-            prompt, images = await render(msgs, tools, kwargs_of(b))
-            cons = await constraint(spec, prompt)
+            kw, stops = kwargs_of(b), stops_of(b)
+            prompt, images = await render(msgs, tools, kw)
             n_top = None
             if b.get("logprobs"):
                 n_top = min(_num(b.get("top_logprobs") or 0, int, "top_logprobs"), oai.MAX_TOP_LOGPROBS)
-            parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b))
-            st = Stream(asyncio.get_running_loop(), tokenizer, parser)
-            req = make_request(b, prompt, st, n_top, images, cons)
+            model = b.get("model") or served_name
+            roles = committee.roles if committee is not None and cm.is_committee(model) else ()
+            if roles:  # the body's values are checked now (a 400 here, not an error in the stream); start() makes the requests
+                make_request(b, prompt, None, n_top, images)
+                parser = st = req = None
+            else:
+                parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops)
+                st = Stream(asyncio.get_running_loop(), tokenizer, parser)
+                req = make_request(b, prompt, st, n_top, images, await constraint(spec, prompt))
             include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
             return _error(str(e))
         except Busy as e:
             return _error(str(e), 503)
         rid = "chatcmpl-" + uuid.uuid4().hex
-        model = b.get("model") or served_name
-        worker.submit(req)
+        answers: list[str] = []
+
+        async def start():
+            """(the Stream, the submitted request) of the reply: with a committee, after its members ran."""
+            nonlocal parser, st, req
+            if roles:
+                answers[:] = await run_committee(request, b, msgs, tools, kw, stops, roles, "chat")
+                p, im = await render(cm.reconcile_messages(msgs, answers, committee.reconcile), tools, kw)
+                parser = OutputParser(fmt, fmt.opens_in_reasoning(p), tools, stops)
+                st = Stream(asyncio.get_running_loop(), tokenizer, parser)
+                req = make_request(b, p, st, n_top, im, await constraint(spec, p))
+            worker.submit(req)
+            return st, req
 
         def finish_reason(r):
             return "tool_calls" if parser.n_tool_calls and r.finish_reason == "stop" else oai.finish_reason(r)
@@ -442,18 +510,26 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                     extra["logprobs"] = {"content": carry_lps}
                 return (role() + [oai.sse(oai.chat_chunk(rid, model, {}, finish_reason(r), extra))]
                         + oai.stream_end(rid, "chat.completion.chunk", model, r, include_usage))
-            return sse_response(st, req, "chat", on_delta, on_done, sse_error, ping=openai_ping)
+            return sse_response(start(), "chat", on_delta, on_done, sse_error, ping=openai_ping)
 
         try:
+            st, req = await start()
             events, r = await result(request, st, req, "chat")
         except Failed as e:
             return _error(e.msg, e.code)
+        except BadRequest as e:
+            return _error(str(e))
+        except Busy as e:
+            return _error(str(e), 503)
         msg, lps = oai.chat_message(events)
         choice = {"index": 0, "message": msg, "logprobs": {"content": lps} if n_top is not None else None, "finish_reason": finish_reason(r)}
         if want_ids:
             choice["token_ids"] = r.output
-        return JSONResponse({"id": rid, "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [choice],
-                             "usage": oai.usage(r), "timings": oai.timings(r)})
+        body = {"id": rid, "object": "chat.completion", "created": int(time.time()), "model": model, "choices": [choice],
+                "usage": oai.usage(r), "timings": oai.timings(r)}
+        if roles:
+            body["committee"] = {"roles": list(roles), "answers": answers}
+        return JSONResponse(body)
 
     # -------------------------------------------------------------------------------------- completions
     @app.post("/v1/completions")
@@ -501,7 +577,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             def on_done(r):
                 last = oai.text_chunk(rid, model, "", oai.finish_reason(r), carry, n_top)
                 return [oai.sse(last)] + oai.stream_end(rid, "text_completion", model, r, include_usage)
-            return sse_response(st, req, "cmpl", on_delta, on_done, sse_error, ping=openai_ping)
+            return sse_response(ready(st, req), "cmpl", on_delta, on_done, sse_error, ping=openai_ping)
 
         try:
             events, r = await result(request, st, req, "cmpl")
@@ -513,20 +589,18 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                              "usage": oai.usage(r), "timings": oai.timings(r)})
 
     # -------------------------------------------------------------------------------------- Anthropic messages
-    async def render_messages(b: dict):
-        """Anthropic request body -> (prompt token ids, OpenAI-style tools, images)."""
+    def convert_messages(b: dict):
+        """Anthropic request body -> (chat messages, OpenAI-style tools, chat template kwargs)."""
         try:
-            msgs, tools = anth.to_messages(b, vision), anth.to_tools(b)
-            kw = anth.template_kwargs(b, default_thinking, default_effort)
+            return anth.to_messages(b, vision), anth.to_tools(b), anth.template_kwargs(b, default_thinking, default_effort)
         except ValueError as e:  # the conversion's checks of the request
             raise BadRequest(str(e)) from None
-        prompt, images = await render(msgs, tools, kw)
-        return prompt, tools, images
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request):
         try:
-            prompt, _, _ = await render_messages(await json_body(request))
+            msgs, tools, kw = convert_messages(await json_body(request))
+            prompt, _ = await render(msgs, tools, kw)
         except BadRequest as e:
             return _anth_error(str(e))
         return {"input_tokens": len(prompt)}
@@ -535,19 +609,36 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     async def messages(request: Request):
         try:
             b = await json_body(request)
-            prompt, tools, images = await render_messages(b)
-            cons = await constraint(anthropic_constraint(b, tools), prompt)
-            parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops_of(b, "stop_sequences"))
-            st = Stream(asyncio.get_running_loop(), tokenizer, parser)
-            req = make_request(b, prompt, st, None, images, cons)
+            msgs, tools, kw = convert_messages(b)
+            spec, stops = anthropic_constraint(b, tools), stops_of(b, "stop_sequences")
+            prompt, images = await render(msgs, tools, kw)
+            model = b.get("model") or served_name
+            roles = committee.roles if committee is not None and cm.is_committee(model) else ()
+            if roles:  # the body's values are checked now; start() makes the members and the reply
+                make_request(b, prompt, None, None, images)
+                parser = st = req = None
+            else:
+                parser = OutputParser(fmt, fmt.opens_in_reasoning(prompt), tools, stops)
+                st = Stream(asyncio.get_running_loop(), tokenizer, parser)
+                req = make_request(b, prompt, st, None, images, await constraint(spec, prompt))
         except BadRequest as e:
             return _anth_error(str(e))
         except Busy as e:
             return _anth_error(str(e), 529)
         mid = "msg_" + uuid.uuid4().hex[:24]
-        model = b.get("model") or served_name
         blocks = anth.Blocks(anth.drops_tool_calls(b))
-        worker.submit(req)
+
+        async def start():
+            """(the Stream, the submitted request) of the reply: with a committee, after its members ran."""
+            nonlocal parser, st, req
+            if roles:
+                answers = await run_committee(request, b, msgs, tools, kw, stops, roles, "msg")
+                p, im = await render(cm.reconcile_messages(msgs, answers, committee.reconcile), tools, kw)
+                parser = OutputParser(fmt, fmt.opens_in_reasoning(p), tools, stops)
+                st = Stream(asyncio.get_running_loop(), tokenizer, parser)
+                req = make_request(b, p, st, None, im, await constraint(spec, p))
+            worker.submit(req)
+            return st, req
 
         def stop_of(r: EngineRequest):
             return anth.stop_reason(r.finish_reason, blocks.n_tool_calls, parser.stop_match)
@@ -561,16 +652,21 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 return blocks.close() + [anth.sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": sr, "stop_sequence": seq},
                                                                     "usage": use(r)}),
                                          anth.sse("message_stop", {"type": "message_stop"})]
-            start = anth.message(mid, model, [], (None, None), anth.usage(len(prompt), 0, 0))
-            return sse_response(st, req, "msg", lambda item: blocks.add(item[1]), on_done,
+            first = anth.message(mid, model, [], (None, None), anth.usage(len(prompt), 0, 0))
+            return sse_response(start(), "msg", lambda item: blocks.add(item[1]), on_done,
                                 lambda msg, code: [anth.sse("error", anth.error_body(msg, code))],
-                                head=[anth.sse("message_start", {"type": "message_start", "message": start})],
-                                ping=anth.sse("ping", {"type": "ping"}))
+                                head=[anth.sse("message_start", {"type": "message_start", "message": first})],
+                                ping=anth.sse("ping", {"type": "ping"}), busy_code=529)
 
         try:
+            st, req = await start()
             events, r = await result(request, st, req, "msg")
         except Failed as e:
             return _anth_error(e.msg, e.code)
+        except BadRequest as e:
+            return _anth_error(str(e))
+        except Busy as e:
+            return _anth_error(str(e), 529)
         for _, ev, _, _ in events:
             blocks.add(ev)
         blocks.close()
@@ -586,8 +682,11 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
 
     @app.get("/v1/models")
     async def models():
-        return {"object": "list", "data": [{"id": served_name, "object": "model", "created": created, "owned_by": "colin-inference-engine",
-                                            "root": cfg.model, "max_model_len": max_len, "config": hf_config}]}
+        entry = {"object": "model", "created": created, "owned_by": "colin-inference-engine", "root": cfg.model, "max_model_len": max_len}
+        data = [{"id": served_name, **entry, "config": hf_config}]
+        if committee is not None:  # the alias of committee mode (engine/server/committee.py)
+            data.append({"id": served_name + cm.SUFFIX, **entry, "committee": {"roles": list(committee.roles)}})
+        return {"object": "list", "data": data}
 
     @app.get("/health")
     async def health():
@@ -652,12 +751,21 @@ def main(argv=None):
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
     ap.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "xhigh"), default="auto",
                     help="the reasoning effort of a thinking request that does not set one (auto: the template's default, xhigh)")
+    ap.add_argument("--committee-size", type=int, default=D.committee_size, metavar="N",
+                    help="members of a committee reply (model name <name>-committee: each member answers the request in a role, then a "
+                         "reconcile pass writes the reply; docs/server.md). Default: 3, or the roles of --committee-roles. 0: the alias is off")
+    ap.add_argument("--committee-roles", default=D.committee_roles, metavar="FILE",
+                    help='a JSON file {"roles": [...], "reconcile": "..."}: the members\' roles and the reconcile instruction')
     ap.add_argument("--api-key", default=os.environ.get("COLINFER_API_KEY") or None,
                     help="require this key on the /v1/ endpoints (Authorization: Bearer, or x-api-key); default: $COLINFER_API_KEY, else no key")
     ap.add_argument("--no-selftest", action="store_true")
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
 
+    try:  # before the model loads: a bad roles file is cheap to fix now
+        committee = cm.Committee.from_config(a.committee_size, a.committee_roles)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"--committee-roles: {e}") from None
     t0 = time.perf_counter()
     total = torch.cuda.get_device_properties(0).total_memory
     mem_cap_bytes = int(min(a.mem_cap_gb * 1e9, total))
@@ -671,7 +779,7 @@ def main(argv=None):
                        spec=a.spec, k=a.k, drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
                        boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
                        max_queue=a.max_queue, max_output_tokens=a.max_output_tokens, max_request_seconds=a.max_request_seconds,
-                       api_key=a.api_key, mem_cap_bytes=mem_cap_bytes,
+                       api_key=a.api_key, mem_cap_bytes=mem_cap_bytes, committee_size=a.committee_size, committee_roles=a.committee_roles,
                        session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, session_dir=a.session_dir,
                        vision=not a.no_vision, vision_preload=a.vision_preload, image_max_pixels=a.image_max_pixels)
     hf = json.load(open(os.path.join(path, "config.json")))
@@ -686,7 +794,7 @@ def main(argv=None):
         raise SystemExit(f"engine failed to start: {worker.error!r}")
     thinking = {"auto": None, "on": True, "off": False}[a.thinking]
     effort = None if a.reasoning_effort == "auto" else a.reasoning_effort
-    app = build_app(worker, tokenizer, a.served_model_name or a.model, gen_defaults, hf_config, thinking, effort)
+    app = build_app(worker, tokenizer, a.served_model_name or a.model, gen_defaults, hf_config, thinking, effort, committee)
     log(f"[server] startup {time.perf_counter() - t0:.1f} s; listening on http://{a.host}:{a.port}/v1")
     import uvicorn
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=30)
