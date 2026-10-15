@@ -237,9 +237,10 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   error fails all requests and stops the process, and systemd restarts it. Thus the server checks every request value
   that reaches the engine before it submits the request, and an error in the output parsing of one request fails only
   that request.
-- **Memory.** At startup, the engine uses ≈61 GB. The weights use 20.2 GB and the INT copies 5.2 GB. The KV caches use
-  3 × 262k × 32 KB = 25.8 GB. The checkpoint ring uses 4.9 GB, and the drafter KV and copies use ≈2.5 GB. The
-  conversation cache uses 0.6 GB of pinned host memory for its file buffers.
+- **Memory.** At startup, the engine uses ≈60 GB. The weights use 20.2 GB and the INT copies 5.2 GB. The KV caches use
+  3 × 262k × 32 KB = 25.8 GB. The checkpoint ring uses 4.9 GB, and the drafter KV and its NVFP4 weights ≈1.9 GB. The
+  CUDA graphs share one memory pool (0.4 GB). The vision tower adds 0.92 GB with the first image. The conversation
+  cache uses 0.6 GB of pinned host memory for its file buffers and 0.14 GB of fixed buffers on the GPU.
 - **Startup** takes ≈25 s. The engine loads the weights and runs a numerical self-test of each matmul path
   (`engine/selftest.py`), which stops the start on a wrong kernel. Then it captures the graphs, calibrates the cycle
   times and runs a warm-up.

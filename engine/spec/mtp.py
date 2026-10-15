@@ -9,7 +9,8 @@ is the post-final-norm hidden state of the target at position i, and the row pre
 Chained steps feed the own normed output of the MTP as the next hidden.
 
 The cost per draft step (the engine streams the drafter again at each step, so its bytes are cycle time):
-  * Its linears run on NVFP4 copies (round-to-nearest from BF16) on the skinny GEMM.
+  * Its linears run on NVFP4 weights (round-to-nearest from BF16) on the skinny GEMM; the prompt pass dequantizes
+    them to BF16 for each call (csrc/prefill_ops.cu dequant_nvfp4) instead of keeping a BF16 copy.
   * The draft head scores DRAFT_VOCAB frequent tokens (engine/spec/draft_vocab.npy) plus up to PROMPT_SLOTS tokens of
     the current prompts. It does not score the 248k vocabulary.
   * With ~/.cache/colinfer/drafter/draft_head_pca.safetensors (tools/lowrank_draft_head.py), the head is a rank-1024
@@ -71,12 +72,13 @@ DRAFT_STOP = 0.1
 
 
 class DraftLinear(RowsLinear):
-    """A drafter linear: BF16 weights for the prompt pass (cuBLAS, many rows) and an NVFP4 copy that the draft steps
-    stream (skinny GEMM, up to MAX_ROWS rows). The residual is added after the GEMM, not in its epilogue."""
+    """A drafter linear on NVFP4 weights (round-to-nearest from BF16): the draft steps stream them (skinny GEMM, up to
+    MAX_ROWS rows), and the prompt pass (cuBLAS, many rows) runs on the same weights, dequantized to BF16 for the call
+    (0.1-0.2 GB for a moment) rather than on a BF16 copy kept beside them (0.85 GB for the drafter). The residual is
+    added after the GEMM, not in its epilogue."""
 
     def __init__(self, w: torch.Tensor):
         super().__init__()
-        self.register_buffer("w", w.contiguous(), persistent=False)
         self.out_features, self.in_features = w.shape
         wf = w.float()
         gs = nvfp4_global_scale(wf)
@@ -87,7 +89,7 @@ class DraftLinear(RowsLinear):
         if x2.shape[0] <= MAX_ROWS:
             self.low.rows(x2, None, out)
         else:
-            out.copy_(F.linear(x2, self.w))
+            out.copy_(F.linear(x2, ops().dequant_nvfp4(self.low.w, self.low.sf, self.low.gscale)))
         if r2 is not None:
             out += r2
 

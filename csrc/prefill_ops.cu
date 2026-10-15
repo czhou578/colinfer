@@ -32,6 +32,31 @@ __global__ void k_fp8_quant(const __nv_bfloat16* __restrict__ x, uint8_t* __rest
     reinterpret_cast<uint2*>(out)[i] = make_uint2(o[0], o[1]);
 }
 
+// bf16 [N, K] from NVFP4: e2m1 w [N, K/2], e4m3 block scales sf [N, K/16] and the global scale, as
+// engine/weights/loader.py dequant_nvfp4 computes it: fp32 value * (scale * gscale), rounded to bf16. One thread per
+// block of 16 elements: 8 bytes of nibbles and one scale in, 32 bytes out.
+__constant__ float c_e2m1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__global__ void k_dequant_nvfp4(const uint8_t* __restrict__ w, const uint8_t* __restrict__ sf, __nv_bfloat16* __restrict__ out, size_t nblk,
+                                float gscale) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nblk) return;
+    const uint2 p = reinterpret_cast<const uint2*>(w)[i];
+    const float s = __half2float(__nv_cvt_fp8_to_halfraw(sf[i], __NV_E4M3)) * gscale;
+    const uint32_t u[2] = {p.x, p.y};
+    uint32_t o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {  // byte j: element 2j in the low nibble, 2j + 1 in the high one
+        const uint32_t b = (u[j >> 2] >> (8 * (j & 3))) & 0xffu;
+        const uint32_t lo = __bfloat16_as_ushort(__float2bfloat16_rn(c_e2m1[b & 0xfu] * s));
+        const uint32_t hi = __bfloat16_as_ushort(__float2bfloat16_rn(c_e2m1[b >> 4] * s));
+        o[j] = lo | (hi << 16);
+    }
+    uint4* dst = reinterpret_cast<uint4*>(out) + 2 * i;
+    dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+    dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+}
+
 // One warp per (t, 128-channel head). Lane l owns the channels 4l .. 4l+3. The output channels [0, c1) go to o0 [T, c1],
 // [c1, c2) to o1 and [c2, C) to o2 (all contiguous). With l2_eps >= 0, the kernel also L2-normalizes the q and k outputs
 // (channels < c2) per head. It computes x / sqrt(sum x^2 + eps) on the bf16 values (the l2norm of the reference, eps
@@ -228,6 +253,11 @@ cudaError_t launch_fp8_quant(const void* x, void* out, size_t n, float scale, cu
     if (n % 8) return cudaErrorInvalidValue;
     const size_t n8 = n / 8;
     pf::k_fp8_quant<<<(n8 + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, (uint8_t*)out, n8, 1.f / scale);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_dequant_nvfp4(const void* w, const void* sf, void* out, size_t nblk, float gscale, cudaStream_t st) {
+    pf::k_dequant_nvfp4<<<(nblk + 255) / 256, 256, 0, st>>>((const uint8_t*)w, (const uint8_t*)sf, (__nv_bfloat16*)out, nblk, gscale);
     return cudaGetLastError();
 }
 

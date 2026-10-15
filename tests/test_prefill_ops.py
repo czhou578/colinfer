@@ -23,6 +23,23 @@ def test_fp8_quant():
     assert torch.equal(out.float(), (x.float() / 0.02).clamp(-448, 448).to(torch.float8_e4m3fn).float())
 
 
+def test_dequant_nvfp4():
+    """Bit for bit the loader's dequant_nvfp4 (the drafter's prompt pass runs on it): zeros (-0.0 kept), tiny and large
+    blocks, every e2m1 code."""
+    from engine.weights.loader import dequant_nvfp4
+    from engine.weights.quantize import nvfp4_global_scale, quantize
+    torch.manual_seed(0)
+    w = torch.randn(96, 2048, device="cuda") * 2
+    w[0, :16], w[1, :16], w[2, :16] = 0.0, 1e-4, 1e3
+    gs = nvfp4_global_scale(w)
+    packed, sf = quantize(w, gs)
+    packed[3, :8] = torch.tensor([0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe], dtype=torch.uint8, device="cuda")  # every code
+    ref = dequant_nvfp4(packed, sf, torch.tensor(gs), out_dtype=torch.bfloat16)
+    out = ops().dequant_nvfp4(packed, sf, float(gs))
+    assert out.dtype == torch.bfloat16 and out.shape == w.shape
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
 @pytest.mark.parametrize("T", [1, 2, 3, 100])
 def test_causal_conv_silu(T):
     C = 10240

@@ -7,7 +7,7 @@
 //   attn_decode.cu   attn_prologue (q/k norm + RoPE + KV write), attn_decode (multi-row tensor-core attention)
 //   gdn_step.cu      gdn_conv, gdn_conv_commit, gdn_delta (Gated DeltaNet decode / verify / commit)
 //   gemm_nvfp4.cu    prefill NVFP4 GEMMs and activation quantization
-//   prefill_ops.cu   prefill glue: fp8_quant, add_rmsnorm, causal_conv_silu, gated_rmsnorm, gate_fp8
+//   prefill_ops.cu   prefill glue: fp8_quant, add_rmsnorm, causal_conv_silu, gated_rmsnorm, gate_fp8, dequant_nvfp4
 //   gdn_prefill.cu   gdn_prefill (chunked delta rule)
 //   attn_prefill.cu  attn_prefill_fp8
 //   sampling.cu      philox_uniform (sampling), rescore_nvfp4 (low-rank draft head)
@@ -376,10 +376,23 @@ void nvfp4_gemm_swiglu(torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torc
 
 // ===================================================================================================== prefill_ops.cu
 cudaError_t launch_fp8_quant(const void*, void*, size_t, float, cudaStream_t);
+cudaError_t launch_dequant_nvfp4(const void*, const void*, void*, size_t, float, cudaStream_t);
 cudaError_t launch_causal_conv_silu(const void*, int, const void*, const void*, void*, void*, void*, int, int, int, int, float, cudaStream_t);
 cudaError_t launch_add_rmsnorm(const void*, const void*, const void*, float, int, int, void*, void*, void*, void*, float, void*, float, cudaStream_t);
 cudaError_t launch_gate_fp8(const void*, const void*, int, int, int, int, void*, float, cudaStream_t);
 cudaError_t launch_gated_rmsnorm(const void*, const void*, int, int, const void*, void*, int, float, cudaStream_t);
+
+// bf16 [N, K] from NVFP4 w [N, K/2] (uint8), e4m3 block scales sf [N, K/16] and the global scale (engine/weights/loader.py
+// dequant_nvfp4, bit for bit)
+torch::Tensor dequant_nvfp4(torch::Tensor w, torch::Tensor sf, double gs) {
+    CHECK_CUDA_TENSOR(w, torch::kUInt8);
+    const int64_t N = w.size(0), K = w.size(1) * 2;
+    TORCH_CHECK(K % 16 == 0, "K must be a multiple of 16");
+    check_sf(sf, N, K);
+    auto out = torch::empty({N, K}, w.options().dtype(torch::kBFloat16));
+    CHECK_LAUNCH(launch_dequant_nvfp4(w.data_ptr(), sf.data_ptr(), out.data_ptr(), (size_t)(N * K / 16), (float)gs, stream()));
+    return out;
+}
 
 // out (float8_e4m3fn, same shape) = saturate(x / scale)
 void fp8_quant(torch::Tensor x, double scale, torch::Tensor out) {
@@ -543,6 +556,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"), py::arg("alpha"), py::arg("gate"), py::arg("hq"), py::arg("hsf"),
           py::arg("norm_const"), py::arg("tile") = 0);
     m.def("fp8_quant", &fp8_quant, "bf16 -> e4m3, static scale", py::arg("x"), py::arg("scale"), py::arg("out"));
+    m.def("dequant_nvfp4", &dequant_nvfp4, "NVFP4 -> bf16 (engine/weights/loader.py dequant_nvfp4)", py::arg("w"), py::arg("sf"), py::arg("gs"));
     m.def("causal_conv_silu", &causal_conv_silu, "GDN causal depthwise conv (k=4) + SiLU, token-major, split q|k|v outputs", py::arg("x"),
           py::arg("state"), py::arg("w"), py::arg("outs"), py::arg("l2_eps") = -1.0);
     m.def("add_rmsnorm", &add_rmsnorm, "fused residual add + RMSNorm (+ NVFP4 / FP8 quantization)", py::arg("x"), py::arg("y"), py::arg("w"),
