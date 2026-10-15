@@ -67,7 +67,8 @@ and the engine uses it when it is present:
 | `~/.cache/colinfer/drafter/draft_head_pca.safetensors` | `tools/lowrank_draft_head.py` | a low-rank draft head: the same drafts for ~1/5 of the draft head's bytes (k=7 cycle 89.8 → 86.0 ms) |
 
 `docs/server.md` describes the flags, the API and the behavior of the server. `deploy/colinfer.service` runs the server
-under systemd. `docs/claude_code.md` tells you how to use the model from the Claude Code CLI.
+under systemd. `docs/claude_code.md` tells you how to use the model from the Claude Code CLI. `docs/night_shift.md`
+runs a list of Claude Code tasks against the server at night, each on its own branch (`tools/night_shift.py`).
 
 ## How it works
 
@@ -108,9 +109,9 @@ decision. In short:
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), the fake NVFP4 activation quantization that the kernel tests compare against (`quant_emul.py`) |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |
-| `tools/` | offline artifacts (decode copies, drafter training, low-rank head) and checkpoint utilities |
+| `tools/` | offline artifacts (decode copies, drafter training, low-rank head), checkpoint utilities, the night shift (`night_shift.py`: Claude Code tasks against the server while the machine idles) |
 | `bench/` | decode / prefill / attention / GEMM / end-to-end benchmarks, nsys trace summaries |
-| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project. |
+| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `night_shift.md` (Claude Code tasks at night), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project. |
 | `PLAN.md` | the original plan and targets |
 
 ## Testing

@@ -1,0 +1,42 @@
+# The tasks of the night shift (docs/night_shift.md). Copy this file to ~/.config/colinfer/night_shift.toml and edit it.
+#   uv run python tools/night_shift.py --dry-run       # check the file, the repositories and the server
+#   uv run python tools/night_shift.py --only NAME     # one task, now
+
+[defaults]
+repo = "~/Projects/my-project"       # the repository of a task (a task may name another)
+base = "HEAD"                        # the commit a task's branch starts from: HEAD, main, origin/main, ...
+timeout = "30m"                      # the wall-clock limit of a task: 90s, 20m, 1.5h
+until = "07:00"                      # no task starts after this time
+allow = []                           # commands every task may run, as Claude Code permission rules (read-only git is always allowed)
+min_free_gb = 16                     # memory available for a task to start
+kill_below_gb = 8                    # a running task is killed below this
+# model = "qwen3.8-27b"              # the model name Claude Code sends (the server accepts any name)
+# effort = "medium"                  # the reasoning effort Claude Code asks for: low, medium, high, xhigh, max
+# server = "http://127.0.0.1:8000"
+# state_dir = "~/.cache/colinfer/night_shift"   # the worktrees, logs and report of each run
+
+# [defaults.env]                     # the environment of the claude process and of the commands it runs
+# UV_PROJECT_ENVIRONMENT = "~/Projects/my-project/.venv"   # a uv project: use its venv instead of making one per worktree
+
+[[task]]
+name = "docstrings-utils"
+prompt = """
+Add a docstring to every public function and class in src/utils.py that has none. Say what it does and what it
+returns. Do not change any behavior. Then run the tests of that module and fix what you broke.
+"""
+allow = ["Bash(uv run pytest tests/test_utils.py*)", "Bash(uv run ruff check*)"]
+timeout = "20m"
+
+[[task]]
+name = "flaky-test-eviction"
+prompt = """
+tests/test_cache.py::test_eviction fails now and then. Run it 20 times. Find the cause. If it is in the test, fix the
+test and not the code under test. Otherwise write what you found to NOTES-flaky.md.
+"""
+allow = ["Bash(uv run pytest tests/test_cache.py*)"]
+timeout = "45m"
+
+[[task]]
+name = "issue-42"
+prompt_file = "~/.config/colinfer/tasks/issue-42.md"   # a long prompt, such as a copied issue
+allow = ["Bash(uv run pytest*)", "Bash(uv run ruff*)"]
