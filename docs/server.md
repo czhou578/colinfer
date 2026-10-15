@@ -42,6 +42,8 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
+| `--committee-size` | 3, or the roles of the file | Members of a committee reply (a request that names the model `<name>-committee`, see "Committee mode" below). 0 turns the alias off. |
+| `--committee-roles` | the built-in roles | A JSON file `{"roles": [...], "reconcile": "..."}` with the members' roles and the reconcile instruction (`{n}`: the number of answers). |
 | `--no-selftest` | off | Skip the startup self-test of the matmul kernels (`engine/selftest.py`). For development only: the test is what catches a miscompiled kernel. |
 | `--no-warmup` | off | Skip the warm-up requests. The first real requests then pay for the first-use compilation and autotuning. |
 | `--api-key` | `$COLINFER_API_KEY`, else none | The `/v1/` endpoints require this key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and `/metrics` stay open. |
@@ -129,7 +131,8 @@ Responses:
 
 Other endpoints:
 
-- `GET /v1/models`. The result includes `max_model_len` and the model config.
+- `GET /v1/models`. The result includes `max_model_len` and the model config, and a second entry `<name>-committee`
+  (committee mode, below) with its roles.
 - `GET /health`.
 - `GET /metrics` (Prometheus), with:
   - step time by kind (prefill chunk, or decode cycle)
@@ -183,6 +186,28 @@ Other endpoints:
   for example during a long prefill. Thus the stream watchdog of the client does not stop the request.
 - **Errors:** the errors have the Anthropic format. A prompt that is too long gets
   `prompt is too long: <n> tokens > <max> maximum`. Claude Code recognizes this text and compacts the conversation.
+
+### Committee mode
+
+A request that names the model `<name>-committee` (or `committee`) gets one answer written from several. The server
+runs one *member* request per role: the same conversation, with the role appended to its last user message (by
+default an implementer, a skeptic and a reviewer; `engine/server/committee.py`). The members run one after another
+through the normal queue. Then a *reconcile* request, the conversation with the members' answers appended, writes the
+final answer. That answer is the reply, in the format of the endpoint (`/v1/chat/completions` or `/v1/messages`,
+with or without a stream). The members' answers appear in the server log, and in the `committee` field of a chat
+completion without a stream.
+
+- **Cost:** about 4x the time of a single answer for answers of the usual length. The members' prompts share the
+  conversation's prefix, so with the prefix cache each member prefills its role text only, and the reconcile pass
+  prefills the answers. A stream sends keep-alive pings while the members run, so the client's watchdog does not end it.
+- **Use it for one question at a time:** a review, a design question, a plan. In an agentic session, every tool-calling
+  turn would pay the 4x. Claude Code switches the model for one question with `/model` (`docs/claude_code.md`).
+- **Sampling:** the request's `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, tools and thinking apply to every
+  member and to the reconcile pass. With a `seed`, member *i* uses `seed + i` and the reconcile pass the seed itself,
+  so a committee reply is reproducible. Constraints (`response_format`, a forced `tool_choice`) and `logprobs` apply
+  to the reconcile pass only. A member's tool calls reach the reconcile pass as text.
+- **Measure before you trust it:** `tools/committee_ab.py` asks a running server the same questions as a single
+  answer and as a committee, and writes the pairs in a random order for a blind judgment, with the times.
 
 ## Behavior to know
 

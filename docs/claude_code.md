@@ -223,7 +223,34 @@ Know these limits:
 - **Quality.** Qwen3.8-27B is smaller than Claude. Give it small and clear tasks. Examine each change before you keep
   it.
 
-## 8. Troubleshooting
+## 8. Committee mode for one question (optional)
+
+The server can answer one question from three members of the model and a reconcile pass (`docs/server.md`, "Committee
+mode"). The reply takes about four times as long. Use it for one review or design question, not for a whole session:
+each tool call of an agentic turn would take four times as long too.
+
+1. Switch the model of the session for the question:
+
+   ```
+   /model qwen3.8-27b-committee
+   ```
+
+2. Ask the question. Terminal 1 shows the three members, then the reply:
+
+   ```
+   22:14:03 [msg member 1/3 31] slot 1 prompt 15902 (cached 15887) -> 412 tok, stop; ...
+   22:14:15 [msg member 2/3 32] ...
+   22:14:27 [msg member 3/3 33] ...
+   22:14:40 [msg 34] slot 1 prompt 17204 (cached 15887) -> 388 tok, stop; ...
+   ```
+
+3. Switch back:
+
+   ```
+   /model qwen3.8-27b
+   ```
+
+## 9. Troubleshooting
 
 | Symptom | Possible cause | Remedy |
 |---|---|---|

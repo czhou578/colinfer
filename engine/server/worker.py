@@ -56,6 +56,8 @@ class ServerConfig:
     vision: bool = True             # image input, when the checkpoint has a vision tower (engine/model/vision.py)
     vision_preload: bool = False    # load the tower's weights at startup and warm up the image path (default: on the first image)
     image_max_pixels: int = 2048 * 2048  # images are resized to at most this many pixels (one token per 32 x 32)
+    committee_size: int | None = None    # members of a committee reply (model name <name>-committee, engine/server/committee.py):
+    committee_roles: str | None = None   # None = 3, or the roles of this JSON file ({"roles": [...], "reconcile": "..."}); 0 turns the alias off
 
 
 class Worker(threading.Thread):
