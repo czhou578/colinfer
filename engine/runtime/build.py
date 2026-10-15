@@ -49,7 +49,8 @@ def load_drafter(model, path: str, weights: str = "auto", log=print):
     elif weights == "none":
         weights = None
     mtp = Mtp(model, path, weights=weights)
-    log(f"[engine] MTP drafter: {weights or 'checkpoint weights'}; low-rank draft head: {'on' if mtp.lr_B is not None else 'off'}")
+    log(f"[engine] MTP drafter: {weights or 'checkpoint weights'}; low-rank draft head: {'on' if mtp.lr_B is not None else 'off'}; "
+        f"quantized {'from the cache' if mtp.cached else 'now (cached for the next start)' if mtp.cache_file else 'now'}")
     return mtp
 
 

@@ -34,7 +34,7 @@ def main():
     eos = fmt.eos_ids
     for w in ([] if a.no_baseline else [None]) + a.weights:
         for k in a.k:
-            gen = MtpGenerator(model, path, max_seq_len=4096, k=k, weights=w, **({"lowrank": None} if a.full_head else {}))
+            gen = MtpGenerator(model, path, max_seq_len=4096, k=k, weights=w, cache=False, **({"lowrank": None} if a.full_head else {}))
             per = collections.defaultdict(lambda: [0, 0, 0, 0])  # drafted, accepted, tokens, cycles
             for x, kind in ids:
                 s0 = dict(gen.stats)

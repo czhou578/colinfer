@@ -32,6 +32,8 @@ MtpCycle captures one CUDA graph per speculative cycle for B slots (k drafts eac
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import os
 
 import numpy as np
@@ -39,6 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
+from safetensors.torch import save_file
 
 from engine.kernels import ops
 from engine.model.fast import (
@@ -57,7 +60,7 @@ from engine.model.prefill import attend_cached, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
 from engine.runtime.sampler import apply_mask
 from engine.spec.accept import draw
-from engine.weights.direct import read_tensors
+from engine.weights.direct import read_tensors, tensor_names
 from engine.weights.loader import dequant_nvfp4, weight_map
 from engine.weights.quantize import nvfp4_global_scale, quantize
 
@@ -86,6 +89,15 @@ class DraftLinear(RowsLinear):
         packed, sf = quantize(wf, gs)
         self.low = Nvfp4Linear(packed, sf, gs)
 
+    @classmethod
+    def from_parts(cls, packed: torch.Tensor, sf: torch.Tensor, gs: float) -> "DraftLinear":
+        """From quantized parts (the drafter's cache, Mtp): what __init__ makes of the BF16 weight."""
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        self.out_features, self.in_features = packed.shape[0], packed.shape[1] * 2
+        self.low = Nvfp4Linear(packed, sf, gs)
+        return self
+
     def rows(self, x2, r2, out):
         if x2.shape[0] <= MAX_ROWS:
             self.low.rows(x2, None, out)
@@ -98,7 +110,7 @@ class DraftLinear(RowsLinear):
 class DraftMLP(nn.Module):
     def __init__(self, g, u, d):
         super().__init__()
-        self.gate, self.up, self.down = DraftLinear(g), DraftLinear(u), DraftLinear(d)
+        self.gate, self.up, self.down = g, u, d
 
     def forward(self, x, residual=None):
         return self.down(F.silu(self.gate(x)) * self.up(x), residual)
@@ -126,29 +138,47 @@ class MtpState(FastState):
 class Mtp(nn.Module):
     """The MTP drafter for `target` (checkpoint at `path`). weights: optional safetensors with mtp.* tensors replacing the
     checkpoint's (tools/train_drafter.py). lowrank: the PCA basis of the low-rank draft head (tools/lowrank_draft_head.py),
-    used when the file exists."""
+    used when the file exists. cache: keep the quantized linears and the low-rank head in DRAFT_DIR, keyed by the files
+    they come from, so the next start reads them (~0.4 GB) instead of quantizing again (~3 s)."""
+
+    LINEARS = ("fc", "layers.0.self_attn.q_proj", "layers.0.self_attn.k_proj", "layers.0.self_attn.v_proj", "layers.0.self_attn.o_proj",
+               "layers.0.mlp.gate_proj", "layers.0.mlp.up_proj", "layers.0.mlp.down_proj")
 
     def __init__(self, target: FastQwen35, path: str, weights: str | None = None,
-                 lowrank: str | None = os.path.join(DRAFT_DIR, "draft_head_pca.safetensors")):
+                 lowrank: str | None = os.path.join(DRAFT_DIR, "draft_head_pca.safetensors"), cache: bool = True):
         super().__init__()
         cfg = target.cfg
         dev = self.dev = target.embed_tokens.weight.device
         self.weights = weights  # None: the checkpoint's
-        t, files = {}, {name: f for name, f in weight_map(path).items() if name.startswith("mtp.")}
+        files = {name: f for name, f in weight_map(path).items() if name.startswith("mtp.")}
+        lowrank = lowrank if lowrank and os.path.exists(lowrank) else None
+        self.cache_file = self._cache_path(path, files, weights, lowrank) if cache else None
+        q = read_tensors(self.cache_file, device=dev) if self.cache_file and os.path.exists(self.cache_file) else None
+        self.cached = q is not None
+        big = {n + ".weight" for n in self.LINEARS} if self.cached else set()  # quantized in the cache: not read as BF16
+        t = {}
         if weights:
-            for name, w in read_tensors(weights, device=dev).items():
+            for name, w in read_tensors(weights, [n for n in tensor_names(weights) if n[4:] not in big], dev).items():
                 if name not in files:
                     raise ValueError(f"{weights}: {name} is not a tensor of the checkpoint's MTP block (tools/train_drafter.py writes them)")
                 t[name[4:]] = w.to(torch.bfloat16)
         rest = {}  # the checkpoint's tensors that `weights` did not replace, read once per file
         for name, f in files.items():
-            if name[4:] not in t:
+            if name[4:] not in t and name[4:] not in big:
                 rest.setdefault(f, []).append(name)
         for f, names in rest.items():
             for name, w in read_tensors(os.path.join(path, f), names, dev).items():
                 t[name[4:]] = w.to(torch.bfloat16)
+        made: dict[str, torch.Tensor] = {}  # what a new cache gets
+
+        def lin(name):
+            if q is not None:
+                return DraftLinear.from_parts(q[name + ".w"], q[name + ".sf"], float(q[name + ".gs"]))
+            d = DraftLinear(t.pop(name + ".weight"))
+            made.update({name + ".w": d.low.w, name + ".sf": d.low.sf, name + ".gs": torch.tensor(d.low.gscale, dtype=torch.float64)})
+            return d
         P = "layers.0."
-        self.fc = DraftLinear(t["fc.weight"])
+        self.fc = lin("fc")
         self.pre_e = self._norm(t["pre_fc_norm_embedding.weight"], cfg)
         self.pre_h = self._norm(t["pre_fc_norm_hidden.weight"], cfg)
         self.norm = self._norm(t["norm.weight"], cfg)
@@ -157,7 +187,7 @@ class Mtp(nn.Module):
         layer.input_layernorm = self._norm(t[P + "input_layernorm.weight"], cfg)
         layer.post_attention_layernorm = self._norm(t[P + "post_attention_layernorm.weight"], cfg)
         a = layer.self_attn
-        a.q_proj, a.k_proj, a.v_proj, a.o_proj = (DraftLinear(t[P + f"self_attn.{n}_proj.weight"]) for n in "qkvo")
+        a.q_proj, a.k_proj, a.v_proj, a.o_proj = (lin(P + f"self_attn.{n}_proj") for n in "qkvo")
         a.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to(dev)
         a.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps).to(dev)
         with torch.no_grad():
@@ -165,7 +195,7 @@ class Mtp(nn.Module):
             a.k_norm.weight = nn.Parameter(t[P + "self_attn.k_norm.weight"], requires_grad=False)
         # q / k / v separate: each keeps its own NVFP4 scales
         KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]), rope_inv_freq(cfg, dev), cfg.mrope_section[1:])
-        layer.mlp = DraftMLP(t[P + "mlp.gate_proj.weight"], t[P + "mlp.up_proj.weight"], t[P + "mlp.down_proj.weight"])
+        layer.mlp = DraftMLP(lin(P + "mlp.gate_proj"), lin(P + "mlp.up_proj"), lin(P + "mlp.down_proj"))
         layer.__class__ = FastDecoderLayer
         self.layer = layer
         self.embed, self.lm_head, self.cfg = target.embed_tokens, target.lm_head, cfg
@@ -178,8 +208,46 @@ class Mtp(nn.Module):
         self.vocab_ids = torch.tensor(allids, device=dev)
         self._lm_draft = None  # the draft vocabulary's rows of lm_head (200 MB), only for the full head (lm_draft)
         self.lr_A = self.lr_B = None
-        if lowrank and os.path.exists(lowrank):
-            self._init_lowrank(lowrank)
+        if lowrank:
+            if q is not None:
+                self._set_lowrank(q["lr_A.w"], q["lr_A.sf"], float(q["lr_A.gs"]), q["lr_full.w"], q["lr_full.sf"], float(q["lr_full.gs"]))
+            else:
+                self._init_lowrank(lowrank)
+                made.update({"lr_A.w": self.lr_A.w, "lr_A.sf": self.lr_A.sf, "lr_A.gs": torch.tensor(self.lr_A.gscale, dtype=torch.float64),
+                             "lr_full.w": self.lr_full[0], "lr_full.sf": self.lr_full[1],
+                             "lr_full.gs": torch.tensor(self.lr_B.gscale, dtype=torch.float64)})
+        if self.cache_file and q is None:
+            try:
+                os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+                host = {}  # through pinned memory: a pageable copy out of the GPU runs at ~0.1 GB/s on this machine
+                for k, v in made.items():
+                    v = v.detach().contiguous()
+                    pin = torch.empty(v.numel() * v.element_size(), dtype=torch.uint8, pin_memory=True)
+                    pin.copy_(v.view(-1).view(torch.uint8))
+                    host[k] = pin.view(v.dtype).view(v.shape)
+                torch.cuda.synchronize()
+                tmp = self.cache_file + ".tmp"
+                save_file(host, tmp)
+                os.replace(tmp, self.cache_file)
+            except OSError as e:
+                print(f"[mtp] drafter cache not written ({e})", flush=True)
+
+    @staticmethod
+    def _cache_path(path: str, files: dict, weights: str | None, lowrank: str | None) -> str:
+        """The cache of the quantized drafter: named by the files the quantization depends on (the shards that hold
+        mtp.*, the fine-tuned weights, the low-rank basis), their sizes and modification times."""
+        def fid(f):
+            st = os.stat(f)
+            return [os.path.basename(f), st.st_size, int(st.st_mtime)]
+        key = {"v": 2, "checkpoint": os.path.basename(path), "shards": [fid(os.path.join(path, f)) for f in sorted(set(files.values()))],
+               "weights": fid(weights) if weights else None, "lowrank": fid(lowrank) if lowrank else None}
+        h = hashlib.blake2b(json.dumps(key, sort_keys=True).encode(), digest_size=8).hexdigest()
+        return os.path.join(DRAFT_DIR, f"quant-{h}.safetensors")
+
+    def _set_lowrank(self, wa, sa, ga, wb, sb, gb):
+        self.lr_A = Nvfp4Linear(wa, sa, ga)
+        self.lr_full = (wb, sb)                                                   # [V_target, r]
+        self.lr_B = Nvfp4Linear(wb[self.vocab_ids].contiguous(), sb[self.vocab_ids].contiguous(), gb, out_fp32=True)
 
     def _init_lowrank(self, file: str):
         """Low-rank draft head: with U [H, r] the top-r principal directions of the drafter's outputs, the draft logits are
@@ -198,9 +266,7 @@ class Mtp(nn.Module):
         del WU
         ga = nvfp4_global_scale(U)
         wa, sa = quantize(U.T.contiguous(), ga)
-        self.lr_A = Nvfp4Linear(wa, sa, ga)
-        self.lr_full = (wb, sb)                                                   # [V_target, r]
-        self.lr_B = Nvfp4Linear(wb[self.vocab_ids].contiguous(), sb[self.vocab_ids].contiguous(), gb, out_fp32=True)
+        self._set_lowrank(wa, sa, ga, wb, sb, gb)
 
     def set_prompt_vocab(self, prompt):
         """Fill the per-request draft-head rows with prompt tokens missing from the static set, in order of first
