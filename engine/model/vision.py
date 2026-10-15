@@ -121,10 +121,13 @@ class VisionTower:
         vc._attn_implementation = "sdpa"
         with torch.device("meta"):
             model = Qwen3_5VisionModel(vc)
-        sd = {}
+        sd, files = {}, {}
         for name, f in weight_map(path).items():
             if name.startswith("model.visual."):
-                with safe_open(os.path.join(path, f), framework="pt", device=str(device)) as sf:
+                files.setdefault(f, []).append(name)
+        for f, names in files.items():  # one open per file: each open parses the shard's header
+            with safe_open(os.path.join(path, f), framework="pt", device=str(device)) as sf:
+                for name in names:
                     sd[name[len("model.visual."):]] = sf.get_tensor(name).to(torch.bfloat16)
         model.load_state_dict(sd, strict=True, assign=True)
         with torch.device(device):  # its frequencies are a buffer, not a weight: computed again, in fp32 as transformers keeps them

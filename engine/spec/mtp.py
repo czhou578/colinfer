@@ -131,16 +131,20 @@ class Mtp(nn.Module):
         cfg = target.cfg
         dev = self.dev = target.embed_tokens.weight.device
         self.weights = weights  # None: the checkpoint's
-        t = {}
-        for name, f in weight_map(path).items():
-            if name.startswith("mtp."):
-                with safe_open(os.path.join(path, f), framework="pt", device=str(dev)) as sf:
-                    t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
+        t, files = {}, {name: f for name, f in weight_map(path).items() if name.startswith("mtp.")}
         if weights:
             with safe_open(weights, framework="pt", device=str(dev)) as sf:
                 for name in sf.keys():
-                    if not (name.startswith("mtp.") and name[4:] in t):
+                    if name not in files:
                         raise ValueError(f"{weights}: {name} is not a tensor of the checkpoint's MTP block (tools/train_drafter.py writes them)")
+                    t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
+        rest = {}  # the checkpoint's tensors that `weights` did not replace, read once per file
+        for name, f in files.items():
+            if name[4:] not in t:
+                rest.setdefault(f, []).append(name)
+        for f, names in rest.items():
+            with safe_open(os.path.join(path, f), framework="pt", device=str(dev)) as sf:
+                for name in names:
                     t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
         P = "layers.0."
         self.fc = DraftLinear(t["fc.weight"])
