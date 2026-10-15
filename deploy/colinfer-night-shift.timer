@@ -1,0 +1,11 @@
+# Starts deploy/colinfer-night-shift.service at 01:00 every night (docs/night_shift.md). Persistent is off: a night that
+# the machine was off is not made up the next morning.
+[Unit]
+Description=colinfer night shift at 01:00
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

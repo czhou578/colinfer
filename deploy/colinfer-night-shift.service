@@ -1,0 +1,24 @@
+# systemd user unit for the night shift (docs/night_shift.md): the Claude Code tasks of ~/.config/colinfer/night_shift.toml
+# run against the colinfer server, one after another. deploy/colinfer-night-shift.timer starts it at 01:00.
+# WorkingDirectory and ExecStart assume the clone is ~/Projects/colin-inference-engine, as deploy/colinfer.service does.
+#   systemctl --user link "$PWD/deploy/colinfer-night-shift.service" "$PWD/deploy/colinfer-night-shift.timer"
+#   systemctl --user enable --now colinfer-night-shift.timer   # every night at 01:00
+#   systemctl --user start colinfer-night-shift                # a run now (stop: the running task is killed, the report is written)
+#   journalctl --user -u colinfer-night-shift -f               # one line per task
+# The run needs the server (Wants= starts it when it is not running) and claude on PATH (~/.local/bin, which user
+# services do not get by default).
+[Unit]
+Description=colinfer night shift: Claude Code tasks against the local model
+Wants=colinfer.service
+After=colinfer.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/colin-inference-engine
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Projects/colin-inference-engine/.venv/bin/python tools/night_shift.py
+# a run lasts hours
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+KillMode=mixed
