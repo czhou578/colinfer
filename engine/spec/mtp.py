@@ -299,7 +299,8 @@ class MtpCycle:
     views into buffers shared by the graphs of every draft length, so a slot keeps its pending input when k changes.
     params: SamplerParams -> sampled cycle (slots with temperature > 0 accept drafts that equal the target's
     position-keyed sample, so the output is exactly plain sampling; greedy for the rest; engine/spec/accept.py);
-    None -> greedy cycle. drafts: MTP drafts made for the next cycle (default k; fewer when k is a suffix-match draft
+    None -> greedy cycle. pool: a graph memory pool shared with the other cycles (fast.py capture: the outputs are
+    valid until the next replay). drafts: MTP drafts made for the next cycle (default k; fewer when k is a suffix-match draft
     length, engine/spec/suffix.py, whose drafts come from the host). mask (optional, int32 [B, k+1, words]): the token
     bitmask of each verify row (constrained decoding, engine/runtime/grammar.py); the target's token at a row is chosen
     among the masked logits, so a draft outside its row's mask is never accepted.
@@ -308,7 +309,7 @@ class MtpCycle:
 
     def __init__(self, model: FastQwen35, mtp: Mtp, state: FastState, mst: MtpState, k: int = 3, params=None,
                  tok: torch.Tensor | None = None, stop_ids: torch.Tensor | None = None, drafts: int | None = None,
-                 mask: torch.Tensor | None = None):
+                 mask: torch.Tensor | None = None, pool=None):
         self.model, self.mtp, self.state, self.mst, self.k, self.params, self.mask = model, mtp, state, mst, k, params, mask
         self.drafts = drafts or k
         dev = state.pos_t.device
@@ -320,7 +321,7 @@ class MtpCycle:
         self._side = torch.cuda.Stream()  # the GDN commit's branch
         self.skip = torch.zeros(1, dtype=torch.int32, device=dev)  # draft early exit flag (skinny_skip)
         state.reset(kv=False)  # the capture's warm-up runs write the first rows; the rest of the KV is never read
-        self.graph, (self.out_tok, self.n, self.logits, self.H) = capture(self._body)
+        self.graph, (self.out_tok, self.n, self.logits, self.H) = capture(self._body, pool)
         state.reset(kv=False)
         mst.pos_t.zero_()
 

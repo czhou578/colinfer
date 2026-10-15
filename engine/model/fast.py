@@ -495,9 +495,12 @@ def attach_decode_copies(model: FastQwen35, files) -> int:
 
 
 # ------------------------------------------------------------------------------------------------------------ graph
-def capture(body):
+def capture(body, pool=None):
     """(a CUDA graph of body(), the outputs of body() in the graph). Two warm-up runs on a side stream first, so first-use
-    allocations and autotuning stay out of the graph. The warm-up executes body() for real."""
+    allocations and autotuning stay out of the graph. The warm-up executes body() for real. pool: a graph memory pool
+    (torch.cuda.graph_pool_handle()) shared with other graphs that never replay concurrently: their temporaries then
+    overlap instead of each graph keeping its own. A graph's outputs may then sit where another graph's temporaries
+    are, so they are valid until the next replay of any graph in the pool."""
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s), torch.inference_mode():
@@ -505,6 +508,6 @@ def capture(body):
             body()
     torch.cuda.current_stream().wait_stream(s)
     graph = torch.cuda.CUDAGraph()
-    with torch.inference_mode(), torch.cuda.graph(graph):
+    with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
         out = body()
     return graph, out

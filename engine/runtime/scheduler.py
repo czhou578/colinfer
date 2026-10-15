@@ -4,6 +4,8 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
 
 * State. One FastState holds all slots (KV cache, GDN conv / recurrent state, positions). With speculation, an MtpState
   also holds the own KV cache of the drafter. Each slot has its own CUDA graphs, on a single-slot view of the state.
+  The graphs share one memory pool: their temporaries overlap instead of each graph keeping its own (1.4 GB for 18
+  graphs), since only one replays at a time. A graph's outputs are read right after its replay, before any other.
 * Decode with MTP (the default). One CUDA graph per (slot, greedy | sampled, draft length k) runs a full speculative
   cycle: verify, acceptance, commit and drafts (engine/spec/mtp.py). Without MTP, each slot has one plain decode graph.
   - Each cycle picks k (3 or 7) for the most expected tokens per second. It uses the running acceptance rate of the
@@ -195,6 +197,7 @@ class Scheduler:
         # draft lengths of K_OPTIONS (capped by k) whose verify rows fit one weight pass of the skinny GEMM (MAX_ROWS =
         # 16), since a second pass streams every weight again. The pending drafts are a chain: a shorter k uses a prefix.
         self.k_opts = [kk for kk in sorted({min(kk, k) for kk in K_OPTIONS + (k,)}) if kk + 1 <= MAX_ROWS] or [MAX_ROWS - 1]
+        self.pool = torch.cuda.graph_pool_handle()  # one memory pool for every graph: they never replay concurrently
         if mtp is not None:
             self.mst = MtpState(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active, rope_delta=self.state.rope_delta)
             self.tok = torch.zeros(n_slots, self.kmax + 1, dtype=torch.long, device=dev)
@@ -206,7 +209,7 @@ class Scheduler:
                     for sampled in (False, True):
                         self.cycles[(b, sampled, kw)] = MtpCycle(model, mtp, sv, mv, kw, params=self.params.view(b, b + 1) if sampled else None,
                                                                  tok=self.tok[b:b + 1, :kw + 1], stop_ids=self.stop_buf[b:b + 1],
-                                                                 drafts=min(kw, k), mask=self.masks[b:b + 1, :kw + 1])
+                                                                 drafts=min(kw, k), mask=self.masks[b:b + 1, :kw + 1], pool=self.pool)
                     if b == 0:  # cycle time per k, for choosing k (the state is garbage here and reset below)
                         g = self.cycles[(b, False, kw)]
                         g.graph.replay()
@@ -224,7 +227,7 @@ class Scheduler:
             self.ctx_draft_s = kv(self.mst.k) / 2.4e11
             self.q_per_kv = cfg.num_attention_heads // cfg.num_key_value_heads
         else:
-            self.graphs = {b: DecodeGraph(model, self.state.view(b, b + 1), self.params.view(b, b + 1), self.masks[b:b + 1, :1])
+            self.graphs = {b: DecodeGraph(model, self.state.view(b, b + 1), self.params.view(b, b + 1), self.masks[b:b + 1, :1], pool=self.pool)
                            for b in range(n_slots)}
         self.state.reset()
         self.slots = [Slot(i) for i in range(n_slots)]
@@ -588,7 +591,7 @@ class Scheduler:
             o = g.out_tok.tolist()[0][:nb]
             s.tokens.append(s.y)
             s.tokens += o[:-1]
-            s.y, s.h_last = o[-1], g.H[0, nb - 1]
+            s.y, s.h_last = o[-1], g.H[0, nb - 1].clone()  # kept past the next replay, which may reuse the graph's output memory
             kf = min(kk, s.fresh)  # stale drafts say nothing about acceptance
             src, st = s.src, s.acc[s.src]
             st[0] = ACC_DECAY * st[0] + min(nb - 1, kf)
