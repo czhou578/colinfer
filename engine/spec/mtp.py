@@ -57,6 +57,7 @@ from engine.model.prefill import attend_cached, prefill, prepare_prefill
 from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
 from engine.runtime.sampler import apply_mask
 from engine.spec.accept import draw
+from engine.weights.direct import read_tensors
 from engine.weights.loader import dequant_nvfp4, weight_map
 from engine.weights.quantize import nvfp4_global_scale, quantize
 
@@ -135,19 +136,17 @@ class Mtp(nn.Module):
         self.weights = weights  # None: the checkpoint's
         t, files = {}, {name: f for name, f in weight_map(path).items() if name.startswith("mtp.")}
         if weights:
-            with safe_open(weights, framework="pt", device=str(dev)) as sf:
-                for name in sf.keys():
-                    if name not in files:
-                        raise ValueError(f"{weights}: {name} is not a tensor of the checkpoint's MTP block (tools/train_drafter.py writes them)")
-                    t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
+            for name, w in read_tensors(weights, device=dev).items():
+                if name not in files:
+                    raise ValueError(f"{weights}: {name} is not a tensor of the checkpoint's MTP block (tools/train_drafter.py writes them)")
+                t[name[4:]] = w.to(torch.bfloat16)
         rest = {}  # the checkpoint's tensors that `weights` did not replace, read once per file
         for name, f in files.items():
             if name[4:] not in t:
                 rest.setdefault(f, []).append(name)
         for f, names in rest.items():
-            with safe_open(os.path.join(path, f), framework="pt", device=str(dev)) as sf:
-                for name in names:
-                    t[name[4:]] = sf.get_tensor(name).to(torch.bfloat16)
+            for name, w in read_tensors(os.path.join(path, f), names, dev).items():
+                t[name[4:]] = w.to(torch.bfloat16)
         P = "layers.0."
         self.fc = DraftLinear(t["fc.weight"])
         self.pre_e = self._norm(t["pre_fc_norm_embedding.weight"], cfg)

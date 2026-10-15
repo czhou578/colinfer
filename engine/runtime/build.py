@@ -19,6 +19,7 @@ from engine.runtime.scheduler import Scheduler
 from engine.selftest import run_selftest
 from engine.spec.mtp import DRAFT_DIR, Mtp
 from engine.spec.suffix import MIN_MATCH
+from engine.weights.direct import release_buffers
 from engine.weights.loader import MODEL, resolve
 
 
@@ -81,6 +82,7 @@ def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 26214
     t1 = time.perf_counter()
     path, m = load_model(model, decode_weights, log)
     mtp = load_drafter(m, path, drafter_weights, log) if spec == "mtp" else None
+    release_buffers()  # the direct reader's pinned staging buffers (engine/weights/direct.py)
     if boundary == "auto":
         boundary = boundary_token(path)
     tower = VisionTower(path, load=vision_preload) if vision and vision_available(path) else None
