@@ -65,6 +65,7 @@ and the engine uses it when it is present:
 | `~/.cache/colinfer/requant/<snapshot>/attn_gdn_int{6_self_attn,5_linear_attn}.safetensors` | `tools/int6_requant.py --bits 6 --filter self_attn`, `--bits 5 --filter linear_attn` (needs the BF16 checkpoint `Qwen/Qwen3.8-27B`) | INT6 / INT5 decode copies of the FP8 attention and GDN projections: ~9.5% faster decode, perplexity within 0.25% |
 | `~/.cache/colinfer/drafter/mtp_ft.safetensors` | `tools/drafter_data.py`, then `tools/train_drafter.py --extract` / `--train` | a fine-tuned MTP drafter: more accepted drafts per cycle |
 | `~/.cache/colinfer/drafter/draft_head_pca.safetensors` | `tools/lowrank_draft_head.py` | a low-rank draft head: the same drafts for ~1/5 of the draft head's bytes (k=7 cycle 89.8 → 86.0 ms) |
+| `~/.cache/colinfer/drafter/quant-<key>.safetensors` | written by the first start | the drafter's NVFP4 linears and low-rank head, quantized once per drafter file (~3 s off every later start) |
 
 `docs/server.md` describes the flags, the API and the behavior of the server. `deploy/colinfer.service` runs the server
 under systemd. `docs/claude_code.md` tells you how to use the model from the Claude Code CLI. `docs/night_shift.md`

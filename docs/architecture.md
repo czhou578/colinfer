@@ -241,9 +241,11 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   3 × 262k × 32 KB = 25.8 GB. The checkpoint ring uses 4.9 GB, and the drafter KV and its NVFP4 weights ≈1.9 GB. The
   CUDA graphs share one memory pool (0.4 GB). The vision tower adds 0.92 GB with the first image. The conversation
   cache uses 0.6 GB of pinned host memory for its file buffers and 0.14 GB of fixed buffers on the GPU.
-- **Startup** takes ≈25 s. The engine loads the weights and runs a numerical self-test of each matmul path
-  (`engine/selftest.py`), which stops the start on a wrong kernel. Then it captures the graphs, calibrates the cycle
-  times and runs a warm-up.
+- **Startup** takes ≈14 s. The engine reads the weights straight from the NVMe into the GPU (`engine/weights/direct.py`:
+  O_DIRECT into pinned buffers, ~9 GB/s, nothing left in the page cache), takes the drafter's quantized parts from
+  `~/.cache/colinfer/drafter/quant-<key>.safetensors` (quantized once per drafter file) and runs a numerical self-test
+  of each matmul path (`engine/selftest.py`), which stops the start on a wrong kernel. Then it captures the graphs
+  into one memory pool, calibrates the cycle times and runs a warm-up. The vision tower loads with the first image.
 
 ## 7. Numerics and the identity guarantee
 
