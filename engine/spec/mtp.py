@@ -175,8 +175,7 @@ class Mtp(nn.Module):
         self.static[ids] = True
         allids = np.concatenate([ids, np.full(PROMPT_SLOTS, ids[0], dtype=ids.dtype)]).astype(np.int64)
         self.vocab_ids = torch.tensor(allids, device=dev)
-        lm = target.lm_head
-        self.lm_draft = Nvfp4Linear(lm.w[self.vocab_ids].contiguous(), lm.sf[self.vocab_ids].contiguous(), lm.gscale, out_fp32=True)
+        self._lm_draft = None  # the draft vocabulary's rows of lm_head (200 MB), only for the full head (lm_draft)
         self.lr_A = self.lr_B = None
         if lowrank and os.path.exists(lowrank):
             self._init_lowrank(lowrank)
@@ -212,11 +211,21 @@ class Mtp(nn.Module):
         extra += [int(self.vocab_ids[0])] * (slots - len(extra))
         ids = torch.tensor(extra, dtype=torch.long, device=self.dev)
         self.vocab_ids[self.n_static:] = ids
-        self.lm_draft.w[self.n_static:] = self.lm_head.w[ids]
-        self.lm_draft.sf[self.n_static:] = self.lm_head.sf[ids]
+        if self._lm_draft is not None:
+            self._lm_draft.w[self.n_static:] = self.lm_head.w[ids]
+            self._lm_draft.sf[self.n_static:] = self.lm_head.sf[ids]
         if self.lr_B is not None:
             self.lr_B.w[self.n_static:] = self.lr_full[0][ids]
             self.lr_B.sf[self.n_static:] = self.lr_full[1][ids]
+
+    @property
+    def lm_draft(self) -> Nvfp4Linear:
+        """The full draft head: lm_head's rows of the draft vocabulary (static, then the prompt's). The low-rank head
+        rescores its candidates against lm_head itself, so this copy exists only without it (and for the tools)."""
+        if self._lm_draft is None:
+            lm = self.lm_head
+            self._lm_draft = Nvfp4Linear(lm.w[self.vocab_ids].contiguous(), lm.sf[self.vocab_ids].contiguous(), lm.gscale, out_fp32=True)
+        return self._lm_draft
 
     def draft(self, g: torch.Tensor):
         """Greedy drafts from MTP outputs g [..., H] -> (token ids [...], the drafter's probability of each: softmax over
@@ -224,8 +233,9 @@ class Mtp(nn.Module):
         if self.lr_B is not None:  # low-rank scores, the top candidates rescored exactly
             g2 = g.reshape(-1, g.shape[-1]).contiguous()
             ap = self.lr_B(self.lr_A(g2))                                           # [N, V] fp32
-            cand = ap.topk(LOWRANK_CANDS, -1).indices                               # [N, C]
-            ex = ops().rescore_nvfp4(g2, self.lm_draft.w, self.lm_draft.sf, self.lm_draft.gscale, cand)
+            cand = ap.topk(LOWRANK_CANDS, -1).indices                               # [N, C] into the draft vocabulary
+            lm = self.lm_head  # the candidates' rows of lm_head itself: the bytes lm_draft would hold
+            ex = ops().rescore_nvfp4(g2, lm.w, lm.sf, lm.gscale, self.vocab_ids[cand])
             best = ex.argmax(-1, keepdim=True)
             ids = self.vocab_ids[cand.gather(-1, best)].view(g.shape[:-1])
             p = torch.exp(ex.gather(-1, best) - torch.logsumexp(ap, -1, keepdim=True)).clamp_max(1.0)
