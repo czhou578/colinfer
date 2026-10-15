@@ -31,10 +31,10 @@ import time
 
 import torch
 import torch.nn as nn
-from safetensors import safe_open
 
 from engine.kernels import ops
 from engine.model.qwen35 import Attention, DecoderLayer, GatedDeltaNet, ModelState, Qwen35Config, Qwen35ForCausalLM, rope_inv_freq
+from engine.weights.direct import read_tensors, tensor_names
 from engine.weights.loader import PREFIX, SKIP_PREFIXES, quant_kind, resolve, shard_files
 from engine.weights.quantize import REQUANT_DIR
 
@@ -186,11 +186,9 @@ def load_fast_model(path_or_repo: str, device="cuda") -> Qwen35ForCausalLM:
     cfg = Qwen35Config.from_checkpoint(path)
     t0 = time.time()
     raw: dict[str, torch.Tensor] = {}
-    for f in shard_files(path):
-        with safe_open(os.path.join(path, f), framework="pt", device=device) as sf:
-            for n in sf.keys():
-                if not n.startswith(SKIP_PREFIXES):
-                    raw[n] = sf.get_tensor(n)
+    for f in shard_files(path):  # direct reads (engine/weights/direct.py): ~9 GB/s against ~4 through safetensors, no page cache
+        f = os.path.join(path, f)
+        raw.update(read_tensors(f, [n for n in tensor_names(f) if not n.startswith(SKIP_PREFIXES)], device))
     with torch.device("meta"):
         model = Qwen35ForCausalLM(cfg)
     quant: dict[str, nn.Module] = {}
@@ -341,6 +339,7 @@ class KernelGDN(GatedDeltaNet):
         gdn.__class__ = cls
         gdn.qkvz = StackedFp8Linear([gdn.in_proj_qkv, gdn.in_proj_z])
         gdn.w_ba = torch.cat([gdn.in_proj_b.weight, gdn.in_proj_a.weight]).contiguous()
+        del gdn.in_proj_b, gdn.in_proj_a  # the kernels read w_ba (47 MB over the model otherwise kept twice)
         gdn._spec = None
         return gdn
 
@@ -467,30 +466,29 @@ def attach_decode_copies(model: FastQwen35, files) -> int:
     of linears attached."""
     n = 0
     for file in files:
-        with safe_open(file, framework="pt", device=str(model.embed_tokens.weight.device)) as f:
-            keys = set(f.keys())
+        t = read_tensors(file, device=model.embed_tokens.weight.device)
 
-            def copy_of(names):
-                if not all(PREFIX + m + ".qweight_lo" in keys for m in names):
-                    return None
-                gs = {float(f.get_tensor(PREFIX + m + ".weight_scale_2")) for m in names}
-                if len(gs) != 1:
-                    raise RuntimeError(f"{file}: {names} must share one global scale to stay one launch (tools/int6_requant.py)")
-                cat = lambda suffix: torch.cat([f.get_tensor(PREFIX + m + suffix) for m in names]).contiguous()  # noqa: E731
-                return IntLinear(cat(".qweight_lo"), cat(".qweight_hi"), cat(".weight_scale"), gs.pop())
-            for i, layer in enumerate(model.layers):
-                p = f"layers.{i}."
-                if layer.block_type == "full_attention":
-                    a = layer.self_attn
-                    parts = ((a.qkv, [p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"]), (a.o_proj, [p + "self_attn.o_proj"]))
-                else:
-                    g = layer.linear_attn
-                    parts = ((g.qkvz, [p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"]), (g.out_proj, [p + "linear_attn.out_proj"]))
-                for mod, names in parts:
-                    d = copy_of(names)
-                    if d is not None:
-                        mod.dec = d
-                        n += len(names)
+        def copy_of(names):
+            if not all(PREFIX + m + ".qweight_lo" in t for m in names):
+                return None
+            gs = {float(t[PREFIX + m + ".weight_scale_2"]) for m in names}
+            if len(gs) != 1:
+                raise RuntimeError(f"{file}: {names} must share one global scale to stay one launch (tools/int6_requant.py)")
+            cat = lambda suffix: torch.cat([t[PREFIX + m + suffix] for m in names]).contiguous()  # noqa: E731
+            return IntLinear(cat(".qweight_lo"), cat(".qweight_hi"), cat(".weight_scale"), gs.pop())
+        for i, layer in enumerate(model.layers):
+            p = f"layers.{i}."
+            if layer.block_type == "full_attention":
+                a = layer.self_attn
+                parts = ((a.qkv, [p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj"]), (a.o_proj, [p + "self_attn.o_proj"]))
+            else:
+                g = layer.linear_attn
+                parts = ((g.qkvz, [p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"]), (g.out_proj, [p + "linear_attn.out_proj"]))
+            for mod, names in parts:
+                d = copy_of(names)
+                if d is not None:
+                    mod.dec = d
+                    n += len(names)
     return n
 
 

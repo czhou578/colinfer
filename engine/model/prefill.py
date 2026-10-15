@@ -71,8 +71,6 @@ def prepare_prefill(model: FastQwen35):
         mlp.p_g = dict(mlp.p_gu, w=mlp.p_gu["w"][:I], sf=mlp.p_gu["sf"][:sfh], N=I)
         mlp.p_u = dict(mlp.p_gu, w=mlp.p_gu["w"][I:], sf=mlp.p_gu["sf"][sfh:], N=I)
         mlp.p_down["nc"] = torch.tensor([1.0 / mlp.p_down["in_scale"]], dtype=torch.float32, device=mlp.p_gu["w"].device)
-    if isinstance(model.lm_head, Nvfp4Linear):  # for all-token logits (perplexity); decode uses the skinny GEMM
-        model.p_lm = _nvfp4_operands([model.lm_head])
     torch.cuda.empty_cache()
     model.prefill_ready = True
 
@@ -225,6 +223,10 @@ def prefill(model: FastQwen35, input_ids: torch.Tensor, state: FastState, chunk:
         if return_hidden:
             hid.append(model.norm(x))
         if all_logits:
+            if model.p_lm is None:  # the lm_head as a GEMM operand (79 MB of swizzled scales): only the perplexity tool needs it
+                if not isinstance(model.lm_head, Nvfp4Linear):
+                    raise NotImplementedError("all-token logits need an NVFP4 lm_head")
+                model.p_lm = _nvfp4_operands([model.lm_head])
             xq = torch.empty(T, x.shape[1] // 2, dtype=torch.uint8, device=x.device)
             xsf = torch.empty(ops().nvfp4_sf_size(T, x.shape[1]), dtype=torch.uint8, device=x.device)
             ops().add_rmsnorm(x, None, model.norm.weight, model.norm.eps, q4=xq, sf4=xsf, in_scale4=model.p_lm["in_scale"])

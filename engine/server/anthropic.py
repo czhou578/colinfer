@@ -235,7 +235,8 @@ class Blocks:
     def __init__(self, drop_tool_calls: bool = False):
         self.content: list[dict] = []
         self.open: str | None = None  # "thinking" or "text" while that block is open
-        self.n_tool_calls = 0
+        self.parts: list[str] = []    # the open block's text so far (joined into `content` when it closes: a long reply's
+        self.n_tool_calls = 0         # deltas would otherwise copy the whole block each time)
         self.drop = drop_tool_calls
 
     def add(self, events) -> list[str]:
@@ -263,7 +264,7 @@ class Blocks:
                                     else {"type": "text", "text": ""})
                 start = {"type": "thinking", "thinking": "", "signature": ""} if key == "thinking" else {"type": "text", "text": ""}
                 out.append(sse("content_block_start", {"type": "content_block_start", "index": len(self.content) - 1, "content_block": start}))
-            self.content[-1][key] += x
+            self.parts.append(x)
             out.append(sse("content_block_delta", {"type": "content_block_delta", "index": len(self.content) - 1,
                                                    "delta": {"type": f"{key}_delta", key: x}}))
         return out
@@ -273,6 +274,8 @@ class Blocks:
         if self.open is None:
             return []
         i, out = len(self.content) - 1, []
+        self.content[i][self.open] = "".join(self.parts)
+        self.parts = []
         if self.open == "thinking":
             out.append(sse("content_block_delta", {"type": "content_block_delta", "index": i,
                                                    "delta": {"type": "signature_delta", "signature": SIGNATURE}}))

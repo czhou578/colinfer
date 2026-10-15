@@ -215,10 +215,10 @@ class Scheduler:
                         g.graph.replay()
                         torch.cuda.synchronize()
                         t0 = time.perf_counter()
-                        for _ in range(3):
+                        for _ in range(2):
                             g.graph.replay()
                         torch.cuda.synchronize()
-                        self.cycle_s[kw] = (time.perf_counter() - t0) / 3
+                        self.cycle_s[kw] = (time.perf_counter() - t0) / 2
             self.mst.pos_t.zero_()
             # cycle_s is measured at ~0 context; per token of a slot's context a cycle also reads the target's KV once
             # (multi-row attention: whatever k) and the drafter's KV once per draft step (seconds per token, ~240 GB/s)
