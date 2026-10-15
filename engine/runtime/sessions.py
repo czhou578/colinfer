@@ -18,9 +18,11 @@ reply after a restore from disk is the reply after a restore from memory, bit fo
 The scheduler (engine/runtime/scheduler.py) saves the checkpoints that later requests restore: the end of each reply and
 the message boundaries of each prompt, for prefixes of at least `min_tokens`. It saves them when a request ends, through
 a writer thread. The writer reads the KV rows of the full blocks straight from the slot, so the scheduler calls wait()
-before it rewrites rows of a slot that a pending save still has to read. The rows of the partial block, the newest ones,
-are copied with the GDN state when the save is queued. A next turn that keeps the slot's history up to the last full
-block (it restores a checkpoint of the same conversation) then starts without waiting for the write.
+before it rewrites rows of a slot that a pending save still has to read, and the GDN state straight from the
+scheduler's checkpoint ring, whose buffer the scheduler does not reuse while the save is pending (pinned()). The rows
+of the partial block, the newest ones, and the drafter's hidden state are copied into one of MAX_PENDING fixed buffers
+when the save is queued. A next turn that keeps the slot's history up to the last full block (it restores a
+checkpoint of the same conversation) then starts without waiting for the write.
 
 A restore runs on the engine thread at admission, when the disk holds a longer prefix of the prompt than the memory
 checkpoints. A failed read (a file evicted meanwhile, a disk error) falls back to prefill.
@@ -48,7 +50,7 @@ ROOT = os.path.expanduser("~/.cache/colinfer/sessions")
 BLOCK = 1024        # tokens per KV block: 34 MB with the drafter's rows
 MIN_TOKENS = 2048   # shorter prefixes are not worth a checkpoint of ~154 MB: their prefill takes ~0.6 s
 MIN_GAIN = 256      # a disk checkpoint must beat the best memory checkpoint by this many tokens (any prefill costs a weight pass)
-MAX_PENDING = 4     # saves that wait for the writer before save() blocks: each holds its GDN state and partial block on the GPU (~190 MB)
+MAX_PENDING = 4     # saves that wait for the writer before save() blocks: each holds a fixed buffer for its partial block (~36 MB)
 ALIGN = 4096        # direct I/O: buffer addresses, file offsets and lengths
 HEADER = 4096       # a JSON header at the start of each file, padded with spaces
 VERSION = 2         # of the file layout and the token hashing
@@ -96,8 +98,10 @@ class _Job:
     key: bytes
     reply: bool
     chain: list
-    own: torch.Tensor | None   # the checkpoint file's bytes after its header (device): the GDN state, the drafter's
-                               # hidden and the KV rows of the partial block [n - n % B, n), copied when queued
+    buf: int                   # the scheduler's ring buffer of the checkpoint: not reused while the save is pending
+    gdn: list | None           # device views of its GDN state (conv, then rec per layer) in the ring
+    own: int                   # the store's fixed buffer that holds the drafter's hidden and the KV rows of the partial
+    own_n: int                 # block [n - n % B, n), copied when queued; own_n bytes of it
     ready: torch.cuda.Event
 
 
@@ -128,7 +132,10 @@ class SessionStore:
         largest = -(-largest // ALIGN) * ALIGN
         self.wbuf = torch.empty(largest, dtype=torch.uint8, pin_memory=True)  # the writer's
         self.rbuf = [torch.empty(largest, dtype=torch.uint8, pin_memory=True) for _ in range(2)]  # restores alternate between them
-        self.wstream = torch.cuda.Stream(state.pos_t.device)
+        dev = state.pos_t.device
+        self.own_bufs = [torch.empty(2 * self.h_dim + (block - 1) * row, dtype=torch.uint8, device=dev) for _ in range(MAX_PENDING)]
+        self.own_free = list(range(MAX_PENDING))
+        self.wstream = torch.cuda.Stream(dev)
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
         self.files: collections.OrderedDict[str, int] = collections.OrderedDict()  # path -> bytes, least recently used first
@@ -248,10 +255,12 @@ class SessionStore:
                 + ([h] if h is not None else []))
 
     # ------------------------------------------------------------------------------------------------ save (engine thread)
-    def save(self, b: int, tokens, salt: str | None, reply: bool, conv: list, rec: list, h: torch.Tensor | None):
-        """Queues the checkpoint of the prefix `tokens` of slot b. conv / rec: its GDN state per layer (device tensors,
-        copied now), h: the drafter's input hidden state or None. The KV rows of the partial block [n - n % B, n) are
-        copied now too; the writer reads those of the full blocks [0, n - n % B) from the slot later (see wait())."""
+    def save(self, b: int, tokens, salt: str | None, reply: bool, buf: int, conv: list, rec: list, h: torch.Tensor | None):
+        """Queues the checkpoint of the prefix `tokens` of slot b. buf: its buffer in the scheduler's ring, which holds
+        conv / rec, its GDN state per layer (device views, read by the writer later: the scheduler leaves the buffer
+        alone while the save is pending, see pinned()); h: the drafter's input hidden state or None, copied now with the
+        KV rows of the partial block [n - n % B, n); the writer reads those of the full blocks [0, n - n % B) from the
+        slot later (see wait())."""
         toks = np.asarray(tokens, dtype=np.int64)  # image tokens are ids past 2^31 (engine/model/vision.py)
         n = len(toks)
         chain = self._chain(toks, salt, n // self.block)
@@ -263,11 +272,15 @@ class SessionStore:
                 return
             if any(j.key == key for j in self.pending):
                 return
-            while len(self.pending) >= MAX_PENDING:
+            while not self.own_free:
                 self.cv.wait()
-        gdn = list(conv) + list(rec) + ([h] if h is not None and self.mst is not None else [])
-        own = torch.cat([_bytes(t) for t in gdn + self._kv(b, n // self.block * self.block, n)])
-        job = _Job(b, n, key, reply, chain, own, torch.cuda.Event())
+            j = self.own_free.pop()
+        own, off = self.own_bufs[j], 0
+        for t in ([h] if h is not None and self.mst is not None else []) + self._kv(b, n // self.block * self.block, n):
+            m = _nbytes(t)
+            own[off:off + m].copy_(_bytes(t))
+            off += m
+        job = _Job(b, n, key, reply, chain, buf, list(conv) + list(rec), j, off, torch.cuda.Event())
         job.ready.record()
         with self.lock:
             self.pending.append(job)
@@ -287,6 +300,11 @@ class SessionStore:
             while self.pending:
                 self.cv.wait()
 
+    def pinned(self) -> set[int]:
+        """The ring buffers of the pending saves: the writer still reads their GDN state."""
+        with self.lock:
+            return {j.buf for j in self.pending}
+
     # ------------------------------------------------------------------------------------------------ the writer thread
     @torch.inference_mode()  # the buffers are inference tensors when the engine thread made them under inference mode
     def _run(self):
@@ -301,9 +319,10 @@ class SessionStore:
                 self.stats["errors"] += 1
                 self.log(f"[sessions] save of {job.n} tokens failed: {type(e).__name__}: {e}")
             finally:
-                job.own = None
+                job.gdn = None
                 with self.cv:
                     self.pending.remove(job)
+                    self.own_free.append(job.own)
                     self.cv.notify_all()
 
     def _write_job(self, j: _Job):
@@ -319,7 +338,7 @@ class SessionStore:
                 self._add(path, self._write(path, {"kind": "block", "rows": [i * B, (i + 1) * B]}, self._kv(j.slot, i * B, (i + 1) * B)),
                           ("b", key))
         path = os.path.join(self.dir, f"c-{j.n}-{int(j.reply)}-{j.key.hex()}.ck")
-        size = self._write(path, {"kind": "ckpt", "n": j.n, "rows": [nb * B, j.n]}, [j.own])
+        size = self._write(path, {"kind": "ckpt", "n": j.n, "rows": [nb * B, j.n]}, j.gdn + [self.own_bufs[j.own][:j.own_n]])
         self._add(path, size, ("c", j.n, j.key, j.reply))
 
     def _write(self, path: str, header: dict, pieces: list[torch.Tensor]) -> int:

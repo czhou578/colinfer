@@ -149,10 +149,35 @@ def test_the_next_turn_does_not_wait_for_the_write_of_the_last_reply(make, monke
     assert run(make(), p3).reused == len(p1) + len(r1.output) - 1  # a new engine: from disk
 
 
+def test_a_ring_buffer_is_not_reused_while_its_save_is_pending(make, monkeypatch):
+    """The writer reads a checkpoint's GDN state from the scheduler's ring. With a ring of two, the snapshots of the
+    next requests (in other slots: no wait for the save) would take that buffer; they must take the other one (or
+    none), so the file holds the saved state."""
+    gate, write = threading.Event(), SessionStore._write
+
+    def gated_write(self, *a):
+        gate.wait(5)
+        return write(self, *a)
+    monkeypatch.setattr(SessionStore, "_write", gated_write)
+    sched, rng = make(n_checkpoints=2), random.Random(12)
+    p1 = prompt(rng, 300)
+    r1 = run(sched, p1)  # its reply-end save waits for the gate, pinning its ring buffer
+    for _ in range(2):
+        run(sched, prompt(rng, 300))  # two snapshots each: they may reuse only the other buffer (the second finds none)
+    with sched.store.lock:
+        pend = {j.buf: j.n for j in sched.store.pending}
+    assert pend and all(len(c.tokens) == pend[c.buf] for c in sched.ckpts if c.buf in pend)  # a pinned buffer holds its saved state
+    gate.set()
+    sched.store.flush()
+    r2 = run(make(n_checkpoints=2), p1 + r1.output + prompt(rng, 10))  # a new engine: from disk, exact
+    assert r2.reused == len(p1) + len(r1.output) - 1
+
+
 def test_a_slot_that_still_holds_the_rows_reads_only_the_gdn_state(make, monkeypatch):
     sched, rng = make(n_checkpoints=1), random.Random(6)
     p1 = prompt(rng, 300)
     r1 = run(sched, p1)
+    sched.store.flush()  # saved: its ring buffer may be reused
     run(sched, prompt(rng, 100))  # another slot; the ring of one checkpoint now holds only this one
     assert not any(c.slot == 0 for c in sched.ckpts) and sched.slots[0].tokens[:len(p1)] == p1
     reads = []
@@ -176,8 +201,8 @@ def test_a_disk_restore_for_a_side_request_copies_the_prefix_into_another_slot(m
     system = prompt(rng, 300)
     main = chat(rng, system, prompt(rng, 1200))
     r1 = run(sched, main)
+    sched.store.flush()  # saved: the ring buffers may be reused
     run(sched, prompt(rng, 200))  # another conversation: its snapshots push the main one's system-prompt checkpoint out of the ring
-    sched.store.flush()
     assert not any(len(c.tokens) == 301 for c in sched.ckpts)
     r2 = run(sched, chat(rng, system, prompt(rng, 40)), 10)
     assert r2.slot != r1.slot and r2.reused == 301 and sched.store.stats["restores"] == 1

@@ -206,9 +206,10 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   checkpoint: the blocks and the checkpoint go back into a slot with direct reads (~12 GB/s) and pinned copies
   (~59 GB/s). If a slot still holds the KV of that prefix, only the checkpoint file is read. The writer reads the KV
   of the full blocks from the slot itself, so admission waits for a pending save before it rewrites rows that the save
-  still has to read. A save copies its partial block when it is queued, so the next turn of the conversation, which
-  keeps the history up to the last full block, does not wait for the write. A budget (64 GB) evicts the least
-  recently used files.
+  still has to read, and the GDN state from the checkpoint ring, whose buffer is not reused while the save is
+  pending. A save copies its partial block into a fixed buffer when it is queued, so the next turn of the
+  conversation, which keeps the history up to the last full block, does not wait for the write. A budget (64 GB)
+  evicts the least recently used files.
 - **Images** (`engine/model/vision.py`). The server resizes and patches each image as the checkpoint's image processor
   does (`engine/server/images.py`), and gives it a run of placeholder ids past the vocabulary: one per 2 x 2 group of
   16-pixel patches, derived from a hash of the pixels. Thus the memory and disk caches tell images apart. A prefill

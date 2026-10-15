@@ -283,15 +283,30 @@ class Scheduler:
         if same is not None:
             same.disk |= disk
             return
-        if not self.free_bufs:  # evict the oldest
-            self._drop(self.ckpts[0])
-        buf, b = self.free_bufs.pop(), s.idx
+        buf, b = self._take_buf(), s.idx
+        if buf is None:
+            return
         for i in self.gdn_layers:
             self.ring_conv[i][buf].copy_(self.state.conv[i][b])
             self.ring_rec[i][buf].copy_(self.state.rec[i][b])
         if self.ring_h is not None:
             self.ring_h[buf].copy_(s.h_last.view(-1))
         self.ckpts.append(Checkpoint(b, key, buf, s.salt, reply, disk or reply))
+
+    def _take_buf(self) -> int | None:
+        """A ring buffer for a new snapshot: a free one, else that of the oldest checkpoint, which goes. A buffer whose
+        state a pending disk save still reads (store.pinned()) is left alone; None when every buffer is such."""
+        pinned = self.store.pinned() if self.store is not None else ()
+        for b in self.free_bufs:
+            if b not in pinned:
+                self.free_bufs.remove(b)
+                return b
+        for c in self.ckpts:
+            if c.buf not in pinned:
+                self._drop(c)
+                self.free_bufs.remove(c.buf)
+                return c.buf
+        return None
 
     def _copy_kv(self, src: int, dst: int, L: int):
         """The KV rows [0, L) of slot src into slot dst (the target's and the drafter's), on the GPU."""
@@ -356,7 +371,7 @@ class Scheduler:
         for c in self.ckpts:
             if c.slot == s.idx and c.disk and not c.saved and len(c.tokens) >= st.min_tokens:
                 c.saved = True
-                st.save(s.idx, c.tokens, c.salt, c.reply, [self.ring_conv[i][c.buf] for i in self.gdn_layers],
+                st.save(s.idx, c.tokens, c.salt, c.reply, c.buf, [self.ring_conv[i][c.buf] for i in self.gdn_layers],
                         [self.ring_rec[i][c.buf] for i in self.gdn_layers], self.ring_h[c.buf] if self.ring_h is not None else None)
 
     # ---------------------------------------------------------------- admission
