@@ -197,6 +197,35 @@ final answer. That answer is the reply, in the format of the endpoint (`/v1/chat
 with or without a stream). The members' answers appear in the server log, and in the `committee` field of a chat
 completion without a stream.
 
+To use it, name the model `<name>-committee` in a request. Nothing else changes:
+
+```bash
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model": "qwen3.8-27b-committee", "messages": [{"role": "user", "content": "Review this design: ..."}]}'
+```
+
+The reply is a normal chat completion. Its `committee` field holds the members' answers, and the server log shows one
+line per member (`[chat member 1/3 ...]`), then the reply. On the Anthropic API, the `model` field of a `/v1/messages`
+request works the same way; Claude Code switches the model for one question with `/model` (`docs/claude_code.md`,
+section 8). To change the members, start the server with `--committee-roles roles.json`, a file like this (`{n}` in
+the reconcile instruction becomes the number of answers):
+
+```json
+{"roles": ["You are the implementer of this committee. ...",
+           "You are the skeptic of this committee. ...",
+           "You are the reviewer of this committee. ..."],
+ "reconcile": "The {n} members of a committee answered the request above independently. ... Write the single best final answer ..."}
+```
+
+To find out whether it helps on your questions, on a running server:
+
+```bash
+uv run python tools/committee_ab.py                        # the built-in design and review questions, single vs committee
+uv run python tools/committee_ab.py --prompts questions.md # your own prompts, separated by blank lines
+# judge ~/.cache/colinfer/committee_ab/<run>/pairs.md without looking at the key, then:
+uv run python tools/committee_ab.py --reveal ~/.cache/colinfer/committee_ab/<run>
+```
+
 - **Cost:** about 4x the time of a single answer for answers of the usual length. The members' prompts share the
   conversation's prefix, so with the prefix cache each member prefills its role text only, and the reconcile pass
   prefills the answers. A stream sends keep-alive pings while the members run, so the client's watchdog does not end it.
