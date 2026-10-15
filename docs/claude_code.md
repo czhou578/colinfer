@@ -261,3 +261,33 @@ each tool call of an agentic turn would take four times as long too.
 | The WebSearch tool fails with `API Error: 400 this server does not run server tools (web_search_20250305)`. | Web search is not available (section 7). | Give the information to the model in your request. |
 | The first answer of a long new conversation is slow. | The server reads the full prompt. | No action is necessary. Refer to section 7. |
 | The server stops with `engine failure`. | A CUDA error occurred. | Start the server again. If the server runs under systemd, the service restarts automatically. |
+
+## 9. Run tasks while you sleep (optional)
+
+The night shift runs a list of Claude Code tasks against the server while the machine idles. Each task works in its
+own git worktree, on a branch `night/<date>/<name>`, and a report lists the branches to review in the morning.
+`docs/night_shift.md` is the manual. The short version:
+
+1. Copy `deploy/night_shift.example.toml` to `~/.config/colinfer/night_shift.toml`. Write one `[[task]]` per job: the
+   repository, the prompt, and the commands the task may run, for example `allow = ["Bash(uv run pytest*)"]`.
+
+2. Check the file, then run one task now:
+
+   ```bash
+   uv run python tools/night_shift.py --dry-run
+   uv run python tools/night_shift.py --only <task name>
+   ```
+
+3. Schedule the nights (01:00). From the root of the clone:
+
+   ```bash
+   systemctl --user link "$PWD/deploy/colinfer-night-shift.service" "$PWD/deploy/colinfer-night-shift.timer"
+   systemctl --user enable --now colinfer-night-shift.timer
+   ```
+
+4. In the morning, open `~/.cache/colinfer/night_shift/<date>/report.md`. It lists each task, its status and its
+   branch, with the commands to review the branch and to resume the task's session.
+
+A task edits files in its worktree and runs the commands you allowed. Anything else that would ask a question is
+denied, so nothing waits at night. Do not allow a task to run the checks that load the model next to the server
+(`docs/night_shift.md`, section 6).

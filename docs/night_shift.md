@@ -11,6 +11,14 @@ most of the day, and a task of 30 to 60 model turns takes 5 to 10 minutes, so on
 > merge it. A task that needs judgment over many steps, such as a flaky test with an unclear cause, often ends in a
 > note rather than a fix.
 
+## The short version
+
+1. Copy `deploy/night_shift.example.toml` to `~/.config/colinfer/night_shift.toml` and write one `[[task]]` per job
+   (section 2).
+2. `uv run python tools/night_shift.py --dry-run`, then `--only <name>` for one task now (section 3).
+3. Link and enable `deploy/colinfer-night-shift.timer` for 01:00 every night (section 4).
+4. In the morning, read `~/.cache/colinfer/night_shift/<date>/report.md` and review the branches it lists (section 5).
+
 ## How the parts connect
 
 ```
