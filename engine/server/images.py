@@ -18,6 +18,8 @@ import io
 import json
 import os
 
+import torch
+
 from engine.model.vision import Image
 
 MAX_PIXELS = 2048 * 2048
@@ -68,30 +70,49 @@ class ImageProcessor:
     """The checkpoint's image processor, from its preprocessor_config.json. max_pixels caps the resized image."""
 
     def __init__(self, path: str, max_pixels: int = MAX_PIXELS):
-        from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
+        from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil, smart_resize
         c = json.load(open(os.path.join(path, "preprocessor_config.json")))
         size = c["size"]
         self.min_pixels, self.max_pixels = size["shortest_edge"], min(size["longest_edge"], max_pixels)
-        self.merge = c["merge_size"]
+        self.merge, self.patch = c["merge_size"], c["patch_size"]
+        self.resize = smart_resize  # the processor's choice of the resized size (height, width)
         self.proc = Qwen2VLImageProcessorPil(size={"shortest_edge": self.min_pixels, "longest_edge": self.max_pixels},
-                                             patch_size=c["patch_size"], temporal_patch_size=c["temporal_patch_size"], merge_size=self.merge,
+                                             patch_size=self.patch, temporal_patch_size=c["temporal_patch_size"], merge_size=self.merge,
                                              image_mean=c["image_mean"], image_std=c["image_std"])
 
-    def load(self, data: bytes) -> Image:
-        """Decodes and prepares one image. ValueError if it is not an image that Pillow reads."""
+    @staticmethod
+    def _open(data: bytes):
+        """The decoded image. ValueError if it is not an image that Pillow reads."""
         import PIL.Image
         try:
             img = PIL.Image.open(io.BytesIO(data))
             img.load()
         except (PIL.UnidentifiedImageError, PIL.Image.DecompressionBombError, OSError, ValueError) as e:
             raise ValueError(f"cannot read the image: {e}") from None
-        if min(img.size) < 1 or max(img.size) / min(img.size) > 200:
-            raise ValueError(f"image of {img.size[0]} x {img.size[1]} pixels: the aspect ratio must be below 200")
-        out = self.proc(images=[img.convert("RGB")], return_tensors="pt")
-        pixels = out["pixel_values"].float().contiguous()
-        grid = tuple(int(x) for x in out["image_grid_thw"][0])
-        key = int.from_bytes(hashlib.blake2b(pixels.numpy().tobytes() + repr(grid).encode(), digest_size=6).digest(), "little")
-        return Image(pixels, grid, key, self.merge)
+        return img
+
+    def load(self, data: bytes) -> Image:
+        """Checks one image (decoded now, not kept) and gives it its grid, from its size, and its key, from its bytes.
+        Its patches are made when the vision tower needs them (Image.patches: the resize, normalization and patching
+        take up to ~0.5 s), which a prefix cache hit never does. ValueError if it is not an image that Pillow reads."""
+        img = self._open(data)
+        w, h = img.size
+        if min(w, h) < 1 or max(w, h) / min(w, h) > 200:
+            raise ValueError(f"image of {w} x {h} pixels: the aspect ratio must be below 200")
+        rh, rw = self.resize(h, w, factor=self.patch * self.merge, min_pixels=self.min_pixels, max_pixels=self.max_pixels)
+        grid = (1, rh // self.patch, rw // self.patch)
+        hsh = hashlib.blake2b(digest_size=6)
+        hsh.update(data)
+        hsh.update(repr(grid).encode())
+        key = int.from_bytes(hsh.digest(), "little")
+        return Image(None, grid, key, self.merge, make=lambda: self.patches(data, grid))
+
+    def patches(self, data: bytes, grid: tuple) -> torch.Tensor:
+        """The processor's patches of an image that load() accepted: [patches, 3 * 2 * 16 * 16] float32."""
+        out = self.proc(images=[self._open(data).convert("RGB")], return_tensors="pt")
+        if tuple(int(x) for x in out["image_grid_thw"][0]) != grid:
+            raise ValueError(f"image grid {tuple(out['image_grid_thw'][0].tolist())} differs from the one derived from its size, {grid}")
+        return out["pixel_values"].float().contiguous()
 
 
 def expand(prompt: list[int], images: list[Image], pad_id: int, vocab: int) -> list[int]:

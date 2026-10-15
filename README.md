@@ -91,7 +91,7 @@ decision. In short:
 - **Constrained decoding** (llguidance): JSON schemas (`response_format`) and forced tool calls (`tool_choice`
   required / a named tool, also on the Anthropic API) mask the logits of each verify row, so speculation stays exact.
 - **Images** run through the checkpoint's vision tower (a 27-block ViT, BF16, loaded on the first image) at prefill. Their tokens get multimodal
-  RoPE positions, and the prefix caches tell images apart by a hash of their pixels, so a conversation that sends the
+  RoPE positions, and the prefix caches tell images apart by a hash of their bytes, so a conversation that sends the
   same screenshot again does not encode it again.
 
 ## Repository

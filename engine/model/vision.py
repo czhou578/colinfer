@@ -2,11 +2,12 @@
 Qwen3_5VisionModel) and the multimodal RoPE positions of a prompt that holds images.
 
 A prompt holds each image as a run of n placeholder tokens: one per 2 x 2 group of 16-pixel patches of the resized
-image. Each run gets its own ids past the vocabulary, derived from a hash of the pixels (Image.ids). Thus the prefix
-caches, in memory and on disk, tell two images apart, and a conversation that sends the same image again reuses it.
-Prefill embeds these tokens as the image pad token and replaces their rows with the output of the vision tower
-(engine/model/prefill.py embed()). The engine runs the vision tower only for images whose tokens it prefills, so a
-restored prefix costs nothing.
+image. Each run gets its own ids past the vocabulary, derived from a hash of the image's bytes and its grid
+(Image.ids). Thus the prefix caches, in memory and on disk, tell two images apart, and a conversation that sends the
+same image again reuses it. Prefill embeds these tokens as the image pad token and replaces their rows with the
+output of the vision tower (engine/model/prefill.py embed()). The engine runs the vision tower only for images whose
+tokens it prefills, and the image processor's work (resize, normalize, patch: up to ~0.5 s) happens only then
+(Image.patches), so a restored prefix costs nothing.
 
 Positions (multimodal RoPE, as get_rope_index of transformers' Qwen3.5): a text token at prompt index p rotates by
 p + delta, where delta sums max(gh, gw) - gh * gw over the images before p (gh x gw: the grid of the image's tokens).
@@ -19,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+from typing import Callable
 
 import numpy as np
 import torch
@@ -31,14 +33,24 @@ ID_BITS = 48  # image token ids: vocab + (key + j) mod 2^48, for token j of an i
 
 @dataclasses.dataclass
 class Image:
-    """One image of a prompt: the image processor's patches and grid (engine/server/images.py), its place in the prompt
-    and, once computed, the vision tower's output."""
-    pixels: torch.Tensor          # [patches, 3 * 2 * 16 * 16] float32 (CPU)
+    """One image of a prompt: its grid and key from the image processor (engine/server/images.py), its place in the
+    prompt, its patches (given, or made by `make` when the vision tower needs them) and, once computed, the tower's
+    output."""
+    pixels: torch.Tensor | None   # [patches, 3 * 2 * 16 * 16] float32 (CPU); None until patches() makes them
     grid: tuple[int, int, int]    # (t, h, w) in patches
-    key: int                      # a 48-bit hash of the pixels and the grid
+    key: int                      # a 48-bit hash of the image's bytes and the grid
     merge: int = 2                # patches per token side (spatial_merge_size)
     start: int = -1               # the prompt index of its first token
     embeds: torch.Tensor | None = None  # [n, hidden] bf16 (device), the vision tower's output
+    make: Callable[[], torch.Tensor] | None = None  # the processor's resize, normalize and patch of the image's bytes
+
+    def patches(self) -> torch.Tensor:
+        """The pixels, made now if the image came without them."""
+        if self.pixels is None:
+            if self.make is None:
+                raise ValueError("an image without pixels")
+            self.pixels = self.make()
+        return self.pixels
 
     @property
     def hw(self) -> tuple[int, int]:
@@ -128,10 +140,12 @@ class VisionTower:
         """The image's token embeddings [n, hidden] bf16, in the order of its tokens (row-major over its grid)."""
         if self.model is None:
             self.load()
-        if im.pixels.shape != (im.grid[0] * im.grid[1] * im.grid[2], self.patch_dim):
-            raise ValueError(f"image patches {tuple(im.pixels.shape)} do not match the grid {im.grid}")
-        px = im.pixels.to(self.device, non_blocking=True)
-        out = self.model(hidden_states=px, grid_thw=torch.tensor([im.grid], device=self.device)).pooler_output
+        px = im.patches()
+        if px.shape != (im.grid[0] * im.grid[1] * im.grid[2], self.patch_dim):
+            raise ValueError(f"image patches {tuple(px.shape)} do not match the grid {im.grid}")
+        out = self.model(hidden_states=px.to(self.device), grid_thw=torch.tensor([im.grid], device=self.device)).pooler_output
+        if im.make is not None:
+            im.pixels = None  # up to 100 MB of host memory, made again if ever needed
         return out.to(torch.bfloat16)
 
 

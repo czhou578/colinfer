@@ -704,6 +704,8 @@ class Scheduler:
         req.done, req.finish_reason, req.t_done = True, reason, time.perf_counter()
         for im in req.images:
             im.embeds = None
+            if im.make is not None:
+                im.pixels = None
         self.metrics.requests.inc(reason=reason)
         self.metrics.generated_tokens.inc(len(req.output))
         if req.hook is not None:

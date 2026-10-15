@@ -212,7 +212,9 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   evicts the least recently used files.
 - **Images** (`engine/model/vision.py`). The server resizes and patches each image as the checkpoint's image processor
   does (`engine/server/images.py`), and gives it a run of placeholder ids past the vocabulary: one per 2 x 2 group of
-  16-pixel patches, derived from a hash of the pixels. Thus the memory and disk caches tell images apart. A prefill
+  16-pixel patches, derived from a hash of the image's bytes and its grid (from its size, without processing it).
+  Thus the memory and disk caches tell images apart, and a resent image costs a decode (~30 ms) until the caches
+  miss: only then are its patches made (resize, normalize, patch: up to ~0.5 s) and the vision tower run. A prefill
   chunk that holds image tokens embeds them as the image pad token, then replaces their rows with the output of the
   vision tower (transformers' Qwen3_5VisionModel, BF16, 0.92 GB, loaded on the first image unless `--vision-preload`;
   run once per image and only when its tokens are prefilled).

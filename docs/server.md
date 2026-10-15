@@ -246,7 +246,9 @@ Other endpoints:
   image processor does, to multiples of 32 pixels between 65,536 pixels and `--image-max-pixels`, and gives it one
   prompt token per 32 x 32 pixels: a 1920 x 1080 screenshot is 2,040 tokens. The vision tower runs during the prefill
   of those tokens, 0.4 s for a 1080p screenshot. A conversation that sends the same image again restores it from the
-  prefix caches without running the vision tower again.
+  prefix caches without running the vision tower again: the image is keyed by its bytes and its grid, which the
+  server gets from the image's size, so a resent image costs a decode (~30 ms) and no processing until the caches
+  miss.
 
   The checkpoint's static activation scales were calibrated on text. Measured against the BF16 model of transformers
   on four test images, the engine's answer tokens differ more in log-probability on images (0.18 on average) than on

@@ -164,11 +164,27 @@ def test_image_processor_and_expansion():
     except Exception:  # noqa: BLE001
         pytest.skip("needs the checkpoint's preprocessor_config.json")
     a, b = proc.load(png("red", (640, 480))), proc.load(png("green", (640, 480)))
-    assert a.grid == (1, 30, 40) and a.n == 300 and a.pixels.shape == (1200, 3 * 2 * 16 * 16)
+    assert a.grid == (1, 30, 40) and a.n == 300 and a.pixels is None and a.patches().shape == (1200, 3 * 2 * 16 * 16)
     assert a.key != b.key and proc.load(png("red", (640, 480))).key == a.key
     assert proc.load(png("red", (8, 8))).n == 64  # small images grow to the minimum of 65,536 pixels
     with pytest.raises(ValueError):
         proc.load(b"not an image")
+    # the grid comes from the image's size alone: it must be the processor's, and the patches made later its patches
+    import random
+
+    from PIL import Image as PI
+    rng = random.Random(0)
+    sizes = [(8, 8), (1023, 769), (4000, 300), (300, 4000), (2048, 2048), (3000, 2000)]
+    sizes += [(rng.randrange(1, 1200), rng.randrange(1, 1200)) for _ in range(20)]
+    for w, h in sizes:
+        if max(w, h) / min(w, h) > 200:
+            continue
+        data = png((rng.randrange(256), 0, 0), (w, h))
+        im = proc.load(data)
+        want = proc.proc(images=[PI.open(io.BytesIO(data)).convert("RGB")], return_tensors="pt")
+        assert im.grid == tuple(int(x) for x in want["image_grid_thw"][0]), (w, h)
+        if w * h <= 1200 * 1200:
+            assert torch.equal(im.patches(), want["pixel_values"].float()), (w, h)
     p = images.expand([1, 2, 99, 3, 99], [a, b], 99, 1000)
     assert a.start == 2 and b.start == 303 and p == [1, 2] + a.ids(1000) + [3] + b.ids(1000)
     with pytest.raises(ValueError):
