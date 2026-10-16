@@ -8,6 +8,7 @@ refer to model-benchmarks, a separate benchmark harness that is not part of this
 
 | File | Date | Contents |
 |---|---|---|
+| `PLAN.md` | 2026-09-30 | the original plan and its targets, written before any code existed; kept as written. `docs/architecture.md` describes the engine as built |
 | `baseline.md`, `baselines_2026-10-03.md` | 2026-10-02/03 | Phase 0: the bandwidth and GEMM ceilings of the chip, vLLM / SGLang baselines, the frozen targets |
 | `gemm_peak_2026-10-02.txt`, `gemv_bench_2026-10-03.txt` | 2026-10-02/03 | raw GEMM-ceiling and GEMV benchmark output |
 | `bf16_inventory.txt`, `fp8_inventory.txt`, `nvfp4_inventory.txt` | 2026-10-03 | tensor inventories of the three checkpoints (`tools/tensor_inventory.py`) |

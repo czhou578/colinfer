@@ -16,7 +16,7 @@ stops), `tests/spec_check.py`. Plain decode (same prefill, same CUDA graph, no d
 The MTP configuration: FP8 drafter weights (per-row scales) and a draft lm_head over the 64k most frequent tokens plus
 the prompt tokens of the request. `tools/draft_vocab.py` chose the 64k tokens from WikiText prose, Python and JSON.
 
-| Exit criterion (PLAN.md Phase 4) | Result |
+| Exit criterion (docs/history/PLAN.md Phase 4) | Result |
 |---|---|
 | Greedy outputs identical with and without spec | **Met**: all prompts token-identical, n-gram and MTP |
 | Output distribution unchanged at T > 0 | **Met**: rejection sampling with a deterministic proposal. `tests/test_spec_accept.py` checks the emitted marginal over 30k trials (TV < 0.02). |

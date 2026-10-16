@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Training data for the drafter (PLAN.md Phase 6: better drafters): the own replies of the target model to varied
+"""Training data for the drafter (docs/history/PLAN.md Phase 6: better drafters): the own replies of the target model to varied
 prompts, generated through a running server (engine/server) and saved as token ids.
 
 The tool builds the prompts offline from local data:

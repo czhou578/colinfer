@@ -1,6 +1,6 @@
 # Baseline measurements (spark-44de)
 
-These are the ground-truth numbers for this unit. `tools/roofline.py` derives all performance targets in `PLAN.md`
+These are the ground-truth numbers for this unit. `tools/roofline.py` derives all performance targets in `docs/history/PLAN.md`
 from them. Run the measurements again after each change of driver, firmware, kernel or toolchain, and after a reboot.
 Add a dated row. Do not overwrite the old rows.
 

@@ -1,4 +1,4 @@
-"""Sampling that speculative decoding reproduces exactly (PLAN.md 4.5, Phase 4 week 14 / Phase 5).
+"""Sampling that speculative decoding reproduces exactly (docs/history/PLAN.md 4.5, Phase 4 week 14 / Phase 5).
 
 The engine draws each token by inverse CDF from the processed distribution p_t of the target (temperature -> min-p ->
 top-k -> top-p, exactly what plain sampling uses). It uses a uniform keyed by (seed, position t).

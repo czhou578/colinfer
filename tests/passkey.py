@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Long-context retrieval check (PLAN.md Phase 3 week 11: FP8 KV numerical stability at depth).
+"""Long-context retrieval check (docs/history/PLAN.md Phase 3 week 11: FP8 KV numerical stability at depth).
 
 The check hides a random 6-digit pass key at a given depth inside filler text of the requested length. Then it asks the
 model to repeat the key, greedy, with thinking off. This tests the chunked prefill (FlashInfer over a long FP8 or BF16

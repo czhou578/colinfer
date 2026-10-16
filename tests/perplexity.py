@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Perplexity on the WikiText test set (PLAN.md 4.7), per weight configuration.
+"""Perplexity on the WikiText test set (docs/history/PLAN.md 4.7), per weight configuration.
 
 It uses the cached Salesforce/wikitext wikitext-103-raw-v1 test split (identical to the test set of WikiText-2). The
 script joins the text with "\\n\\n" as in the HF perplexity guide, and tokenizes it with the tokenizer of the

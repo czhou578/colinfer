@@ -1,4 +1,4 @@
-# systemd user unit for the server: OpenAI and Anthropic APIs (PLAN.md Phase 5, docs/claude_code.md).
+# systemd user unit for the server: OpenAI and Anthropic APIs (docs/history/PLAN.md Phase 5, docs/claude_code.md).
 # WorkingDirectory and ExecStart below assume the clone is ~/Projects/colin-inference-engine. If your clone is elsewhere
 # (a plain `git clone` creates ./colinfer), change both paths first.
 #   systemctl --user link "$PWD/deploy/colinfer.service"   # from the root of the clone

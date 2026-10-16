@@ -23,7 +23,7 @@ harnesses. `docs/server.md` describes the usage.
 - **No prefix reuse in benchmarks:** for each benchmark, the engine ran with `--no-prefix-caching`, or with the
   `--no-cache` option of llama-benchy. The baselines also ran without a prefix cache, so the prefill numbers are raw.
 
-## Targets (PLAN.md 2.5 and docs/history/baseline.md section 5)
+## Targets (docs/history/PLAN.md 2.5 and docs/history/baseline.md section 5)
 
 | Target | Result | |
 |---|---|---|

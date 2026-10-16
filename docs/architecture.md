@@ -1,7 +1,7 @@
 # Architecture
 
 This page describes how colin-inference-engine runs `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark. It describes the
-engine as it is now. The dated logs in `docs/history/` (`phase*`, `baseline.md`, `results.md`) record how the engine got
+engine as it is now. The dated logs in `docs/history/` (`PLAN.md`, `phase*`, `baseline.md`, `results.md`) record how the engine got
 here. They give the measurements behind each decision and the alternatives that the project tried and removed.
 
 ## 1. The machine and the model

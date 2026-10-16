@@ -115,8 +115,7 @@ decision. In short:
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |
 | `tools/` | offline artifacts (decode copies, drafter training, low-rank head), checkpoint utilities, the night shift (`night_shift.py`: Claude Code tasks against the server while the machine idles) |
 | `bench/` | decode / prefill / attention / GEMM / end-to-end benchmarks, nsys trace summaries |
-| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `night_shift.md` (Claude Code tasks at night), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project. |
-| `PLAN.md` | the original plan and targets |
+| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `night_shift.md` (Claude Code tasks at night), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project, and `PLAN.md`, the original plan of 2026-09-30. |
 
 ## Testing
 
