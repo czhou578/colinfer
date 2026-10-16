@@ -262,7 +262,7 @@ each tool call of an agentic turn would take four times as long too.
 | The first answer of a long new conversation is slow. | The server reads the full prompt. | No action is necessary. Refer to section 7. |
 | The server stops with `engine failure`. | A CUDA error occurred. | Start the server again. If the server runs under systemd, the service restarts automatically. |
 
-## 9. Run tasks while you sleep (optional)
+## 10. Run tasks while you sleep (optional)
 
 The night shift runs a list of Claude Code tasks against the server while the machine idles. Each task works in its
 own git worktree, on a branch `night/<date>/<name>`, and a report lists the branches to review in the morning.
