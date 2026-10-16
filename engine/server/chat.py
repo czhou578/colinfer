@@ -1,4 +1,4 @@
-"""Chat formatting and output parsing for the server (PLAN.md 4.6).
+"""Chat formatting and output parsing for the server (docs/history/PLAN.md 4.6).
 
 * Prompt: the own Jinja chat template of the checkpoint, via `tokenizer.apply_chat_template`. tools, enable_thinking,
   reasoning_effort and any other chat_template_kwargs pass straight through. OpenAI-style assistant tool_calls

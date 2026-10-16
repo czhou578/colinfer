@@ -1,4 +1,4 @@
-"""Text-only Qwen3.5 / 3.6 / 3.8 family in plain PyTorch (PLAN.md Phase 1).
+"""Text-only Qwen3.5 / 3.6 / 3.8 family in plain PyTorch (docs/history/PLAN.md Phase 1).
 
 It mirrors modeling_qwen3_5.py of transformers op for op (same dtypes, same op order). Thus greedy generation is
 token-exact against the HF reference. Nothing here is fast. It is the correctness reference for the tests of each later

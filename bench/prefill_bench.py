@@ -5,7 +5,7 @@ TTFT = the prefill of the full prompt + the sample of the first token. (As in a 
 already exists.) The prompts are random token ids, because the cost does not depend on the content.
 
   uv run python bench/prefill_bench.py [--lens 512 2048 8192 32768] [--chunk 2048] [--profile]
-Targets (docs/history/baseline.md section 5 / PLAN.md Phase 3): >= 3,500 tok/s at 2k-8k (plan exit 2,500),
+Targets (docs/history/baseline.md section 5 / docs/history/PLAN.md Phase 3): >= 3,500 tok/s at 2k-8k (plan exit 2,500),
 TTFT(2k) <= 0.6 s (plan 0.8 s), 32k prompt <= 12 s (plan 16 s).
 """
 import argparse

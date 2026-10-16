@@ -6,7 +6,7 @@ Raw logs and outputs: `tests/parity_out/` (git-ignored).
 
 ## Exit criteria status
 
-| Criterion (PLAN.md Phase 1) | Result | Status |
+| Criterion (docs/history/PLAN.md Phase 1) | Result | Status |
 |---|---|---|
 | Token-exact vs HF transformers BF16 on 30 prompts x 128 tokens | 30/30 exact, logit KL 0, max abs logit difference 0.000 over the first 32 steps | **Met** |
 | Perplexity numbers committed per weight configuration | Below | Met |

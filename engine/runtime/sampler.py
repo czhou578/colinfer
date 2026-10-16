@@ -1,4 +1,4 @@
-"""In-graph sampler (PLAN.md 4.3 item 7): greedy / temperature / min-p / top-k / top-p per slot.
+"""In-graph sampler (docs/history/PLAN.md 4.3 item 7): greedy / temperature / min-p / top-k / top-p per slot.
 
 All parameters are in per-slot device buffers, so the decode CUDA graph can capture the sampler. The host rewrites the
 buffers only when the request of a slot changes.

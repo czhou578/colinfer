@@ -696,7 +696,7 @@ shipped NVFP4 MLP is already +0.4% over BF16 (6.9698 vs 6.9404). We did not cont
 
 ## 12. Two draft chains per cycle: measured, not built
 
-A second chain starts from the second-choice first token of the drafter (PLAN.md 4.5 item 3, the smallest tree). It
+A second chain starts from the second-choice first token of the drafter (docs/history/PLAN.md 4.5 item 3, the smallest tree). It
 helps only when the first draft is wrong and the second is right. After that, it continues exactly like the
 teacher-forced unroll. Thus `tools/twochain_sim.py` replays speculative cycles along the 75 held-out replies with the
 fine-tuned head, and counts the tokens per cycle. Its one-chain numbers reproduce those of the engine
