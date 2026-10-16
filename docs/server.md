@@ -24,8 +24,8 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--slots` | 3 | Conversations whose KV stays cached. The server runs one request at a time; the others wait in a FIFO queue. |
 | `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
-| `--drafter-weights` | `auto` | MTP head weights. `auto` uses `~/.cache/colinfer/drafter/mtp_ft.safetensors` (`tools/train_drafter.py`) when it exists. `none` uses the weights of the checkpoint. You can also give a path. Drafts change the speed, never the outputs. The first start with a given drafter file quantizes it and keeps the result in `~/.cache/colinfer/drafter/quant-<key>.safetensors` for the next starts. |
-| `--decode-weights` | `int` | `int`: decode the attention / GDN projections from INT6 / INT5 copies when both files exist in `~/.cache/colinfer/requant/<snapshot>/` (`tools/int6_requant.py --bits 6 --filter self_attn` and `--bits 5 --filter linear_attn`). This gives ~9.5% faster decode, perplexity within 0.25%, and uses +5.2 GB of GPU memory. Without the files, or with `checkpoint`, decode reads the FP8 weights. |
+| `--drafter-weights` | `auto` | MTP head weights. `auto` uses the fine-tuned head of the prepared directory (`tools/prepare.py`, `tools/train_drafter.py`) when it has one. `none` uses the weights of the checkpoint. You can also give a path. Drafts change the speed, never the outputs. The first start with a given drafter file quantizes it and keeps the result in `~/.cache/colinfer/drafter/quant-<key>.safetensors` for the next starts. |
+| `--decode-weights` | `int` | `int`: decode the attention / GDN projections from the INT6 / INT5 copies of the prepared directory (`tools/prepare.py`, which runs `tools/int6_requant.py`) when it has them. This gives ~9.5% faster decode, perplexity within 0.25%, and uses +5.2 GB of GPU memory. Without the files, or with `checkpoint`, decode reads the FP8 weights. |
 | `--no-prefix-caching` | off | Never reuse a prompt prefix: no checkpoint ring, no conversation cache on disk. Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
 | `--no-vision` | off | No image input. Images then become a short text note. |
@@ -226,7 +226,7 @@ completion without a stream.
   of a cycle can fall below 0.1. Then the remaining draft steps of the cycle skip their weight
   GEMMs (~0.35 ms instead of ~1.8 ms a step). The verify rejects their junk drafts, so the outputs do not change. See
   `DRAFT_STOP` in `engine/spec/mtp.py` and `docs/history/phase6_progress.md` section 18.
-- **Low-rank draft head.** `tools/lowrank_draft_head.py` makes `~/.cache/colinfer/drafter/draft_head_pca.safetensors`.
+- **Low-rank draft head.** `tools/lowrank_draft_head.py` makes the basis, and `tools/prepare.py` puts it in the prepared directory.
   With this file, each draft step scores a rank-1024 approximation of the draft lm head and rescores its top 256
   candidates exactly. This gives the same drafts as the full head for ~1/5 of its bytes (k=7 cycle 89.8 → 86.0 ms).
   Without the file, the engine uses the full draft head (`docs/history/phase6_progress.md` section 19).

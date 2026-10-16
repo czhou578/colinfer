@@ -718,11 +718,11 @@ def main(argv=None):
     ap.add_argument("--max-seq-len", type=int, default=D.max_seq_len, help="tokens per slot (prompt + output)")
     ap.add_argument("--spec", choices=("mtp", "none"), default=D.spec)
     ap.add_argument("--drafter-weights", default=D.drafter_weights,
-                    help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors (tools/train_drafter.py) when it "
-                         "exists, none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
+                    help="MTP head weights: auto = the fine-tuned head of the prepared directory (tools/prepare.py) when it has one, "
+                         "none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
     ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default=D.decode_weights,
-                    help="int: decode the attention / GDN projections from INT6 / INT5 copies (tools/int6_requant.py; ~9.5%% faster, "
-                         "perplexity within 0.25%%) when their files exist; checkpoint: from the FP8 weights")
+                    help="int: decode the attention / GDN projections from the INT6 / INT5 copies of the prepared directory "
+                         "(tools/prepare.py; ~9.5%% faster, perplexity within 0.25%%) when it has them; checkpoint: from the FP8 weights")
     ap.add_argument("--no-prefix-caching", action="store_true",
                     help="never reuse a prompt prefix (benchmarking raw prefill): no checkpoint ring, no conversation cache on disk")
     ap.add_argument("--session-cache-gb", type=float, default=D.session_cache_gb,

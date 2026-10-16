@@ -13,7 +13,7 @@ The cost per draft step (the engine streams the drafter again at each step, so i
     them to BF16 for each call (csrc/prefill_ops.cu dequant_nvfp4) instead of keeping a BF16 copy.
   * The draft head scores DRAFT_VOCAB frequent tokens (engine/spec/draft_vocab.npy) plus up to PROMPT_SLOTS tokens of
     the current prompts. It does not score the 248k vocabulary.
-  * With ~/.cache/colinfer/drafter/draft_head_pca.safetensors (tools/lowrank_draft_head.py), the head is a rank-1024
+  * With the low-rank basis of tools/lowrank_draft_head.py (from the prepared directory, engine/runtime/prepared.py), the head is a rank-1024
     approximation. The engine rescores its top LOWRANK_CANDS candidates exactly. This gives the same drafts for ~1/5 of
     the bytes.
 None of this changes the outputs, only how many drafts the verify accepts.
@@ -137,15 +137,15 @@ class MtpState(FastState):
 
 class Mtp(nn.Module):
     """The MTP drafter for `target` (checkpoint at `path`). weights: optional safetensors with mtp.* tensors replacing the
-    checkpoint's (tools/train_drafter.py). lowrank: the PCA basis of the low-rank draft head (tools/lowrank_draft_head.py),
-    used when the file exists. cache: keep the quantized linears and the low-rank head in DRAFT_DIR, keyed by the files
+    checkpoint's (tools/train_drafter.py). lowrank: the PCA basis of the low-rank draft head (tools/lowrank_draft_head.py;
+    the engine takes both from the prepared directory, engine/runtime/build.py), used when the file exists. cache: keep the
+    quantized linears and the low-rank head in DRAFT_DIR, keyed by the files
     they come from, so the next start reads them (~0.4 GB) instead of quantizing again (~3 s)."""
 
     LINEARS = ("fc", "layers.0.self_attn.q_proj", "layers.0.self_attn.k_proj", "layers.0.self_attn.v_proj", "layers.0.self_attn.o_proj",
                "layers.0.mlp.gate_proj", "layers.0.mlp.up_proj", "layers.0.mlp.down_proj")
 
-    def __init__(self, target: FastQwen35, path: str, weights: str | None = None,
-                 lowrank: str | None = os.path.join(DRAFT_DIR, "draft_head_pca.safetensors"), cache: bool = True):
+    def __init__(self, target: FastQwen35, path: str, weights: str | None = None, lowrank: str | None = None, cache: bool = True):
         super().__init__()
         cfg = target.cfg
         dev = self.dev = target.embed_tokens.weight.device

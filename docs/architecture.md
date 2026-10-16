@@ -46,7 +46,8 @@ The server does not use it. It is the reference for the tests of each kernel.
 | GDN in_proj_b / in_proj_a, conv, norms, embeddings | BF16 | BF16 | BF16 |
 | MTP block | BF16 | **NVFP4 copy** (round-to-nearest) | BF16 (cuBLAS) |
 
-`tools/int6_requant.py` makes the INT6 / INT5 copies from the BF16 checkpoint `Qwen/Qwen3.8-27B`. Their weight error is
+`tools/int6_requant.py` makes the INT6 / INT5 copies from the BF16 checkpoint `Qwen/Qwen3.8-27B`, and `tools/prepare.py` puts them in
+the prepared directory `~/.cache/colinfer/prepared/<snapshot>/`, which the engine reads at startup (`engine/runtime/prepared.py`). Their weight error is
 lower than that of the checkpoint's own FP8 (2.24% vs 2.67% relative), at 6.5 / 5.5 bits per weight. Each weight is a
 signed integer q with an e4m3 scale per 16 weights and an fp32 global scale. The file keeps the low bits in an
 NVFP4-layout nibble plane and the high bits in a second plane (`engine/weights/quantize.py`). Against the FP8 weights,
@@ -128,7 +129,7 @@ The engine streams the drafter weights again at each draft step, so the drafter 
 - Its linears run on NVFP4 copies on the skinny GEMM.
 - The draft head scores a static vocabulary of the 64k most frequent tokens (`draft_vocab.npy`) plus up to 4k tokens of
   the current prompts. It does not score all 248k rows.
-- With `draft_head_pca.safetensors`, the draft head is a **low-rank approximation** (g U)(W U)ᵀ. U holds the top 1024
+- With the low-rank basis of the prepared directory (`draft_head_pca.safetensors`), the draft head is a **low-rank approximation** (g U)(W U)ᵀ. U holds the top 1024
   principal directions of the drafter outputs (≈43 MB instead of ≈200 MB). The engine rescores the top 256 candidates
   of this approximation exactly against the real NVFP4 rows (`rescore_nvfp4`). The argmax of the full head is among
   them for 99.96% of drafts, and the measured acceptance does not change.

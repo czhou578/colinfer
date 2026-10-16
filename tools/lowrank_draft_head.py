@@ -71,13 +71,16 @@ def main():
     ap.add_argument("--n", type=int, default=40, help="prompts (tools/drafter_data.py mix)")
     ap.add_argument("--seed", type=int, default=5, help="prompt seed (the evals use 1)")
     ap.add_argument("--rank", type=int, default=1024)
-    ap.add_argument("--weights", default="auto", help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors if present")
+    ap.add_argument("--weights", default="auto",
+                    help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors if present, none = the checkpoint's, or a path")
     ap.add_argument("--out", default=DEFAULT_OUT)
     a = ap.parse_args()
     w = a.weights
     if w == "auto":
         w = os.path.expanduser("~/.cache/colinfer/drafter/mtp_ft.safetensors")
         w = w if os.path.exists(w) else None
+    elif w == "none":
+        w = None
     g, W = collect(a.n, a.seed, w)
     n = g.shape[0]
     tr, te = g[: n * 2 // 3], g[n * 2 // 3:]

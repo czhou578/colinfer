@@ -453,8 +453,10 @@ def to_fast(model: Qwen35ForCausalLM) -> FastQwen35:
 
 # ------------------------------------------------------------------------------------------------------------ decode copies
 def decode_copies_paths(path_or_repo: str) -> list[str]:
-    """INT6 attention + INT5 GDN decode copies of the checkpoint's FP8 projections (tools/int6_requant.py --bits 6 --filter
-    self_attn; --bits 5 --filter linear_attn). WikiText perplexity -0.21%, Python code +0.23% against the FP8 weights."""
+    """Where tools/int6_requant.py writes the INT6 attention + INT5 GDN decode copies of the checkpoint's FP8 projections
+    (--bits 6 --filter self_attn; --bits 5 --filter linear_attn). tools/prepare.py takes them from here into the prepared
+    directory, which the engine reads (engine/runtime/prepared.py). WikiText perplexity -0.21%, Python code +0.23%
+    against the FP8 weights."""
     d = os.path.join(REQUANT_DIR, os.path.basename(resolve(path_or_repo)))
     return [os.path.join(d, f) for f in ("attn_gdn_int6_self_attn.safetensors", "attn_gdn_int5_linear_attn.safetensors")]
 
