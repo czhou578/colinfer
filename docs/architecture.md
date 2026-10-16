@@ -46,7 +46,8 @@ The server does not use it. It is the reference for the tests of each kernel.
 | GDN in_proj_b / in_proj_a, conv, norms, embeddings | BF16 | BF16 | BF16 |
 | MTP block | BF16 | **NVFP4 copy** (round-to-nearest) | BF16 (cuBLAS) |
 
-`tools/int6_requant.py` makes the INT6 / INT5 copies from the BF16 checkpoint `Qwen/Qwen3.8-27B`. Their weight error is
+`tools/int6_requant.py` makes the INT6 / INT5 copies from the BF16 checkpoint `Qwen/Qwen3.8-27B`, and `tools/prepare.py` puts them in
+the prepared directory `~/.cache/colinfer/prepared/<snapshot>/`, which the engine reads at startup (`engine/runtime/prepared.py`). Their weight error is
 lower than that of the checkpoint's own FP8 (2.24% vs 2.67% relative), at 6.5 / 5.5 bits per weight. Each weight is a
 signed integer q with an e4m3 scale per 16 weights and an fp32 global scale. The file keeps the low bits in an
 NVFP4-layout nibble plane and the high bits in a second plane (`engine/weights/quantize.py`). Against the FP8 weights,
@@ -128,7 +129,7 @@ The engine streams the drafter weights again at each draft step, so the drafter 
 - Its linears run on NVFP4 copies on the skinny GEMM.
 - The draft head scores a static vocabulary of the 64k most frequent tokens (`draft_vocab.npy`) plus up to 4k tokens of
   the current prompts. It does not score all 248k rows.
-- With `draft_head_pca.safetensors`, the draft head is a **low-rank approximation** (g U)(W U)ᵀ. U holds the top 1024
+- With the low-rank basis of the prepared directory (`draft_head_pca.safetensors`), the draft head is a **low-rank approximation** (g U)(W U)ᵀ. U holds the top 1024
   principal directions of the drafter outputs (≈43 MB instead of ≈200 MB). The engine rescores the top 256 candidates
   of this approximation exactly against the real NVFP4 rows (`rescore_nvfp4`). The argmax of the full head is among
   them for 99.96% of drafts, and the measured acceptance does not change.
@@ -141,7 +142,7 @@ running per-token acceptance a of a slot, a cycle gives (1 − a^{k+1}) / (1 −
 this by the cycle time measured at startup, plus the KV reads that grow with the context. The verify rows must fit one
 skinny pass (k + 1 ≤ 16).
 
-**Suffix-match drafts** (`engine/spec/suffix.py`, `--suffix-drafts`, default 8). The history of a request is its prompt
+**Suffix-match drafts** (`engine/spec/suffix.py`, repeats of 8 or more tokens). The history of a request is its prompt
 and the reply so far. When the last 8 or more tokens of the history occurred earlier in it, the next cycle uses other
 drafts. It verifies the tokens that followed the earlier occurrence instead of the MTP drafts.
 
@@ -216,7 +217,7 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   Thus the memory and disk caches tell images apart, and a resent image costs a decode (~30 ms) until the caches
   miss: only then are its patches made (resize, normalize, patch: up to ~0.5 s) and the vision tower run. A prefill
   chunk that holds image tokens embeds them as the image pad token, then replaces their rows with the output of the
-  vision tower (transformers' Qwen3_5VisionModel, BF16, 0.92 GB, loaded on the first image unless `--vision-preload`;
+  vision tower (transformers' Qwen3_5VisionModel, BF16, 0.92 GB, loaded on the first image;
   run once per image and only when its tokens are prefilled).
   Positions follow multimodal RoPE (`get_rope_index` of transformers): the tokens of an image that starts at s
   rotate by (t, h, w) = (s', s' + row, s' + col), with s' the rotary position of s, and the text after it continues

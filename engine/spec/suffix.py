@@ -12,7 +12,7 @@ backwards to the longest match.
 """
 from array import array
 
-MIN_MATCH = 8    # the server's default --suffix-drafts: shorter repeats are left to the MTP drafter
+MIN_MATCH = 8    # the server's suffix-draft minimum: shorter repeats are left to the MTP drafter
 NGRAM = 3        # tokens of the lookup key (the shortest match found)
 MAX_MATCH = 32   # match lengths are measured up to this
 MAX_CANDS = 16   # occurrences of the key examined, newest first

@@ -57,15 +57,23 @@ the engine first uses them, in about a minute (`engine/kernels/__init__.py`). Th
 The server has no authentication. It listens on 127.0.0.1 by default. Do not expose it to a network that you do not
 trust.
 
-Three optional files make decode faster. They do not change the output of the model. You make each file once, offline,
-and the engine uses it when it is present:
+One prepare step makes decode faster. It does not change the output of the model. Run it once, offline, with the
+server stopped. It gathers the files below into `~/.cache/colinfer/prepared/<snapshot>/` with a `manifest.json`, and
+the engine loads that directory when it exists (`engine/runtime/prepared.py`):
+
+```bash
+uv run hf download Qwen/Qwen3.8-27B                      # the BF16 checkpoint (55.6 GB), for the INT copies; or pass --skip-int
+uv run python tools/prepare.py                           # a few minutes on the GPU
+```
 
 | File | Made by | Effect |
 |---|---|---|
-| `~/.cache/colinfer/requant/<snapshot>/attn_gdn_int{6_self_attn,5_linear_attn}.safetensors` | `tools/int6_requant.py --bits 6 --filter self_attn`, `--bits 5 --filter linear_attn` (needs the BF16 checkpoint `Qwen/Qwen3.8-27B`) | INT6 / INT5 decode copies of the FP8 attention and GDN projections: ~9.5% faster decode, perplexity within 0.25% |
-| `~/.cache/colinfer/drafter/mtp_ft.safetensors` | `tools/drafter_data.py`, then `tools/train_drafter.py --extract` / `--train` | a fine-tuned MTP drafter: more accepted drafts per cycle |
-| `~/.cache/colinfer/drafter/draft_head_pca.safetensors` | `tools/lowrank_draft_head.py` | a low-rank draft head: the same drafts for ~1/5 of the draft head's bytes (k=7 cycle 89.8 → 86.0 ms) |
-| `~/.cache/colinfer/drafter/quant-<key>.safetensors` | written by the first start | the drafter's NVFP4 linears and low-rank head, quantized once per drafter file (~3 s off every later start) |
+| INT6 / INT5 decode copies of the FP8 attention and GDN projections | `tools/int6_requant.py`, run by `prepare.py` | ~9.5% faster decode, perplexity within 0.25% |
+| a fine-tuned MTP drafter, when one exists | `tools/drafter_data.py`, then `tools/train_drafter.py --extract` / `--train`; `prepare.py` takes the file | more accepted drafts per cycle |
+| a low-rank draft head | `tools/lowrank_draft_head.py`, run by `prepare.py` on that drafter | the same drafts for ~1/5 of the draft head's bytes (k=7 cycle 89.8 → 86.0 ms) |
+
+The first start quantizes the drafter and keeps the result in `~/.cache/colinfer/drafter/quant-<key>.safetensors`
+(~3 s off every later start).
 
 `docs/server.md` describes the flags, the API and the behavior of the server. `deploy/colinfer.service` runs the server
 under systemd. `docs/claude_code.md` tells you how to use the model from the Claude Code CLI. `docs/night_shift.md`

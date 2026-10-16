@@ -712,40 +712,23 @@ def main(argv=None):
     D = ServerConfig()  # the defaults of the flags
     ap = argparse.ArgumentParser(description="colin-inference-engine: an OpenAI- and Anthropic-compatible server")
     ap.add_argument("--model", default=D.model, help="HF repo id (in the local cache) or checkpoint directory")
-    ap.add_argument("--served-model-name", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--slots", type=int, default=D.slots, help="conversations whose KV stays cached; one request runs at a time")
-    ap.add_argument("--max-queue", type=int, default=D.max_queue,
-                    help="requests that can wait for the running one; past it, a request gets a 503 (/v1/messages: 529). 0: no limit")
-    ap.add_argument("--max-output-tokens", type=int, default=D.max_output_tokens,
-                    help="cap on the output tokens of a request, whatever its max_tokens asks (0: the room left in the slot)")
-    ap.add_argument("--max-request-seconds", type=float, default=D.max_request_seconds,
-                    help="a request ends this long after it arrived, running or queued, with finish_reason length (0: never)")
     ap.add_argument("--max-seq-len", type=int, default=D.max_seq_len, help="tokens per slot (prompt + output)")
     ap.add_argument("--spec", choices=("mtp", "none"), default=D.spec)
     ap.add_argument("--drafter-weights", default=D.drafter_weights,
-                    help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors (tools/train_drafter.py) when it "
-                         "exists, none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
-    ap.add_argument("--k", type=int, default=D.k, help="longest MTP draft; each cycle picks 3 or k from the measured acceptance")
-    ap.add_argument("--suffix-drafts", type=int, default=D.suffix_drafts, metavar="N",
-                    help="with MTP: draft the continuation of an earlier occurrence of the last N+ tokens (prompt or reply so far), up to "
-                         "15 tokens when one request decodes; 0 = off. Speeds up replies that repeat their input (code edits)")
-    ap.add_argument("--checkpoints", type=int, default=D.checkpoints, help="prefix checkpoint ring size (154 MB each)")
+                    help="MTP head weights: auto = the fine-tuned head of the prepared directory (tools/prepare.py) when it has one, "
+                         "none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
     ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default=D.decode_weights,
-                    help="int: decode the attention / GDN projections from INT6 / INT5 copies (tools/int6_requant.py; ~9.5%% faster, "
-                         "perplexity within 0.25%%) when their files exist; checkpoint: from the FP8 weights")
+                    help="int: decode the attention / GDN projections from the INT6 / INT5 copies of the prepared directory "
+                         "(tools/prepare.py; ~9.5%% faster, perplexity within 0.25%%) when it has them; checkpoint: from the FP8 weights")
     ap.add_argument("--no-prefix-caching", action="store_true",
-                    help="never reuse a prompt prefix (benchmarking raw prefill; = --checkpoints 0 --session-cache-gb 0)")
+                    help="never reuse a prompt prefix (benchmarking raw prefill): no checkpoint ring, no conversation cache on disk")
     ap.add_argument("--session-cache-gb", type=float, default=D.session_cache_gb,
                     help="disk budget of the conversation cache (KV and GDN state of past conversations, restored after an eviction "
                          "or a restart); 0: off")
-    ap.add_argument("--session-dir", default=D.session_dir, help="directory of the conversation cache")
     ap.add_argument("--no-vision", action="store_true", help="no image input: images become a text note, and the vision tower is not loaded")
-    ap.add_argument("--vision-preload", action="store_true",
-                    help="load the vision tower (0.92 GB) at startup and warm up the image path, instead of on the first image")
-    ap.add_argument("--image-max-pixels", type=int, default=D.image_max_pixels,
-                    help="resize larger images to this many pixels (one prompt token per 32 x 32 pixels)")
     ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
@@ -775,13 +758,13 @@ def main(argv=None):
     from transformers import AutoTokenizer  # a slow import: after the memory cap is set, so a crash here is cheap
     path = resolve(a.model)
     tokenizer = AutoTokenizer.from_pretrained(path)
-    cfg = ServerConfig(model=a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=0 if a.no_prefix_caching else a.checkpoints,
-                       spec=a.spec, k=a.k, drafter_weights=a.drafter_weights, suffix_drafts=a.suffix_drafts, decode_weights=a.decode_weights,
+    # the values without a flag (the queue depth, the request time cap, the checkpoint ring, the draft lengths, the image
+    # size, the cache directory) are the defaults of ServerConfig
+    cfg = ServerConfig(model=a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=0 if a.no_prefix_caching else D.checkpoints,
+                       spec=a.spec, drafter_weights=a.drafter_weights, decode_weights=a.decode_weights,
                        boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
-                       max_queue=a.max_queue, max_output_tokens=a.max_output_tokens, max_request_seconds=a.max_request_seconds,
                        api_key=a.api_key, mem_cap_bytes=mem_cap_bytes, committee_size=a.committee_size, committee_roles=a.committee_roles,
-                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, session_dir=a.session_dir,
-                       vision=not a.no_vision, vision_preload=a.vision_preload, image_max_pixels=a.image_max_pixels)
+                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, vision=not a.no_vision)
     hf = json.load(open(os.path.join(path, "config.json")))
     hf_config = hf.get("text_config", hf)
     gen = json.load(open(os.path.join(path, "generation_config.json"))) if os.path.exists(os.path.join(path, "generation_config.json")) else {}
@@ -794,7 +777,7 @@ def main(argv=None):
         raise SystemExit(f"engine failed to start: {worker.error!r}")
     thinking = {"auto": None, "on": True, "off": False}[a.thinking]
     effort = None if a.reasoning_effort == "auto" else a.reasoning_effort
-    app = build_app(worker, tokenizer, a.served_model_name or a.model, gen_defaults, hf_config, thinking, effort, committee)
+    app = build_app(worker, tokenizer, a.model, gen_defaults, hf_config, thinking, effort, committee)
     log(f"[server] startup {time.perf_counter() - t0:.1f} s; listening on http://{a.host}:{a.port}/v1")
     import uvicorn
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=30)

@@ -450,3 +450,50 @@ def test_constraints_of_both_apis(monkeypatch):
         assert w.submitted[-1].constraint == want, body
     for bad in ({"tool_choice": {"type": "any"}}, {"tools": anth_tool, "tool_choice": {"type": "tool"}}, {"output_format": {"type": "json"}}):
         assert c.post("/v1/messages", json={**m, **bad}).status_code == 400, bad
+
+
+def test_main_wires_the_flags(monkeypatch):
+    """main() builds the ServerConfig from the flags that remain. The values that have no flag (the queue depth, the
+    request time cap, the checkpoint ring, the draft lengths, the image size) are the defaults of ServerConfig. The
+    engine thread, the app and the HTTP server are stand-ins; the tokenizer is the checkpoint's."""
+    import threading
+
+    import engine.server.api as api
+    from engine.weights.loader import MODEL, resolve
+    try:
+        resolve(MODEL)
+    except Exception:
+        pytest.skip("checkpoint not in the local HF cache")
+    if not api.torch.cuda.is_available():
+        pytest.skip("main() reads the GPU's memory size")
+    got = {}
+
+    class FakeThread:
+        def __init__(self, cfg, log):
+            got["cfg"], self.ready, self.error = cfg, threading.Event(), None
+            self.ready.set()
+
+        def start(self):
+            pass
+
+    def fake_app(worker, tokenizer, name, gen_defaults, hf_config, thinking, effort, committee):
+        got.update(name=name, thinking=thinking, effort=effort, committee=committee, gen=gen_defaults)
+        return "app"
+    import uvicorn
+    monkeypatch.setattr(api, "Worker", FakeThread)
+    monkeypatch.setattr(api, "build_app", fake_app)
+    monkeypatch.setattr(api.torch.cuda, "set_per_process_memory_fraction", lambda f: None)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: got.update(served=True))
+    api.main(["--no-prefix-caching", "--spec", "none", "--slots", "1", "--reasoning-effort", "medium", "--committee-size", "0",
+              "--session-cache-gb", "3", "--no-vision", "--mem-cap-gb", "70"])
+    cfg = got["cfg"]
+    assert (cfg.checkpoints, cfg.session_cache_gb, cfg.spec, cfg.slots, cfg.vision) == (0, 0, "none", 1, False)  # --no-prefix-caching wins
+    assert cfg.mem_cap_bytes == 70 * 10**9 and cfg.committee_size == 0
+    D = ServerConfig()
+    assert (cfg.max_queue, cfg.max_output_tokens, cfg.max_request_seconds) == (D.max_queue, D.max_output_tokens, D.max_request_seconds)
+    assert (cfg.k, cfg.suffix_drafts, cfg.image_max_pixels, cfg.session_dir, cfg.vision_preload) == (D.k, D.suffix_drafts, D.image_max_pixels,
+                                                                                                        D.session_dir, D.vision_preload)
+    assert got["name"] == cfg.model == D.model and got["effort"] == "medium" and got["thinking"] is None and got["committee"] is None
+    assert got["served"] and "temperature" in got["gen"]
+    api.main(["--session-cache-gb", "0", "--thinking", "off"])
+    assert got["cfg"].checkpoints == D.checkpoints == 32 and got["thinking"] is False and got["committee"] is not None

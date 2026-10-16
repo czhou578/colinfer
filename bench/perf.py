@@ -129,7 +129,7 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--lens", type=int, nargs="+", default=[2048, 8192, 32768])
-    ap.add_argument("--suffix", type=int, default=MIN_MATCH, help="suffix-match drafts of at least N tokens (the server's --suffix-drafts; 0: off)")
+    ap.add_argument("--suffix", type=int, default=MIN_MATCH, help="suffix-match drafts of at least N tokens (the server uses 8; 0: off)")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     avail0, total = meminfo_kb("MemAvailable"), meminfo_kb("MemTotal")
