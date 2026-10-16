@@ -1,0 +1,21 @@
+# systemd user unit for the local gateway of Claude Code (engine/server/gateway.py, docs/claude_code.md "Claude and Qwen in
+# one picker"): local models go to the colinfer server, every other model goes to api.anthropic.com. It needs no GPU and
+# does not depend on colinfer.service: when the server is down, the Claude rows of the picker keep working.
+# The paths assume the clone is ~/Projects/colin-inference-engine, as deploy/colinfer.service does.
+#   systemctl --user link "$PWD/deploy/colinfer-gateway.service"
+#   systemctl --user enable --now colinfer-gateway
+#   journalctl --user -u colinfer-gateway -f          # one line per request: method, path, model, destination, status, time
+[Unit]
+Description=colinfer gateway for Claude Code: local models to the server, the rest to api.anthropic.com
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/colin-inference-engine
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/Projects/colin-inference-engine/.venv/bin/python -m engine.server.gateway --host 127.0.0.1 --port 8010
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

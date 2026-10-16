@@ -28,6 +28,8 @@ dependencies = [
     # Build helper for torch.utils.cpp_extension / CMake.
     "ninja>=1.11",
     "fastapi>=0.142.2",
+    # The local gateway for Claude Code (engine/server/gateway.py) relays requests to the server or to api.anthropic.com.
+    "httpx>=0.28",
     # HTTP server: uvicorn picks up uvloop and httptools when they are installed (its [standard] extra also brings
     # file watching, websockets and .env support, which the server does not use).
     "uvicorn>=0.54.0",

@@ -250,7 +250,57 @@ each tool call of an agentic turn would take four times as long too.
    /model qwen3.8-27b
    ```
 
-## 9. Troubleshooting
+## 9. Claude and Qwen in one picker (optional)
+
+Every model request of Claude Code goes to one address, `ANTHROPIC_BASE_URL`. A small gateway on this machine
+(`engine/server/gateway.py`) takes that place and routes by model name. The Qwen rows go to the colinfer server. The
+Claude rows go to `api.anthropic.com` with your claude.ai login. You switch between them with the model button at the
+bottom of the prompt box, or with `/model`. The gateway needs no GPU, so the Claude rows work while the server is down.
+
+> **NOTE:** Anthropic does not support non-Claude models through a gateway. The Claude rows bill to your subscription as
+> before: with only `ANTHROPIC_BASE_URL` set, Claude Code keeps the claude.ai login as its credential.
+
+1. Start the gateway as a user service. From the root of the clone:
+
+   ```bash
+   systemctl --user link "$PWD/deploy/colinfer-gateway.service"
+   systemctl --user enable --now colinfer-gateway
+   curl -s localhost:8010/health
+   ```
+
+2. Point Claude Code at the gateway and add the Qwen rows. Edit `~/.claude/settings.json`. These keys apply to the VS
+   Code extension and to the CLI:
+
+   ```json
+   {
+     "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8010" },
+     "modelPicker": {
+       "options": [
+         { "model": "qwen3.8-27b", "label": "Qwen3.8-27B (local)", "description": "colinfer on this machine" },
+         { "model": "qwen3.8-27b-committee", "label": "Qwen3.8-27B committee (local)",
+           "description": "three members and a reconcile pass, about 4x slower" }
+       ]
+     }
+   }
+   ```
+
+   > **CAUTION:** Do not set `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` in this setup. A token there replaces your
+   > login, and the Claude rows stop with a 401.
+
+3. Reload VS Code with "Developer: Reload Window". New chats show the Qwen rows after the built-in rows. The Default row
+   stays your Claude model. Pick a Qwen row for a question, and pick a Claude row to go back.
+
+What the gateway sends where:
+
+- To `api.anthropic.com`: the request as it came, with the login token and the `anthropic-beta` header.
+- To the server: the request without the login token, so the token never reaches the local process, and without the
+  attribution block that Claude Code puts first in the system prompt. Thus the server's prefix cache works across
+  sessions, and this setup does not need `CLAUDE_CODE_ATTRIBUTION_HEADER=0` from section 3.
+- One log line per request: method, path, model, destination, status and time. No header, no body.
+
+Run the server without `--api-key` in this setup. The `claude-qwen` command of section 3 still works beside the gateway.
+
+## 10. Troubleshooting
 
 | Symptom | Possible cause | Remedy |
 |---|---|---|
@@ -261,3 +311,35 @@ each tool call of an agentic turn would take four times as long too.
 | The WebSearch tool fails with `API Error: 400 this server does not run server tools (web_search_20250305)`. | Web search is not available (section 7). | Give the information to the model in your request. |
 | The first answer of a long new conversation is slow. | The server reads the full prompt. | No action is necessary. Refer to section 7. |
 | The server stops with `engine failure`. | A CUDA error occurred. | Start the server again. If the server runs under systemd, the service restarts automatically. |
+| With the gateway (section 9), a Qwen row answers `the colinfer server ... does not answer`. | The server is not running. | `systemctl --user start colinfer`, then ask again. The Claude rows work meanwhile. |
+| With the gateway, every row answers `401`. | `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` is set, so Claude Code sends that token instead of your login. | Remove the variable from `~/.claude/settings.json` and your shell, then reload the window. |
+
+## 11. Run tasks while you sleep (optional)
+
+The night shift runs a list of Claude Code tasks against the server while the machine idles. Each task works in its
+own git worktree, on a branch `night/<date>/<name>`, and a report lists the branches to review in the morning.
+`docs/night_shift.md` is the manual. The short version:
+
+1. Copy `deploy/night_shift.example.toml` to `~/.config/colinfer/night_shift.toml`. Write one `[[task]]` per job: the
+   repository, the prompt, and the commands the task may run, for example `allow = ["Bash(uv run pytest*)"]`.
+
+2. Check the file, then run one task now:
+
+   ```bash
+   uv run python tools/night_shift.py --dry-run
+   uv run python tools/night_shift.py --only <task name>
+   ```
+
+3. Schedule the nights (01:00). From the root of the clone:
+
+   ```bash
+   systemctl --user link "$PWD/deploy/colinfer-night-shift.service" "$PWD/deploy/colinfer-night-shift.timer"
+   systemctl --user enable --now colinfer-night-shift.timer
+   ```
+
+4. In the morning, open `~/.cache/colinfer/night_shift/<date>/report.md`. It lists each task, its status and its
+   branch, with the commands to review the branch and to resume the task's session.
+
+A task edits files in its worktree and runs the commands you allowed. Anything else that would ask a question is
+denied, so nothing waits at night. Do not allow a task to run the checks that load the model next to the server
+(`docs/night_shift.md`, section 6).
