@@ -56,6 +56,11 @@ class FakeWorker:
         self.metrics = Metrics()
         self.reply, self.error = CharTokenizer().encode(reply), error
         self.submitted, self.aborted = [], []
+        self.spec = None  # (cycles, drafted, accepted) to give each request, as the speculative scheduler would
+
+    def _spec(self, req):
+        if self.spec is not None:
+            req.cycles, req.drafted, req.accepted = self.spec
 
     def submit(self, req):
         self.submitted.append(req)
@@ -73,6 +78,7 @@ class FakeWorker:
                 break
             if len(req.output) >= req.max_new_tokens:
                 break
+        self._spec(req)
         req.done, req.finish_reason, req.t_done = True, reason, time.perf_counter()
         req.hook.finish(req)
 
@@ -394,6 +400,44 @@ def test_output_tokens_and_time_of_a_request_are_capped():
     c.post(CHAT, json={"messages": USER, "max_tokens": 3})
     c.post("/v1/messages", json={"max_tokens": 50, "messages": USER})
     assert [r.max_new_tokens for r in w.submitted] == [5, 3, 5] and all(r.max_seconds == 7.5 for r in w.submitted)
+
+
+def test_timings_count_each_phase():
+    """Each phase has its tokens and its rate: the prefill over the prompt tokens no checkpoint served, the decode over
+    the output tokens after the first, the acceptance over the drafts verified. A phase the request never reached (an
+    end in the queue, or during the prefill) has no rate."""
+    from engine.runtime.scheduler import Request
+    r = Request(list(range(1000)), reused=600, t_submit=10.0, t_admit=10.5, t_first=10.7, t_done=14.7, output=list(range(201)),
+                cycles=50, drafted=350, accepted=150)
+    t = oai.timings(r)
+    assert (t["queue_s"], t["ttft_s"], t["prefill_tokens"], t["prefill_s"], t["prefill_tok_s"]) == (0.5, 0.7, 400, 0.2, 2000.0)
+    assert (t["decode_tokens"], t["decode_s"], t["decode_tok_s"]) == (200, 4.0, 50.0)
+    assert (t["decode_cycles"], t["draft_tokens"], t["draft_accepted"], t["draft_accept_rate"]) == (50, 350, 150, 0.4286)
+    queued = oai.timings(Request([1, 2, 3], t_submit=10.0, t_done=12.0))  # a timeout in the queue
+    assert (queued["queue_s"], queued["ttft_s"], queued["prefill_s"], queued["prefill_tok_s"], queued["decode_tok_s"]) == (2.0, None, 0.0, None, None)
+    cut = oai.timings(Request([1, 2, 3], t_submit=10.0, t_admit=10.0, t_done=12.0))  # an abort during the prefill
+    assert (cut["queue_s"], cut["ttft_s"], cut["prefill_s"], cut["prefill_tok_s"], cut["draft_accept_rate"]) == (0.0, None, 2.0, None, None)
+    one = oai.timings(Request([1, 2, 3], t_submit=1.0, t_admit=1.0, t_first=2.0, t_done=2.0, output=[7]))  # a stop token first
+    assert (one["prefill_tok_s"], one["decode_tokens"], one["decode_tok_s"]) == (3.0, 0, None)
+
+
+def test_the_log_line_shows_each_phase(monkeypatch):
+    """One line per request: the phases with their tokens and rates, and the acceptance when the server drafted."""
+    from engine.server import api
+    lines = []
+    monkeypatch.setattr(api, "log", lambda *a: lines.append(" ".join(map(str, a))))
+    c, w = client("hello world<|im_end|>")
+    w.spec = (5, 15, 9)
+    assert c.post(CHAT, json={"messages": USER}).status_code == 200
+    r = w.submitted[0]
+    seg = lines[0].split(" | ")
+    assert re.fullmatch(rf"\[chat -?\d+\] slot -1 prompt {len(r.prompt)} \(cached 0\) -> {len(r.output)} tok, stop; queue 0\.00s ttft 0\.00s", seg[0])
+    assert seg[1] == f"prefill {len(r.prompt)} tok -"  # the fake's first token comes at its admission: no prefill time
+    assert re.fullmatch(rf"decode {len(r.output) - 1} tok \d+\.\d tok/s", seg[2])
+    assert seg[3] == f"accept 60% (9/15 drafts, {(len(r.output) - 1) / 5:.1f} tok/cycle)"
+    w.spec, lines[:] = None, []  # a plain server: no accept segment
+    c.post(CHAT, json={"messages": USER})
+    assert len(lines) == 1 and len(lines[0].split(" | ")) == 3
 
 
 def test_a_timeout_reads_as_a_cut_off():

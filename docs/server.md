@@ -128,8 +128,9 @@ Responses:
   - In a stream, each call arrives in one delta when it is complete.
 - **Usage:** `usage` includes `prompt_tokens_details.cached_tokens`, the prompt tokens that the server restored from a
   checkpoint, in memory or on disk.
-- **Timings:** a `timings` object gives the queue time, the TTFT, the prefill tokens and speed, and the decode time and
-  speed.
+- **Timings:** a `timings` object gives one count and one rate per phase: the queue time, the TTFT, the prefill tokens
+  and speed, the decode tokens, time and speed, and the speculation of the decode: the cycles, the draft tokens that the
+  cycles verified and accepted, and the acceptance rate. A rate is `null` when the request did not reach its phase.
 - **Streaming metrics:** the first content chunk of a stream carries vLLM-style `request_metrics`.
 
 Other endpoints:

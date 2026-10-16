@@ -70,8 +70,12 @@ Keep terminal 1 open. The server shows one line for each request that it complet
 show as `[msg ...]`, for example:
 
 ```
-22:10:33 [msg 24] slot 0 prompt 15887 (cached 15818) -> 588 tok, stop; queue 0.00s ttft 0.13s decode 49.7 tok/s
+22:10:33 [msg 24] slot 0 prompt 15887 (cached 15818) -> 588 tok, stop; queue 0.00s ttft 0.13s | prefill 69 tok 530 tok/s | decode 587 tok 49.7 tok/s | accept 62% (612/980 drafts, 3.6 tok/cycle)
 ```
+
+The line has one segment per phase. `prefill` counts the prompt tokens that no checkpoint served, with their speed.
+`decode` counts the output tokens after the first, with their speed. `accept` is the draft acceptance rate: the draft
+tokens that the speculative cycles accepted, over the draft tokens that they verified, and the output tokens per cycle.
 
 > **NOTE:** To run the server as a systemd service, refer to the "systemd" section of `docs/server.md`.
 

@@ -142,6 +142,9 @@ class Request:
     t_admit: float = 0.0
     t_first: float = 0.0            # first output token
     t_done: float = 0.0
+    cycles: int = 0                 # decode steps: speculative cycles, or plain steps (the first token comes from the prefill)
+    drafted: int = 0                # draft tokens the cycles verified: k per cycle, the junk rows after a draft early exit included
+    accepted: int = 0               # draft tokens the cycles accepted (the accepted prefix of each cycle's drafts)
 
 
 @dataclasses.dataclass
@@ -600,6 +603,8 @@ class Scheduler:
             m.drafted.inc(kk, source=src)  # per source: the MTP head, or the copy of an earlier match (suffix)
             m.accepted.inc(nb - 1, source=src)
             m.tokens_per_cycle.observe(nb, source=src)
+            req = s.req  # the request's own counts, before _emit may end it (its finish hook reads them)
+            req.cycles, req.drafted, req.accepted = req.cycles + 1, req.drafted + kk, req.accepted + nb - 1
             lp = self._logprobs(g.logits[0, :nb], o, s.req.logprobs) if s.req.logprobs is not None else None
             self._emit(s, o, lp)
             if s.sfx is not None and s.phase == "decode":
@@ -615,6 +620,7 @@ class Scheduler:
             y = int(nxt.tolist()[0])
             s.tokens.append(s.y)
             s.y = y
+            s.req.cycles += 1
             lp = self._logprobs(g.logits[0:1], [y], s.req.logprobs) if s.req.logprobs is not None else None
             self._emit(s, [y], lp)
         m.step_seconds.observe(time.perf_counter() - t0, kind="decode")

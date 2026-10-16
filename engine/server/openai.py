@@ -29,12 +29,27 @@ def usage(req: EngineRequest) -> dict:
 
 
 def timings(req: EngineRequest) -> dict:
-    pre = len(req.prompt) - req.reused
-    prefill_s = max(req.t_first - req.t_admit, 1e-9)
-    decode_s = max(req.t_done - req.t_first, 1e-9)
-    return {"queue_s": round(req.t_admit - req.t_submit, 4), "ttft_s": round(req.t_first - req.t_submit, 4), "prefill_tokens": pre,
-            "prefill_s": round(prefill_s, 4), "prefill_tok_s": round(pre / prefill_s, 1), "decode_s": round(decode_s, 4),
-            "decode_tok_s": round((len(req.output) - 1) / decode_s, 2) if len(req.output) > 1 else None}
+    """The phases of a finished request (llama.cpp's `timings`), each with its token count and its rate:
+
+    * queue: submit to admission (the restore of a checkpoint is part of it);
+    * prefill: admission to the first token, over the prompt tokens that no checkpoint served;
+    * decode: the first token to the end, over the output tokens after the first (the first comes from the prefill);
+    * speculation: the decode cycles, the draft tokens they verified (k per cycle) and accepted, and the acceptance rate.
+
+    A rate is None when its phase has nothing to count, or when the request ended (an abort, a timeout) before the phase:
+    a request that ended in the queue has no TTFT and no prefill rate; one that ended during its prefill has no prefill
+    rate (the prefill time is the time it ran)."""
+    pre, dec = len(req.prompt) - req.reused, max(len(req.output) - 1, 0)
+    admit = req.t_admit or req.t_done  # 0.0: it ended in the queue
+    first = req.t_first or req.t_done  # 0.0: it ended before its first token
+    prefill_s, decode_s = first - admit, req.t_done - first
+    return {"queue_s": round(admit - req.t_submit, 4), "ttft_s": round(first - req.t_submit, 4) if req.t_first else None,
+            "prefill_tokens": pre, "prefill_s": round(prefill_s, 4),
+            "prefill_tok_s": round(pre / prefill_s, 1) if req.t_first and pre > 0 and prefill_s > 0 else None,
+            "decode_tokens": dec, "decode_s": round(decode_s, 4),
+            "decode_tok_s": round(dec / decode_s, 2) if dec > 0 and decode_s > 0 else None,
+            "decode_cycles": req.cycles, "draft_tokens": req.drafted, "draft_accepted": req.accepted,
+            "draft_accept_rate": round(req.accepted / req.drafted, 4) if req.drafted > 0 else None}
 
 
 def finish_reason(r: EngineRequest) -> str:

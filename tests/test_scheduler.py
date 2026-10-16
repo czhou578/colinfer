@@ -120,6 +120,22 @@ def test_queued_requests_match_the_reference(make):
         assert r.output == reference(r.prompt, r.max_new_tokens) and r.finish_reason == "length"
 
 
+def test_requests_count_their_decode_steps(make):
+    """Plain decode: one cycle per output token after the first (the prefill makes the first), no drafts; a request that
+    ends in the queue ran no cycle."""
+    sched, rng = make(), random.Random(5)
+    r = sched.run([S.Request(prompt(rng, 30), max_new_tokens=12)])[0]
+    assert (r.cycles, r.drafted, r.accepted) == (11, 0, 0)
+    one = sched.run([S.Request(prompt(rng, 30), max_new_tokens=1)])[0]
+    assert (len(one.output), one.cycles) == (1, 0)
+    queued = S.Request(prompt(rng, 30), max_new_tokens=5, max_seconds=1e-9)
+    sched.submit(S.Request(prompt(rng, 300), max_new_tokens=3))
+    sched.submit(queued)
+    while sched.busy():
+        sched.step()
+    assert (queued.finish_reason, queued.cycles, queued.t_admit, queued.t_first) == ("timeout", 0, 0.0, 0.0)
+
+
 def test_stop_tokens_and_min_tokens(make):
     sched, rng = make(), random.Random(1)
     p = prompt(rng, 50)

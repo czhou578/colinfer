@@ -305,9 +305,19 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         return prompt, images
 
     def log_done(req: EngineRequest, kind: str):
+        """One line per finished request: what it was, then one segment per phase with the tokens of that phase and its
+        rate (engine/server/openai.py timings). A rate the request never reached shows as "-". The last segment, on a
+        speculative server, is the draft acceptance: accepted / verified draft tokens, and the output tokens per cycle."""
         t = oai.timings(req)
-        log(f"[{kind} {req.rid}] slot {req.slot} prompt {len(req.prompt)} (cached {req.reused}) -> {len(req.output)} tok, "
-            f"{req.finish_reason}; queue {t['queue_s']:.2f}s ttft {t['ttft_s']:.2f}s decode {t['decode_tok_s'] or 0:.1f} tok/s")
+        num = lambda v, nd, unit: f"{v:.{nd}f}{unit}" if v is not None else "-"  # noqa: E731
+        line = (f"[{kind} {req.rid}] slot {req.slot} prompt {len(req.prompt)} (cached {req.reused}) -> {len(req.output)} tok, "
+                f"{req.finish_reason}; queue {t['queue_s']:.2f}s ttft {num(t['ttft_s'], 2, 's')}"
+                f" | prefill {t['prefill_tokens']} tok {num(t['prefill_tok_s'], 0, ' tok/s')}"
+                f" | decode {t['decode_tokens']} tok {num(t['decode_tok_s'], 1, ' tok/s')}")
+        if req.drafted:
+            line += (f" | accept {100 * t['draft_accept_rate']:.0f}% ({req.accepted}/{req.drafted} drafts, "
+                     f"{t['decode_tokens'] / req.cycles:.1f} tok/cycle)")
+        log(line)
 
     # -------------------------------------------------------------------------------------- the two ways to answer
     # Every endpoint answers through these two: result() for a reply in one body, sse_response() for a stream. Each
