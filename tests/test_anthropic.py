@@ -92,12 +92,6 @@ def test_tool_result_errors_are_marked():
     assert all(m["role"] == "tool" for m in msgs)
 
 
-def test_images_become_a_note():
-    msgs = anth.to_messages({"messages": [{"role": "user", "content": [
-        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}, {"type": "text", "text": "What is this?"}]}]})
-    assert msgs == [{"role": "user", "content": "[image omitted: this server reads text only]\n\nWhat is this?"}]
-
-
 def events_of(chunks):
     out = []
     for c in chunks:

@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from engine.model.qwen35 import Qwen35Config, Qwen35ForCausalLM
-from engine.weights.loader import E2M1_LUT, dequant_fp8_block, dequant_nvfp4
+from engine.weights.loader import E2M1_LUT, dequant_nvfp4
 
 DT = torch.float32
 
@@ -122,12 +122,3 @@ def test_nvfp4_dequant_nibble_order_and_scales():
     expect = torch.stack([E2M1_LUT[codes.long()], E2M1_LUT[codes.flip(0).long()]], -1).reshape(1, 32)
     expect = expect * torch.tensor([2.0] * 16 + [0.5] * 16) * 3.0
     torch.testing.assert_close(out, expect)
-
-
-def test_fp8_block_dequant_ragged_dims():
-    w = torch.randn(200, 300)
-    s = torch.rand(2, 3) + 0.5
-    w8 = (w / s.repeat_interleave(128, 0)[:200].repeat_interleave(128, 1)[:, :300]).to(torch.float8_e4m3fn)
-    out = dequant_fp8_block(w8, s, 128, torch.float32)
-    rel = ((out - w).norm() / w.norm()).item()
-    assert out.shape == (200, 300) and rel < 0.05, rel

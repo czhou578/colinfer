@@ -7,7 +7,6 @@ checkpoint. It scores the text in non-overlapping windows of --ctx tokens, each 
 token except the first of each window.
 
   uv run python tests/perplexity.py --ckpt Qwen/Qwen3.8-27B                # BF16
-  uv run python tests/perplexity.py --ckpt Qwen/Qwen3.8-27B-FP8            # FP8 dequantized to BF16
   uv run python tests/perplexity.py --ckpt nvidia/Qwen3.8-27B-NVFP4        # NVFP4/FP8 dequantized to BF16
 Options: --ctx 2048 --max-tokens 65536 --json out.json
 """
