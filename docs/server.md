@@ -21,24 +21,14 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `8000` | |
 | `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. |
-| `--served-model-name` | the `--model` value | The id that `/v1/models` reports. Requests can name any model. |
 | `--slots` | 3 | Conversations whose KV stays cached. The server runs one request at a time; the others wait in a FIFO queue. |
-| `--max-queue` | 8 | Requests that can wait for the running one. Past it, a request gets a 503 (`/v1/messages`: 529, `overloaded_error`), which Hermes Agent and Claude Code retry. 0: no limit. |
-| `--max-output-tokens` | 0 | A cap on the output tokens of a request, whatever its `max_tokens` asks. 0: the room left in the slot. |
-| `--max-request-seconds` | 1800 | A request ends this long after it arrived, running or still in the queue, with `finish_reason` `length` (`stop_reason` `max_tokens`). 0: never. |
 | `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
-| `--k` | 7 | The longest MTP draft. Each cycle picks k=3 or 7 from the measured acceptance (see below). |
-| `--suffix-drafts` | 8 | Suffix-match drafts of at least N matched tokens. 0 turns them off. See below. |
 | `--drafter-weights` | `auto` | MTP head weights. `auto` uses `~/.cache/colinfer/drafter/mtp_ft.safetensors` (`tools/train_drafter.py`) when it exists. `none` uses the weights of the checkpoint. You can also give a path. Drafts change the speed, never the outputs. The first start with a given drafter file quantizes it and keeps the result in `~/.cache/colinfer/drafter/quant-<key>.safetensors` for the next starts. |
 | `--decode-weights` | `int` | `int`: decode the attention / GDN projections from INT6 / INT5 copies when both files exist in `~/.cache/colinfer/requant/<snapshot>/` (`tools/int6_requant.py --bits 6 --filter self_attn` and `--bits 5 --filter linear_attn`). This gives ~9.5% faster decode, perplexity within 0.25%, and uses +5.2 GB of GPU memory. Without the files, or with `checkpoint`, decode reads the FP8 weights. |
-| `--checkpoints` | 32 | The prefix-checkpoint ring, 154 MB each. The server allocates it at startup. |
-| `--no-prefix-caching` | off | Never reuse a prompt prefix (the same as `--checkpoints 0 --session-cache-gb 0`). Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
+| `--no-prefix-caching` | off | Never reuse a prompt prefix: no checkpoint ring, no conversation cache on disk. Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
-| `--session-dir` | `~/.cache/colinfer/sessions` | The directory of the conversation cache. It holds one subdirectory per engine configuration (checkpoint, decode weights, drafter); the budget covers all of them. |
-| `--image-max-pixels` | 4194304 | Larger images are resized to this many pixels (2048 x 2048). An image costs one prompt token per 32 x 32 pixels, so at most 4,096 tokens. |
 | `--no-vision` | off | No image input. Images then become a short text note. |
-| `--vision-preload` | off | Load the vision tower (0.92 GB) at startup and warm up the image path. By default it loads on the first image request, which is then ~1-2 s slower, and a server that never sees an image keeps the memory. |
 | `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
@@ -46,6 +36,19 @@ Then the process holds about 61 GB of the 121 GB unified memory until it exits.
 | `--committee-roles` | the built-in roles | A JSON file `{"roles": [...], "reconcile": "..."}` with the members' roles and the reconcile instruction (`{n}`: the number of answers). |
 | `--no-selftest` | off | Skip the startup self-test of the matmul kernels (`engine/selftest.py`). For development only: the test is what catches a miscompiled kernel. |
 | `--no-warmup` | off | Skip the warm-up requests. The first real requests then pay for the first-use compilation and autotuning. |
+
+These values have no flag. They are the defaults of `ServerConfig` in `engine/server/worker.py`:
+
+- The queue holds 8 waiting requests. Past that, a request gets a 503 (`/v1/messages`: 529, `overloaded_error`), which
+  Hermes Agent and Claude Code retry.
+- A request ends 1,800 s after it arrived, running or still in the queue, with `finish_reason` `length` (`stop_reason`
+  `max_tokens`). There is no other cap on the output tokens: a request can use the room left in its slot.
+- The prefix-checkpoint ring holds 32 snapshots of 154 MB. The server allocates it at startup.
+- A cycle drafts up to 7 tokens with the MTP head, and uses suffix-match drafts for repeats of 8 or more tokens.
+- The conversation cache lives in `~/.cache/colinfer/sessions`, one subdirectory per engine configuration (checkpoint,
+  decode weights, drafter). The budget covers all of them.
+- An image is resized to at most 4,194,304 pixels (2048 x 2048), one prompt token per 32 x 32 pixels, so at most 4,096
+  tokens. The vision tower (0.92 GB) loads on the first image request, which is then 1-2 s slower.
 | `--api-key` | `$COLINFER_API_KEY`, else none | The `/v1/` endpoints require this key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and `/metrics` stay open. |
 
 ## API
@@ -227,7 +230,7 @@ completion without a stream.
   With this file, each draft step scores a rank-1024 approximation of the draft lm head and rescores its top 256
   candidates exactly. This gives the same drafts as the full head for ~1/5 of its bytes (k=7 cycle 89.8 → 86.0 ms).
   Without the file, the engine uses the full draft head (`docs/history/phase6_progress.md` section 19).
-- **Suffix-match drafts (`--suffix-drafts N`, default 8, 0 = off).** The history of a request is its prompt and the reply
+- **Suffix-match drafts (repeats of 8 or more tokens).** The history of a request is its prompt and the reply
   so far. When the last N or more tokens of the history occurred earlier in it, the cycle drafts the tokens that
   followed that earlier occurrence (`engine/spec/suffix.py`). These drafts replace the MTP drafts.
 
@@ -268,7 +271,7 @@ completion without a stream.
   decode weights and the drafter weights: another configuration writes to its own subdirectory. A file that is
   missing or damaged makes that request prefill instead.
 - **Images** (`engine/model/vision.py`, `engine/server/images.py`). The server resizes an image as the checkpoint's
-  image processor does, to multiples of 32 pixels between 65,536 pixels and `--image-max-pixels`, and gives it one
+  image processor does, to multiples of 32 pixels between 65,536 and 4,194,304 pixels, and gives it one
   prompt token per 32 x 32 pixels: a 1920 x 1080 screenshot is 2,040 tokens. The vision tower runs during the prefill
   of those tokens, 0.4 s for a 1080p screenshot. A conversation that sends the same image again restores it from the
   prefix caches without running the vision tower again: the image is keyed by its bytes and its grid, which the
@@ -281,8 +284,8 @@ completion without a stream.
   MMMU-Pro 74.86 for this checkpoint against 75.14 in BF16. Text that is small in the image can be misread.
 - **One request at a time.** A request that arrives while another runs waits in the queue, also behind a long
   prefill. The three slots keep the last three conversations cached: a side request goes to another slot, so the main
-  conversation keeps its cache. The queue holds `--max-queue` requests; past that, requests are refused with a 503
-  (529 on `/v1/messages`). A request ends `--max-request-seconds` after it arrived, so one runaway request cannot
+  conversation keeps its cache. The queue holds 8 requests; past that, requests are refused with a 503
+  (529 on `/v1/messages`). A request ends 1,800 s after it arrived, so one runaway request cannot
   hold the engine for longer than that.
 - **Failures restart the process.** A failed CUDA call fails each in-flight request with a 500 and stops the process.
   Then systemd restarts it. An error while the server formats the output of one request (the parser runs on the engine

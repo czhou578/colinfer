@@ -141,7 +141,7 @@ running per-token acceptance a of a slot, a cycle gives (1 − a^{k+1}) / (1 −
 this by the cycle time measured at startup, plus the KV reads that grow with the context. The verify rows must fit one
 skinny pass (k + 1 ≤ 16).
 
-**Suffix-match drafts** (`engine/spec/suffix.py`, `--suffix-drafts`, default 8). The history of a request is its prompt
+**Suffix-match drafts** (`engine/spec/suffix.py`, repeats of 8 or more tokens). The history of a request is its prompt
 and the reply so far. When the last 8 or more tokens of the history occurred earlier in it, the next cycle uses other
 drafts. It verifies the tokens that followed the earlier occurrence instead of the MTP drafts.
 
@@ -216,7 +216,7 @@ The code is in `engine/runtime/scheduler.py`, `engine/server/worker.py` (the eng
   Thus the memory and disk caches tell images apart, and a resent image costs a decode (~30 ms) until the caches
   miss: only then are its patches made (resize, normalize, patch: up to ~0.5 s) and the vision tower run. A prefill
   chunk that holds image tokens embeds them as the image pad token, then replaces their rows with the output of the
-  vision tower (transformers' Qwen3_5VisionModel, BF16, 0.92 GB, loaded on the first image unless `--vision-preload`;
+  vision tower (transformers' Qwen3_5VisionModel, BF16, 0.92 GB, loaded on the first image;
   run once per image and only when its tokens are prefilled).
   Positions follow multimodal RoPE (`get_rope_index` of transformers): the tokens of an image that starts at s
   rotate by (t, h, w) = (s', s' + row, s' + col), with s' the rotary position of s, and the text after it continues
