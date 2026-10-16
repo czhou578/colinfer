@@ -20,7 +20,9 @@ prefix.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -47,7 +49,8 @@ class Qwen35Config:
     linear_conv_kernel_dim: int = 4
     rms_norm_eps: float = 1e-6
     vocab_size: int = 248320
-    max_position_embeddings: int = 262144
+    max_position_embeddings: int = 262144  # the native context: the positions the checkpoint was trained on
+    yarn_factor: float = 1.0               # > 1: YaRN scales the rope of the native context by this factor (rope_inv_freq, apply_yarn)
     tie_word_embeddings: bool = False
     mrope_section: list[int] = field(default_factory=lambda: [11, 11, 10])  # rotary frequencies per (t, h, w) axis (multimodal RoPE)
     mrope_interleaved: bool = True  # the axes alternate over the frequencies (Qwen3-VL / 3.5) instead of taking a run each
@@ -57,6 +60,9 @@ class Qwen35Config:
         c = json.load(open(os.path.join(path, "config.json")))
         t = c.get("text_config", c)
         rp = t.get("rope_parameters", {})
+        if rp.get("rope_type", "default") not in ("default", "yarn"):
+            raise NotImplementedError(f"rope_type {rp['rope_type']!r}: only default and yarn are implemented")
+        yarn = rp.get("rope_type") == "yarn"  # a checkpoint that ships with YaRN: its native context is the original one
         return cls(
             hidden_size=t["hidden_size"],
             intermediate_size=t["intermediate_size"],
@@ -74,7 +80,8 @@ class Qwen35Config:
             linear_conv_kernel_dim=t["linear_conv_kernel_dim"],
             rms_norm_eps=t["rms_norm_eps"],
             vocab_size=t["vocab_size"],
-            max_position_embeddings=t.get("max_position_embeddings", 262144),
+            max_position_embeddings=rp["original_max_position_embeddings"] if yarn else t.get("max_position_embeddings", 262144),
+            yarn_factor=float(rp["factor"]) if yarn else 1.0,
             tie_word_embeddings=t.get("tie_word_embeddings", c.get("tie_word_embeddings", False)),
             mrope_section=list(rp.get("mrope_section", [11, 11, 10])),
             mrope_interleaved=bool(rp.get("mrope_interleaved", False)),
@@ -85,10 +92,62 @@ class Qwen35Config:
         return int(self.head_dim * self.partial_rotary_factor)
 
 
+YARN_BETA_FAST, YARN_BETA_SLOW = 32, 1  # YaRN: a frequency that turns more than 32 times over the native context stays; less than once is scaled
+
+
 def rope_inv_freq(cfg: Qwen35Config, device=None) -> torch.Tensor:
-    """The RoPE frequencies of the rotary dims (fp32), as the reference computes them; every attention path uses these."""
-    d = cfg.rotary_dim
-    return 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=device) / d))
+    """The RoPE frequencies of the rotary dims (fp32), as the reference computes them; every attention path uses these.
+
+    With cfg.yarn_factor > 1 they are the YaRN frequencies (Peng et al. 2023), as transformers' `yarn` rope type computes
+    them: a frequency that turns less than once over the native context is divided by the factor, a frequency that
+    turns more than 32 times over it stays, and a linear ramp over the dims between joins the two. The factor also
+    scales the rotated dims of q and k (yarn_attention_factor); apply_yarn folds that into the norms."""
+    d, s = cfg.rotary_dim, cfg.yarn_factor
+    inv = 1.0 / (cfg.rope_theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=device) / d))
+    if s <= 1:
+        return inv
+
+    def dim_of(turns: float) -> float:  # the (fractional) dim whose frequency turns this many times over the native context
+        return d * math.log(cfg.max_position_embeddings / (turns * 2 * math.pi)) / (2 * math.log(cfg.rope_theta))
+    low, high = max(math.floor(dim_of(YARN_BETA_FAST)), 0), min(math.ceil(dim_of(YARN_BETA_SLOW)), d - 1)
+    if high == low:
+        high += 0.001
+    ramp = ((torch.arange(d // 2, dtype=torch.float32, device=device) - low) / (high - low)).clamp(0, 1)  # 0: keep, 1: divide
+    return inv * (1 - ramp) + inv / s * ramp
+
+
+def yarn_attention_factor(cfg: Qwen35Config) -> float:
+    """YaRN's scale of the rotated dims of q and k (its "mscale"): 0.1 ln(factor) + 1, or 1 without scaling."""
+    return 0.1 * math.log(cfg.yarn_factor) + 1.0 if cfg.yarn_factor > 1 else 1.0
+
+
+def fold_yarn_scale(attn: "Attention", cfg: Qwen35Config) -> None:
+    """Folds yarn_attention_factor into an attention layer's q and k norms, once. transformers multiplies cos and sin by
+    the factor, which scales the rotated dims of q and k by it. The rotation is linear, so scaling those dims of the
+    zero-centered norms' outputs is the same: (1 + w) -> a (1 + w) over the first rotary_dim weights. Thus every attention
+    path (the reference module, the kernel prologue, the drafter) applies the factor without a change of its own."""
+    a = yarn_attention_factor(cfg)
+    if a == 1.0:
+        return
+    r = cfg.rotary_dim
+    with torch.no_grad():
+        for norm in (attn.q_norm, attn.k_norm):
+            w = norm.weight
+            w[:r] = (a * (1.0 + w[:r].float()) - 1.0).to(w.dtype)
+
+
+def apply_yarn(model: "Qwen35ForCausalLM", factor: float) -> None:
+    """Scales the model's rope by YaRN for `factor` times its native context: the config (rope_inv_freq picks the YaRN
+    frequencies from it; call before to_fast, which reads them) and the q / k norms of every attention layer (the
+    attention factor, fold_yarn_scale). The checkpoint's weights are not touched on disk."""
+    if factor <= 1:
+        return
+    if model.cfg.yarn_factor > 1:
+        raise ValueError(f"the model already has YaRN x{model.cfg.yarn_factor}")
+    model.cfg = dataclasses.replace(model.cfg, yarn_factor=float(factor))
+    for layer in model.layers:
+        if layer.block_type == "full_attention":
+            fold_yarn_scale(layer.self_attn, model.cfg)
 
 
 def mrope_axes(cfg: Qwen35Config, device=None) -> torch.Tensor:

@@ -36,7 +36,7 @@ class ServerConfig:
     main reads its argparse defaults from here), so a test constructs the same object with a few fields changed."""
     model: str = MODEL
     slots: int = 3
-    max_seq_len: int = 262144
+    max_seq_len: int = 524288   # twice the checkpoint's native 262144: YaRN x2 (engine/runtime/build.py load_model)
     checkpoints: int = 32
     spec: str = "mtp"
     k: int = 7

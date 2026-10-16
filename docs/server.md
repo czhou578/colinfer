@@ -4,7 +4,7 @@ The engine includes a server for `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark. It
 Anthropic-compatible API. `docs/architecture.md` describes the design.
 
 ```bash
-uv run python -m engine.server                     # 127.0.0.1:8000, 3 slots x 262,144 tokens, MTP speculation
+uv run python -m engine.server                     # 127.0.0.1:8000, 3 slots x 524,288 tokens, MTP speculation
 curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages": [{"role": "user", "content": "hi"}], "stream": true}'
 ```
@@ -15,21 +15,21 @@ With a warm page cache, startup takes about 25 s:
 - 12 s for the self-test and the graph capture
 - 3 s for the warm-up
 
-Then the process holds about 61 GB of the 121 GB unified memory until it exits.
+Then the process holds about 88 GB of the 121 GB unified memory until it exits.
 
 | Flag | Default | |
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `8000` | |
 | `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. |
 | `--slots` | 3 | Conversations whose KV stays cached. The server runs one request at a time; the others wait in a FIFO queue. |
-| `--max-seq-len` | 262144 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. |
+| `--max-seq-len` | 524288 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. The checkpoint was trained on 262,144 positions. Past them, the server scales the rope with YaRN by the ratio (x2 at the default), as Qwen documents for its models. YaRN is static: it applies to every request, and costs a little quality on short prompts. Set `--max-seq-len 262144` for the unscaled model. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
 | `--drafter-weights` | `auto` | MTP head weights. `auto` uses the fine-tuned head of the prepared directory (`tools/prepare.py`, `tools/train_drafter.py`) when it has one. `none` uses the weights of the checkpoint. You can also give a path. Drafts change the speed, never the outputs. The first start with a given drafter file quantizes it and keeps the result in `~/.cache/colinfer/drafter/quant-<key>.safetensors` for the next starts. |
 | `--decode-weights` | `int` | `int`: decode the attention / GDN projections from the INT6 / INT5 copies of the prepared directory (`tools/prepare.py`, which runs `tools/int6_requant.py`) when it has them. This gives ~9.5% faster decode, perplexity within 0.25%, and uses +5.2 GB of GPU memory. Without the files, or with `checkpoint`, decode reads the FP8 weights. |
 | `--no-prefix-caching` | off | Never reuse a prompt prefix: no checkpoint ring, no conversation cache on disk. Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
 | `--no-vision` | off | No image input. Images then become a short text note. |
-| `--mem-cap-gb` | 80 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. |
+| `--mem-cap-gb` | 105 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. The engine allocates about 88 GB at startup. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
 | `--committee-size` | 3, or the roles of the file | Members of a committee reply (a request that names the model `<name>-committee`, see "Committee mode" below). 0 turns the alias off. |

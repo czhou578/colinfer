@@ -45,7 +45,7 @@ perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
 git clone --recursive https://github.com/czhou578/colinfer.git && cd colinfer   # CUTLASS is a submodule
 uv sync                                                  # Python 3.12, torch 2.14 (cu130), FlashInfer 0.7 (sm121a)
 uv run hf download nvidia/Qwen3.8-27B-NVFP4             # into the Hugging Face cache
-uv run python -m engine.server                           # 127.0.0.1:8000, 3 slots x 262,144 tokens, MTP speculation
+uv run python -m engine.server                           # 127.0.0.1:8000, 3 slots x 524,288 tokens, MTP speculation
 curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages": [{"role": "user", "content": "hi"}], "stream": true}'
 ```

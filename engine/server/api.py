@@ -1,6 +1,6 @@
 """OpenAI- and Anthropic-compatible HTTP server.
 
-    uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 262144] [--spec mtp|none]
+    uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 524288] [--spec mtp|none]
 
 Endpoints: /v1/chat/completions and /v1/completions (SSE streaming, usage + timings, logprobs, stop strings, seeds,
 tools, thinking; engine/server/openai.py formats them), /v1/messages and /v1/messages/count_tokens (the Anthropic
@@ -739,7 +739,7 @@ def main(argv=None):
                     help="disk budget of the conversation cache (KV and GDN state of past conversations, restored after an eviction "
                          "or a restart); 0: off")
     ap.add_argument("--no-vision", action="store_true", help="no image input: images become a text note, and the vision tower is not loaded")
-    ap.add_argument("--mem-cap-gb", type=float, default=80.0, help="hard cap on this process's GPU memory (torch allocator)")
+    ap.add_argument("--mem-cap-gb", type=float, default=105.0, help="hard cap on this process's GPU memory (torch allocator)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
     ap.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "xhigh"), default="auto",

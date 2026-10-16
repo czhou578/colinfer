@@ -15,6 +15,7 @@ from typing import Literal
 
 from engine.kernels import ops
 from engine.model.fast import attach_decode_copies, load_fast_model, to_fast
+from engine.model.qwen35 import apply_yarn, yarn_attention_factor
 from engine.model.vision import VisionTower, vision_available
 from engine.runtime.prepared import Prepared
 from engine.runtime.prepared import read as read_prepared
@@ -26,16 +27,25 @@ from engine.weights.direct import release_buffers
 from engine.weights.loader import MODEL, resolve
 
 
-def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print, prep: Prepared | None | str = "auto"):
+def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print, prep: Prepared | None | str = "auto",
+               max_seq_len: int | None = None):
     """(checkpoint directory, the model on the kernel decode path). decode_weights: "int" streams the INT6 / INT5 decode
     copies of the attention / GDN projections from the prepared directory (tools/prepare.py) when it has them;
-    "checkpoint" streams the checkpoint's FP8 weights. prep: the manifest of the prepared directory ("auto": read it)."""
+    "checkpoint" streams the checkpoint's FP8 weights. prep: the manifest of the prepared directory ("auto": read it).
+    max_seq_len: the slot length the model will run at; past the checkpoint's native context, YaRN scales its rope by
+    the ratio (engine/model/qwen35.py apply_yarn), as Qwen documents for its models."""
     if decode_weights not in ("int", "checkpoint"):
         raise ValueError(f"decode_weights: int or checkpoint, not {decode_weights!r}")
     path = resolve(path_or_repo)
     if prep == "auto":
         prep = read_prepared(path)
-    model = to_fast(load_fast_model(path))
+    model = load_fast_model(path)
+    native = model.cfg.max_position_embeddings
+    if max_seq_len is not None and max_seq_len > native:
+        apply_yarn(model, max_seq_len / native)
+        log(f"[engine] YaRN x{max_seq_len / native:g}: {max_seq_len} tokens per slot over the checkpoint's {native} native positions "
+            f"(rope frequencies scaled, q / k rotated dims x{yarn_attention_factor(model.cfg):.4f})")
+    model = to_fast(model)
     if decode_weights == "int":
         if prep is not None and prep.decode:
             log(f"[engine] decode streams the INT6 / INT5 projection copies of {prep.dir}: {attach_decode_copies(model, prep.decode)} linears")
@@ -69,7 +79,7 @@ def _file_id(f: str) -> list:
     return [os.path.basename(f), st.st_size, int(st.st_mtime)]
 
 
-def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 262144, checkpoints: int = 32, spec: str = "mtp", k: int = 7,
+def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 524288, checkpoints: int = 32, spec: str = "mtp", k: int = 7,
                  drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int",
                  boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, vision: bool = True, vision_preload: bool = False,
                  metrics=None, log=print):
@@ -88,7 +98,7 @@ def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 26214
     prep = read_prepared(path)  # a manifest that names a missing file stops the start here
     log(f"[engine] prepared directory: {prep.dir} (made {prep.made})" if prep is not None else
         "[engine] no prepared directory (tools/prepare.py): the checkpoint alone")
-    path, m = load_model(path, decode_weights, log, prep)
+    path, m = load_model(path, decode_weights, log, prep, max_seq_len)
     mtp = load_drafter(m, path, drafter_weights, log, prep) if spec == "mtp" else None
     release_buffers()  # the direct reader's pinned staging buffers (engine/weights/direct.py)
     if boundary == "auto":

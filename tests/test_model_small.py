@@ -6,6 +6,8 @@
   input embeddings
 Run: uv run pytest tests/test_model_small.py -q
 """
+import dataclasses
+
 import pytest
 import torch
 
@@ -65,8 +67,9 @@ def test_split_prefill_matches_one_shot(model, ids, split):
     torch.testing.assert_close(torch.cat([a, b], 1), full, rtol=1e-4, atol=1e-4)
 
 
-def hf_tiny(model):
-    """transformers' Qwen3_5ForCausalLM with the weights of the tiny reference model."""
+def hf_tiny(model, sd=None, rope=None):
+    """transformers' Qwen3_5ForCausalLM with the weights of the tiny reference model (sd: other weights for it; rope:
+    further rope_parameters, e.g. YaRN)."""
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
     from tests.hf_fallback import force_hf_torch_fallbacks
@@ -81,10 +84,10 @@ def hf_tiny(model):
                              rms_norm_eps=c.rms_norm_eps, vocab_size=c.vocab_size, tie_word_embeddings=False,
                              rope_parameters={"rope_type": "default", "rope_theta": c.rope_theta,
                                               "partial_rotary_factor": c.partial_rotary_factor,
-                                              "mrope_section": c.mrope_section, "mrope_interleaved": True})
+                                              "mrope_section": c.mrope_section, "mrope_interleaved": True} | (rope or {}))
     hcfg._attn_implementation = "sdpa"
     hf = Qwen3_5ForCausalLM(hcfg).to(DT).eval()
-    sd = {("lm_head.weight" if k == "lm_head.weight" else "model." + k): v for k, v in model.state_dict().items()}
+    sd = {("lm_head.weight" if k == "lm_head.weight" else "model." + k): v for k, v in (sd or model.state_dict()).items()}
     missing, unexpected = hf.load_state_dict(sd, strict=False)
     assert not unexpected and not [m for m in missing if "rotary" not in m], (missing, unexpected)
     return hf
@@ -112,6 +115,79 @@ def test_matches_hf_tiny_with_an_image(model, ids):
     ours = model(ids, None, positions=pos, embeds=emb)
     torch.testing.assert_close(ours, ref, rtol=1e-4, atol=1e-4)
     assert not torch.allclose(ours, model(ids, None, embeds=emb), atol=1e-3)  # the positions matter
+
+
+# ------------------------------------------------------------------------------------------------------------ YaRN
+def yarn_cfg(**kw):
+    """A config with YaRN x2 over a short native context, so that the tiny rotary dims (8) span keep, ramp and divide."""
+    return dataclasses.replace(tiny_cfg(), **({"max_position_embeddings": 1024, "yarn_factor": 2.0} | kw))
+
+
+@pytest.mark.parametrize("cfg", [yarn_cfg(), yarn_cfg(yarn_factor=4.0),
+                                 Qwen35Config(head_dim=256, partial_rotary_factor=0.25, rope_theta=1e7, yarn_factor=2.0)])  # Qwen3.8's dims
+def test_yarn_frequencies_match_transformers(cfg):
+    import types
+
+    from transformers.modeling_rope_utils import _compute_yarn_parameters
+
+    from engine.model.qwen35 import rope_inv_freq, yarn_attention_factor
+    rp = {"rope_type": "yarn", "rope_theta": cfg.rope_theta, "partial_rotary_factor": cfg.partial_rotary_factor, "factor": cfg.yarn_factor,
+          "original_max_position_embeddings": cfg.max_position_embeddings}
+    hc = types.SimpleNamespace(rope_parameters=rp, head_dim=cfg.head_dim, hidden_size=cfg.hidden_size, num_attention_heads=cfg.num_attention_heads,
+                               max_position_embeddings=cfg.max_position_embeddings * cfg.yarn_factor, standardize_rope_params=lambda: None)
+    ref, scale = _compute_yarn_parameters(hc)
+    ours = rope_inv_freq(cfg)
+    plain = rope_inv_freq(dataclasses.replace(cfg, yarn_factor=1.0))
+    torch.testing.assert_close(ours, ref, rtol=1e-6, atol=0)
+    assert yarn_attention_factor(cfg) == pytest.approx(scale)
+    assert ours.shape == (cfg.rotary_dim // 2,) and torch.all(ours <= plain) and ours[0] == plain[0]  # the fastest frequency is kept
+
+
+@torch.inference_mode()
+def test_yarn_model_matches_hf_yarn(ids):
+    """apply_yarn (the YaRN frequencies, the attention factor folded into the q / k norms) against transformers' yarn
+    rope type (the factor on cos and sin) with the same raw weights."""
+    from engine.model.qwen35 import apply_yarn, yarn_attention_factor
+    torch.manual_seed(0)
+    m = Qwen35ForCausalLM(yarn_cfg(yarn_factor=1.0)).to(DT)
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            p.normal_(0, 0.1 if "norm" in n else 0.08)
+    m.eval()
+    raw = {k: v.clone() for k, v in m.state_dict().items()}
+    plain = m(ids, None).clone()
+    apply_yarn(m, 2.0)
+    assert m.cfg.yarn_factor == 2.0 and yarn_attention_factor(m.cfg) == pytest.approx(0.1 * torch.log(torch.tensor(2.0)).item() + 1)
+    a = m.layers[3].self_attn
+    r = m.cfg.rotary_dim
+    torch.testing.assert_close(1 + a.q_norm.weight[:r], yarn_attention_factor(m.cfg) * (1 + raw["layers.3.self_attn.q_norm.weight"][:r]))
+    torch.testing.assert_close(a.k_norm.weight[r:], raw["layers.3.self_attn.k_norm.weight"][r:])  # the pass-through dims stay
+    hf = hf_tiny(m, sd=raw, rope={"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 1024})
+    ref = hf(input_ids=ids, use_cache=False).logits
+    ours = m(ids, None)
+    torch.testing.assert_close(ours, ref, rtol=1e-4, atol=1e-4)
+    assert not torch.allclose(ours, plain, atol=1e-3)  # the scaling changes the outputs
+    with pytest.raises(ValueError):
+        apply_yarn(m, 2.0)  # not twice
+
+
+def test_config_reads_a_yarn_checkpoint(tmp_path):
+    import json
+    c = yarn_cfg()
+    t = {"hidden_size": c.hidden_size, "intermediate_size": c.intermediate_size, "num_hidden_layers": c.num_hidden_layers,
+         "layer_types": c.layer_types, "num_attention_heads": c.num_attention_heads, "num_key_value_heads": c.num_key_value_heads,
+         "head_dim": c.head_dim, "linear_num_key_heads": c.linear_num_key_heads, "linear_num_value_heads": c.linear_num_value_heads,
+         "linear_key_head_dim": c.linear_key_head_dim, "linear_value_head_dim": c.linear_value_head_dim,
+         "linear_conv_kernel_dim": c.linear_conv_kernel_dim, "rms_norm_eps": c.rms_norm_eps, "vocab_size": c.vocab_size,
+         "max_position_embeddings": 4096, "rope_parameters": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024,
+                                                               "rope_theta": 1e4, "partial_rotary_factor": 0.25, "mrope_section": [1, 1, 2]}}
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": t}))
+    got = Qwen35Config.from_checkpoint(str(tmp_path))
+    assert (got.yarn_factor, got.max_position_embeddings, got.rope_theta) == (4.0, 1024, 1e4)
+    t["rope_parameters"] = {"rope_type": "linear", "factor": 2.0, "rope_theta": 1e4}
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": t}))
+    with pytest.raises(NotImplementedError):
+        Qwen35Config.from_checkpoint(str(tmp_path))
 
 
 def test_nvfp4_dequant_nibble_order_and_scales():

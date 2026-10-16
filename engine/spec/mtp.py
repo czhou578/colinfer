@@ -57,7 +57,7 @@ from engine.model.fast import (
     capture,
 )
 from engine.model.prefill import attend_cached, prefill, prepare_prefill
-from engine.model.qwen35 import DecoderLayer, RMSNorm, rope_inv_freq
+from engine.model.qwen35 import DecoderLayer, RMSNorm, fold_yarn_scale, rope_inv_freq
 from engine.runtime.sampler import apply_mask
 from engine.spec.accept import draw
 from engine.weights.direct import read_tensors, tensor_names
@@ -193,6 +193,7 @@ class Mtp(nn.Module):
         with torch.no_grad():
             a.q_norm.weight = nn.Parameter(t[P + "self_attn.q_norm.weight"], requires_grad=False)
             a.k_norm.weight = nn.Parameter(t[P + "self_attn.k_norm.weight"], requires_grad=False)
+        fold_yarn_scale(a, cfg)  # the target's YaRN (apply_yarn), if any: the drafter's norms come raw from the files
         # q / k / v separate: each keeps its own NVFP4 scales
         KernelAttention.adopt(a, LinearGroup([a.q_proj, a.k_proj, a.v_proj]), rope_inv_freq(cfg, dev), cfg.mrope_section[1:])
         layer.mlp = DraftMLP(lin(P + "mlp.gate_proj"), lin(P + "mlp.up_proj"), lin(P + "mlp.down_proj"))

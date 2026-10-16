@@ -157,7 +157,7 @@ claude-qwen -p "Add a function perimeter(w, h) to shapes.py."
 At the start, Claude Code shows these messages. They are normal for a model that is not Claude:
 
 - `"qwen3.8-27b" isn't described by this version's model catalog ...`: Claude Code does not know the model, so it
-  assumes a context window of 200,000 tokens. A server slot holds 262,144 tokens, so you do not have to change this
+  assumes a context window of 200,000 tokens. A server slot holds 524,288 tokens, so you do not have to change this
   value.
 - `claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set ...`: the connectors of
   your claude.ai account are not available in this session.
