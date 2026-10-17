@@ -31,8 +31,10 @@ systemd timer (01:00)  -->  tools/night_shift.py  --claude -p-->  Claude Code  -
 
 - The colinfer server, as a systemd service (`docs/server.md`, section "systemd"). The night shift starts it when it is
   not running, and waits for it.
-- Claude Code, connected to the server as `docs/claude_code.md` describes. Make sure that `claude-qwen` works once
-  before you plan a night.
+- The Claude Code CLI (`claude` on your `PATH`). The night shift sets the server address and the model itself, so
+  the gateway and the settings of `docs/claude_code.md` are not needed for it. Make sure that one request works once
+  before you plan a night: `claude --model qwen3.8-27b -p "say ready"` with the gateway, or `claude-qwen -p "say ready"`
+  (`docs/claude_code.md`, section 9).
 - A task file, `~/.config/colinfer/night_shift.toml` (section 2).
 
 ## 2. Make the task file

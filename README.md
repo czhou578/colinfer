@@ -76,9 +76,10 @@ The first start quantizes the drafter and keeps the result in `~/.cache/colinfer
 (~3 s off every later start).
 
 `docs/server.md` describes the flags, the API and the behavior of the server. `deploy/colinfer.service` runs the server
-under systemd. `docs/claude_code.md` tells you how to use the model from the Claude Code CLI, and how a local gateway
-(`engine/server/gateway.py`) puts Claude and Qwen in one model picker. `docs/night_shift.md`
-runs a list of Claude Code tasks against the server at night, each on its own branch (`tools/night_shift.py`).
+under systemd. `docs/claude_code.md` tells you how to use the model from Claude Code, in the VS Code extension or the
+CLI: a local gateway (`engine/server/gateway.py`, `deploy/colinfer-gateway.service`) puts Claude and Qwen in one model
+picker. `docs/night_shift.md` runs a list of Claude Code tasks against the server at night, each on its own branch
+(`tools/night_shift.py`).
 
 ## How it works
 
