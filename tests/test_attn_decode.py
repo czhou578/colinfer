@@ -3,6 +3,7 @@
 - that each row is bit-identical to a one-row launch at the length of that row (this makes speculation
   output-invariant)
 - the full KernelAttention layer (prologue + attention + gate) against the reference qwen35.Attention
+Both head layouts: GQA 24 / 4 (Qwen3.8-27B) and 24 / 2 (qwen4_exp).
 Run: uv run pytest tests/test_attn_decode.py -q"""
 import pytest
 import torch
@@ -25,19 +26,20 @@ def ref(q, k, v, seq_lens):
 Hq, Hkv, D = 24, 4, 256
 
 
-def cache(B, Lmax):
-    k = (torch.randn(B, Hkv, Lmax, D, device="cuda") * 2).to(torch.float8_e4m3fn)
-    v = torch.randn(B, Hkv, Lmax, D, device="cuda").to(torch.float8_e4m3fn)
+def cache(B, Lmax, hkv=Hkv):
+    k = (torch.randn(B, hkv, Lmax, D, device="cuda") * 2).to(torch.float8_e4m3fn)
+    v = torch.randn(B, hkv, Lmax, D, device="cuda").to(torch.float8_e4m3fn)
     return k, v, k.bfloat16(), v.bfloat16()  # the reference sees exactly the values the kernel reads
 
 
+@pytest.mark.parametrize("hkv", [4, 2])
 @pytest.mark.parametrize("B,T,lens", [(1, 1, [1]), (1, 1, [31]), (1, 1, [1000]), (1, 1, [8192]), (3, 1, [5, 4096, 777]),
                                       (1, 4, [300]), (2, 8, [17, 2000]), (1, 3, [33]), (2, 10, [600, 64]), (1, 16, [1500])])
-def test_attn_decode_matches_sdpa(B, T, lens):
+def test_attn_decode_matches_sdpa(B, T, lens, hkv):
     from engine.kernels import ops
     torch.manual_seed(sum(lens) + T)
     Lmax = 8448
-    k, v, kr, vr = cache(B, Lmax)
+    k, v, kr, vr = cache(B, Lmax, hkv)
     q = torch.randn(B, Hq, T, D, device="cuda").bfloat16()
     sl = torch.tensor(lens, dtype=torch.int32, device="cuda")
     out = torch.empty_like(q)
@@ -47,13 +49,14 @@ def test_attn_decode_matches_sdpa(B, T, lens):
     assert err <= 1e-2 * max(1.0, r.float().abs().max().item()), err  # P is rounded to f16 (~5e-4 relative), plus a bf16 ulp
 
 
+@pytest.mark.parametrize("hkv", [4, 2])
 @pytest.mark.parametrize("T,L", [(4, 37), (8, 4000), (8, 33), (2, 70), (12, 900), (8, 64 * 16 * 3 + 5)])
-def test_rows_bit_identical_to_single_row(T, L):
+def test_rows_bit_identical_to_single_row(T, L, hkv):
     """Row t of a T-row launch at seq_len L == the one-row launch at seq_len L - (T-1-t), including the gated layout."""
     from engine.kernels import ops
     torch.manual_seed(T * 1000 + L)
     B, Lmax = 2, 4096 + 64 * 16 * 3
-    k, v, _, _ = cache(B, Lmax)
+    k, v, _, _ = cache(B, Lmax, hkv)
     q = torch.randn(B, Hq, T, D, device="cuda").bfloat16()
     gate = torch.randn(B, T, Hq, 2 * D, device="cuda").bfloat16()
     sl = torch.tensor([L, L + 3], dtype=torch.int32, device="cuda")
@@ -73,13 +76,15 @@ class _LinearR(torch.nn.Linear):
         return y if residual is None else y + residual
 
 
+@pytest.mark.parametrize("hkv", [4, 2])
 @pytest.mark.parametrize("B,T,pos", [(1, 1, 37), (2, 1, 500), (1, 3, 64)])
-def test_kernel_attention_layer_matches_reference(B, T, pos):
-    """Fused prologue (q/k norm, RoPE, fp8 KV write) + multi-row attention + gated combine vs qwen35.Attention."""
+def test_kernel_attention_layer_matches_reference(B, T, pos, hkv):
+    """Fused prologue (q/k norm, RoPE, fp8 KV write) + multi-row attention + gated combine vs qwen35.Attention. With
+    hkv = 2 this checks that attn_prologue serves the 24 / 2 layout of qwen4_exp unchanged."""
     from engine.model.fast import FastState, KernelAttention, LinearGroup
     from engine.model.qwen35 import Attention, ModelState, Qwen35Config
     torch.manual_seed(B * 100 + T + pos)
-    cfg = Qwen35Config(layer_types=["full_attention"], num_hidden_layers=1)
+    cfg = Qwen35Config(layer_types=["full_attention"], num_hidden_layers=1, num_key_value_heads=hkv)
     ref = Attention(cfg).cuda().bfloat16()
     for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
         old = getattr(ref, name)

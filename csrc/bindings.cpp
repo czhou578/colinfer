@@ -182,7 +182,7 @@ void rmsnorm(torch::Tensor x, torch::Tensor w, double eps, torch::Tensor out) {
 }
 
 // ===================================================================================================== attn_decode.cu
-int attn_decode_tc_nb();
+int attn_decode_tc_nb(int);
 cudaError_t launch_attn_decode_tc(const void*, const void*, const void*, const int*, void*, float*, void*, int, int, int, int, int, int, float,
                                   const void*, cudaStream_t);
 cudaError_t launch_attn_prologue(const void*, const void*, const void*, int, int, int, const void*, const void*, const float*, const int*, void*,
@@ -246,7 +246,9 @@ void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, 
     }
     const int64_t B = q.size(0), Hq = q.size(1), T = q.size(2), Dh = q.size(3), Hkv = k_cache.size(1), Lmax = k_cache.size(2);
     TORCH_CHECK(k_cache.size(0) == B && Dh == HEAD_DIM && seq_lens.numel() == B, "bad shapes");
-    const int NB = attn_decode_tc_nb();
+    TORCH_CHECK(Hq % Hkv == 0 && attn_decode_tc_nb((int)(Hq / Hkv)) > 0, "attn_decode: compiled for 6 or 12 query heads per KV head, got ", Hq,
+                " / ", Hkv);
+    const int NB = attn_decode_tc_nb((int)(Hq / Hkv));
     auto part_acc = torch::empty({B * Hq * T * NB, Dh}, q.options().dtype(torch::kFloat32));
     auto part_ml = torch::empty({B * Hq * T * NB, 2}, q.options().dtype(torch::kFloat32));
     CHECK_LAUNCH(launch_attn_decode_tc(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), seq_lens.data_ptr<int>(), out.data_ptr(),
@@ -257,7 +259,7 @@ void attn_decode(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, 
 cudaError_t launch_gdn_conv(const void*, int, const void*, const void*, void*, int, int, int, cudaStream_t);
 cudaError_t launch_gdn_conv_commit(const void*, int, void*, const int*, int, int, int, cudaStream_t);
 cudaError_t launch_gdn_delta(const void*, const void*, int, const void*, const void*, int, const void*, const void*, const void*, float*, void*,
-                             const int*, int, int, int, float, int, cudaStream_t);
+                             const int*, int, int, int, float, int, int, cudaStream_t);
 
 // out bf16 [B, T, C] = silu(causal depthwise conv) of T new tokens per slot from the conv window (not written).
 // mixed: bf16 [B, T, C] (rows may be strided); conv_state: bf16 [B, C, 3]; w: bf16 [C, 4] (or [C, 1, 4]).
@@ -283,9 +285,11 @@ void gdn_conv_commit(torch::Tensor mixed, torch::Tensor conv_state, torch::Tenso
 //   n (optional): int32 [B]. The op writes back the state advanced by n[b] tokens (0: no change).
 // qkv bf16 [B, T, 2*Hk*128 + Hv*128] (the conv output). z [B, T, Hv*128]. b, a [B, T, Hv]. z, b and a can be column
 // slices of wider rows, and b and a share a row stride. A_log, dt_bias bf16 [Hv]. norm_w bf16 [128]. state fp32
-// [B, Hv, 128, 128].
+// [B, Hv, 128, 128]. gate_act: the activation of the output gate z, 0 = silu (Qwen3.8-27B), 1 = sigmoid (qwen4_exp).
 void gdn_delta(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tensor a, torch::Tensor A_log, torch::Tensor dt_bias,
-               torch::Tensor norm_w, torch::Tensor state, c10::optional<torch::Tensor> out, int64_t Hk, double eps, c10::optional<torch::Tensor> n) {
+               torch::Tensor norm_w, torch::Tensor state, c10::optional<torch::Tensor> out, int64_t Hk, double eps, c10::optional<torch::Tensor> n,
+               int64_t gate_act) {
+    TORCH_CHECK(gate_act == 0 || gate_act == 1, "gdn_delta: gate_act must be 0 (silu) or 1 (sigmoid)");
     for (auto* t : {&qkv, &A_log, &dt_bias, &norm_w}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     CHECK_CUDA_TENSOR(state, torch::kFloat32);
     const int64_t B = state.size(0), Hv = state.size(1), C = 2 * Hk * GDN_DK + Hv * GDN_DV, T = qkv.numel() / (B * C);
@@ -301,7 +305,8 @@ void gdn_delta(torch::Tensor qkv, torch::Tensor z, torch::Tensor b, torch::Tenso
         op = out->data_ptr();
     }
     CHECK_LAUNCH(launch_gdn_delta(qkv.data_ptr(), z.data_ptr(), (int)ldz, b.data_ptr(), a.data_ptr(), (int)ldba, A_log.data_ptr(), dt_bias.data_ptr(),
-                                  norm_w.data_ptr(), state.data_ptr<float>(), op, opt_i32(n, B, "n"), B, Hk, Hv, (float)eps, T, stream()));
+                                  norm_w.data_ptr(), state.data_ptr<float>(), op, opt_i32(n, B, "n"), B, Hk, Hv, (float)eps, T, (int)gate_act,
+                                  stream()));
 }
 
 // ===================================================================================================== gemm_nvfp4.cu
@@ -380,7 +385,7 @@ cudaError_t launch_dequant_nvfp4(const void*, const void*, void*, size_t, float,
 cudaError_t launch_causal_conv_silu(const void*, int, const void*, const void*, void*, void*, void*, int, int, int, int, float, cudaStream_t);
 cudaError_t launch_add_rmsnorm(const void*, const void*, const void*, float, int, int, void*, void*, void*, void*, float, void*, float, cudaStream_t);
 cudaError_t launch_gate_fp8(const void*, const void*, int, int, int, int, void*, float, cudaStream_t);
-cudaError_t launch_gated_rmsnorm(const void*, const void*, int, int, const void*, void*, int, float, cudaStream_t);
+cudaError_t launch_gated_rmsnorm(const void*, const void*, int, int, const void*, void*, int, float, int, cudaStream_t);
 
 // bf16 [N, K] from NVFP4 w [N, K/2] (uint8), e4m3 block scales sf [N, K/16] and the global scale (engine/weights/loader.py
 // dequant_nvfp4, bit for bit)
@@ -446,14 +451,16 @@ void gate_fp8(torch::Tensor o, torch::Tensor gate, int64_t D, double scale, torc
     CHECK_LAUNCH(launch_gate_fp8(o.data_ptr(), gate.data_ptr(), (int)gate.stride(0), T, H, D, out.data_ptr(), (float)scale, stream()));
 }
 
-// o, out: bf16 [T*heads, 128] contiguous; z: bf16 [T, heads*128] (rows may be strided); w [128]
-void gated_rmsnorm(torch::Tensor o, torch::Tensor z, torch::Tensor w, double eps, torch::Tensor out) {
+// o, out: bf16 [T*heads, 128] contiguous; z: bf16 [T, heads*128] (rows may be strided); w [128]. gate_act: 0 = silu(z),
+// 1 = sigmoid(z).
+void gated_rmsnorm(torch::Tensor o, torch::Tensor z, torch::Tensor w, double eps, torch::Tensor out, int64_t gate_act) {
+    TORCH_CHECK(gate_act == 0 || gate_act == 1, "gated_rmsnorm: gate_act must be 0 (silu) or 1 (sigmoid)");
     for (auto* t : {&o, &w, &out}) CHECK_CUDA_TENSOR(*t, torch::kBFloat16);
     TORCH_CHECK(z.is_cuda() && z.scalar_type() == torch::kBFloat16 && z.dim() == 2 && z.stride(1) == 1, "z: bf16 [T, heads*128], unit-stride rows");
     const int64_t heads = z.size(1) / GDN_DV;
     TORCH_CHECK(z.size(1) % GDN_DV == 0 && o.numel() == z.size(0) * z.size(1) && out.numel() == o.numel() && w.numel() == GDN_DV, "bad shapes");
     CHECK_LAUNCH(launch_gated_rmsnorm(o.data_ptr(), z.data_ptr(), (int)z.stride(0), (int)heads, w.data_ptr(), out.data_ptr(), o.numel() / GDN_DV,
-                                      (float)eps, stream()));
+                                      (float)eps, (int)gate_act, stream()));
 }
 
 // ===================================================================================================== gdn_prefill.cu
@@ -551,7 +558,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gdn_conv_commit", &gdn_conv_commit, "advance the GDN conv window by n tokens", py::arg("mixed"), py::arg("conv_state"), py::arg("n"));
     m.def("gdn_delta", &gdn_delta, "GDN gated delta rule + gated RMSNorm over T tokens per slot", py::arg("qkv"), py::arg("z"), py::arg("b"),
           py::arg("a"), py::arg("A_log"), py::arg("dt_bias"), py::arg("norm_w"), py::arg("state"), py::arg("out"), py::arg("Hk"), py::arg("eps"),
-          py::arg("n") = py::none());
+          py::arg("n") = py::none(), py::arg("gate_act") = 0);
     // prefill
     m.def("nvfp4_sf_size", &nvfp4_sf_size, "bytes of a swizzled NVFP4 scale tensor for [rows, K]", py::arg("rows"), py::arg("K"));
     m.def("nvfp4_quant", &nvfp4_quant, "bf16 -> NVFP4 (packed e2m1 + swizzled e4m3 scales), static global scale", py::arg("x"), py::arg("in_scale"), py::arg("q"), py::arg("sf"));
@@ -569,7 +576,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("eps"), py::arg("x_out") = py::none(), py::arg("n_out") = py::none(), py::arg("q4") = py::none(), py::arg("sf4") = py::none(),
           py::arg("in_scale4") = 1.0, py::arg("q8") = py::none(), py::arg("in_scale8") = 1.0);
     m.def("gate_fp8", &gate_fp8, "attention output gate fused with FP8 quantization", py::arg("o"), py::arg("gate"), py::arg("D"), py::arg("scale"), py::arg("out"));
-    m.def("gated_rmsnorm", &gated_rmsnorm, "GDN gated RMSNorm over rows of 128", py::arg("o"), py::arg("z"), py::arg("w"), py::arg("eps"), py::arg("out"));
+    m.def("gated_rmsnorm", &gated_rmsnorm, "GDN gated RMSNorm over rows of 128", py::arg("o"), py::arg("z"), py::arg("w"), py::arg("eps"), py::arg("out"),
+          py::arg("gate_act") = 0);
     m.def("gdn_prefill", &gdn_prefill, "chunked Gated DeltaNet forward (prefill), continuing state in place", py::arg("q"), py::arg("k"),
           py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("state"), py::arg("o"), py::arg("scale"));
     m.def("attn_prefill_fp8", &attn_prefill_fp8, "causal prefill attention, FP8 Q K^T over an e4m3 KV cache", py::arg("q"),
