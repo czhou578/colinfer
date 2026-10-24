@@ -210,5 +210,20 @@ kernel build. The 27B's tests must keep passing in every worktree.
   and prefill paths differ by about 2% (the prefill quantizes the activations to NVFP4). Known limit: the split-K
   counters of the skinny GEMM are global, so two split-K launches must not overlap on different streams. memcheck,
   racecheck and synccheck are clean (synccheck needs `--num-cuda-barriers 4096` on the grouped GEMM). The startup
-  self-test covers the BF16 skinny format, the MoE decode path and the grouped GEMM. K2 (QSA, HC, GDN kernels) is in
-  progress in its worktree.
+  self-test covers the BF16 skinny format, the MoE decode path and the grouped GEMM.
+- **2026-10-24, K2 merged.** The GDN kernels take a `gate_act` flag (sigmoid for this family; the 27B path keeps its
+  bits). The decode attention runs GQA 24/2 as well as 24/4 (the tensor-core core moved to `csrc/attn_tc.cuh`, with a
+  list mode for the sparse path). The QSA kernels (`csrc/qsa.cu`): the selection equals a stable sort and torch.topk
+  with forced ties up to 65536 blocks; `qsa_attn` over 2051 keys takes 9.3 us at T = 1 and 72 us at T = 8 (227 to
+  235 GB/s) at any context length; `qsa_score` takes about 24 to 50 us at 65k blocks; `qsa_topk` takes about 70 us
+  at 65k blocks (one block per row: about 0.85 ms per token over 12 layers at 262k, the first thing to speed up).
+  The hyper-connection kernels (`csrc/hc.cu`): `hc_post` and the grouped norm are bit-exact against transformers;
+  `hc_mix` streams W_up at about 200 GB/s (33 us at M = 1); a full gated residual takes 14 / 40 / 74 us at M = 1 / 8 /
+  16. The down | inject product runs on `bf16_gemv` until the BF16 skinny GEMM replaces it (torch's bf16 matmul is
+  not row-invariant). The host row reader `ops().ple_gather` reaches about 170k cold rows per second at 128 rows
+  per call and 370k to 410k at 4096 rows per call on the NVMe drive (O_DIRECT and plain pread within 10%). memcheck,
+  racecheck (filtered to the engine's kernels) and synccheck are clean. The startup self-test covers 22 paths. Open:
+  the model must record `rope_pos` rows before `qsa_block_keys` when an image is in the context; `qsa_topk` at long
+  context; the thread count of the row reader (small warm batches want 1 to 2 threads, cold batches 64).
+- **Next:** milestone M1, the decode model on the kernels (`engine/model/fast_qwen4exp.py`), the family dispatch and
+  the golden test against `tools/qwen4exp_reference.py`.
