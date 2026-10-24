@@ -86,7 +86,9 @@ def qsa_attn(q, k, v, sel, nsel, pos_t, scale, gate=None, out=None):
 DENSE_LEN = TOPK_BLOCKS * RATIO + RATIO - 1  # 2051: a row at position p sees every token iff p + 1 <= 2051
 SELECT_GROUP = 512  # rows per score buffer (fp32 [512, L / 4]: 134 MB at 262k tokens)
 LIST_GROUP = 256  # rows per qsa_attn launch of the "list" path (its fp32 partials: 151 MB)
-PREFILL_PATH = "union"  # the default path of prefill_attend (bench/prefill_chunk_bench.py)
+PREFILL_PATH = "union"  # the default path of prefill_attend. On the real checkpoint and WikiText (bench/prefill_chunk_bench.py --part real), a
+# 4096-row chunk: a 4-row group attends to 3108 keys (union) at the prefix 8k and 3695 at 64k (one row: 2048 + its tail); union 12.8 / 15.0 ms,
+# mask 21.1 / 107.5 ms per layer
 
 
 def _row_pos(pos0: int, T: int, step: int, device) -> torch.Tensor:

@@ -12,7 +12,16 @@ random weights at the real dims, with no checkpoint (every allocation stays well
                  chunks of 2048 tokens, the warm path at T = 1 and 16 (decode), and the hit rate of a row cache over the
                  WikiText token stream of tools/ple_hotset.py (CPU and drive only)
 
+  --part real    the real checkpoint (about 80 GB: run it under the GPU lock): the WikiText prompt of --real-tokens tokens
+                 prefilled in chunks of 4096 and of 2048 (one call each) and in one call per 4096-token chunk (the
+                 scheduler's way): the state of the runs compared (GDN conv / rec, PLE conv, K / V, indexer keys, block keys)
+                 and 16 greedy tokens after each; the time of each call per chunk (tok/s); then a WikiText prefill to
+                 --long-tokens tokens in 4096-token calls, with the tok/s of each chunk, and, at the chunks that start at
+                 --probe prefixes, the union size of the sparse attention (keys per 4-row group) and the time of the union
+                 and the mask paths on each attention layer's real data
+
    ./py bench/prefill_chunk_bench.py --part layers attn
+   flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py bench/prefill_chunk_bench.py --part real
    ./py bench/prefill_chunk_bench.py --part ple --ple-file <snapshot>/model-fp8-mtp-ple.safetensors
 """
 import argparse
@@ -198,9 +207,212 @@ def ple(path: str, tokens: int, cache_gb: float):
     table.close()
 
 
+# ------------------------------------------------------------------------------------------------------------ the real model
+class AttendProbe:
+    """Wraps qsa_kernels.prefill_attend (the function that prefill_qwen4exp.qsa_layer calls). At a chunk whose pos0 is in
+    `prefixes`, it records for each attention layer the union size (keys per group of 4 rows), the time of the union and the
+    mask paths (CUDA events, median of 3) and their relative difference; the chunk's output is the default path's."""
+
+    def __init__(self, prefixes):
+        from engine.model import qsa_kernels as qk
+        self.qk, self.orig, self.prefixes, self.rows = qk, qk.prefill_attend, set(prefixes), []
+        qk.prefill_attend = self
+
+    def close(self):
+        self.qk.prefill_attend = self.orig
+
+    def __call__(self, q, kc, vc, sel, nsel, pos0, scale, gate, path=None):
+        if pos0 not in self.prefixes:
+            return self.orig(q, kc, vc, sel, nsel, pos0, scale, gate, path)
+        T = q.shape[2]
+        ul, uc = self.qk.prefill_union(sel, nsel, pos0, T)
+        res, outs = dict(pos0=pos0, T=T, keys_per_group=float(uc.float().mean()) * 4, keys_per_group_max=int(uc.max()) * 4,
+                         selected_per_row=float(nsel.float().mean()) * 4), {}
+        for path_ in ("union", "mask"):
+            ts = []
+            for _ in range(3):
+                a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                a.record()
+                outs[path_] = self.orig(q, kc, vc, sel, nsel, pos0, scale, gate, path_)
+                b.record()
+                b.synchronize()
+                ts.append(a.elapsed_time(b))
+            res[f"{path_}_ms"] = sorted(ts)[1]
+        res["rel_union_mask"] = float((outs["union"].float() - outs["mask"].float()).norm() / outs["mask"].float().norm())
+        self.rows.append(res)
+        return outs[path or self.qk.PREFILL_PATH]
+
+
+def _state_diff(a, b, n: int) -> dict:
+    """The largest relative L2 difference (and max |delta|) per kind of state tensor of two one-slot FastState4 over the
+    first n positions."""
+    def rel(x, y):
+        x, y = x.float(), y.float()
+        return float((x - y).norm() / y.norm().clamp_min(1e-30)), float((x - y).abs().max())
+    kinds = {"gdn conv": [(a.conv[i], b.conv[i]) for i in a.conv], "gdn rec": [(a.rec[i], b.rec[i]) for i in a.rec],
+             "ple conv": [(a.ple_conv[i], b.ple_conv[i]) for i in a.ple_conv],
+             "k": [(a.k[i][:, :, :n], b.k[i][:, :, :n]) for i in a.k], "v": [(a.v[i][:, :, :n], b.v[i][:, :, :n]) for i in a.v],
+             "ik": [(a.ik[i][:, :n], b.ik[i][:, :n]) for i in a.ik], "ikb": [(a.ikb[i][:, :n // 4], b.ikb[i][:, :n // 4]) for i in a.ikb]}
+    def same(x, y):
+        return torch.equal(x.view(torch.uint8), y.view(torch.uint8)) if x.dtype == torch.float8_e4m3fn else torch.equal(x, y)
+    out = {}
+    for k, pairs in kinds.items():
+        r = [rel(x, y) for x, y in pairs]
+        out[k] = dict(rel=max(v[0] for v in r), max_abs=max(v[1] for v in r), equal=all(same(x, y) for x, y in pairs),
+                      per_layer=[v[0] for v in r])
+    out["rope_pos"] = dict(equal=torch.equal(a.rope_pos[:, :n], b.rope_pos[:, :n]))
+    return out
+
+
+def _greedy(model, st, logits, ids, n: int) -> list[int]:
+    """n greedy tokens after a prefill: eager decode steps on st, the n-gram rows from the host (model.host_rows)."""
+    ctx, out = list(ids[-2:]), []
+    for _ in range(n):
+        t = int(logits.argmax())
+        out.append(t)
+        rows = model.host_rows([[t]], [ctx]).cuda()
+        ctx = [ctx[1], t]
+        logits = model(torch.tensor([[t]], device=DEV), st, rows)[0]
+    return out
+
+
+def _calls(pq, model, st, ids, chunk, log=None) -> list[float]:
+    """Prefill ids in one call per chunk (prev2 from the prompt: the scheduler's way); the seconds of each call."""
+    eos = model.cfg.eos_token_id
+    ts, out = [], None
+    for c0 in range(0, len(ids), chunk):
+        x = torch.tensor([ids[c0:c0 + chunk]], device=DEV)
+        prev2 = ([eos, eos] + ids[:c0])[-2:]
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = pq.prefill(model, x, st, chunk=chunk, prev2=prev2)
+        torch.cuda.synchronize()
+        ts.append(time.perf_counter() - t0)
+        if log:
+            log(c0, x.shape[1], ts[-1])
+    return ts, out
+
+
+def real(name: str, n_tok: int, n_long: int, probes, out: str | None = None):
+    import json
+
+    from transformers import AutoTokenizer
+
+    from engine.model import prefill_qwen4exp as pq
+    from engine.model.fast_qwen4exp import load_fast_qwen4exp
+    from engine.weights.loader import resolve
+    from engine.weights.ple import PleFeeder
+    from tests.perplexity import wikitext_test
+    path, model = load_fast_qwen4exp(name)
+    ple = model.ple_layer()
+    model.feeder = PleFeeder(ple.table, cache_rows=6_250_000, params=ple.params, image_token_id=model.cfg.image_token_id)
+    tok = AutoTokenizer.from_pretrained(resolve(path))
+    all_ids = tok(wikitext_test(), return_tensors="pt").input_ids[0][:max(3 * n_tok, n_long)].tolist()
+    ids = all_ids[:n_tok]
+    eos = model.cfg.eos_token_id
+    L = -(-(n_tok + 64) // 16) * 16
+    res = {}
+    # 1. the same prompt in chunks of 4096 and 2048 (one call each), and in one call per 4096-token chunk
+    states, first = {}, {}
+    for tag, chunk, per_call in (("4096", 4096, False), ("2048", 2048, False), ("4096 per call", 4096, True)):
+        st = model.new_state(1, L)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        if per_call:
+            _, logits = _calls(pq, model, st, ids, chunk)
+        else:
+            logits = pq.prefill(model, torch.tensor([ids], device=DEV), st, chunk=chunk)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        h, m, _, _ = model.feeder.stats(reset=True)
+        print(f"[real] prefill of {n_tok} WikiText tokens, chunk {tag}: {dt:.2f} s ({n_tok / dt:.0f} tok/s; feeder {h} hits, {m} misses)",
+              flush=True)
+        states[tag], first[tag] = st, logits[0].clone()
+        res[f"prefill_s {tag}"] = dt
+    for tag in ("2048", "4096 per call"):
+        d = _state_diff(states[tag], states["4096"], n_tok)
+        lg = (first[tag] - first["4096"]).abs().max().item()
+        res[f"state {tag} vs 4096"] = d
+        print(f"[real] state after chunk {tag} against chunk 4096: " +
+              "; ".join(f"{k} " + ("equal" if v.get("equal") else f"rel {v['rel']:.2e} max {v['max_abs']:.3g}") for k, v in d.items()) +
+              f"; last logits max |delta| {lg:.4f}", flush=True)
+        for k, v in d.items():
+            if "per_layer" in v and not v["equal"]:
+                print(f"[real]     {k} rel by layer: " + " ".join(f"{x:.1e}" for x in v["per_layer"]), flush=True)
+    toks = {tag: _greedy(model, states[tag], first[tag], ids, 16) for tag in states}
+    res["greedy"] = toks
+    for tag in ("2048", "4096 per call"):
+        same = toks[tag] == toks["4096"]
+        i = next((j for j, (a, b) in enumerate(zip(toks[tag], toks["4096"])) if a != b), None)
+        print(f"[real] 16 greedy tokens after chunk {tag}: {'equal to' if same else f'differ at token {i} from'} chunk 4096", flush=True)
+    del states, first
+    torch.cuda.empty_cache()
+    # 2. the time of each call (warm row cache: the same prompt again)
+    for chunk in (4096, 2048):
+        st = model.new_state(1, L)
+        ts, _ = _calls(pq, model, st, ids, chunk)
+        res[f"calls {chunk}"] = ts
+        print(f"[real] one call per {chunk}-token chunk, warm rows: " +
+              ", ".join(f"@{c0 // 1024}k {chunk / t:.0f} tok/s ({t * 1e3:.0f} ms)" for c0, t in zip(range(0, n_tok, chunk), ts)), flush=True)
+        del st
+    # 2b. cold rows, one call per 4096-token chunk: without and with next_ids (two regions of the text that no run read yet)
+    if len(all_ids) >= 3 * n_tok:
+        for tag, a0, ahead in (("without next_ids", n_tok, False), ("with next_ids", 2 * n_tok, True)):
+            part = all_ids[a0:a0 + n_tok]
+            st = model.new_state(1, L)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for c0 in range(0, n_tok, 4096):
+                nxt = part[c0 + 4096:c0 + 8192] if ahead else None
+                pq.prefill(model, torch.tensor([part[c0:c0 + 4096]], device=DEV), st, prev2=([eos, eos] + part[:c0])[-2:], next_ids=nxt)
+            torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            res[f"cold {tag}"] = dt
+            print(f"[real] {n_tok} tokens with cold rows, one call per 4096-token chunk {tag}: {dt:.2f} s ({n_tok / dt:.0f} tok/s)", flush=True)
+            del st
+    # 3. a long WikiText prefill in 4096-token calls, the attention probe at the given prefixes
+    if n_long:
+        st = model.new_state(1, -(-(n_long + 64) // 16) * 16)
+        probe = AttendProbe(probes)
+        rows = []
+
+        def log(c0, T, t):
+            rows.append((c0, T, t))
+            if c0 // 4096 % 4 == 0 or c0 in probes:
+                print(f"[real]   long prefill: the chunk at {c0 // 1024}k: {T / t:.0f} tok/s ({t * 1e3:.0f} ms){' (probed)' if c0 in probes else ''}",
+                      flush=True)
+        try:
+            _calls(pq, model, st, all_ids[:n_long], 4096, log)
+        finally:
+            probe.close()
+        res["long_calls"] = rows
+        res["probe"] = probe.rows
+        for p in sorted(probes):
+            r = [x for x in probe.rows if x["pos0"] == p]
+            if not r:
+                continue
+            mean = {k: sum(x[k] for x in r) / len(r) for k in ("keys_per_group", "selected_per_row", "union_ms", "mask_ms")}
+            kmax, rmax = max(x["keys_per_group_max"] for x in r), max(x["rel_union_mask"] for x in r)
+            print(f"[real] sparse attention at the prefix {p // 1024}k (T = {r[0]['T']}, {len(r)} layers): union {mean['keys_per_group']:.0f} keys "
+                  f"per 4-row group (max {kmax}; one row selects {mean['selected_per_row']:.0f}); union {mean['union_ms']:.2f} ms, mask "
+                  f"{mean['mask_ms']:.2f} ms per layer; rel(union, mask) up to {rmax:.1e}", flush=True)
+            for x in r:
+                print(f"[real]     {x['keys_per_group']:7.0f} keys/group  union {x['union_ms']:6.2f} ms  mask {x['mask_ms']:7.2f} ms  "
+                      f"rel {x['rel_union_mask']:.1e}")
+    h, m, held, cap = model.feeder.stats()
+    print(f"[real] feeder after the long prefill: {held} rows held of {cap}; {model.feeder.gather_rows} rows read from the file in all")
+    if out:
+        json.dump(res, open(out, "w"), indent=1, default=str)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--part", nargs="+", default=["layers", "attn"], choices=["layers", "attn", "ple"])
+    ap.add_argument("--part", nargs="+", default=["layers", "attn"], choices=["layers", "attn", "ple", "real"])
+    ap.add_argument("--model", default="nvidia/Qwen3.8-Flash-Next-NVFP4")
+    ap.add_argument("--real-tokens", type=int, default=12288, help="--part real: the prompt of the chunk comparison")
+    ap.add_argument("--long-tokens", type=int, default=65536 + 4096, help="--part real: the long prefill (0: skip it)")
+    ap.add_argument("--json", help="--part real: write the results here")
+    ap.add_argument("--probe", type=int, nargs="*", default=[8192, 65536], help="--part real: the prefixes of the attention probe")
     ap.add_argument("--ple-file", default=None, help="the checkpoint's model-fp8-mtp-ple.safetensors")
     ap.add_argument("--tokens", type=int, default=4_000_000, help="--part ple: WikiText tokens of the hit-rate run")
     ap.add_argument("--cache-gb", type=float, default=2.0)
@@ -211,6 +423,8 @@ def main():
         attn()
     if "ple" in a.part:
         ple(a.ple_file, a.tokens, a.cache_gb)
+    if "real" in a.part:
+        real(a.model, a.real_tokens, a.long_tokens, a.probe, a.json)
 
 
 if __name__ == "__main__":

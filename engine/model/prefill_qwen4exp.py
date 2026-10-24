@@ -23,6 +23,23 @@ prefill(model, input_ids, state, chunk, ...) runs the layers chunk by chunk, wit
 engine/model/prefill.py's prefill plus rows / prev2: the n-gram rows of the prompt (u8 [T, 16, 160]) come in `rows`, or
 the model's feeder (model.feeder, engine.weights.ple.PleFeeder) reads them from the tokens and the two tokens before
 them (prev2); its worker gathers the next chunk's rows while the GPU runs the current one.
+
+The scheduler's recipe (engine/runtime/scheduler.py through engine/model/family.py):
+
+1. Once after the load: prepare_prefill(model). It attaches model.feeder, a PleFeeder with a 1 GB row cache
+   (FEEDER_ROWS). The decode hooks use the same feeder: before a replay, model.feeder.rows_for(tokens, prev2) gives the
+   pinned rows u8 [T, 16, 160] of the replay's tokens; copy them into the graph's feed_buffer(B, T)[b].
+2. One call per chunk of a slot b: view = state.view(b, b + 1); view.pos = start (the tokens the slot holds; view.pos_t
+   holds the same on the device); then
+       logits = prefill(model, ids, view, logits=last, chunk=CHUNK, prev2=prev2, next_ids=nxt)
+   ids: int64 [1, n] on the device. prev2: the slot's two tokens before ids (slot.tokens[-2:]); None only at start 0,
+   which reads as (eos, eos). nxt (optional): the tokens of the slot's next prefill call; the feeder then reads their
+   rows from the drive while the GPU runs this call (the rows of a cold 4096-token chunk take about 150 ms).
+   A call of n > CHUNK tokens runs ceil(n / CHUNK) chunks; logits=False skips the lm_head (not the last chunk).
+3. return_hidden=True returns (logits, hidden4 [n, 10240]): the pre-mixer stream that the MTP drafter reads.
+4. The call writes K / V, ik, ikb and rope_pos for the n positions, advances the GDN conv / rec and ple_conv of the slot,
+   and adds n to view.pos_t on the device (view.pos too, on the view). Decode continues from there; its first
+   before_replay context is the last two tokens of the prompt.
 """
 from __future__ import annotations
 
@@ -35,7 +52,7 @@ import torch.nn.functional as F
 from engine.kernels import ops
 from engine.model import qsa_kernels as qk
 
-CHUNK = 2048  # tokens per chunk (bench/prefill_chunk_bench.py measures 2048, 4096 and 8192)
+CHUNK = 4096  # tokens per chunk: the real checkpoint prefills 2780 tok/s at 4096 and 2610 at 2048 (bench/prefill_chunk_bench.py --part real)
 HC = 4  # hyper-connection streams
 
 
@@ -195,6 +212,21 @@ def ple_layer(x4: torch.Tensor, rows: torch.Tensor, ple, state, li: int) -> torc
     return x4
 
 
+FEEDER_ROWS = 6_250_000  # the default row cache of prepare_prefill's feeder: 1 GB of 160-byte rows
+STAGING = 3  # the pinned staging buffers of the prefill rows per feeder (the chunk in flight, a prefetch, one more)
+
+
+def prepare_prefill(model, cache_rows: int = FEEDER_ROWS):
+    """One-time setup (the family's prepare_prefill; idempotent): model.feeder, an engine.weights.ple.PleFeeder with a row
+    cache of cache_rows rows on the PLE layer's table, unless the model has a feeder already. The prefill and the decode
+    hooks share it. The MoE needs nothing more: KernelMoE swizzles its prefill operands when it is built."""
+    ple = next((layer.ple for layer in model.layers if getattr(layer, "ple", None) is not None), None)
+    if getattr(model, "feeder", None) is None and ple is not None:
+        from engine.weights.ple import PleFeeder
+        model.feeder = PleFeeder(ple.table, cache_rows=cache_rows, params=ple.params, image_token_id=model.cfg.image_token_id)
+    return model
+
+
 def _feeder(model):
     """(the model's feeder, whether it is a temporary one): model.feeder (engine.weights.ple.PleFeeder, with the row
     cache), else a feeder without a cache on the PLE layer's table."""
@@ -204,6 +236,43 @@ def _feeder(model):
     from engine.weights.ple import PleFeeder
     ple = next(layer.ple for layer in model.layers if getattr(layer, "ple", None) is not None)
     return PleFeeder(ple.table, cache_rows=0, params=ple.params, image_token_id=model.cfg.image_token_id), True
+
+
+class _Rows:
+    """The n-gram rows of prefill chunks through the staging buffers of a feeder (PleFeeder.staging / release).
+
+    now(tokens, prev2) returns the pinned rows of a chunk and the index of the buffer that holds them: the result of a
+    pending prefetch of the same tokens and context (also one that an earlier prefill call started), else a fresh read
+    into a buffer that no pending prefetch writes. prefetch(tokens, prev2, busy) starts the read of a later chunk on the
+    feeder's worker, into a buffer other than busy (the buffer of the chunk in flight). The pending prefetch (its key and
+    buffer) lives on the feeder, so it survives from one prefill call to the next. A buffer is reused only after the
+    device copy out of it ends (the event of release)."""
+
+    def __init__(self, feeder):
+        self.f = feeder
+
+    @property
+    def pending(self):
+        """(key, buffer) of the prefill's prefetch while the feeder still holds it (another prefetch waits for it and
+        replaces it: the buffer is then free)."""
+        p, fp = getattr(self.f, "_prefill_pending", None), self.f._pending
+        if p is not None and (fp is None or fp[0] != p[0]):
+            p = self.f._prefill_pending = None
+        return p
+
+    def now(self, tokens, prev2) -> tuple[torch.Tensor, int]:
+        p, key = self.pending, self.f._key(tokens, prev2)
+        if p is not None and p[0] == key:
+            self.f._prefill_pending = None
+            return self.f.rows_for(tokens, prev2), p[1]  # the prefetch's tensor (rows_for waits for it)
+        i = next(j for j in range(STAGING) if p is None or j != p[1])
+        return self.f.rows_for(tokens, prev2, out=self.f.staging(i, len(tokens))), i
+
+    def prefetch(self, tokens, prev2, busy: int):
+        p = self.pending
+        i = next(j for j in range(STAGING) if j != busy and (p is None or j != p[1]))
+        self.f.prefetch(tokens, prev2, out=self.f.staging(i, len(tokens)))  # first waits for the earlier prefetch
+        self.f._prefill_pending = (self.f._key(tokens, prev2), i)
 
 
 # ------------------------------------------------------------------------------------------------------------ the model
@@ -222,7 +291,8 @@ def _embed(model, ids: torch.Tensor, c0: int, embeds) -> torch.Tensor:
 
 @torch.inference_mode()
 def prefill(model, input_ids: torch.Tensor, state, chunk: int = CHUNK, all_logits: bool = False, return_hidden: bool = False, embeds=None,
-            rope_pos: torch.Tensor | None = None, logits: bool = True, rows: torch.Tensor | None = None, prev2=None, path: str | None = None):
+            rope_pos: torch.Tensor | None = None, logits: bool = True, rows: torch.Tensor | None = None, prev2=None, path: str | None = None,
+            next_ids=None):
     """input_ids [1, T] from position state.pos of a single-slot FastState4 (a view of one slot). Returns the fp32
     logits of the last token [1, vocab] (the decode model's mixer and lm_head on its row), or with all_logits the bf16
     logits of every token [T, vocab] (a bf16 matmul with lm_head.w; the perplexity tool), or None with logits=False.
@@ -231,8 +301,10 @@ def prefill(model, input_ids: torch.Tensor, state, chunk: int = CHUNK, all_logit
     The n-gram rows: rows u8 [T, 16, 160] (CPU or device; kept unchanged until the GPU has read them), else the feeder
     of the model (model.feeder, or a temporary one without a cache) reads them from prev2, the two tokens of the slot
     before input_ids (default (eos, eos), which only a sequence start may use). With several chunks, the feeder gathers
-    the next chunk's rows on its worker thread while the GPU runs the current chunk. path: the attention path of
-    qsa_kernels.prefill_attend (default "union")."""
+    the next chunk's rows on its worker thread while the GPU runs the current chunk. next_ids (optional, the model's
+    feeder only): the tokens of the next prefill call of the slot; the feeder starts to gather their rows (the first
+    `chunk` of them) after the last chunk of this call is queued, and the next call with those tokens picks them up.
+    path: the attention path of qsa_kernels.prefill_attend (default "union")."""
     assert input_ids.shape[0] == 1, "one slot at a time"
     T_all = input_ids.shape[1]
     if state.pos + T_all > state.max_seq_len:
@@ -241,25 +313,20 @@ def prefill(model, input_ids: torch.Tensor, state, chunk: int = CHUNK, all_logit
     if rows is not None and rows.shape[0] != T_all:
         raise ValueError(f"rows: {rows.shape[0]} rows for {T_all} tokens")
     dev = input_ids.device
-    feeder, own, hist = None, False, None
+    feeder, own, hist, rd = None, False, None, None
     if has_ple and rows is None:
         if prev2 is None:
             if state.pos != 0:
                 raise ValueError("the n-gram rows of a continued prompt depend on the slot's history: pass prev2 (or rows)")
             prev2 = (model.cfg.eos_token_id,) * 2
         feeder, own = _feeder(model)
+        rd = _Rows(feeder)
         hist = np.concatenate([np.asarray(prev2, np.int64).reshape(-1), input_ids[0].cpu().numpy().astype(np.int64)])
-
-    def host_rows(c0: int, T: int, i: int, now: bool):
-        """The rows of the chunk at c0 in staging buffer i: read now (rows_for), or started on the worker (prefetch)."""
-        tok, ctx = hist[c0 + 2:c0 + 2 + T], hist[c0:c0 + 2]
-        buf = feeder.staging(i, T)
-        return feeder.rows_for(tok, ctx, out=buf) if now else feeder.prefetch(tok, ctx, out=buf)
 
     eps = model.cfg.rms_norm_eps
     outs, hid, x_last = [], [], None
     try:
-        for k, c0 in enumerate(range(0, T_all, chunk)):
+        for c0 in range(0, T_all, chunk):
             ids = input_ids[0, c0:c0 + chunk]
             T = ids.numel()
             rows_c = None
@@ -267,10 +334,14 @@ def prefill(model, input_ids: torch.Tensor, state, chunk: int = CHUNK, all_logit
                 rc = rows[c0:c0 + T]
                 rows_c = rc.to(dev, non_blocking=rc.is_pinned())
             elif feeder is not None:
-                rows_c = host_rows(c0, T, k % 2, True).to(dev, non_blocking=True)
-                feeder.release(k % 2)
+                buf, i = rd.now(hist[c0 + 2:c0 + 2 + T], hist[c0:c0 + 2])
+                rows_c = buf.to(dev, non_blocking=True)
+                feeder.release(i)
                 if c0 + chunk < T_all:  # the next chunk's rows: gathered while the GPU runs this chunk
-                    host_rows(c0 + chunk, min(chunk, T_all - c0 - chunk), (k + 1) % 2, False)
+                    c1 = c0 + chunk
+                    rd.prefetch(hist[c1 + 2:c1 + 2 + min(chunk, T_all - c1)], hist[c1:c1 + 2], i)
+                elif next_ids is not None and len(next_ids) and not own:  # the next call's first chunk
+                    rd.prefetch(np.asarray(next_ids, np.int64)[:chunk], hist[-2:], i)
             rp = rope_pos[c0:c0 + T] if rope_pos is not None else None
             x4 = _embed(model, ids, c0, embeds).repeat(1, HC)  # [T, 10240]
             pos0 = state.pos

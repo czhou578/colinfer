@@ -295,7 +295,10 @@ def test_prefill_mini_model(tmp_path):
     write_safetensors(path, [(prefix + ".weight_scale", torch.tensor([0.0078125], dtype=torch.bfloat16))] +
                       ngram_shards(table.view(torch.float8_e4m3fn).cpu(), 4, [2, 0, 3, 1], prefix))
     tab = NgramTable(path, prefix)
-    fast.feeder = PleFeeder(tab, 100000, params=ref.layers[1].ple.ple_embedding.params, image_token_id=cfg.image_token_id)
+    fast.layers[1].ple.table, fast.layers[1].ple.params = tab, ref.layers[1].ple.ple_embedding.params
+    pq.prepare_prefill(fast, cache_rows=100000)  # attaches the feeder (the family's prepare_prefill), once
+    feeder = fast.feeder
+    assert isinstance(feeder, PleFeeder) and feeder.stats()[3] >= 100000 and pq.prepare_prefill(fast).feeder is feeder
     st3 = _fast_state(cfg, L)
     via_feeder = pq.prefill(fast, ids, st3, chunk=1024, all_logits=True)
     assert torch.equal(via_feeder, logits)
@@ -305,5 +308,12 @@ def test_prefill_mini_model(tmp_path):
         pq.prefill(fast, ids[:, 1024:], st4, chunk=1024, all_logits=True)  # a continued prompt needs prev2
     b = pq.prefill(fast, ids[:, 1024:], st4, chunk=1024, all_logits=True, prev2=ids[0, 1022:1024].tolist())
     assert torch.equal(torch.cat([a, b]), logits)
+    # the next call's rows gathered ahead (next_ids), then a call with other tokens than announced: the same logits
+    for nxt in (ids[0, 1024:2048].tolist(), ids[0, 1000:2024].tolist()):
+        st5 = _fast_state(cfg, L)
+        a = pq.prefill(fast, ids[:, :1024], st5, chunk=1024, all_logits=True, next_ids=nxt)
+        assert fast.feeder._prefill_pending is not None
+        b = pq.prefill(fast, ids[:, 1024:], st5, chunk=1024, all_logits=True, prev2=ids[0, 1022:1024].tolist())
+        assert torch.equal(torch.cat([a, b]), logits)
     fast.feeder.close()
     tab.close()
