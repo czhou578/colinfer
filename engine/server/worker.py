@@ -33,12 +33,14 @@ WARMUP_IDS = (1000, 150000)  # ordinary text tokens for the warm-up prompts: pas
 @dataclasses.dataclass
 class ServerConfig:
     """What the engine thread builds and the HTTP layer enforces. The defaults are the server's flags (engine/server/api.py
-    main reads its argparse defaults from here), so a test constructs the same object with a few fields changed."""
+    main reads its argparse defaults from here), so a test constructs the same object with a few fields changed. None in
+    slots, max_seq_len, checkpoints and spec: the default of the model's family (engine/model/family.py). The engine
+    thread writes the values it built with into these fields before it sets `ready`."""
     model: str = MODEL
-    slots: int = 3
-    max_seq_len: int = 524288   # twice the checkpoint's native 262144: YaRN x2 (engine/runtime/build.py load_model)
-    checkpoints: int = 32
-    spec: str = "mtp"
+    slots: int | None = None        # the 27B: 3; qwen4_exp: 2
+    max_seq_len: int | None = None  # the 27B: 524288, twice the checkpoint's native 262144 (YaRN x2); qwen4_exp: 262144
+    checkpoints: int | None = None  # the 27B: 32; qwen4_exp: 16
+    spec: str | None = None         # the 27B: mtp; qwen4_exp: none
     k: int = 7
     drafter_weights: str = "auto"
     suffix_drafts: int = MIN_MATCH
@@ -91,12 +93,15 @@ class Worker(threading.Thread):
                                            drafter_weights=c.drafter_weights, suffix_drafts=c.suffix_drafts, decode_weights=c.decode_weights,
                                            boundary=c.boundary_token, selftest=c.selftest, vision=c.vision, vision_preload=c.vision_preload,
                                            metrics=self.metrics, log=log)
+        # the values of the family's defaults, for the log below and the HTTP layer (build_app reads max_seq_len)
+        c.slots, c.max_seq_len, c.checkpoints = sched.n_slots, sched.max_seq_len, sched.n_checkpoints
+        c.spec = "mtp" if sched.mtp is not None else "none"
         t3 = time.perf_counter()
         if c.warmup:
             self._warmup(sched, sched.model.cfg.vocab_size)
         if c.session_cache_gb > 0:  # after the warm-up, whose requests are not worth keeping
             sched.store = SessionStore(sched.state, getattr(sched, "mst", None), sched.fingerprint, int(c.session_cache_gb * 1e9),
-                                       c.session_dir, log=log)
+                                       c.session_dir, log=log, h_dim=sched.h_dim)
         t4 = time.perf_counter()
         self.sched = sched
         self.startup.update(warmup_s=round(t4 - t3, 1), total_s=round(t4 - t0, 1))

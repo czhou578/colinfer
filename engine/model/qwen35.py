@@ -204,6 +204,20 @@ class ModelState:
             for t in d.values():
                 t.zero_()
 
+    def kv_tensors(self) -> list[torch.Tensor]:
+        """The tensors with one row per position, [B, H, L, D] with the time on dim 2: [k[i], v[i] for i in sorted(k)].
+        The scheduler (_copy_kv) and the disk cache (engine/runtime/sessions.py) move the rows of a slot in this order,
+        so the order fixes the bytes of the session files. The state of qwen4_exp (engine/model/fast_qwen4exp.py
+        FastState4) has the same hook: the same k / v pairs first, then its indexer keys ik [B, 1, L, 128], its block
+        keys ikb [B, 1, L / 4, 128] (a tensor with L / r rows holds one row per r positions) and rope_pos [B, 1, L, 3]."""
+        return [t for i in sorted(self.k) for t in (self.k[i], self.v[i])]
+
+    def snap_tensors(self) -> list[torch.Tensor]:
+        """The tensors of a snapshot, [B, ...]: [conv[i] for i in sorted(conv)] + [rec[i] for i in sorted(rec)]. The
+        checkpoint ring of the scheduler, the slot reset at admission and the session files use this order. FastState4
+        has the same hook: conv, rec, then its PLE conv state ple_conv."""
+        return [self.conv[i] for i in sorted(self.conv)] + [self.rec[i] for i in sorted(self.rec)]
+
 
 # ----------------------------------------------------------------------------------------------
 # Building blocks

@@ -2,6 +2,9 @@
 
     uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 524288] [--spec mtp|none]
 
+The values above are the defaults for the 27B. The defaults of --slots, --max-seq-len and --spec come from the family
+of the model (engine/model/family.py).
+
 Endpoints: /v1/chat/completions and /v1/completions (SSE streaming, usage + timings, logprobs, stop strings, seeds,
 tools, thinking; engine/server/openai.py formats them), /v1/messages and /v1/messages/count_tokens (the Anthropic
 Messages API, engine/server/anthropic.py), /v1/models, /health, /metrics (Prometheus), /v1/status (slots and
@@ -33,7 +36,7 @@ import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from engine.model.family import check_served
+from engine.model.family import check_served, family_of
 from engine.runtime.build import NotEnoughMemory, check_memory
 from engine.runtime.grammar import Grammars
 from engine.runtime.scheduler import Request as EngineRequest
@@ -780,9 +783,11 @@ def main(argv=None):
     ap.add_argument("--model", default=D.model, help="HF repo id (in the local cache) or checkpoint directory")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--slots", type=int, default=D.slots, help="conversations whose KV stays cached; one request runs at a time")
-    ap.add_argument("--max-seq-len", type=int, default=D.max_seq_len, help="tokens per slot (prompt + output)")
-    ap.add_argument("--spec", choices=("mtp", "none"), default=D.spec)
+    ap.add_argument("--slots", type=int, default=D.slots,
+                    help="conversations whose KV stays cached; one request runs at a time (default: the model family's, 3 for the 27B)")
+    ap.add_argument("--max-seq-len", type=int, default=D.max_seq_len,
+                    help="tokens per slot (prompt + output; default: the model family's, 524288 for the 27B)")
+    ap.add_argument("--spec", choices=("mtp", "none"), default=D.spec, help="speculative decoding (default: the model family's, mtp for the 27B)")
     ap.add_argument("--drafter-weights", default=D.drafter_weights,
                     help="MTP head weights: auto = the fine-tuned head of the prepared directory (tools/prepare.py) when it has one, "
                          "none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
@@ -821,7 +826,11 @@ def main(argv=None):
     path = resolve(a.model)
     try:  # before the CUDA context and the slow imports: both read only config.json, so a refused start costs little
         check_served(path)  # a family the engine cannot serve yet (engine/model/family.py)
-        check_memory(path, a.slots, a.max_seq_len, a.spec)
+        fd = family_of(path).defaults  # the flags without a value take the family's defaults
+        slots = fd.slots if a.slots is None else a.slots
+        max_seq_len = fd.max_seq_len if a.max_seq_len is None else a.max_seq_len
+        spec = a.spec or fd.spec
+        check_memory(path, slots, max_seq_len, spec)
     except NotImplementedError as e:
         log(f"[server] {e}")
         raise SystemExit(2) from None
@@ -835,13 +844,13 @@ def main(argv=None):
 
     from transformers import AutoTokenizer  # a slow import: after the memory cap is set, so a crash here is cheap
     tokenizer = AutoTokenizer.from_pretrained(path)
-    # the values without a flag (the queue depth, the request time cap, the body size, the checkpoint ring, the draft lengths,
-    # the image size, the cache directory) are the defaults of ServerConfig
-    cfg = ServerConfig(model=a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=0 if a.no_prefix_caching else D.checkpoints,
-                       spec=a.spec, drafter_weights=a.drafter_weights, decode_weights=a.decode_weights,
+    # the values without a flag (the queue depth, the request time cap, the body size, the draft lengths, the image size, the
+    # cache directory) are the defaults of ServerConfig; the checkpoint ring is the family's
+    cfg = ServerConfig(model=a.model, slots=slots, max_seq_len=max_seq_len, checkpoints=0 if a.no_prefix_caching else fd.checkpoints,
+                       spec=spec, drafter_weights=a.drafter_weights, decode_weights=a.decode_weights,
                        boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
                        api_key=a.api_key, mem_cap_bytes=mem_cap_bytes, committee_size=a.committee_size, committee_roles=a.committee_roles,
-                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, vision=not a.no_vision)
+                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, vision=fd.vision and not a.no_vision)
     hf = json.load(open(os.path.join(path, "config.json")))
     hf_config = hf.get("text_config", hf)
     gen = json.load(open(os.path.join(path, "generation_config.json"))) if os.path.exists(os.path.join(path, "generation_config.json")) else {}

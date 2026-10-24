@@ -640,8 +640,9 @@ def test_constraints_of_both_apis(monkeypatch):
 
 def test_main_wires_the_flags(monkeypatch):
     """main() builds the ServerConfig from the flags that remain. The values that have no flag (the queue depth, the
-    request time cap, the checkpoint ring, the draft lengths, the image size) are the defaults of ServerConfig. The
-    engine thread, the app and the HTTP server are stand-ins; the tokenizer is the checkpoint's."""
+    request time cap, the draft lengths, the image size) are the defaults of ServerConfig. The slots, the slot length,
+    the speculation and the checkpoint ring default to those of the model's family. The engine thread, the app and the
+    HTTP server are stand-ins; the tokenizer is the checkpoint's."""
     import threading
 
     import engine.runtime.build as build
@@ -684,7 +685,9 @@ def test_main_wires_the_flags(monkeypatch):
     assert got["name"] == cfg.model == D.model and got["effort"] == "medium" and got["thinking"] is None and got["committee"] is None
     assert got["served"] and "temperature" in got["gen"]
     api.main(["--session-cache-gb", "0", "--thinking", "off"])
-    assert got["cfg"].checkpoints == D.checkpoints == 32 and got["thinking"] is False and got["committee"] is not None
+    c = got["cfg"]  # the flags without a value: the defaults of the 27B's family (engine/model/family.py)
+    assert (c.slots, c.max_seq_len, c.checkpoints, c.spec, c.vision) == (3, 524288, 32, "mtp", True)
+    assert got["thinking"] is False and got["committee"] is not None
     # the default cap: the engine's torch peak (89.5e9 with the vision tower) and a margin, not more of the host's memory
     assert got["cfg"].mem_cap_bytes == int(min(95e9, api.torch.cuda.get_device_properties(0).total_memory))
 

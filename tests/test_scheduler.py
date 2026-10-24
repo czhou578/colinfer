@@ -311,3 +311,170 @@ def test_a_time_limit_ends_a_running_request_and_drops_a_queued_one(make):
     assert a.output == reference(a.prompt, 2000)[:len(a.output)]
     assert b.finish_reason == "timeout" and b.output == [] and b.slot == -1
     assert sched.metrics.requests.get(reason="timeout") == 2
+
+
+# ------------------------------------------------------------------------------------------------ a state with more tensors
+P2, R = 997, 4  # the modulus of the second hash; positions per row of the block tensor
+
+
+class ExtState(FastState):
+    """FastState with the extra tensors of a state like qwen4_exp's FastState4, through the same hooks: a per-position
+    tensor `ex` (a copy of the tokens), a tensor `exb` with one row per R positions (the token at the first position of
+    each group) and a snapshot tensor `h2` (a second hash of the history). The scheduler and the disk cache know them
+    only through kv_tensors() and snap_tensors()."""
+
+    def __init__(self, cfg, batch, max_seq_len, device):
+        super().__init__(cfg, batch, max_seq_len, device)
+        self.ex = torch.zeros(batch, 1, max_seq_len, 1, dtype=torch.uint8, device=device)
+        self.exb = torch.zeros(batch, 1, max_seq_len // R, 1, dtype=torch.uint8, device=device)
+        self.h2 = torch.zeros(batch, 1, dtype=torch.float32, device=device)
+
+    def reset(self, kv: bool = True):
+        super().reset(kv)
+        self.h2.zero_()
+        if kv:
+            self.ex.zero_()
+            self.exb.zero_()
+
+    def view(self, lo, hi):
+        v = super().view(lo, hi)
+        v.ex, v.exb, v.h2 = self.ex[lo:hi], self.exb[lo:hi], self.h2[lo:hi]
+        return v
+
+    def kv_tensors(self):
+        return super().kv_tensors() + [self.ex, self.exb]
+
+    def snap_tensors(self):
+        return super().snap_tensors() + [self.h2]
+
+
+def ext_reference(prompt, n):
+    """The ExtModel's greedy continuation: (h + 2 h2 + 4 s + 5 sb) mod V. s: the sum of the tokens (in k and in ex);
+    sb: the sum of the tokens at the positions 0, R, 2R, ... (in exb)."""
+    h, h2, s, sb, out = 0, 0, 0, 0, []
+
+    def feed(t, p):
+        nonlocal h, h2, s, sb
+        h, h2, s, sb = (h * 31 + t) % P, (h2 * 7 + t) % P2, s + t, sb + (t if p % R == 0 else 0)
+    for p, t in enumerate(prompt):
+        feed(t, p)
+    while len(out) < n:
+        out.append((h + 2 * h2 + 4 * s + 5 * sb) % V)
+        feed(out[-1], len(prompt) + len(out) - 1)
+    return out
+
+
+class ExtModel(StubModel):
+    """StubModel on an ExtState: the next token also reads the extra tensors, so an output is exact only if the
+    scheduler moved them with the rest of the state."""
+
+    def new_state(self, batch, max_seq_len):
+        return ExtState(CFG, batch, max_seq_len, "cuda")
+
+    def __call__(self, tok, state):
+        act, y = state.active > 0, tok[:, 0]
+        h, h2 = state.rec[0][:, 0, 0, 0], state.h2[:, 0]
+        h_new = torch.where(act, torch.remainder(h * 31 + y.float(), P), h)
+        h2_new = torch.where(act, torch.remainder(h2 * 7 + y.float(), P2), h2)
+        state.rec[0][:, 0, 0, 0], state.h2[:, 0] = h_new, h2_new
+        kb, ex, exb = state.k[1].view(torch.uint8)[:, 0, :, 0], state.ex[:, 0, :, 0], state.exb[:, 0, :, 0]
+        rows, pos = torch.arange(kb.shape[0], device="cuda"), state.pos_t.long().clamp_max(kb.shape[1] - 1)
+        y8 = y.to(torch.uint8)
+        kb[rows, pos] = torch.where(act, y8, kb[rows, pos])
+        ex[rows, pos] = torch.where(act, y8, ex[rows, pos])
+        exb[rows, pos // R] = torch.where(act & (pos % R == 0), y8, exb[rows, pos // R])
+        state.pos_t += state.active
+        n = state.pos_t[:, None]
+        s = (kb.int() * (torch.arange(kb.shape[1], device="cuda") < n)).sum(-1)
+        sx = (ex.int() * (torch.arange(ex.shape[1], device="cuda") < n)).sum(-1)
+        sb = (exb.int() * (torch.arange(exb.shape[1], device="cuda") * R < n)).sum(-1)
+        nxt = torch.remainder(h_new.long() + 2 * h2_new.long() + s + 3 * sx + 5 * sb, V)
+        return torch.zeros(kb.shape[0], V, device="cuda").scatter_(1, nxt[:, None], 10.0)
+
+
+def ext_prefill(model, ids, state, return_hidden=False, logits=True):
+    """stub_prefill for the ExtModel. The scheduler gets it as its prefill_fn (the family's prefill)."""
+    toks, p0 = ids[0].tolist(), state.pos
+    h, h2 = float(state.rec[0][0, 0, 0, 0]), float(state.h2[0, 0])
+    for t in toks:
+        h, h2 = (h * 31 + t) % P, (h2 * 7 + t) % P2
+    state.rec[0][0, 0, 0, 0], state.h2[0, 0] = h, h2
+    t8 = torch.tensor(toks, dtype=torch.uint8, device="cuda")
+    kb, ex, exb = state.k[1].view(torch.uint8)[0, 0, :, 0], state.ex[0, 0, :, 0], state.exb[0, 0, :, 0]
+    kb[p0:p0 + len(toks)] = t8
+    ex[p0:p0 + len(toks)] = t8
+    for i, t in enumerate(toks):
+        if (p0 + i) % R == 0:
+            exb[(p0 + i) // R] = t
+    state.pos += len(toks)
+    state.pos_t += len(toks)
+    if not logits:
+        return None
+    n = state.pos
+    out = torch.zeros(1, V, device="cuda")
+    out[0, (int(h) + 2 * int(h2) + 4 * int(kb[:n].int().sum()) + 5 * int(exb[:-(-n // R)].int().sum())) % V] = 10.0
+    return out
+
+
+@pytest.fixture
+def make_ext():
+    """Schedulers of the ExtModel, with its prefill as prefill_fn (S.prefill stays the dense one) and a before_replay
+    hook that records its calls."""
+    def make(**kw):
+        calls = []
+        kw = dict(n_slots=3, max_seq_len=L, n_checkpoints=8, prefill_chunk=64, ckpt_interval=128, boundary_token=BND) | kw
+        sched = Checked(ExtModel(), prefill_fn=ext_prefill, before_replay=lambda s, toks: calls.append((s.idx, list(toks), len(s.tokens))), **kw)
+        sched.replays = calls
+        return sched
+    return make
+
+
+def test_the_state_hooks_of_the_27b_keep_the_old_order():
+    """kv_tensors() and snap_tensors() of FastState list the tensors in the order that the ring and the session files
+    used before the hooks: the k / v pairs by layer, then conv by layer, then rec by layer."""
+    cfg = Qwen35Config(hidden_size=8, intermediate_size=8, num_hidden_layers=4, layer_types=["linear_attention", "full_attention"] * 2,
+                       num_attention_heads=1, num_key_value_heads=1, head_dim=8, linear_num_key_heads=1, linear_num_value_heads=1,
+                       linear_key_head_dim=2, linear_value_head_dim=2, linear_conv_kernel_dim=2, vocab_size=V)
+    st = FastState(cfg, 2, 64, "meta")
+    assert [id(t) for t in st.kv_tensors()] == [id(t) for t in (st.k[1], st.v[1], st.k[3], st.v[3])]
+    assert [id(t) for t in st.snap_tensors()] == [id(t) for t in (st.conv[0], st.conv[2], st.rec[0], st.rec[2])]
+
+
+def test_a_state_with_extra_tensors_keeps_them_across_restores_and_copies(make_ext, monkeypatch):
+    """The checks of the dense stub on the ExtModel: a turn restores its checkpoint, a side request runs in another slot
+    with a copy of the prefix (the block rows too), and the rows of each plain decode step reach before_replay."""
+    monkeypatch.setattr(S, "COPY_MIN_TAIL", 64)
+    sched, rng = make_ext(ckpt_interval=10**6), random.Random(20)
+    system = prompt(rng, 301)  # the copied prefix (302 tokens) ends inside a group of R positions
+    main = chat(rng, system, prompt(rng, 300))
+    r1 = sched.run([S.Request(main, max_new_tokens=20)])[0]
+    assert r1.output == ext_reference(main, 20)
+    side = chat(rng, system, prompt(rng, 40))
+    r2 = sched.run([S.Request(side, max_new_tokens=10)])[0]
+    assert r2.slot != r1.slot and r2.reused == 302 and r2.output == ext_reference(side, 10)
+    p3 = main + r1.output + prompt(rng, 30)
+    r3 = sched.run([S.Request(p3, max_new_tokens=20)])[0]
+    assert r3.slot == r1.slot and r3.reused == len(main) + len(r1.output) - 1 and r3.output == ext_reference(p3, 20)
+    # each plain step of r3: the one row [y], y the last output token; the history does not hold y yet
+    steps = [c for c in sched.replays[-19:]]
+    assert [c[1] for c in steps] == [[t] for t in r3.output[:-1]] and all(c[0] == r3.slot for c in steps)
+    assert [c[2] for c in steps] == list(range(len(p3), len(p3) + 19))
+
+
+@pytest.mark.parametrize("slots,ring,tail", [(3, 6, 64), (2, 3, S.COPY_MIN_TAIL)])
+def test_random_conversations_on_a_state_with_extra_tensors_stay_exact(make_ext, monkeypatch, slots, ring, tail):
+    """test_random_conversations_stay_exact on the ExtModel."""
+    monkeypatch.setattr(S, "COPY_MIN_TAIL", tail)
+    sched, rng = make_ext(n_slots=slots, n_checkpoints=ring, ckpt_interval=64), random.Random(slots * 10 + ring + 1)
+    systems, done = [prompt(rng, 299), prompt(rng, 41)], []
+    for _ in range(30):
+        kind = rng.choice(["new", "turn", "changed", "side", "branch"]) if done else "new"
+        p, out = rng.choice(done) if done else ([], [])
+        user = prompt(rng, rng.choice((5, 61, 203)))
+        p = {"new": lambda: chat(rng, rng.choice(systems), user), "turn": lambda: p + out + [BND] + user + [BND] + prompt(rng, 2),
+             "changed": lambda: p[:-3] + prompt(rng, 5) + [BND] + user, "side": lambda: chat(rng, systems[0], user),
+             "branch": lambda: p[:rng.randrange(1, len(p))] + user}[kind]()
+        p = p if len(p) < L - 64 else p[-(L // 2):]
+        r = sched.run([S.Request(p, max_new_tokens=rng.choice((3, 20)))])[0]
+        assert r.output == ext_reference(p, r.max_new_tokens), kind
+        done.append((p, r.output))

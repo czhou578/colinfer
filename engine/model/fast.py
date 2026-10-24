@@ -239,7 +239,10 @@ class FastState(ModelState):
     scheduler cover one slot each). rope_delta (int32 [B]): the rotary position of a new row is its cache position plus
     this (multimodal RoPE: after an image, the text positions run behind the cache rows; engine/model/vision.py). spec:
     True while FastQwen35.verify runs (the GDN layers then leave their state for commit()). view(lo, hi) shares the
-    tensors of slots [lo, hi)."""
+    tensors of slots [lo, hi). The hooks kv_tensors() and snap_tensors() (from ModelState) list the per-position tensors
+    and the snapshot tensors, in the order of the checkpoint ring and of the session files. The state of qwen4_exp
+    (engine/model/fast_qwen4exp.py FastState4) implements the same two hooks: its kv_tensors() adds ik, ikb and
+    rope_pos after the k / v pairs, and its snap_tensors() adds ple_conv after conv and rec."""
 
     def __init__(self, cfg, batch, max_seq_len, device):
         super().__init__(cfg, batch, max_seq_len, device, torch.bfloat16, kv_dtype=torch.float8_e4m3fn)
@@ -396,6 +399,12 @@ class FastQwen35(Qwen35ForCausalLM):
 
     def new_state(self, batch: int, max_seq_len: int) -> FastState:
         return FastState(self.cfg, batch, max_seq_len, self.embed_tokens.weight.device)
+
+    @property
+    def drafter_hidden_dim(self) -> int:
+        """The width of the hidden state that the MTP drafter reads (the post-norm hidden of the target): hidden_size.
+        The checkpoint ring and the session files keep one such row per checkpoint. qwen4_exp: 4 x hidden_size."""
+        return self.cfg.hidden_size
 
     def forward(self, input_ids: torch.Tensor, state: FastState) -> torch.Tensor:
         """One decode step: input_ids [B, 1] at positions state.pos_t -> fp32 logits [B, vocab]; pos_t += active."""

@@ -14,7 +14,8 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
     followed the earlier occurrence instead (engine/spec/suffix.py), up to SUFFIX_K = 15 drafts.
 * Prefill. An engine step runs one prefill chunk (engine/model/prefill.py) or one decode step. With MTP, the scheduler
   writes the KV rows of the drafter for the chunk right after the chunk.
-* Prefix checkpoints. A ring, preallocated at startup, holds GDN state snapshots (conv + recurrent, 154 MB).
+* Prefix checkpoints. A ring, preallocated at startup, holds GDN state snapshots (conv + recurrent, 154 MB): the
+  tensors of the state's snap_tensors() hook. The KV rows of the state are the tensors of its kv_tensors() hook.
   - The scheduler takes a snapshot at the prompt end, at the generation end and every `ckpt_interval` prompt tokens.
   - It also takes snapshots at two chat message boundaries (`boundary_token`, <|im_start|>). These are the end of the
     first message (a shared system prompt), and the start of the last message before the generation prompt (the
@@ -180,12 +181,20 @@ class Slot:
 class Scheduler:
     def __init__(self, model: FastQwen35, n_slots: int = 3, max_seq_len: int = 32768, n_checkpoints: int = 32, mtp=None, k: int = 3,
                  prefill_chunk: int = CHUNK, ckpt_interval: int = 8192, metrics: Metrics | None = None,
-                 boundary_token: int | None = None, suffix_min: int = 0):
-        prepare_prefill(model)
+                 boundary_token: int | None = None, suffix_min: int = 0, prefill_fn=None, prepare_fn=None, before_replay=None,
+                 feed_buffer=None):
+        """prefill_fn, prepare_fn: the prefill callables of the model's family (engine/model/family.py); None: those of
+        engine/model/prefill.py. before_replay (optional): a callable (slot, tokens) that runs right before each decode
+        replay, with the token ids of the slot's rows: [y, d1..dk] for a speculative cycle, [y] for a plain step. The
+        history of the slot (slot.tokens) does not hold y yet. feed_buffer (optional): a callable (B, T) -> the fixed
+        device buffer that a plain decode graph passes to the model as its third argument."""
+        self.prefill_fn, self.prepare_fn, self.before_replay = prefill_fn, prepare_fn, before_replay
+        (prepare_fn or prepare_prefill)(model)
         self.model, self.mtp, self.k = model, mtp, k
         self.suffix_min = suffix_min if mtp is not None else 0  # > 0: suffix-match drafts of at least this match length
         self.kmax = max(k, SUFFIX_K) if self.suffix_min else k   # longest draft a cycle verifies
         self.n_slots, self.max_seq_len, self.chunk, self.ckpt_interval = n_slots, max_seq_len, prefill_chunk, ckpt_interval
+        self.n_checkpoints = n_checkpoints
         self.metrics = metrics or Metrics()
         self.boundary = boundary_token
         self.state = model.new_state(n_slots, max_seq_len)
@@ -230,17 +239,19 @@ class Scheduler:
             self.ctx_draft_s = kv(self.mst.k) / 2.4e11
             self.q_per_kv = cfg.num_attention_heads // cfg.num_key_value_heads
         else:
-            self.graphs = {b: DecodeGraph(model, self.state.view(b, b + 1), self.params.view(b, b + 1), self.masks[b:b + 1, :1], pool=self.pool)
+            feed = feed_buffer(1, 1) if feed_buffer is not None else None
+            self.graphs = {b: DecodeGraph(model, self.state.view(b, b + 1), self.params.view(b, b + 1), self.masks[b:b + 1, :1], pool=self.pool,
+                                          prepare=prepare_fn, feed=feed)
                            for b in range(n_slots)}
         self.state.reset()
         self.slots = [Slot(i) for i in range(n_slots)]
-        # checkpoint ring, allocated once
-        self.gdn_layers = sorted(self.state.rec)
-        self.ring_conv = {i: torch.zeros((n_checkpoints,) + self.state.conv[i].shape[1:], dtype=self.state.conv[i].dtype, device=dev)
-                          for i in self.gdn_layers}
-        self.ring_rec = {i: torch.zeros((n_checkpoints,) + self.state.rec[i].shape[1:], dtype=self.state.rec[i].dtype, device=dev)
-                         for i in self.gdn_layers}
-        self.ring_h = torch.zeros(n_checkpoints, cfg.hidden_size, dtype=torch.bfloat16, device=dev) if mtp is not None else None
+        # the state's tensors, in the order of its hooks: the per-position rows (_copy_kv), the snapshot (the ring)
+        self.kv_t, self.snap_t = self.state.kv_tensors(), self.state.snap_tensors()
+        self.seq_len = max(t.shape[2] for t in self.kv_t)  # a tensor with seq_len / r rows holds one row per r positions
+        # checkpoint ring, allocated once: one buffer per snapshot tensor, in the hook's order
+        self.ring = [torch.zeros((n_checkpoints,) + t.shape[1:], dtype=t.dtype, device=dev) for t in self.snap_t]
+        self.h_dim = model.drafter_hidden_dim if mtp is not None else 0  # the drafter's input hidden state, kept per checkpoint
+        self.ring_h = torch.zeros(n_checkpoints, self.h_dim, dtype=torch.bfloat16, device=dev) if mtp is not None else None
         self.ckpts: list[Checkpoint] = []  # oldest first
         self.free_bufs = list(range(n_checkpoints))
         self.queue: collections.deque[Request] = collections.deque()
@@ -292,9 +303,8 @@ class Scheduler:
         buf, b = self._take_buf(), s.idx
         if buf is None:
             return
-        for i in self.gdn_layers:
-            self.ring_conv[i][buf].copy_(self.state.conv[i][b])
-            self.ring_rec[i][buf].copy_(self.state.rec[i][b])
+        for r, t in zip(self.ring, self.snap_t):
+            r[buf].copy_(t[b])
         if self.ring_h is not None:
             self.ring_h[buf].copy_(s.h_last.view(-1))
         self.ckpts.append(Checkpoint(b, key, buf, s.salt, reply, disk or reply))
@@ -315,10 +325,11 @@ class Scheduler:
         return None
 
     def _copy_kv(self, src: int, dst: int, L: int):
-        """The KV rows [0, L) of slot src into slot dst (the target's and the drafter's), on the GPU."""
-        for d in (self.state.k, self.state.v):
-            for t in d.values():
-                t[dst, :, :L].copy_(t[src, :, :L])
+        """The KV rows [0, L) of slot src into slot dst (the target's and the drafter's), on the GPU: the rows of every
+        per-position tensor of the state (kv_tensors). A tensor with one row per r positions copies its rows [0, ceil(L / r))."""
+        for t in self.kv_t:
+            n = -(-L * t.shape[2] // self.seq_len)
+            t[dst, :, :n].copy_(t[src, :, :n])
         if self.mtp is not None:
             for d in (self.mst.k, self.mst.v):
                 d[0][dst, :, :L].copy_(d[0][src, :, :L])
@@ -340,9 +351,8 @@ class Scheduler:
         b, L = s.idx, len(c.tokens)
         if c.slot != b:
             self._copy_kv(c.slot, b, L)
-        for i in self.gdn_layers:
-            self.state.conv[i][b].copy_(self.ring_conv[i][c.buf])
-            self.state.rec[i][b].copy_(self.ring_rec[i][c.buf])
+        for r, t in zip(self.ring, self.snap_t):
+            t[b].copy_(r[c.buf])
         self._set_history(s, list(c.tokens), min(shared, L))
         s.h_last = self.ring_h[c.buf].clone() if self.ring_h is not None else None
         self.state.pos_t[b] = L
@@ -359,7 +369,7 @@ class Scheduler:
         self.store.wait(b, n if s is holder else 0)
         if holder is not None and s is not holder:
             self._copy_kv(holder.idx, b, n)
-        h = torch.empty(self.model.cfg.hidden_size, dtype=torch.bfloat16, device=self.dev) if self.mtp is not None else None
+        h = torch.empty(self.h_dim, dtype=torch.bfloat16, device=self.dev) if self.mtp is not None else None
         if not self.store.load(hit, b, h, kv=holder is None):
             if s is not holder:
                 self._set_history(s, [], 0)  # its KV is partly overwritten
@@ -377,8 +387,8 @@ class Scheduler:
         for c in self.ckpts:
             if c.slot == s.idx and c.disk and not c.saved and len(c.tokens) >= st.min_tokens:
                 c.saved = True
-                st.save(s.idx, c.tokens, c.salt, c.reply, c.buf, [self.ring_conv[i][c.buf] for i in self.gdn_layers],
-                        [self.ring_rec[i][c.buf] for i in self.gdn_layers], self.ring_h[c.buf] if self.ring_h is not None else None)
+                h = self.ring_h[c.buf] if self.ring_h is not None else None
+                st.save(s.idx, c.tokens, c.salt, c.reply, c.buf, [r[c.buf] for r in self.ring], h)
 
     # ---------------------------------------------------------------- admission
     def submit(self, req: Request) -> Request:
@@ -456,9 +466,8 @@ class Scheduler:
             if best is not None:
                 self._restore(s, best, shared[b])
             else:
-                for i in self.gdn_layers:
-                    self.state.conv[i][b].zero_()
-                    self.state.rec[i][b].zero_()
+                for t in self.snap_t:
+                    t[b].zero_()
                 self._set_history(s, [], 0)
                 s.h_last = None
                 self.state.pos_t[b] = 0
@@ -533,10 +542,11 @@ class Scheduler:
         images = s.req.images
         img = dict(embeds=self._image_embeds(images, start, start + n), rope_pos=self._rope(images, start, start + n)) if images else {}
         ids = torch.tensor([self._ids(chunk, images)], device=self.dev)
+        pf = self.prefill_fn or prefill
         if self.mtp is not None:  # only the last chunk's logits are read (the first token)
-            logits, H = prefill(self.model, ids, view, return_hidden=True, logits=last, **img)
+            logits, H = pf(self.model, ids, view, return_hidden=True, logits=last, **img)
         else:
-            logits = prefill(self.model, ids, view, logits=last, **img)
+            logits = pf(self.model, ids, view, logits=last, **img)
         s.tokens += chunk
         s.todo = s.todo[len(chunk):]
         if s.sfx is not None:  # the suffix-match index of the history grows on the host while the GPU runs the chunk
@@ -587,6 +597,8 @@ class Scheduler:
             g = self.cycles[(s.idx, s.req.temperature > 0, kk)]
             if s.req.constraint is not None:  # the mask of each verify row: the grammar after the drafts before it
                 self._row_masks(s.req, s.idx, self.tok[s.idx, 1:kk + 1].tolist())
+            if self.before_replay is not None:  # the rows [y, d1..dk] of the cycle
+                self.before_replay(s, self.tok[s.idx, :kk + 1].tolist())
             g.graph.replay()
             self._evt.record()
             self._evt.synchronize()  # releases the GIL while the GPU works
@@ -614,6 +626,8 @@ class Scheduler:
             g = self.graphs[s.idx]
             if s.req.constraint is not None:
                 self._row_masks(s.req, s.idx, [])
+            if self.before_replay is not None:  # the one row [y] of the step
+                self.before_replay(s, [s.y])
             nxt = g.step(torch.tensor([s.y]).to(self.dev))
             self._evt.record()
             self._evt.synchronize()

@@ -79,6 +79,8 @@ def main():
     ap.add_argument("--k", type=int, default=7)
     ap.add_argument("--only-alone", action="store_true", help="just the single-request speeds")
     ap.add_argument("--checkpoint-weights", action="store_true", help="decode the FP8 projections instead of the INT6 / INT5 copies")
+    ap.add_argument("--sessions-dir", help="check 7 writes its session files into this new directory and keeps them (default: a temporary "
+                                           "directory, removed at the end). A change that must keep the bytes compares two such directories")
     a = ap.parse_args()
     fmt = ChatFormat.from_checkpoint()
     tok, EOS, IM_START = fmt.tok, fmt.eos_ids, fmt.im_start
@@ -234,7 +236,9 @@ def main():
           f"to the uncached run with the same chunk boundaries ({sum(x == y for x, y in zip(r2.output, r2b.output))}/{len(r2.output)})")
 
     # 7. the disk cache across a restart
-    d = tempfile.mkdtemp(prefix="sessions-check-", dir=os.path.expanduser("~/.cache/colinfer"))
+    if a.sessions_dir:
+        os.makedirs(a.sessions_dir)  # a new directory: files of an earlier run would change what check 7 restores
+    d = a.sessions_dir or tempfile.mkdtemp(prefix="sessions-check-", dir=os.path.expanduser("~/.cache/colinfer"))
     try:
         notes = {"role": "system", "content": "You are a careful assistant. Field log: " + " ".join(
             f"day {i}: sensor {i % 7} read {(37 * i) % 101} units." for i in range(1400))}
@@ -267,7 +271,8 @@ def main():
               f"output {'IDENTICAL' if rd.output == rm.output else 'DIFFERENT'} to the memory restore "
               f"({sum(x == y for x, y in zip(rd.output, rm.output))}/{len(rm.output)})")
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        if not a.sessions_dir:
+            shutil.rmtree(d, ignore_errors=True)
 
     # 8. an image
     if spec.vision is not None:

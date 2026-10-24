@@ -8,9 +8,12 @@ What the store keeps (one directory per engine configuration, see `fingerprint`)
 * KV blocks. Block j holds the rows [jB, (j+1)B) of the attention layers of the target (K and V, fp8 as cached) and
   the rows of the drafter shifted by one, [jB - 1, (j+1)B - 1): the drafter's row i reads token i + 1. Thus every byte
   of the block depends only on the tokens [0, (j+1)B). The hash chain of those tokens (and the cache salt) names the
-  block, so conversations that share a prefix (a system prompt) share its blocks.
-* Checkpoints. The GDN state (conv windows and recurrent states) and the drafter's input hidden state at a prefix of n
-  tokens, plus the KV rows of its partial block [n - n % B, n). The hash of the tokens [0, n) names the checkpoint.
+  block, so conversations that share a prefix (a system prompt) share its blocks. The rows of the target are those of
+  the tensors of its state's kv_tensors() hook, in that order (engine/model/qwen35.py ModelState). A tensor with one
+  row per r positions (the block keys of qwen4_exp) gives the rows [jB / r, (j+1)B / r).
+* Checkpoints. The GDN state (conv windows and recurrent states: the tensors of the snap_tensors() hook) and the
+  drafter's input hidden state at a prefix of n tokens, plus the KV rows of its partial block [n - n % B, n). The hash
+  of the tokens [0, n) names the checkpoint.
 
 A restore of n tokens reads the n // B blocks and the checkpoint. These are exactly the bytes that the slot held, so a
 reply after a restore from disk is the reply after a restore from memory, bit for bit.
@@ -99,41 +102,59 @@ class _Job:
     reply: bool
     chain: list
     buf: int                   # the scheduler's ring buffer of the checkpoint: not reused while the save is pending
-    gdn: list | None           # device views of its GDN state (conv, then rec per layer) in the ring
+    gdn: list | None           # device views of its snapshot in the ring (the state's snap_tensors, in order)
     own: int                   # the store's fixed buffer that holds the drafter's hidden and the KV rows of the partial
     own_n: int                 # block [n - n % B, n), copied when queued; own_n bytes of it
     ready: torch.cuda.Event
 
 
+def _shapes(state, mst) -> dict:
+    """The shapes of the state for the fingerprint. The keys of the 27B (its k / v pairs, conv and rec) come first in the
+    hooks; the tensors after them (qwen4_exp: ik, ikb, rope_pos; ple_conv) add the keys kv_extra and snap_extra, so the
+    fingerprint of a state without them stays the one of the files on disk."""
+    kv, snap = state.kv_tensors(), state.snap_tensors()
+    nkv, nc, nr = 2 * len(state.k), len(state.conv), len(state.rec)
+    shapes = {"kv": [list(t.shape[1:]) for t in kv[:nkv:2]], "kv_dtype": str(kv[0].dtype),
+              "conv": [list(t.shape[1:]) for t in snap[:nc]], "rec": [list(t.shape[1:]) for t in snap[nc:nc + nr]],
+              "drafter_kv": list(mst.k[0].shape[1:]) if mst is not None else None}
+    for key, extra in (("kv_extra", kv[nkv:]), ("snap_extra", snap[nc + nr:])):
+        if extra:
+            shapes[key] = [[list(t.shape[1:]), str(t.dtype)] for t in extra]
+    return shapes
+
+
 class SessionStore:
-    """The disk cache of one engine. state: the scheduler's FastState (all slots); mst: the drafter's MtpState or None;
-    fingerprint: what the cached bytes depend on (engine/runtime/build.py: the checkpoint, the decode weights, the
-    drafter); budget: bytes on disk, over all configurations under root."""
+    """The disk cache of one engine. state: the scheduler's state of all slots (with the hooks kv_tensors() and
+    snap_tensors()); mst: the drafter's MtpState or None; fingerprint: what the cached bytes depend on
+    (engine/runtime/build.py: the checkpoint, the decode weights, the drafter); budget: bytes on disk, over all
+    configurations under root. h_dim: the width of the drafter's input hidden state (the scheduler's h_dim); None:
+    hidden_size of the state's config."""
 
     def __init__(self, state, mst, fingerprint: dict, budget: int, root: str = ROOT, block: int = BLOCK,
-                 min_tokens: int = MIN_TOKENS, log=print):
+                 min_tokens: int = MIN_TOKENS, log=print, h_dim: int | None = None):
         self.state, self.mst, self.budget, self.block, self.min_tokens, self.log = state, mst, budget, block, min_tokens, log
         self.min_gain = MIN_GAIN
-        self.layers = sorted(state.k)
-        self.gdn_layers = sorted(state.rec)
-        shapes = {"kv": [list(state.k[i].shape[1:]) for i in self.layers], "kv_dtype": str(state.k[self.layers[0]].dtype),
-                  "conv": [list(state.conv[i].shape[1:]) for i in self.gdn_layers], "rec": [list(state.rec[i].shape[1:]) for i in self.gdn_layers],
-                  "drafter_kv": list(mst.k[0].shape[1:]) if mst is not None else None}
-        fp = dict(fingerprint, version=VERSION, block=block, shapes=shapes)
+        self.kv_t, self.snap_t = state.kv_tensors(), state.snap_tensors()
+        L = max(t.shape[2] for t in self.kv_t)
+        self.ratio = [L // t.shape[2] for t in self.kv_t]  # positions per row of each per-position tensor
+        if any(block % r for r in self.ratio):
+            raise ValueError(f"block {block}: not a multiple of the row ratios {sorted(set(self.ratio))}")
+        fp = dict(fingerprint, version=VERSION, block=block, shapes=_shapes(state, mst))
         self.fp = hashlib.blake2b(json.dumps(fp, sort_keys=True).encode(), digest_size=8).hexdigest()
         self.root, self.dir = root, os.path.join(root, self.fp)
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, "fingerprint.json"), "w") as f:
             json.dump(fp, f, indent=1, sort_keys=True)
-        row = sum(2 * _nbytes(state.k[i][0, :, 0]) for i in self.layers) + (2 * _nbytes(mst.k[0][0, :, 0]) if mst is not None else 0)
-        self.gdn_bytes = sum(_nbytes(state.conv[i][0]) + _nbytes(state.rec[i][0]) for i in self.gdn_layers)
-        self.h_dim = state.cfg.hidden_size if mst is not None else 0
-        largest = HEADER + max(block * row, self.gdn_bytes + 2 * self.h_dim + (block - 1) * row)
+        self.row_bytes = [_nbytes(t[0, :, 0]) for t in self.kv_t]  # the bytes of one row of each per-position tensor
+        self.drafter_row = 2 * _nbytes(mst.k[0][0, :, 0]) if mst is not None else 0
+        self.gdn_bytes = sum(_nbytes(t[0]) for t in self.snap_t)
+        self.h_dim = (h_dim if h_dim is not None else state.cfg.hidden_size) if mst is not None else 0
+        largest = HEADER + max(self._span(block), self.gdn_bytes + 2 * self.h_dim + self._span(block - 1))
         largest = -(-largest // ALIGN) * ALIGN
         self.wbuf = torch.empty(largest, dtype=torch.uint8, pin_memory=True)  # the writer's
         self.rbuf = [torch.empty(largest, dtype=torch.uint8, pin_memory=True) for _ in range(2)]  # restores alternate between them
         dev = state.pos_t.device
-        self.own_bufs = [torch.empty(2 * self.h_dim + (block - 1) * row, dtype=torch.uint8, device=dev) for _ in range(MAX_PENDING)]
+        self.own_bufs = [torch.empty(2 * self.h_dim + self._span(block - 1), dtype=torch.uint8, device=dev) for _ in range(MAX_PENDING)]
         self.own_free = list(range(MAX_PENDING))
         self.wstream = torch.cuda.Stream(dev)
         self.lock = threading.Lock()
@@ -238,12 +259,18 @@ class SessionStore:
                 pass
 
     # ------------------------------------------------------------------------------------------------ the slot's bytes
+    def _span(self, n: int) -> int:
+        """The most bytes that the KV rows of n positions take, from a position that is a multiple of every ratio:
+        the target's and the drafter's."""
+        return sum(m * -(-n // r) for m, r in zip(self.row_bytes, self.ratio)) + n * self.drafter_row
+
     def _kv(self, b: int, r0: int, r1: int) -> list[torch.Tensor]:
-        """Device views of the KV rows [r0, r1) of slot b: the target's, then the drafter's rows [r0 - 1, r1 - 1)."""
+        """Device views of the KV rows [r0, r1) of slot b: the target's (a tensor with one row per r positions: its
+        rows [r0 / r, ceil(r1 / r))), then the drafter's rows [r0 - 1, r1 - 1)."""
         out = []
-        for i in self.layers:
-            for t in (self.state.k[i], self.state.v[i]):
-                out += [t[b, h, r0:r1] for h in range(t.shape[1])]
+        for t, r in zip(self.kv_t, self.ratio):
+            a, z = r0 // r, -(-r1 // r)
+            out += [t[b, h, a:z] for h in range(t.shape[1])]
         d0, d1 = max(r0 - 1, 0), r1 - 1
         if self.mst is not None and d1 > d0:
             for t in (self.mst.k[0], self.mst.v[0]):
@@ -251,16 +278,15 @@ class SessionStore:
         return out
 
     def _gdn(self, b: int, h: torch.Tensor | None) -> list[torch.Tensor]:
-        return ([self.state.conv[i][b] for i in self.gdn_layers] + [self.state.rec[i][b] for i in self.gdn_layers]
-                + ([h] if h is not None else []))
+        return [t[b] for t in self.snap_t] + ([h] if h is not None else [])
 
     # ------------------------------------------------------------------------------------------------ save (engine thread)
-    def save(self, b: int, tokens, salt: str | None, reply: bool, buf: int, conv: list, rec: list, h: torch.Tensor | None):
+    def save(self, b: int, tokens, salt: str | None, reply: bool, buf: int, snap: list, h: torch.Tensor | None):
         """Queues the checkpoint of the prefix `tokens` of slot b. buf: its buffer in the scheduler's ring, which holds
-        conv / rec, its GDN state per layer (device views, read by the writer later: the scheduler leaves the buffer
-        alone while the save is pending, see pinned()); h: the drafter's input hidden state or None, copied now with the
-        KV rows of the partial block [n - n % B, n); the writer reads those of the full blocks [0, n - n % B) from the
-        slot later (see wait())."""
+        snap, its snapshot in the order of the state's snap_tensors() (device views, read by the writer later: the
+        scheduler leaves the buffer alone while the save is pending, see pinned()); h: the drafter's input hidden state
+        or None, copied now with the KV rows of the partial block [n - n % B, n); the writer reads those of the full
+        blocks [0, n - n % B) from the slot later (see wait())."""
         toks = np.asarray(tokens, dtype=np.int64)  # image tokens are ids past 2^31 (engine/model/vision.py)
         n = len(toks)
         chain = self._chain(toks, salt, n // self.block)
@@ -280,7 +306,7 @@ class SessionStore:
             m = _nbytes(t)
             own[off:off + m].copy_(_bytes(t))
             off += m
-        job = _Job(b, n, key, reply, chain, buf, list(conv) + list(rec), j, off, torch.cuda.Event())
+        job = _Job(b, n, key, reply, chain, buf, list(snap), j, off, torch.cuda.Event())
         job.ready.record()
         with self.lock:
             self.pending.append(job)

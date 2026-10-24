@@ -11,8 +11,9 @@ import pytest
 import torch
 
 import engine.runtime.scheduler as S
-from engine.runtime.sessions import SessionStore
-from tests.test_scheduler import BND, Checked, L, StubModel, chat, prompt, reference, stub_prefill
+from engine.model.fast import FastState
+from engine.runtime.sessions import SessionStore, _shapes
+from tests.test_scheduler import BND, CFG, Checked, ExtModel, L, StubModel, chat, ext_prefill, ext_reference, prompt, reference, stub_prefill
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the GPU")
 BLOCK = 64
@@ -209,3 +210,61 @@ def test_a_disk_restore_for_a_side_request_copies_the_prefix_into_another_slot(m
     p3 = main + r1.output + prompt(rng, 30)
     r3 = run(sched, p3)
     assert r3.slot == r1.slot and r3.reused == len(main) + len(r1.output) - 1  # the main conversation, still in memory
+
+
+# ------------------------------------------------------------------------------------------------ a state with more tensors
+def test_the_fingerprint_of_the_27b_state_keeps_its_shapes():
+    """The shapes of the fingerprint come from the state's hooks, and equal the dict that the store wrote before the
+    hooks (the name of the directory of the 27B's files depends on it). A state with extra tensors adds two keys."""
+    st, mst = FastState(CFG, 2, 64, "meta"), FastState(CFG, 2, 64, "meta")
+    old = {"kv": [list(st.k[i].shape[1:]) for i in sorted(st.k)], "kv_dtype": str(st.k[min(st.k)].dtype),
+           "conv": [list(st.conv[i].shape[1:]) for i in sorted(st.rec)], "rec": [list(st.rec[i].shape[1:]) for i in sorted(st.rec)],
+           "drafter_kv": list(mst.k[1].shape[1:])}
+    mst.k = {0: mst.k[1]}
+    assert _shapes(st, mst) == old
+    ext = ExtModel().new_state(2, 64)
+    assert set(_shapes(ext, None)) - set(old) == {"kv_extra", "snap_extra"}
+
+
+@pytest.fixture
+def make_ext(tmp_path):
+    """make() of this file on the ExtModel of tests/test_scheduler.py, with its prefill as the scheduler's prefill_fn."""
+    stores = []
+
+    def make(budget=10**9, **kw):
+        for st in stores:
+            st.flush()
+        kw = dict(n_slots=3, max_seq_len=L, n_checkpoints=8, prefill_chunk=64, ckpt_interval=10**6, boundary_token=BND) | kw
+        sched = Checked(ExtModel(), prefill_fn=ext_prefill, **kw)
+        with torch.inference_mode():
+            sched.store = SessionStore(sched.state, None, {"model": "ext"}, budget, str(tmp_path), block=BLOCK, min_tokens=BLOCK,
+                                       log=lambda *a: None)
+        sched.store.min_gain = 16
+        stores.append(sched.store)
+        return sched
+    yield make
+    for st in stores:
+        st.flush()
+
+
+def run_ext(sched, p, n=20, **kw):
+    r = sched.run([S.Request(p, max_new_tokens=n, **kw)])[0]
+    assert r.output == ext_reference(p, n)
+    return r
+
+
+def test_a_state_with_extra_tensors_restores_from_disk(make_ext):
+    """The rows of the extra per-position tensors (one with a row per 4 positions) go into the blocks and the partial
+    block, and the extra snapshot tensor into the checkpoint: after an eviction, after a restart, and into another slot
+    whose KV is still in memory, each next turn is exact."""
+    sched, rng = make_ext(), random.Random(30)
+    p1 = prompt(rng, 299)  # a partial block that ends inside a group of 4 positions
+    r1 = run_ext(sched, p1)
+    for _ in range(3):  # three other conversations take all the slots
+        run_ext(sched, prompt(rng, 100))
+    p2 = p1 + r1.output + prompt(rng, 30)
+    r2 = run_ext(sched, p2)
+    assert r2.reused == len(p1) + len(r1.output) - 1 and sched.store.stats["restores"] == 1
+    sched.store.flush()
+    p3 = p2 + r2.output + prompt(rng, 7)
+    assert run_ext(make_ext(), p3).reused == len(p2) + len(r2.output) - 1  # a restart: a new engine, the same directory
