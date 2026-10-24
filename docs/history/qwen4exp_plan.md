@@ -200,4 +200,15 @@ kernel build. The 27B's tests must keep passing in every worktree.
   per token in plain PyTorch. The checkpoint's scales confirm the kernel contract: gate and up share their global scale
   in every expert, and each layer and projection has one input scale. The hot-set tool measured the n-gram table's LRU
   hit rate at 51% to 68% on WikiText and 83% to 90% on TinyStories for caches of 0.5 to 5 GB, so cold rows stay a real
-  cost (risk 2). Milestones K1 (MoE kernels) and K2 (QSA, HC, GDN kernels) are in progress in their worktrees.
+  cost (risk 2).
+- **2026-10-24, K1 merged.** The MoE decode kernels (`csrc/moe.cu`) stream 208 GB/s at 10 distinct experts and 238 GB/s
+  at 75; a full MoE layer (router, routing, shared expert, experts, combine) takes 196 us at one row, 935 us at 8 rows
+  and 1635 us at 16 rows, so 9.4 / 45 / 78 ms over 48 layers. The CUTLASS SM120 grouped NVFP4 GEMM compiles and runs
+  on sm_121a (`csrc/moe_prefill.cu`): a layer's MoE prefill takes 8.8 ms at 2048 tokens, 11.3 ms at 4096 and 16.6 ms
+  at 8192, which is a MoE ceiling of 4.8k / 7.5k / 10.3k tok/s. The scheduler's raster swizzle (8) matters: without
+  it the grouped GEMM runs 2.3 to 3 times slower. The routing weights are bf16-rounded but kept in f32; the decode
+  and prefill paths differ by about 2% (the prefill quantizes the activations to NVFP4). Known limit: the split-K
+  counters of the skinny GEMM are global, so two split-K launches must not overlap on different streams. memcheck,
+  racecheck and synccheck are clean (synccheck needs `--num-cuda-barriers 4096` on the grouped GEMM). The startup
+  self-test covers the BF16 skinny format, the MoE decode path and the grouped GEMM. K2 (QSA, HC, GDN kernels) is in
+  progress in its worktree.
