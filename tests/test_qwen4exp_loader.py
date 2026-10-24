@@ -115,3 +115,24 @@ def test_a_corrupted_multiplier_is_refused(ckpt, tmp_path):
     write_safetensors(f, items)
     with pytest.raises(ValueError, match="layer_multipliers"):
         QL.load_qwen4exp(bad, "cuda", log=lambda s: None)
+
+
+def test_verify_tool(ckpt, tmp_path):
+    """tools/verify_qwen4exp.py passes the synthetic checkpoint, and reports a corrupted multiplier and a missing expert."""
+    from tools.verify_qwen4exp import verify
+    path, _, _ = ckpt
+    logs = []
+    assert verify(path, log=logs.append) == []
+    assert any("gate/up global scales equal: True" in s for s in logs)
+    bad = str(tmp_path / "bad")
+    shutil.copytree(path, bad)
+    wm = QL.weight_map(bad)
+    mult = "model.language_model.layers.1.ple.ple_embedding.layer_multipliers"
+    gone = "model.language_model.layers.2.mlp.experts.1.up_proj.weight_scale"
+    for f in {wm[mult], wm[gone]}:
+        f = os.path.join(bad, f)
+        with safe_open(f, "pt") as s:
+            items = [(k, s.get_tensor(k)) for k in s.keys() if k != gone]
+        write_safetensors(f, [(k, t * 3 if k == mult else t) for k, t in items])
+    errors = verify(bad, log=lambda s: None)
+    assert any(mult in e for e in errors) and any(gone in e for e in errors), errors
