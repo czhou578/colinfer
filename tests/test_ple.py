@@ -105,3 +105,23 @@ def test_ngram_rows_numpy_shapes_and_refusals():
     assert (r1 >= 0).all() and (r1 < p.padded_rows).all()
     with pytest.raises(ValueError):
         ngram_rows(np.array([p.vocab_size]), np.array([eos, eos]), p)  # an image placeholder id must become image_token_id first
+
+
+def test_hotset_lru_curve_equals_a_simulated_lru():
+    """tools/ple_hotset.py's stack-distance hit rates equal an LRU cache simulated access by access."""
+    from collections import OrderedDict
+
+    from tools.ple_hotset import lru_hit_rates
+    acc = np.random.default_rng(3).zipf(1.3, 5000) % 700
+    sizes = [1, 5, 50, 300, 1000]
+    for s, h in zip(sizes, lru_hit_rates(acc, sizes)):
+        cache, hits = OrderedDict(), 0
+        for r in acc.tolist():
+            if r in cache:
+                hits += 1
+                cache.move_to_end(r)
+            else:
+                cache[r] = None
+                if len(cache) > s:
+                    cache.popitem(last=False)
+        assert h == hits / acc.size, s
