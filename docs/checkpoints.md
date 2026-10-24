@@ -1,6 +1,6 @@
 # Model checkpoints on this machine
 
-Written 2026-10-03. Two Qwen3.8-27B checkpoints are in the default Hugging Face cache (`~/.cache/huggingface/hub`). The
+Written 2026-10-03, updated 2026-10-24. Two Qwen3.8-27B checkpoints and the Qwen3.8-Flash-Next MoE checkpoint are in the default Hugging Face cache (`~/.cache/huggingface/hub`). The
 FP8 checkpoint `Qwen/Qwen3.8-27B-FP8` was deleted on 2026-10-09: the engine cannot serve its block-scaled FP8, and
 only the FP8 perplexity baseline used it.
 We downloaded them with `hf download <repo>` from the project venv. Thus vLLM, SGLang and `transformers` find them by
@@ -11,6 +11,7 @@ repo id with no extra configuration. Our loader finds the same path with
 |---|---|---|---|---|---|
 | `Qwen/Qwen3.8-27B` | BF16 | `1d4bf0f2ff60` | 55.6 GB | 18 | downloaded, verified |
 | `nvidia/Qwen3.8-27B-NVFP4` | NVFP4 (mixed: MLP + lm_head NVFP4, attention/GDN FP8, MTP BF16) | `482ca0f38322` | 21.9 GB | 3 | downloaded, verified |
+| `nvidia/Qwen3.8-Flash-Next-NVFP4` | NVFP4 routed experts, the rest BF16; the n-gram table and the MTP experts FP8 in one 53.7 GB file | `fc694b54fb01` | 132.7 GB | 10 + 1 | downloaded and verified 2026-10-24 (`docs/history/qwen4exp_plan.md`) |
 
 ## Local paths (snapshot directories, one per Hub commit)
 
@@ -19,6 +20,8 @@ repo id with no extra configuration. Our loader finds the same path with
   `~/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`
 - `nvidia/Qwen3.8-27B-NVFP4` (the serving checkpoint)
   `~/.cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/482ca0f3832238542f8f5295dde86b5f22711d80`
+- `nvidia/Qwen3.8-Flash-Next-NVFP4` (the MoE target of branch `moe`; the engine does not serve it yet)
+  `~/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47`
 
 ## Verification
 

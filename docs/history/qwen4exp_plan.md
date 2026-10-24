@@ -190,3 +190,14 @@ kernel build. The 27B's tests must keep passing in every worktree.
 - The MTP semantics are inferred from the shapes. A wrong guess costs acceptance rate, not correctness.
 - Top-k near-ties can differ from HF on real text; the engine's own paths agree with each other by construction.
 - The decode copies of the hyper-connection matrices (K = 320 for W_up) need a format of their own.
+
+## 9. Status log
+
+- **2026-10-24.** The checkpoint is downloaded and verified (11 shards, 132.7 GB). Milestone A is merged: the reference
+  model is bit-identical to transformers in fp32 on the tiny model (without a cache, with a cache, with an image), the
+  loader stacks the experts at load time, and the n-gram table reads from disk. On the real checkpoint, the reference
+  loads 77.8 GB in 34 s and gives coherent greedy continuations (`tools/qwen4exp_reference.py`), at about one second
+  per token in plain PyTorch. The checkpoint's scales confirm the kernel contract: gate and up share their global scale
+  in every expert, and each layer and projection has one input scale. The hot-set tool measured the n-gram table's LRU
+  hit rate at 51% to 68% on WikiText and 83% to 90% on TinyStories for caches of 0.5 to 5 GB, so cold rows stay a real
+  cost (risk 2). Milestones K1 (MoE kernels) and K2 (QSA, HC, GDN kernels) are in progress in their worktrees.
