@@ -67,13 +67,18 @@ def _open(path: str) -> tuple[int, bool]:
         return os.open(path, os.O_RDONLY), False
 
 
-def read_tensors(path: str, names=None, device="cuda") -> dict[str, torch.Tensor]:
-    """The tensors of a safetensors file (all, or `names`) on `device`, read directly (see the module docstring)."""
+def read_tensors(path: str, names=None, device="cuda", into: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor]:
+    """The tensors of a safetensors file (all, or `names`) on `device`, read directly (see the module docstring).
+
+    into: {name: destination} for some of the names read. The bytes of such a tensor go straight into its destination
+    (a preallocated contiguous tensor of the same dtype and element count, on any device, e.g. a slot of a stacked
+    tensor), and the result leaves the name out. Destinations of names not read are ignored."""
     h, base = header(path)
     want = [(v["data_offsets"][0], v["data_offsets"][1], k) for k, v in h.items() if names is None or k in names]
     if names is not None and len(want) != len(set(names)):
         raise KeyError(f"{path}: missing {sorted(set(names) - set(k for _, _, k in want))[:5]}")
     want.sort()
+    into = into or {}
     out, spans = {}, []  # spans: [file offset, length, name, destination's flat uint8 view] of each non-empty tensor, in file order
     for b, e, k in want:
         v = h[k]
@@ -83,7 +88,14 @@ def read_tensors(path: str, names=None, device="cuda") -> dict[str, torch.Tensor
             n *= d
         if n * torch.empty(0, dtype=dt).element_size() != e - b:
             raise ValueError(f"{path}: {k}: {v['shape']} {v['dtype']} does not match its {e - b} bytes")
-        if e > b:
+        dst = into.get(k)
+        if dst is not None:
+            if dst.dtype != dt or dst.numel() != n or not dst.is_contiguous():
+                raise ValueError(f"{path}: {k}: the destination {dst.dtype} {tuple(dst.shape)} (contiguous {dst.is_contiguous()}) "
+                                 f"does not take {v['dtype']} {v['shape']}")
+            if e > b:
+                spans.append([base + b, e - b, k, dst.view(-1).view(torch.uint8)])
+        elif e > b:
             spans.append([base + b, e - b, k, None])  # allocated when its first chunk arrives: 10 GB of cudaMalloc overlaps the reads
         else:
             out[k] = torch.empty(v["shape"], dtype=dt, device=device)

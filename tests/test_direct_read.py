@@ -56,3 +56,31 @@ def test_small_file_and_no_direct_io(tmp_path, monkeypatch):
     big = str(tmp_path / "b.safetensors")
     save_file(tensors(1), big)
     same(big, D.read_tensors(big), list(tensors(1)))
+
+
+@pytest.mark.parametrize("chunk", [D.CHUNK, 16384])
+def test_into_preallocated_destinations(tmp_path, monkeypatch, chunk):
+    """into={name: destination}: the bytes land in slots of stacked tensors (on the GPU, or on the CPU for scalars), the
+    result leaves those names out, and the read allocates nothing on the GPU for them."""
+    monkeypatch.setattr(D, "CHUNK", chunk)
+    path = str(tmp_path / "t.safetensors")
+    ts = tensors(2)
+    save_file(ts, path)
+    stack = torch.zeros(3, 37, 5000, dtype=torch.uint8, device="cuda")      # c.qweight goes to slot 1
+    fp8 = torch.zeros(2, 513, 129, dtype=torch.float8_e4m3fn, device="cuda")  # d.weight to slot 0
+    scal = torch.zeros(4, 3)                                                 # j.weight_scale_2 to [2, 1], on the CPU
+    into = {"c.qweight": stack[1], "d.weight": fp8[0], "j.weight_scale_2": scal[2, 1], "not.in.file": torch.zeros(1)}
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    got = D.read_tensors(path, ["c.qweight", "d.weight", "j.weight_scale_2"], into=into)
+    assert got == {} and torch.cuda.memory_allocated() == before
+    assert torch.equal(stack[1].cpu(), ts["c.qweight"]) and not stack[0].any() and not stack[2].any()
+    assert torch.equal(fp8[0].cpu().view(torch.uint8), ts["d.weight"].view(torch.uint8)) and not fp8[1].view(torch.uint8).any()
+    assert scal[2, 1] == 1.5 and scal.sum() == 1.5
+    rest = D.read_tensors(path, into=into)  # all names: the others come back as usual
+    assert sorted(rest) == sorted(set(ts) - {"c.qweight", "d.weight", "j.weight_scale_2"})
+    same(path, rest, list(rest))
+    with pytest.raises(ValueError, match="destination"):
+        D.read_tensors(path, ["a.weight"], into={"a.weight": torch.zeros(3, 1001, device="cuda")})  # fp32 for bf16
+    with pytest.raises(ValueError, match="destination"):
+        D.read_tensors(path, ["a.weight"], into={"a.weight": torch.zeros(1001, 6, dtype=torch.bfloat16, device="cuda")[:, :3]})
