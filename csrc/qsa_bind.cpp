@@ -2,6 +2,7 @@
 // the kernel files of the qwen4_exp work can be developed in parallel. Each wrapper checks the shapes / dtypes / strides and
 // launches on the current stream, so a CUDA graph can capture each op. Python wrappers: engine/model/qsa_kernels.py.
 #include <c10/cuda/CUDAStream.h>
+#include <string.h>
 #include <torch/extension.h>
 
 #include "shapes.h"
@@ -160,8 +161,31 @@ void qsa_attn(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, tor
                                      (float)scale, gp, stream()));
 }
 
+int ple_read_rows(int, const int64_t*, uint8_t*, int64_t, int64_t, bool, int);
+
+// The PLE n-gram rows (csrc/ple_io.cpp): out[i] = the out.size(1) bytes of the file fd at the byte offset offsets[i], read by
+// a pool of `threads` threads (the pool keeps the largest count asked). offsets: int64 [n] on the CPU; out: uint8 [n, row <=
+// 4096] on the CPU (pinned or not). direct: fd is open with O_DIRECT (the reads then take the aligned page(s) of a row).
+// Releases the GIL while it reads.
+void ple_gather(int64_t fd, torch::Tensor offsets, torch::Tensor out, bool direct, int64_t threads) {
+    TORCH_CHECK(offsets.device().is_cpu() && offsets.is_contiguous() && offsets.scalar_type() == torch::kInt64 && offsets.dim() == 1,
+                "ple_gather: offsets must be a contiguous CPU int64 [n] tensor");
+    TORCH_CHECK(out.device().is_cpu() && out.is_contiguous() && out.scalar_type() == torch::kUInt8 && out.dim() == 2 && out.size(0) == offsets.size(0),
+                "ple_gather: out must be a contiguous CPU uint8 [n, row] tensor");
+    TORCH_CHECK(out.size(1) >= 1 && out.size(1) <= 4096 && threads >= 1 && threads <= 256 && fd >= 0, "ple_gather: row in [1, 4096], threads in [1, 256]");
+    TORCH_CHECK(offsets.numel() == 0 || offsets.min().item<int64_t>() >= 0, "ple_gather: negative offset");
+    int err;
+    {
+        pybind11::gil_scoped_release nogil;
+        err = ple_read_rows((int)fd, offsets.data_ptr<int64_t>(), out.data_ptr<uint8_t>(), out.size(0), out.size(1), direct, (int)threads);
+    }
+    TORCH_CHECK(err == 0, "ple_gather: read failed: ", strerror(err));
+}
+
 void bind_qsa(pybind11::module_& m) {
     namespace py = pybind11;
+    m.def("ple_gather", &ple_gather, "PLE n-gram table rows: pread of n rows at byte offsets by a thread pool (GIL released)", py::arg("fd"),
+          py::arg("offsets"), py::arg("out"), py::arg("direct") = false, py::arg("threads") = 32);
     m.def("qsa_prologue", &qsa_prologue, "QSA indexer prologue: q_layernorm + RoPE of the 4 query heads, raw key write", py::arg("idx"),
           py::arg("qn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("ik"), py::arg("q_out"), py::arg("eps"), py::arg("active") = py::none(),
           py::arg("rope_delta") = py::none(), py::arg("rope_pos") = py::none(), py::arg("sec_h") = 11, py::arg("sec_w") = 10);
