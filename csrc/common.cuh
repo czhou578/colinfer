@@ -59,6 +59,23 @@ __device__ __forceinline__ float ex2(float x) {  // 2^x, the approximate hardwar
 }
 __device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16(x)); }  // round through bf16
 
+// ---- rotary embedding: the partial, interleaved multimodal RoPE of Qwen3.5 / 3.8 ----
+// The rotary position of frequency i of a row. rp3 (optional) holds the (t, h, w) positions of the row: frequency i takes
+// h when i % 3 == 1 and i < 3 sec_h, w when i % 3 == 2 and i < 3 sec_w, else t. Without rp3, every frequency takes pos.
+__device__ __forceinline__ int rope_position(int i, int pos, const int* rp3, int sec_h, int sec_w) {
+    if (rp3 == nullptr) return pos;
+    return rp3[(i % 3 == 1 && i < 3 * sec_h) ? 1 : (i % 3 == 2 && i < 3 * sec_w) ? 2 : 0];
+}
+// Dim d (< R) of a row after the rotation: the dims d and d + R / 2 rotate as a pair by the angle rp * inv_freq of
+// frequency d % (R / 2). xs holds the row before the rotation (fp32), xn = xs[d]. fp32 math, sincosf.
+__device__ __forceinline__ float rope_rotate(const float* xs, int d, int R, float xn, int rp, float inv_freq) {
+    const int half = R / 2;
+    const float ang = (float)rp * inv_freq;
+    float sn, cs;
+    sincosf(ang, &sn, &cs);
+    return d < half ? xn * cs - xs[d + half] * sn : xn * cs + xs[d - half] * sn;
+}
+
 // ---- conversions ----
 // 8 bf16 in a uint4 -> 8 floats
 __device__ __forceinline__ void bf16x8_to_float(const uint4 v, float* f) {

@@ -1,5 +1,7 @@
 // norm.cu -- zero-centered RMSNorm for decode rows: out = bf16( x / rms(x) * (1 + w) ), fp32 math,
 // same rounding as engine/model/qwen35.RMSNorm. One block per row, 16-byte loads.
+// The grouped form (the hc_norm of qwen4_exp's hyper-connections, csrc/hc_bind.cpp) views [M, groups * K] as M * groups
+// rows of K: row r normalizes on its own and takes the weight row r % groups of w [groups, K].
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -10,8 +12,9 @@ namespace rmsn {
 constexpr int THREADS = 256;
 
 __global__ void __launch_bounds__(THREADS) k_rmsnorm(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
-                                                      __nv_bfloat16* __restrict__ out, int K, float eps) {
+                                                      __nv_bfloat16* __restrict__ out, int K, float eps, int groups) {
     PDL_TRIGGER();
+    w += (size_t)(blockIdx.x % groups) * K;
     const __nv_bfloat16* xr = x + (size_t)blockIdx.x * K;
     __nv_bfloat16* orow = out + (size_t)blockIdx.x * K;
     float ss = 0.f;
@@ -53,6 +56,13 @@ __global__ void __launch_bounds__(THREADS) k_rmsnorm(const __nv_bfloat16* __rest
 
 cudaError_t launch_rmsnorm(const void* x, const void* w, void* out, int M, int K, float eps, cudaStream_t st) {
     if (K % 8) return cudaErrorInvalidValue;
-    rmsn::k_rmsnorm<<<M, rmsn::THREADS, 0, st>>>((const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, K, eps);
+    rmsn::k_rmsnorm<<<M, rmsn::THREADS, 0, st>>>((const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, K, eps, 1);
+    return cudaGetLastError();
+}
+
+// x, out [M, groups * K]; w [groups * K]: each K-wide group of a row normalizes on its own with its slice of w.
+cudaError_t launch_rmsnorm_grouped(const void* x, const void* w, void* out, int M, int K, int groups, float eps, cudaStream_t st) {
+    if (K % 8 || groups < 1) return cudaErrorInvalidValue;
+    rmsn::k_rmsnorm<<<M * groups, rmsn::THREADS, 0, st>>>((const __nv_bfloat16*)x, (const __nv_bfloat16*)w, (__nv_bfloat16*)out, K, eps, groups);
     return cudaGetLastError();
 }

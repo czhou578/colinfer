@@ -15,7 +15,8 @@ def _inputs(B, T, seed):
     proj = torch.randn(B, T, C + Z, device="cuda").bfloat16()   # [mixed | z], as the stacked qkv / z projection writes it
     ba = torch.randn(B, T, 2 * Hv, device="cuda").bfloat16()    # [b | a]
     p = dict(A_log=(torch.randn(Hv, device="cuda") * 0.5).bfloat16(), dt_bias=torch.randn(Hv, device="cuda").bfloat16(),
-             norm_w=(torch.randn(128, device="cuda") * 0.2 + 1).bfloat16(), w=(torch.randn(C, 1, 4, device="cuda") * 0.5).bfloat16())
+             norm_w=(torch.randn(128, device="cuda") * 0.2 + 1).bfloat16(), w=(torch.randn(C, 1, 4, device="cuda") * 0.5).bfloat16(),
+             gate_act=0)
     conv0 = torch.randn(B, C, 3, device="cuda").bfloat16()
     rec0 = torch.randn(B, Hv, 128, 128, device="cuda") * 0.1
     return proj, ba, p, conv0, rec0
@@ -33,15 +34,17 @@ def _step(ops, mixed, z, b, a, p, conv, rec, n, out=True):
     if n is not None:
         ops.gdn_conv_commit(mixed, conv, n)
     o = torch.empty(B, T, Z, device="cuda", dtype=torch.bfloat16) if out else None
-    ops.gdn_delta(qkv, z, b, a, p["A_log"], p["dt_bias"], p["norm_w"], rec, o, Hk, 1e-6, n)
+    ops.gdn_delta(qkv, z, b, a, p["A_log"], p["dt_bias"], p["norm_w"], rec, o, Hk, 1e-6, n, gate_act=p["gate_act"])
     return o, qkv
 
 
+@pytest.mark.parametrize("gate_act", [0, 1])
 @pytest.mark.parametrize("B,T", [(1, 4), (2, 3), (1, 1), (1, 8), (2, 16)])
-def test_verify_commit_bit_exact(B, T):
+def test_verify_commit_bit_exact(B, T, gate_act):
     from engine.kernels import ops
     o_ = ops()
     proj, ba, p, conv0, rec0 = _inputs(B, T, B * 10 + T)
+    p["gate_act"] = gate_act
     mixed, z, b, a = _views(proj, ba)
     one = torch.ones(B, dtype=torch.int32, device="cuda")
     # reference: T single-token decode steps

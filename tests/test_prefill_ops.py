@@ -58,15 +58,20 @@ def test_causal_conv_silu(T):
     assert torch.equal(torch.cat(outs, -1), ref2.contiguous())
 
 
-def test_gated_rmsnorm():
-    from engine.model.qwen35 import RMSNormGated
-    n = RMSNormGated(128, 1e-6).cuda().bfloat16()
+@pytest.mark.parametrize("gate_act", [0, 1])
+def test_gated_rmsnorm(gate_act):
+    """silu(z) (gate_act 0, Qwen3.8-27B) and sigmoid(z) (gate_act 1, qwen4_exp), bit for bit"""
+    from tests.test_gdn_step import gated_norm
+    n = gated_norm(gate_act, 128, 1e-6).cuda().bfloat16()
     with torch.no_grad():
         n.weight.normal_(1, 0.2)
     o = torch.randn(4096, 128, device="cuda").bfloat16()
-    z = torch.randn(4096, 128, device="cuda").bfloat16()
+    z = torch.randn(4096, 128, device="cuda").bfloat16() * 3
     out = torch.empty_like(o)
-    ops().gated_rmsnorm(o, z, n.weight.data, 1e-6, out)
+    if gate_act:
+        ops().gated_rmsnorm(o, z, n.weight.data, 1e-6, out, gate_act=1)
+    else:
+        ops().gated_rmsnorm(o, z, n.weight.data, 1e-6, out)  # the default stays silu
     assert torch.equal(out, n(o, z))
 
 

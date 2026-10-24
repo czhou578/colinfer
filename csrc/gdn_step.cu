@@ -13,7 +13,8 @@
 // k_delta        one block per (slot, value head h), 512 threads. Head h reads q / k of key head h / (Hv / Hk) and v of head
 //                h, L2-normalizes q and k, then per token on its fp32 state S [dk = 128, dv = 128]:
 //                    S *= exp(g);  kv = S^T k;  delta = (v - kv) * beta;  S += k delta^T;  o = S^T q
-//                and the gated RMSNorm  out = bf16(bf16(w * bf16(rmsnorm(bf16(o)))) * silu(z)).
+//                and the gated RMSNorm  out = bf16(bf16(w * bf16(rmsnorm(bf16(o)))) * act(z)). act is silu (gate_act 0,
+//                Qwen3.8-27B) or sigmoid (gate_act 1, qwen4_exp).
 //                beta = bf16(sigmoid(b)), g = -exp(A_log) * softplus(a + dt_bias). Rounding points follow transformers'
 //                torch_recurrent_gated_delta_rule + Qwen3_5RMSNormGated (engine/model/qwen35.py).
 //
@@ -48,6 +49,7 @@ using namespace cc;
 constexpr int DK = GDN_DK, DV = GDN_DV, THREADS = 512, MAX_T = THREADS / 32;
 
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }  // fast: the decode path, not bit-matched
+__device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
 
 __global__ void k_conv(const __nv_bfloat16* __restrict__ mixed, const __nv_bfloat16* __restrict__ conv_state, const __nv_bfloat16* __restrict__ w,
                        __nv_bfloat16* __restrict__ out, int T, int C, int ldm) {
@@ -89,7 +91,7 @@ __global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restri
                                                     const __nv_bfloat16* __restrict__ A_log, const __nv_bfloat16* __restrict__ dt_bias,
                                                     const __nv_bfloat16* __restrict__ norm_w, float* __restrict__ state,
                                                     __nv_bfloat16* __restrict__ out, int Hk, int Hv, float eps, int T,
-                                                    const int* __restrict__ n_ptr, int ldz, int ldba) {
+                                                    const int* __restrict__ n_ptr, int ldz, int ldba, int gate_act) {
     PDL_TRIGGER();
     const int b = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int kh = h / (Hv / Hk), C = 2 * Hk * DK + Hv * DV;
@@ -187,7 +189,7 @@ __global__ void __launch_bounds__(THREADS) k_delta(const __nv_bfloat16* __restri
             const float xn = bf(o[j] * rsqrtf(var + eps));
             const float y = bf(__bfloat162float(norm_w[c]) * xn);
             const float g = __bfloat162float(z[bt * ldz + h * DV + c]);
-            out[bt * Hv * DV + h * DV + c] = __float2bfloat16(y * silu(g));
+            out[bt * Hv * DV + h * DV + c] = __float2bfloat16(gate_act ? y * sigm(g) : y * silu(g));
         }
     }
 }
@@ -207,8 +209,9 @@ cudaError_t launch_gdn_conv_commit(const void* mixed, int ldm, void* conv_state,
 }
 
 cudaError_t launch_gdn_delta(const void* qkv, const void* z, int ldz, const void* b, const void* a, int ldba, const void* A_log, const void* dt_bias,
-                             const void* norm_w, float* state, void* out, const int* n, int B, int Hk, int Hv, float eps, int T, cudaStream_t st) {
-    if (T < 1 || T > gdn::MAX_T || (!out && !n)) return cudaErrorInvalidValue;
+                             const void* norm_w, float* state, void* out, const int* n, int B, int Hk, int Hv, float eps, int T, int gate_act,
+                             cudaStream_t st) {
+    if (T < 1 || T > gdn::MAX_T || (!out && !n) || (gate_act != 0 && gate_act != 1)) return cudaErrorInvalidValue;
     const int smem = (T * (3 * 128 + (out ? 4 * 128 : 0)) + 2 * 4 * 128 + 2 * T) * (int)sizeof(float);
     static bool attr = false;
     if (!attr) {
@@ -218,6 +221,7 @@ cudaError_t launch_gdn_delta(const void* qkv, const void* z, int ldz, const void
     }
     gdn::k_delta<<<dim3(Hv, B), gdn::THREADS, smem, st>>>((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)z, (const __nv_bfloat16*)b,
                                                           (const __nv_bfloat16*)a, (const __nv_bfloat16*)A_log, (const __nv_bfloat16*)dt_bias,
-                                                          (const __nv_bfloat16*)norm_w, state, (__nv_bfloat16*)out, Hk, Hv, eps, T, n, ldz, ldba);
+                                                          (const __nv_bfloat16*)norm_w, state, (__nv_bfloat16*)out, Hk, Hv, eps, T, n, ldz, ldba,
+                                                          gate_act);
     return cudaGetLastError();
 }

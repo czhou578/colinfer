@@ -2,7 +2,8 @@
 //   k_fp8_quant            bf16 [M, K] -> e4m3 [M, K] = sat(x / in_scale)                        (W8A8 GEMM inputs)
 //   k_causal_conv_silu_l2  GDN: mixed bf16 [T, C] (token-major), conv window [C, 3] -> bf16(silu(bf16(conv))), with the q / k
 //                          heads L2-normalized (the chunked delta rule's input)
-//   k_gated_rmsnorm        GDN output: o, z bf16 [N, 128] -> bf16(bf16(w * bf16(rmsnorm(o))) * silu(z))
+//   k_gated_rmsnorm        GDN output: o, z bf16 [N, 128] -> bf16(bf16(w * bf16(rmsnorm(o))) * act(z)), act = silu (gate_act 0)
+//                          or sigmoid (gate_act 1, qwen4_exp)
 //   k_add_rmsnorm          residual add + RMSNorm + the next GEMM's activation quantization (NVFP4 and / or e4m3)
 //   k_gate_fp8             attention output gate + e4m3 quantization for o_proj
 // The rounding points follow the PyTorch reference (engine/model/qwen35.py).
@@ -16,6 +17,7 @@ namespace pf {
 using namespace cc;
 
 __device__ __forceinline__ float silu(float x) { return x / (1.f + expf(-x)); }  // precise: must round like torch
+__device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }  // torch's sigmoid, same rounding
 
 __global__ void k_fp8_quant(const __nv_bfloat16* __restrict__ x, uint8_t* __restrict__ out, size_t n8, float inv_scale) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -104,7 +106,7 @@ __global__ void k_causal_conv_silu_l2(const __nv_bfloat16* __restrict__ x, int l
 
 // one warp per row of 128; row = token * heads + head. z row (token, head) lives at z + token * ldz + head * 128.
 __global__ void k_gated_rmsnorm(const __nv_bfloat16* __restrict__ o, const __nv_bfloat16* __restrict__ z, int ldz, int heads,
-                                const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out, int N, float eps) {
+                                const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out, int N, float eps, int gate_act) {
     const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= N) return;
     float x[4], ss = 0.f;
@@ -122,7 +124,7 @@ __global__ void k_gated_rmsnorm(const __nv_bfloat16* __restrict__ o, const __nv_
         const float xn = bf(x[i] * r);
         const float y = bf(__bfloat162float(w[lane * 4 + i]) * xn);
         const float g = __bfloat162float(zr[lane * 4 + i]);
-        out[(size_t)row * 128 + lane * 4 + i] = __float2bfloat16(y * silu(g));
+        out[(size_t)row * 128 + lane * 4 + i] = __float2bfloat16(gate_act ? y * sigm(g) : y * silu(g));
     }
 }
 
@@ -273,9 +275,11 @@ cudaError_t launch_causal_conv_silu(const void* x, int ldx, const void* state, c
     return cudaGetLastError();
 }
 
-cudaError_t launch_gated_rmsnorm(const void* o, const void* z, int ldz, int heads, const void* w, void* out, int N, float eps, cudaStream_t st) {
+cudaError_t launch_gated_rmsnorm(const void* o, const void* z, int ldz, int heads, const void* w, void* out, int N, float eps, int gate_act,
+                                 cudaStream_t st) {
+    if (gate_act != 0 && gate_act != 1) return cudaErrorInvalidValue;
     pf::k_gated_rmsnorm<<<(N + 7) / 8, 256, 0, st>>>((const __nv_bfloat16*)o, (const __nv_bfloat16*)z, ldz, heads, (const __nv_bfloat16*)w,
-                                                     (__nv_bfloat16*)out, N, eps);
+                                                     (__nv_bfloat16*)out, N, eps, gate_act);
     return cudaGetLastError();
 }
 
