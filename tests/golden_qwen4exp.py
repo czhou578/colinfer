@@ -16,10 +16,20 @@ model (engine/model/fast_qwen4exp.py), captures one decode step (T = 1, one slot
 3. times the decode step (T = 1) and a verify of 8 rows at 1k context (the median of 20 graph replays), and, with
    --profile, breaks the decode step down by kernel class.
 
+With --prefill (milestone M2), the script checks the prefill path (engine/model/prefill_qwen4exp.py) instead of 1-3:
+
+4. attaches an n-gram feeder with a row cache to the model (model.feeder), prefills each golden prompt as one chunk, then
+   decodes 32 greedy tokens through the decode graph. It compares the tokens with the reference under the near-tie rule,
+   and the prefill logits of the last prompt token with the decode path's logits of the same token (max |delta|, argmax).
+5. a long prompt (--long-tokens WikiText tokens, default 3000): the prefill against the token-by-token decode path for the
+   same prompt. It compares the per-token NLL and argmax of every prompt token, then 16 greedy tokens after the prompt:
+   they must be equal or diverge first at a near-tie of both paths.
+
 The reference runs with a bf16 KV cache; the engine's KV cache is fp8. That is one source of small logit differences.
 
 Usage (loads about 78 GB on the GPU; take the GPU lock):
     flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py [--profile] [--no-ppl]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py --prefill [--long-tokens 3000]
 """
 from __future__ import annotations
 
@@ -39,6 +49,7 @@ NEAR_TIE = 0.2      # a divergence where the reference's margin is below this is
                     # (the reference's lm_head rounds its logits to bf16; its fp32 logits picked the engine's token at the first such case)
 PPL_GATE = 0.005    # the perplexity ratio must be within 0.5%
 STOP = (248044, 248046)
+FEEDER_ROWS = 6_250_000  # the row cache of the prefill's n-gram feeder: 1 GB of 160-byte rows
 
 
 class Stepper:
@@ -65,18 +76,36 @@ class Stepper:
         self.graph.replay()
         return self.out[0]
 
+    def prefill(self, ids: list[int], chunk: int | None = None, **kw):
+        """Prefills ids into a fresh state (engine/model/prefill_qwen4exp.py; model.feeder reads the n-gram rows) and
+        returns what prefill returns (default: the fp32 logits [1, V] of the next token). The decode graph continues there."""
+        from engine.model import prefill_qwen4exp as pq
+        self.reset()
+        out = pq.prefill(self.model, torch.tensor([ids], device="cuda"), self.st, chunk=chunk or pq.CHUNK, **kw)
+        self.ctx = ([self.eos, self.eos] + list(ids))[-2:]
+        return out
+
 
 def margin(logits: torch.Tensor) -> float:
     v = logits.topk(2).values
     return float(v[0] - v[1])
 
 
-def golden(step: Stepper, want: list[dict]) -> bool:
+def feed(step: Stepper, ids: list[int]) -> torch.Tensor:
+    """The decode path over ids from a fresh state, token by token: the fp32 logits [V] after the last one."""
+    step.reset()
+    for t in ids:
+        logits = step(t)
+    return logits
+
+
+def golden(step: Stepper, want: list[dict], start=None) -> bool:
+    """Greedy decoding of each golden prompt against the reference's tokens. start(ids) -> the logits [V] after the
+    prompt ids from a fresh state: the decode path token by token (feed, the default) or a prefill."""
+    start = start or (lambda ids: feed(step, ids))
     ok = True
     for w in want:
-        step.reset()
-        for t in w["prompt_ids"]:
-            logits = step(t)
+        logits = start(w["prompt_ids"])
         got, margins = [], []
         for _ in range(len(w["tokens"])):
             nxt = int(logits.argmax())
@@ -93,9 +122,7 @@ def golden(step: Stepper, want: list[dict]) -> bool:
             else min(len(got), len(w["tokens"]))
         m = w["margins"][i] if i < len(w["margins"]) else float("nan")
         if i < len(got):  # the engine's logits at the divergence: replay the reference's prefix
-            step.reset()
-            for t in w["prompt_ids"] + w["tokens"][:i]:
-                logits = step(t)
+            logits = start(w["prompt_ids"] + w["tokens"][:i])
             v, k = logits.topk(3)
             print(f"[golden4]   engine top-3 at token {i} after the reference's prefix: {list(zip(k.tolist(), [round(a, 4) for a in v.tolist()]))}")
         near = m < NEAR_TIE
@@ -118,6 +145,98 @@ def perplexity(step: Stepper, ids: list[int]) -> tuple[torch.Tensor, torch.Tenso
         nll[j] = -torch.log_softmax(logits, -1)[ids[j + 1]]
         nll16[j] = -torch.log_softmax(logits.bfloat16().float(), -1)[ids[j + 1]]
     return nll.cpu(), nll16.cpu(), time.time() - t0
+
+
+def greedy(step: Stepper, logits: torch.Tensor, n: int) -> tuple[list[int], list[float], list[torch.Tensor]]:
+    """n greedy tokens from logits [V] through the decode graph: (the tokens, the margin of each, the logits of each)."""
+    got, margins, seen = [], [], []
+    for _ in range(n):
+        nxt = int(logits.argmax())
+        got.append(nxt)
+        margins.append(margin(logits))
+        seen.append(logits.clone())
+        if nxt in STOP:
+            break
+        logits = step(nxt)
+    return got, margins, seen
+
+
+def prefill_logits(step: Stepper, want: list[dict]) -> list[dict]:
+    """For each golden prompt: the prefill's fp32 logits of the last prompt token against the decode path's logits of
+    the same token (max |delta|, relative L2, the argmax of both, the decode path's margin)."""
+    out = []
+    for w in want:
+        ids = w["prompt_ids"]
+        dec = feed(step, ids).clone()
+        pf = step.prefill(ids)[0].clone()
+        r = dict(prompt=w["prompt"][:40], tokens=len(ids), max_abs=float((pf - dec).abs().max()),
+                 rel=float((pf - dec).norm() / dec.norm()), argmax_equal=int(pf.argmax()) == int(dec.argmax()), decode_margin=margin(dec))
+        print(f"[golden4] prefill vs decode, last prompt token of {r['prompt']!r} ({len(ids)} tokens): max |delta| {r['max_abs']:.4f}, "
+              f"rel {r['rel']:.2e}, argmax {'equal' if r['argmax_equal'] else 'DIFFERENT'} (decode margin {r['decode_margin']:.3f})")
+        out.append(r)
+    return out
+
+
+def long_prompt(step: Stepper, ids: list[int], n_new: int = 16) -> dict:
+    """A long prompt through the decode path token by token and through the prefill (one chunk of up to pq.CHUNK tokens,
+    more chunks beyond): the NLL and argmax of every prompt token, the logits of the last one, then n_new greedy tokens.
+    The greedy tokens pass if they are equal, or if the first divergence is a near-tie: the gap between the two paths'
+    tokens is below NEAR_TIE in the logits of either path at that point."""
+    from engine.model import prefill_qwen4exp as pq
+    N = len(ids)
+    tgt = torch.tensor(ids[1:], device="cuda")
+    nll_dec = torch.zeros(N - 1, dtype=torch.float64, device="cuda")
+    arg_dec = torch.zeros(N - 1, dtype=torch.long, device="cuda")
+    t0 = time.time()
+    step.reset()
+    for j, t in enumerate(ids):
+        logits = step(t)
+        if j < N - 1:
+            nll_dec[j] = -torch.log_softmax(logits, -1)[ids[j + 1]]
+            arg_dec[j] = logits.argmax()
+    t_dec = time.time() - t0
+    tok_dec, m_dec, l_dec = greedy(step, logits, n_new)
+    last_dec = l_dec[0]
+    torch.cuda.synchronize()
+    t0 = time.time()
+    pf_all = step.prefill(ids, all_logits=True)  # bf16 [N, V]
+    torch.cuda.synchronize()
+    t_pf = time.time() - t0
+    nll_pf = torch.zeros(N - 1, dtype=torch.float64, device="cuda")
+    arg_pf = torch.zeros(N - 1, dtype=torch.long, device="cuda")
+    for a in range(0, N - 1, 512):
+        b = min(N - 1, a + 512)
+        lg = pf_all[a:b].float()
+        nll_pf[a:b] = torch.nn.functional.cross_entropy(lg, tgt[a:b], reduction="none").double()
+        arg_pf[a:b] = lg.argmax(-1)
+    del pf_all
+    pf = step.prefill(ids)[0]
+    tok_pf, m_pf, l_pf = greedy(step, pf, n_new)
+    r = dict(tokens=N, decode_s=t_dec, prefill_s=t_pf, ppl_decode=math.exp(float(nll_dec.mean())), ppl_prefill=math.exp(float(nll_pf.mean())),
+             argmax_agree=float((arg_dec == arg_pf).double().mean()), nll_max_abs=float((nll_dec - nll_pf).abs().max()),
+             last_max_abs=float((l_pf[0] - last_dec).abs().max()), last_argmax_equal=int(l_pf[0].argmax()) == int(last_dec.argmax()),
+             greedy_decode=tok_dec, greedy_prefill=tok_pf)
+    print(f"[golden4] long prompt of {N} tokens: the prefill (all logits, {pq.CHUNK}-token chunks) {t_pf:.2f} s, the decode path {t_dec:.0f} s; "
+          f"ppl prefill {r['ppl_prefill']:.4f} / decode {r['ppl_decode']:.4f}; argmax agreement {r['argmax_agree']:.2%}; per-token NLL "
+          f"max |delta| {r['nll_max_abs']:.3f}; last token: logits max |delta| {r['last_max_abs']:.4f}, argmax "
+          f"{'equal' if r['last_argmax_equal'] else 'DIFFERENT'}")
+    if tok_pf == tok_dec:
+        r["greedy_ok"] = True
+        print(f"[golden4] long prompt: {len(tok_pf)} greedy tokens equal (smallest margin: decode {min(m_dec):.3f}, prefill {min(m_pf):.3f})")
+        return r
+    i = next((j for j, (a, b) in enumerate(zip(tok_dec, tok_pf)) if a != b), min(len(tok_dec), len(tok_pf)))
+    if i >= min(len(tok_dec), len(tok_pf)):  # one stopped early
+        r["greedy_ok"] = False
+        print(f"[golden4] long prompt: the greedy tokens differ in length: decode {tok_dec}, prefill {tok_pf}")
+        return r
+    a, b = tok_dec[i], tok_pf[i]
+    gap_dec = float(l_dec[i][a] - l_dec[i][b])  # the decode path's preference for its token
+    gap_pf = float(l_pf[i][b] - l_pf[i][a])
+    near = min(gap_dec, gap_pf) < NEAR_TIE
+    r.update(greedy_ok=near, divergence=i, gap_decode=gap_dec, gap_prefill=gap_pf)
+    print(f"[golden4] long prompt: first greedy divergence at token {i} of {n_new}: decode {a}, prefill {b}; the gap in the decode path's "
+          f"logits {gap_dec:.3f}, in the prefill's {gap_pf:.3f} -> {'near-tie' if near else 'REAL DIVERGENCE'}")
+    return r
 
 
 def timed(fn, n: int = 20) -> float:
@@ -163,6 +282,36 @@ def profile(step: Stepper, n: int = 5):
         print(f"    {c:58s} {us / 1000:7.2f} ms  {100 * us / total:5.1f}%")
 
 
+def prefill_mode(step: Stepper, want: dict, args, res: dict) -> bool:
+    """4 and 5 of the docstring, with the model's feeder (a row cache of FEEDER_ROWS rows). Returns the verdict."""
+    from engine.weights.ple import PleFeeder
+    model = step.model
+    ple = model.ple_layer()
+    model.feeder = PleFeeder(ple.table, cache_rows=FEEDER_ROWS, params=ple.params, image_token_id=model.cfg.image_token_id)
+    res["prefill_logits"] = prefill_logits(step, want["prompts"])
+    ok = golden(step, want["prompts"], start=lambda ids: step.prefill(ids)[0])
+    res["golden_prefill_ok"] = ok
+    print(f"[golden4] GOLDEN WITH PREFILL {'PASSED' if ok else 'FAILED'}")
+    if args.long_tokens:
+        from transformers import AutoTokenizer
+
+        from engine.weights.loader import resolve
+        from tests.perplexity import wikitext_test
+        tok = AutoTokenizer.from_pretrained(resolve(args.model))
+        ids = tok(wikitext_test(), return_tensors="pt").input_ids[0][:args.long_tokens].tolist()
+        r = long_prompt(step, ids)
+        res["long"] = r
+        ok &= r["greedy_ok"]
+    h, m, held, cap = model.feeder.stats()
+    res["feeder"] = dict(hits=h, misses=m, held=held, capacity=cap, file_rows=model.feeder.gather_rows)
+    print(f"[golden4] feeder: {h} hits, {m} misses ({h / max(1, h + m):.1%} of the distinct rows of each call from the cache), "
+          f"{held} rows held of {cap}, {model.feeder.gather_rows} rows read from the file")
+    print(f"[golden4] PREFILL CHECK {'PASSED' if ok else 'FAILED'}")
+    if args.json:
+        json.dump(res, open(args.json, "w"), indent=1)
+    return ok
+
+
 @torch.inference_mode()
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -172,6 +321,8 @@ def main():
     ap.add_argument("--json", help="write the results here")
     ap.add_argument("--dump", help="save the per-token WikiText NLLs here (torch.save)")
     ap.add_argument("--no-timing", action="store_true")
+    ap.add_argument("--prefill", action="store_true", help="check the prefill path (4 and 5 of the docstring) instead of the decode path")
+    ap.add_argument("--long-tokens", type=int, default=3000, help="--prefill: the WikiText tokens of the long prompt (0: skip it)")
     args = ap.parse_args()
     from engine.model.fast import capture
     from engine.model.fast_qwen4exp import load_fast_qwen4exp
@@ -186,6 +337,8 @@ def main():
     res["gb_after_state_and_graph"] = torch.cuda.memory_allocated() / 1e9
     print(f"[golden4] memory_allocated: {res['gb_after_load']:.2f} GB after the load, {res['gb_after_state_and_graph']:.2f} GB with the "
           f"4096-token state and the decode graph")
+    if args.prefill:
+        sys.exit(0 if prefill_mode(step, want, args, res) else 1)
     ok = golden(step, want["prompts"])
     res["golden_ok"] = ok
     print(f"[golden4] GOLDEN {'PASSED' if ok else 'FAILED'}")
