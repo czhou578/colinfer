@@ -1,4 +1,4 @@
-// qsa_bind.cpp -- torch bindings of qsa.cu, and of the PLE row reader of ple_io.cpp (ple_gather). bindings.cpp calls
+// qsa_bind.cpp -- torch bindings of qsa.cu, qsa_prefill.cu and hc_prefill.cu, and of the PLE row reader of ple_io.cpp (ple_gather). bindings.cpp calls
 // bind_qsa(m) from the module; each kernel file of qwen4_exp has its own binding file. Each wrapper checks the shapes /
 // dtypes / strides and launches on the current stream, so a CUDA graph can capture each op (ple_gather is a host function and runs no kernel). Python wrappers:
 // engine/model/qsa_kernels.py.
@@ -162,6 +162,72 @@ void qsa_attn(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, tor
                                      (float)scale, gp, stream()));
 }
 
+// ------------------------------------------------------------------------------------------------------------------
+// qsa_prefill.cu: the sparse attention of a prefill chunk of one slot (T rows at pos_t[0] .. pos_t[0] + T - 1).
+cudaError_t launch_qsa_score_rows(const void*, const void*, const int*, float*, int, int, cudaStream_t);
+int qsa_union_cap();
+cudaError_t launch_qsa_union(const int*, const int*, const int*, int*, int*, int, int, cudaStream_t);
+cudaError_t launch_qsa_union_attn(const void*, const void*, const void*, const int*, const int*, const int*, const void*, int, void*, int, int, int,
+                                  int, float, cudaStream_t);
+
+// The block scores of all T rows of a chunk in one launch, bit-identical per row to qsa_score: q_idx bf16 [T, 4, 128]
+// (any leading shape with T * 4 rows of 128); ikb bf16 [NBL, 128] (or [1, NBL, 128]); scores fp32 [T, NBL].
+void qsa_score_rows(torch::Tensor q_idx, torch::Tensor ikb, torch::Tensor pos_t, torch::Tensor scores) {
+    QSA_CHECK_TENSOR(q_idx, torch::kBFloat16);
+    QSA_CHECK_TENSOR(ikb, torch::kBFloat16);
+    QSA_CHECK_TENSOR(scores, torch::kFloat32);
+    TORCH_CHECK(q_idx.numel() % (HI * DI) == 0 && q_idx.size(-1) == DI, "q_idx: bf16 [T, 4, 128]");
+    const int64_t T = q_idx.numel() / (HI * DI);
+    TORCH_CHECK(ikb.size(-1) == DI && ikb.numel() / DI == ikb.size(-2) && (ikb.dim() == 2 || ikb.size(0) == 1), "ikb: bf16 [NBL, 128] of one slot");
+    const int64_t NBL = ikb.size(-2);
+    TORCH_CHECK(scores.numel() == T * NBL && scores.size(-1) == NBL, "scores: fp32 [T, NBL]");
+    check_pos(pos_t, 1);
+    QSA_CHECK_LAUNCH(launch_qsa_score_rows(q_idx.data_ptr(), ikb.data_ptr(), pos_t.data_ptr<int>(), scores.data_ptr<float>(), T, NBL, stream()));
+}
+
+// The union of the selected and tail blocks of each group of 4 rows: sel int32 [T, 512], nsel int32 [T] (the chunk's
+// selection); ul int32 [ceil(T / 4), qsa_union_cap()] gets (block << 4) | (the mask of the group's rows that attend to
+// it) in ascending block order, uc int32 [ceil(T / 4)] the count. nblocks: (pos0 + T) / 4 + 1 or more.
+void qsa_union(torch::Tensor sel, torch::Tensor nsel, torch::Tensor pos_t, torch::Tensor ul, torch::Tensor uc, int64_t nblocks) {
+    for (auto* t : {&sel, &nsel, &ul, &uc}) QSA_CHECK_TENSOR(*t, torch::kInt32);
+    const int64_t T = nsel.numel(), NG = (T + 3) / 4;
+    TORCH_CHECK(T >= 1 && sel.numel() == T * TOPK, "sel: int32 [T, 512], nsel: int32 [T]");
+    TORCH_CHECK(ul.numel() == NG * qsa_union_cap() && uc.numel() == NG, "ul: int32 [ceil(T / 4), qsa_union_cap()], uc: int32 [ceil(T / 4)]");
+    TORCH_CHECK(nblocks >= 1 && nblocks <= (1 << 22), "nblocks out of range");
+    check_pos(pos_t, 1);
+    QSA_CHECK_LAUNCH(launch_qsa_union(sel.data_ptr<int>(), nsel.data_ptr<int>(), pos_t.data_ptr<int>(), ul.data_ptr<int>(), uc.data_ptr<int>(), T,
+                                      nblocks, stream()));
+}
+
+// The sparse attention of a chunk over the group unions (GQA 12 Hkv / Hkv): q bf16 [1, Hq, T, 256] (the prologue
+// output), caches e4m3 [1, Hkv, Lmax, 256] with the chunk's rows written, gate: the q rows bf16 [T, >= Hq * 512] with
+// unit-stride rows (q | gate per head; a column view is fine), out bf16 [T, Hq * 256] = attn * sigmoid(gate).
+void qsa_union_attn(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor pos_t, torch::Tensor ul, torch::Tensor uc,
+                    torch::Tensor gate, torch::Tensor out, double scale) {
+    QSA_CHECK_TENSOR(q, torch::kBFloat16);
+    QSA_CHECK_TENSOR(k_cache, torch::kFloat8_e4m3fn);
+    QSA_CHECK_TENSOR(v_cache, torch::kFloat8_e4m3fn);
+    QSA_CHECK_TENSOR(ul, torch::kInt32);
+    QSA_CHECK_TENSOR(uc, torch::kInt32);
+    QSA_CHECK_TENSOR(out, torch::kBFloat16);
+    TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(3) == HEAD_DIM, "q: bf16 [1, Hq, T, 256]");
+    const int64_t Hq = q.size(1), T = q.size(2);
+    TORCH_CHECK(k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes() && k_cache.size(0) == 1 && k_cache.size(3) == HEAD_DIM,
+                "caches: e4m3 [1, Hkv, Lmax, 256]");
+    const int64_t Hkv = k_cache.size(1), Lmax = k_cache.size(2);
+    TORCH_CHECK(Hq == 12 * Hkv, "qsa_union_attn: 12 query heads per KV head");
+    TORCH_CHECK(gate.is_cuda() && gate.scalar_type() == torch::kBFloat16 && gate.dim() == 2 && gate.size(0) == T && gate.stride(1) == 1 &&
+                    gate.size(1) >= Hq * 2 * HEAD_DIM,
+                "gate: bf16 [T, Hq * 512] with unit-stride rows");
+    const int64_t NG = (T + 3) / 4;
+    TORCH_CHECK(ul.numel() == NG * qsa_union_cap() && uc.numel() == NG, "ul / uc: the qsa_union output of T rows");
+    TORCH_CHECK(out.numel() == T * Hq * HEAD_DIM, "out: bf16 [T, Hq * 256]");
+    check_pos(pos_t, 1);
+    QSA_CHECK_LAUNCH(launch_qsa_union_attn(q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), pos_t.data_ptr<int>(), ul.data_ptr<int>(),
+                                           uc.data_ptr<int>(), gate.data_ptr(), (int)gate.stride(0), out.data_ptr(), Hq, Hkv, T, Lmax, (float)scale,
+                                           stream()));
+}
+
 int ple_read_rows(int, const int64_t*, uint8_t*, int64_t, int64_t, bool, int);
 
 // The PLE n-gram rows (csrc/ple_io.cpp): out[i] = the out.size(1) bytes of the file fd at the byte offset offsets[i], read by
@@ -183,10 +249,102 @@ void ple_gather(int64_t fd, torch::Tensor offsets, torch::Tensor out, bool direc
     TORCH_CHECK(err == 0, "ple_gather: read failed: ", strerror(err));
 }
 
+// The PLE row cache (csrc/ple_io.cpp). The handle frees the cache when Python drops it.
+struct PleRowCache;
+PleRowCache* ple_cache_create(int64_t, int64_t, int64_t);
+void ple_cache_destroy(PleRowCache*);
+void ple_cache_lookup(PleRowCache*, const int64_t*, int64_t, uint8_t*, uint8_t*);
+void ple_cache_insert(PleRowCache*, const int64_t*, int64_t, const uint8_t*);
+void ple_cache_counters(PleRowCache*, int64_t*);
+void ple_cache_reset_counters(PleRowCache*);
+
+struct PleCache {
+    PleRowCache* c;
+    int64_t row;
+    PleCache(int64_t capacity, int64_t row_, int64_t ways) : c(ple_cache_create(capacity, row_, ways)), row(row_) {}
+    ~PleCache() { ple_cache_destroy(c); }
+    PleCache(const PleCache&) = delete;
+    PleCache& operator=(const PleCache&) = delete;
+};
+
+namespace {
+void check_rows(const torch::Tensor& ids, const torch::Tensor& rows, int64_t row, const char* fn) {
+    TORCH_CHECK(ids.device().is_cpu() && ids.is_contiguous() && ids.scalar_type() == torch::kInt64 && ids.dim() == 1, fn,
+                ": ids must be a contiguous CPU int64 [n] tensor");
+    TORCH_CHECK(rows.device().is_cpu() && rows.is_contiguous() && rows.scalar_type() == torch::kUInt8 && rows.dim() == 2 &&
+                    rows.size(0) == ids.size(0) && rows.size(1) == row,
+                fn, ": rows must be a contiguous CPU uint8 [n, ", row, "] tensor");
+}
+}  // namespace
+
+// A row cache of `capacity` rows of `row` bytes, `ways` per set.
+std::shared_ptr<PleCache> ple_cache_new(int64_t capacity, int64_t row, int64_t ways) {
+    TORCH_CHECK(capacity >= 1 && row >= 1 && row <= 4096 && ways >= 1 && ways <= 64, "ple_cache_new: capacity >= 1, row in [1, 4096], ways in [1, 64]");
+    return std::make_shared<PleCache>(capacity, row, ways);
+}
+
+// out[i] = the cached row of ids[i]; returns the miss mask uint8 [n] (1: not cached, out[i] untouched). GIL released.
+torch::Tensor ple_cache_lookup_t(const std::shared_ptr<PleCache>& h, torch::Tensor ids, torch::Tensor out) {
+    check_rows(ids, out, h->row, "ple_cache_lookup");
+    auto miss = torch::empty({ids.size(0)}, torch::dtype(torch::kUInt8));
+    {
+        pybind11::gil_scoped_release nogil;
+        ple_cache_lookup(h->c, ids.data_ptr<int64_t>(), ids.size(0), out.data_ptr<uint8_t>(), miss.data_ptr<uint8_t>());
+    }
+    return miss;
+}
+
+// Stores rows[i] as the row of ids[i]. GIL released.
+void ple_cache_insert_t(const std::shared_ptr<PleCache>& h, torch::Tensor ids, torch::Tensor rows) {
+    check_rows(ids, rows, h->row, "ple_cache_insert");
+    pybind11::gil_scoped_release nogil;
+    ple_cache_insert(h->c, ids.data_ptr<int64_t>(), ids.size(0), rows.data_ptr<uint8_t>());
+}
+
+// (hits, misses, rows held, capacity in rows) since the creation or the last reset.
+std::vector<int64_t> ple_cache_stats(const std::shared_ptr<PleCache>& h, bool reset) {
+    std::vector<int64_t> out(4);
+    ple_cache_counters(h->c, out.data());
+    if (reset) ple_cache_reset_counters(h->c);
+    return out;
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// hc_prefill.cu: the tail of the gated residual over the rows of a prefill chunk.
+cudaError_t launch_hc_mix_rows(const void*, int, const void*, void*, int, int, cudaStream_t);
+
+// y [T, H] = bf16((((p0 + p1) + p2) + p3) / 4), p_s = bf16(bf16(sigmoid(u_s)) * n_s): u bf16 [T, 4 H] (unit-stride rows,
+// any row stride), n bf16 [T, 4 H] contiguous, y bf16 [T, H] contiguous.
+void hc_mix_rows(torch::Tensor u, torch::Tensor n, torch::Tensor y) {
+    QSA_CHECK_TENSOR(n, torch::kBFloat16);
+    QSA_CHECK_TENSOR(y, torch::kBFloat16);
+    TORCH_CHECK(u.is_cuda() && u.scalar_type() == torch::kBFloat16 && u.dim() == 2 && u.stride(1) == 1, "u: bf16 [T, 4 H] with unit-stride rows");
+    const int64_t T = y.size(0), H = y.size(1);
+    TORCH_CHECK(y.dim() == 2 && u.size(0) == T && u.size(1) == 4 * H && n.numel() == T * 4 * H && H % 8 == 0 && u.stride(0) % 8 == 0,
+                "hc_mix_rows: u, n [T, 4 H], y [T, H], H % 8 == 0");
+    QSA_CHECK_LAUNCH(launch_hc_mix_rows(u.data_ptr(), (int)u.stride(0), n.data_ptr(), y.data_ptr(), T, H, stream()));
+}
+
 void bind_qsa(pybind11::module_& m) {
     namespace py = pybind11;
+    m.def("hc_mix_rows", &hc_mix_rows, "gated residual tail over prefill rows: sigmoid, product, ordered stream mean", py::arg("u"), py::arg("n"),
+          py::arg("y"));
+    py::class_<PleCache, std::shared_ptr<PleCache>>(m, "PleCache");
+    m.def("ple_cache_new", &ple_cache_new, "PLE row cache: set-associative, LRU per set, capacity in rows", py::arg("capacity"), py::arg("row") = 160,
+          py::arg("ways") = 8);
+    m.def("ple_cache_lookup", &ple_cache_lookup_t, "PLE row cache lookup: the cached rows into out, returns the miss mask", py::arg("cache"),
+          py::arg("ids"), py::arg("out"));
+    m.def("ple_cache_insert", &ple_cache_insert_t, "PLE row cache insert", py::arg("cache"), py::arg("ids"), py::arg("rows"));
+    m.def("ple_cache_stats", &ple_cache_stats, "PLE row cache (hits, misses, rows held, capacity)", py::arg("cache"), py::arg("reset") = false);
     m.def("ple_gather", &ple_gather, "PLE n-gram table rows: pread of n rows at byte offsets by a thread pool (GIL released)", py::arg("fd"),
           py::arg("offsets"), py::arg("out"), py::arg("direct") = false, py::arg("threads") = 32);
+    m.def("qsa_score_rows", &qsa_score_rows, "QSA block scores of all rows of a prefill chunk (bit-identical to qsa_score per row)", py::arg("q_idx"),
+          py::arg("ikb"), py::arg("pos_t"), py::arg("scores"));
+    m.def("qsa_union_cap", &qsa_union_cap, "the entries per group of the qsa_union output");
+    m.def("qsa_union", &qsa_union, "QSA prefill: the union of the selected and tail blocks of each group of 4 rows", py::arg("sel"), py::arg("nsel"),
+          py::arg("pos_t"), py::arg("ul"), py::arg("uc"), py::arg("nblocks"));
+    m.def("qsa_union_attn", &qsa_union_attn, "QSA prefill attention over the group unions (fp8 KV, output gate)", py::arg("q"), py::arg("k_cache"),
+          py::arg("v_cache"), py::arg("pos_t"), py::arg("ul"), py::arg("uc"), py::arg("gate"), py::arg("out"), py::arg("scale"));
     m.def("qsa_prologue", &qsa_prologue, "QSA indexer prologue: q_layernorm + RoPE of the 4 query heads, raw key write", py::arg("idx"),
           py::arg("qn_w"), py::arg("inv_freq"), py::arg("pos_t"), py::arg("ik"), py::arg("q_out"), py::arg("eps"), py::arg("active") = py::none(),
           py::arg("rope_delta") = py::none(), py::arg("rope_pos") = py::none(), py::arg("sec_h") = 11, py::arg("sec_w") = 10);
