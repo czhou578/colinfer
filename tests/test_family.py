@@ -140,6 +140,7 @@ def test_the_moe_family_has_its_own_defaults(tmp_path, monkeypatch):
     length past the native context before the memory check."""
     path = moe_config(tmp_path)
     stub_modules(monkeypatch)
+    monkeypatch.setattr(F, "NOT_SERVED_YET", {})  # the round-2 state: the scheduler wiring is done
     assert check_served(path) == "qwen4_exp"
     fam = family_of(path)
     assert fam.name == "qwen4_exp" and fam.load("p", "int", print, None, 262144) == ("path", "model")

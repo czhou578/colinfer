@@ -21,7 +21,7 @@ import time
 from typing import Literal
 
 from engine.kernels import ops
-from engine.model.family import Family, family_of
+from engine.model.family import Family, check_served, family_of
 from engine.model.fast import attach_decode_copies, load_fast_model, to_fast
 from engine.model.qwen35 import apply_yarn, yarn_attention_factor
 from engine.model.vision import VisionTower, vision_available
@@ -189,7 +189,8 @@ def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: i
     if spec not in ("mtp", "none", None):
         raise ValueError(f"spec: mtp or none, not {spec!r}")
     path = resolve(model)
-    fam = family_of(path)  # a family the engine cannot serve yet is refused before anything else
+    check_served(path)  # a family the engine cannot serve yet is refused before anything else
+    fam = family_of(path)
     d = fam.defaults
     slots = d.slots if slots is None else slots
     max_seq_len = d.max_seq_len if max_seq_len is None else max_seq_len
