@@ -12,6 +12,7 @@ import time
 import torch
 
 from engine.kernels import ops
+from engine.model.moe_kernels import moe_selftest, skinny_bf16_selftest
 from engine.weights.loader import dequant_nvfp4
 from engine.weights.quant_emul import fake_quant_nvfp4_unscaled
 from engine.weights.quantize import dequant_int, int_global_scale, nvfp4_global_scale, pack5, pack6, quantize_int
@@ -102,6 +103,9 @@ def run_selftest(verbose: bool = False) -> dict:
     o.attn_decode(q, kc, vc, torch.tensor([600], dtype=torch.int32, device=dev), out, D ** -0.5)
     ref = torch.nn.functional.scaled_dot_product_attention(q.float(), kc.float(), vc.float(), enable_gqa=True)
     res["attn_decode_fp8kv"] = _rel(out, ref)
+    # the qwen4_exp paths (engine/model/moe_kernels.py): the BF16 skinny format, the MoE decode kernels, the grouped prefill GEMM
+    res.update(skinny_bf16_selftest(o, g))
+    res.update(moe_selftest(o, g))
     torch.cuda.synchronize()
     bad = {k: v for k, v in res.items() if not v < TOL}
     if verbose:
