@@ -17,6 +17,7 @@ import time
 from typing import Literal
 
 from engine.kernels import ops
+from engine.model.family import check_served
 from engine.model.fast import FastState, attach_decode_copies, load_fast_model, to_fast
 from engine.model.qwen35 import Qwen35Config, apply_yarn, yarn_attention_factor
 from engine.model.vision import VisionTower, vision_available
@@ -40,6 +41,7 @@ def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print
     if decode_weights not in ("int", "checkpoint"):
         raise ValueError(f"decode_weights: int or checkpoint, not {decode_weights!r}")
     path = resolve(path_or_repo)
+    check_served(path)
     if prep == "auto":
         prep = read_prepared(path)
     model = load_fast_model(path)
@@ -154,6 +156,7 @@ def build_engine(model: str = MODEL, *, slots: int = 3, max_seq_len: int = 52428
     if spec not in ("mtp", "none"):
         raise ValueError(f"spec: mtp or none, not {spec!r}")
     path = resolve(model)
+    check_served(path)  # a family the engine cannot serve yet is refused before anything else
     check_memory(path, slots, max_seq_len, spec)  # before the CUDA context and the weights
     t0 = time.perf_counter()
     ops()  # build / load the CUDA extension
