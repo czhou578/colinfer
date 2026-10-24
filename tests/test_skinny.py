@@ -1,4 +1,4 @@
-"""The tensor-core skinny GEMM (csrc/skinny.cu) on NVFP4, FP8, INT6 / INT5 and SwiGLU weights. The tests check:
+"""The tensor-core skinny GEMM (csrc/skinny.cu) on NVFP4, FP8, INT6 / INT5, BF16 and SwiGLU weights. The tests check:
 - the accuracy against an fp32 reference built from the dequantization of the loader (INT6 / INT5: x @ (q * s)^T,
   with the one bf16 rounding of q * s that the kernel does)
 - that each output row is bit-identical for any number of rows (this keeps plain decode, verify and the drafter
@@ -94,6 +94,64 @@ def test_swiglu():
     g = x.float() @ dequant_nvfp4(wg, sg, torch.tensor(0.3), torch.float32).T
     u = x.float() @ dequant_nvfp4(wu, su, torch.tensor(0.2), torch.float32).T
     assert rel(out, torch.nn.functional.silu(g) * u) < 3e-3
+
+
+@pytest.mark.parametrize("N,K", [(520, 2560), (2560, 640), (1032, 1024), (8, 128)])
+def test_bf16_accuracy_and_row_invariance(N, K):
+    torch.manual_seed(N + K + 7)
+    w = (torch.randn(N, K, device="cuda") * 0.05).bfloat16()
+    x = torch.randn(16, K, device="cuda").bfloat16()
+    res = torch.randn(16, N, device="cuda").bfloat16()
+    ref = x.float() @ w.float().T
+    full = torch.empty(16, N, device="cuda", dtype=torch.float32)
+    ops().skinny_bf16(x, w, None, full)
+    assert rel(full, ref) < 1e-5
+    for M in (1, 3, 8):  # the first M rows of a 16-row launch, bit for bit
+        out = torch.empty(M, N, device="cuda", dtype=torch.float32)
+        ops().skinny_bf16(x[:M].contiguous(), w, None, out)
+        assert torch.equal(out, full[:M])
+    for i in (0, 9, 15):  # any row alone equals its result in the 16-row launch
+        out = torch.empty(1, N, device="cuda", dtype=torch.float32)
+        ops().skinny_bf16(x[i:i + 1].contiguous(), w, None, out)
+        assert torch.equal(out[0], full[i])
+    out = torch.empty(16, N, device="cuda", dtype=torch.bfloat16)
+    ops().skinny_bf16(x, w, res, out)
+    assert rel(out, ref + res.float()) < 3e-3
+    assert torch.equal(out, (full + res.float()).bfloat16())
+
+
+@pytest.mark.parametrize("N,K", [(640, 2560), (256, 1024)])
+def test_swiglu_bf16(N, K):
+    torch.manual_seed(N + 3)
+    wg, wu = ((torch.randn(N, K, device="cuda") * 0.03).bfloat16() for _ in range(2))
+    x = torch.randn(16, K, device="cuda").bfloat16()
+    out = torch.empty(16, N, device="cuda", dtype=torch.bfloat16)
+    ops().skinny_swiglu_bf16(x, wg, wu, out)
+    ref = torch.nn.functional.silu(x.float() @ wg.float().T) * (x.float() @ wu.float().T)
+    assert rel(out, ref) < 3e-3
+    for i in (0, 5, 15):
+        o1 = torch.empty(1, N, device="cuda", dtype=torch.bfloat16)
+        ops().skinny_swiglu_bf16(x[i:i + 1].contiguous(), wg, wu, o1)
+        assert torch.equal(o1[0], out[i])
+
+
+def test_bf16_skip_flag_and_bad_shapes():
+    w = torch.randn(64, 256, device="cuda").bfloat16()
+    x = torch.randn(2, 256, device="cuda").bfloat16()
+    out = torch.full((2, 64), 7.0, device="cuda", dtype=torch.bfloat16)
+    flag = torch.ones(1, dtype=torch.int32, device="cuda")  # the launch reads the device int: keep it alive
+    ops().skinny_skip(flag)
+    try:
+        ops().skinny_bf16(x, w, None, out)
+    finally:
+        ops().skinny_skip(None)
+    assert torch.equal(out, torch.zeros_like(out))
+    with pytest.raises(RuntimeError):  # K % 128
+        ops().skinny_bf16(torch.randn(1, 192, device="cuda").bfloat16(), torch.randn(64, 192, device="cuda").bfloat16(), None, out[:1])
+    with pytest.raises(RuntimeError):  # M <= 16
+        ops().skinny_bf16(torch.randn(17, 256, device="cuda").bfloat16(), w, None, torch.empty(17, 64, device="cuda"))
+    with pytest.raises(RuntimeError):  # w dtype
+        ops().skinny_bf16(x, w.float(), None, out)
 
 
 def test_skip_flag_zeroes_output_without_reading():
