@@ -30,3 +30,13 @@ def test_moe_family_is_refused_with_the_plan(tmp_path):
         build.build_engine(path, selftest=False)
     with pytest.raises(NotImplementedError, match="not served yet"):
         build.load_model(path)
+
+
+def test_server_main_refuses_the_moe_family_before_the_memory_check(tmp_path):
+    """engine.server's main checks the family right after it resolves the model, before its memory check (which reads the
+    dense config and would fail with a KeyError on this family)."""
+    from engine.server import api
+    path = write_config(tmp_path, "qwen4_exp")
+    with pytest.raises(SystemExit) as e:
+        api.main(["--model", path])
+    assert e.value.code == 2  # not NO_MEMORY_EXIT: the family check ran first

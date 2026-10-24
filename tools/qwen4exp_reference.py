@@ -2,7 +2,8 @@
 
 The reference (engine/model/qwen4exp.py, loaded by engine/weights/qwen4exp_loader.py) is slow: about one second per
 token, because it dequantizes each routed expert on the fly. It is the ground truth of the kernel path: the golden test
-of the decode milestone compares the tokens of the engine with the tokens that this tool writes.
+of the decode milestone (M1, docs/history/qwen4exp_plan.md) compares the tokens of the engine with the tokens that this
+tool writes.
 
 Usage (loads about 78 GB on the GPU; stop the server first):
     uv run python tools/qwen4exp_reference.py                       # three built-in prompts, 24 tokens each

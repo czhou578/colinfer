@@ -17,6 +17,7 @@ KernelMoE.prefill(x [T, K]) runs a prefill chunk on csrc/moe_prefill.cu: the (to
 
 moe_reference() is the pure-torch reference (the per-expert loop of transformers, in fp32) for the tests.
 skinny_bf16_selftest() and moe_selftest() are the entries of the startup self-test (engine/selftest.py).
+Tests: tests/test_moe.py (decode) and tests/test_moe_prefill.py (prefill). Bench: bench/moe_bench.py.
 """
 from __future__ import annotations
 

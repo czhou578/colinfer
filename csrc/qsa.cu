@@ -1,6 +1,6 @@
 // qsa.cu -- Qwen Sparse Attention kernels for qwen4_exp (docs/history/qwen4exp_plan.md section 5.3): the indexer
 // prologue, the block keys, the block scores, the top-k selection and the sparse decode attention. The bindings are in
-// qsa_bind.cpp, the Python wrappers in engine/model/qsa_kernels.py.
+// qsa_bind.cpp, the Python wrappers in engine/model/qsa_kernels.py. Tests: tests/test_qsa.py.
 //
 // The indexer of a layer scores 4-token blocks of the context for each query row. Each row then attends to its top 512
 // blocks plus the tail (the tokens of its incomplete block). A row's selection and its attention depend only on the row,

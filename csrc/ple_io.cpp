@@ -11,7 +11,7 @@
 // so a small batch from the page cache wants few threads, and cold rows from the drive want many. The calling thread
 // works too, and returns when all rows are read. The bound function releases the GIL. Python: ops().ple_gather (bound in
 // qsa_bind.cpp). For plain reads, the caller sets posix_fadvise(fd, POSIX_FADV_RANDOM): readahead would read 128 KB per
-// row.
+// row. Tests: tests/test_ple_io.py.
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>

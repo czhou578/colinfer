@@ -33,6 +33,7 @@ import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+from engine.model.family import check_served
 from engine.runtime.build import NotEnoughMemory, check_memory
 from engine.runtime.grammar import Grammars
 from engine.runtime.scheduler import Request as EngineRequest
@@ -818,8 +819,12 @@ def main(argv=None):
         raise SystemExit(f"--committee-roles: {e}") from None
     t0 = time.perf_counter()
     path = resolve(a.model)
-    try:  # before the CUDA context and the slow imports: it reads only config.json, so a refused start costs little
+    try:  # before the CUDA context and the slow imports: both read only config.json, so a refused start costs little
+        check_served(path)  # a family the engine cannot serve yet (engine/model/family.py)
         check_memory(path, a.slots, a.max_seq_len, a.spec)
+    except NotImplementedError as e:
+        log(f"[server] {e}")
+        raise SystemExit(2) from None
     except NotEnoughMemory as e:
         log(f"[server] {e}")
         raise SystemExit(NO_MEMORY_EXIT) from None

@@ -1,6 +1,6 @@
 // moe_prefill.cu -- prefill MoE for qwen4_exp (docs/history/qwen4exp_plan.md section 3, "MoE prefill"): the (token, slot) pairs
 // sorted by expert run through two grouped NVFP4 GEMMs, one group per expert, with the CUTLASS 4.8 SM120 block-scaled
-// ptr-array kernel. engine/model/moe_kernels.py (KernelMoE.prefill) chains the steps:
+// ptr-array kernel. Tests: tests/test_moe_prefill.py. engine/model/moe_kernels.py (KernelMoE.prefill) chains the steps:
 //
 //   plan (torch, no host sync)  order = the pairs sorted by expert (stable), off[e] = the first sorted row of expert e,
 //                               sfo[e] = the first scale row of group e (each group padded to 128 rows)

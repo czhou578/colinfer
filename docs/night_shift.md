@@ -165,11 +165,12 @@ run the night shift in a container.
 or anything that reaches outside the worktree.
 
 > **CAUTION:** Do not allow a task to run anything that loads the model next to the server. `tests/golden.py`,
-> `tests/perplexity.py` and an HF reference run each take 40 GB or more. `tests/check.sh` without `--quick` takes about
-> 90 GB: `tests/scheduler_check.py` builds the server's engine. The server holds 88 GB of the 121 GB of the machine, so
-> such a load over-commits the memory, and an over-commit powers the machine off. The `kill_below_gb` guard kills the
-> task when the available memory falls under its limit, but a single large allocation can get past it. For this
-> repository, allow `tests/check.sh --quick` and `uv run pytest tests/` only.
+> `tests/perplexity.py` and an HF reference run each take 40 GB or more. `tools/qwen4exp_reference.py` loads 77.8 GB of
+> Qwen3.8-Flash-Next. `tests/check.sh` without `--quick` takes about 90 GB: `tests/scheduler_check.py` builds the
+> server's engine. The server holds 88 GB of the 121 GB of the machine, so such a load over-commits the memory, and an
+> over-commit powers the machine off. The `kill_below_gb` guard kills the task when the available memory falls under its
+> limit, but a single large allocation can get past it. For this repository, allow `tests/check.sh --quick` and
+> `uv run pytest tests/` only.
 
 **The Stop hook.** The review harness has a Stop hook that runs ruff and pytest when a turn of Claude Code ends with
 changed code (`docs/review.md`). The night shift sets `REVIEW_STOP_CHECK=0`, so the hook does not run in a task. To

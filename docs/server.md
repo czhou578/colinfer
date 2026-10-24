@@ -25,7 +25,7 @@ estimate, and `build_engine` makes the same check for the end-to-end checks and 
 | Flag | Default | |
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `8000` | |
-| `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. |
+| `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. The engine serves the `qwen3_5` family (`model_type` in `config.json`), which includes Qwen3.8-27B. Support for the `qwen4_exp` family (Qwen3.8-Flash-Next, `nvidia/Qwen3.8-Flash-Next-NVFP4`) is in progress, and the engine does not serve it yet. `check_served` in `engine/model/family.py` refuses such a checkpoint with a message that names the plan, `docs/history/qwen4exp_plan.md`; the server and `build_engine` call it before their memory checks. A note for the day this family is served: the plan estimates about 100 GB of memory at 2 slots x 262,144 tokens, without the drafter and the decode copies (94 GB plus the 6 GB reserve). That is an estimate of the plan, not a measurement. |
 | `--slots` | 3 | Conversations whose KV stays cached. The server runs one request at a time; the others wait in a FIFO queue. |
 | `--max-seq-len` | 524288 | Tokens per slot (prompt plus output). The fp8 KV cache costs 32 KB per token per slot. The checkpoint was trained on 262,144 positions. Past them, the server scales the rope with YaRN by the ratio (x2 at the default), as Qwen documents for its models. YaRN is static: it applies to every request, and costs a little quality on short prompts. Set `--max-seq-len 262144` for the unscaled model. |
 | `--spec` | `mtp` | `none` turns off speculation and runs plain one-token decode. |
@@ -41,6 +41,7 @@ estimate, and `build_engine` makes the same check for the end-to-end checks and 
 | `--committee-roles` | the built-in roles | A JSON file `{"roles": [...], "reconcile": "..."}` with the members' roles and the reconcile instruction (`{n}`: the number of answers). |
 | `--no-selftest` | off | Skip the startup self-test of the matmul kernels (`engine/selftest.py`). For development only: the test is what catches a miscompiled kernel. |
 | `--no-warmup` | off | Skip the warm-up requests. The first real requests then pay for the first-use compilation and autotuning. |
+| `--api-key` | `$COLINFER_API_KEY`, else none | The `/v1/` endpoints require this key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and `/metrics` stay open. |
 
 These values have no flag. They are the defaults of `ServerConfig` in `engine/server/worker.py`:
 
@@ -61,7 +62,6 @@ These values have no flag. They are the defaults of `ServerConfig` in `engine/se
   decode weights, drafter). The budget covers all of them.
 - An image is resized to at most 4,194,304 pixels (2048 x 2048), one prompt token per 32 x 32 pixels, so at most 4,096
   tokens. The vision tower (0.92 GB) loads on the first image request, which is then 1-2 s slower.
-| `--api-key` | `$COLINFER_API_KEY`, else none | The `/v1/` endpoints require this key, as `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and `/metrics` stay open. |
 
 ## API
 

@@ -8,7 +8,7 @@
   milestones M1 to M5 of docs/history/qwen4exp_plan.md. Until then the engine refuses the checkpoint with a clear message,
   instead of a KeyError from the dense config reader.
 
-check_served(path) runs before the memory check of the build, so the refusal costs nothing.
+check_served(path) runs before the memory check of the build, so the refusal costs nothing. Tests: tests/test_family.py.
 """
 from __future__ import annotations
 

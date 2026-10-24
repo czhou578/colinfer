@@ -3,7 +3,7 @@
 // bf16 values as a dense weight of the same format.
 //
 // Also the host accessor of the skip flag of the draft early exit (skinny_set_skip in skinny.cu): the MoE launches read the
-// same flag as the skinny launches.
+// same flag as the skinny launches. Tests: tests/test_skinny.py and tests/test_moe.py.
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>

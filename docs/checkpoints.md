@@ -30,6 +30,11 @@ the repo. For the nvidia repo, it uses the LFS sha256 from the Hub. All 87 shard
 download. The download times on the Wi-Fi of this machine were: NVFP4 5.1 min, FP8 7.4 min, BF16 11.4 min (30 to
 140 MB/s).
 
+`uv run python tools/verify_qwen4exp.py` checks `nvidia/Qwen3.8-Flash-Next-NVFP4` further, without the GPU: the
+config, the index and the headers (the dtype and shape of each tensor of the language model), the n-gram hash buffers
+against `engine/weights/ple.py`, the shards and rows of the n-gram table, and the global and input scales of the
+experts.
+
 ## Where the bytes are
 
 huggingface_hub 1.x keeps large files in a shared content-addressed store,
@@ -47,4 +52,8 @@ For the total, use `du -sh ~/.cache/huggingface/hub` (102 GB with the three Qwen
 - To download again or update, run `uv run hf download <repo>`. To delete, run `uv run hf cache delete` (interactive).
   Removing only the `models--*` directory leaves its large files in `blobs/`. A blob can belong to several models
   (the NVFP4 and BF16 checkpoints share their tokenizer), so delete only the blobs that no other snapshot links to.
-- Each checkpoint contains a vision tower (~0.9 GB BF16). The engine is text-only and does not use it.
+- Each checkpoint contains a vision tower. The engine serves images with the vision tower of
+  `nvidia/Qwen3.8-27B-NVFP4` (0.92 GB BF16, loaded on the first image; `engine/model/vision.py`). The loader of
+  `nvidia/Qwen3.8-Flash-Next-NVFP4` skips its vision tower: images for that model are a later milestone.
+- The n-gram table of `nvidia/Qwen3.8-Flash-Next-NVFP4` (51.2 GB, in `model-fp8-mtp-ple.safetensors`) stays on disk.
+  The loader does not load the table: it attaches a row reader to the file (`NgramTable`, `engine/weights/ple.py`).

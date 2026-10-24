@@ -12,7 +12,8 @@ loader reads by name, so this needs nothing special.
 Everything else is BF16 and loads as is. The loader skips the vision tower (model.visual.*), the MTP block (mtp.*) and
 the n-gram shards by name. It checks the PLE buffers of the checkpoint (layer_multipliers, ngram_heads_vocab_sizes,
 ngram_heads_offsets) against the values that engine/weights/ple.py computes, and attaches an NgramTable over the
-n-gram file to each PLE layer: the 51 GB table stays on disk.
+n-gram file to each PLE layer: the 51 GB table stays on disk. Tests: tests/test_qwen4exp_loader.py, on a synthetic
+checkpoint in the nvidia layout (tests/qwen4exp_ckpt.py).
 
 Usage:
     model = load_qwen4exp("nvidia/Qwen3.8-Flash-Next-NVFP4")   # repo id in the HF cache, or a local dir

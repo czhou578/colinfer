@@ -16,6 +16,8 @@ the table as shards `<prefix>.shard_<i>.weight` [rows_per_shard, 160]. Row r is 
 does not store the shards in index order, so the reader takes each shard's offset from the file's own header. A row
 read is an O_DIRECT preadv of the 4 KB page(s) that hold the row, on a thread pool: O_DIRECT keeps the page cache
 from holding 4 KB per 160 B row, and preadv releases the GIL. The value of a row is bf16(e4m3 * scale) (dequant).
+csrc/ple_io.cpp (ops().ple_gather, tests/test_ple_io.py) holds a C++ thread pool for the same row reads; NgramTable does
+not call it. Tests: tests/test_ple.py, on the synthetic checkpoints of tests/qwen4exp_ckpt.py.
 """
 from __future__ import annotations
 

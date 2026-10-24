@@ -6,9 +6,10 @@ into the sublayer input y [2560], and computes the injection weights inj [4]; af
 back into each stream: x4_s += o * inj_s. The rounding points follow transformers' Qwen4ExpTextGatedResidual: bf16
 weights, fp32 math, one rounding per op.
 
-The down | inject product (K = 10240) runs on bf16_gemv for now: it rounds once and gives each row the same bits for any
-M. (torch's bf16 matmul does neither: cuBLAS reduces split-K partials in bf16 and picks its kernel by M.) The BF16
-skinny GEMM of the MoE work replaces it later."""
+The down | inject product (K = 10240) runs on bf16_gemv: it rounds once and gives each row the same bits for any M.
+(torch's bf16 matmul does neither: cuBLAS reduces split-K partials in bf16 and picks its kernel by M.) The BF16 skinny
+GEMM (ops().skinny_bf16, csrc/skinny.cu) is to replace it (docs/history/qwen4exp_plan.md section 9).
+Tests: tests/test_hc.py. hc_selftest() is an entry of the startup self-test (engine/selftest.py)."""
 from __future__ import annotations
 
 import torch
@@ -94,8 +95,8 @@ def _rel(a, b):
 
 
 def hc_selftest(o, g: torch.Generator) -> dict[str, float]:
-    """Startup self-test of the hyper-connection kernels (engine/selftest.py style): relative errors of hc_norm + hc_mix +
-    hc_post against the torch reference at M = 3. o: ops(); g: a CUDA generator."""
+    """Startup self-test of the hyper-connection kernels (an entry of engine/selftest.py): relative errors of hc_norm +
+    hc_mix + hc_post against the torch reference at M = 3. o: ops(); g: a CUDA generator."""
     dev, M = "cuda", 3
     rnd = lambda *s, sc=1.0: (torch.randn(*s, device=dev, generator=g) * sc).bfloat16()  # noqa: E731
     gr = KernelGatedResidual(rnd(STREAMS * HIDDEN, sc=0.2), rnd(LOWRANK, STREAMS * HIDDEN, sc=0.01), rnd(STREAMS, STREAMS * HIDDEN, sc=0.01),

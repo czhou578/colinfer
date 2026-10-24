@@ -2,6 +2,7 @@
 // its stripe partials. Two files instantiate it:
 //   csrc/attn_decode.cu  dense keys: row t of slot b attends to the positions [0, seq_len - (T - 1 - t)).
 //   csrc/qsa.cu          a key list per row (Qwen Sparse Attention): the selected 4-token blocks, then the tail.
+// Tests: tests/test_attn_decode.py (dense, GQA 24/4 and 24/2) and tests/test_qsa.py (the list).
 //
 // k              [B, Hkv, Lmax, D] e4m3 cache, with the rows of the new tokens already written (v the same)
 // q              [B, Hq, T, D] bf16

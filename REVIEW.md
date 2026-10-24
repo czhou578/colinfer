@@ -25,6 +25,20 @@ colinfer is an inference engine for one model (Qwen3.8-27B) on one machine (a DG
 server runs one request at a time. Its main promise is exact output: the tokens with speculation are the tokens
 without speculation, bit for bit.
 
+The branch `moe` adds a second model family, the MoE model Qwen3.8-Flash-Next (`qwen4_exp`). Its support is in
+progress, and the server does not serve it yet. Its files are `engine/model/family.py`, `qwen4exp.py`,
+`moe_kernels.py`, `qsa_kernels.py` and `hc_kernels.py`, `engine/weights/qwen4exp_loader.py` and `ple.py`,
+`csrc/moe.cu`, `moe_prefill.cu`, `qsa.cu`, `hc.cu`, `ple_io.cpp` and their `*_bind.cpp`. The same promise holds for
+it, with these invariants:
+
+- Every output row of a MoE, QSA or hyper-connection decode kernel is bit-identical for any set of rows in the launch.
+  A reduction whose order depends on the rows of the launch (a split by row count, an atomic, a bf16 matmul of torch)
+  breaks this.
+- The n-gram table (51.2 GB) is never resident. The host reads its rows from the disk on demand. A change that loads
+  the table or maps it whole is failure 3.
+- A family that the engine cannot serve is refused (`check_served`, `engine/model/family.py`) before the memory check
+  and before the CUDA context.
+
 ## What failure looks like here
 
 1. **The output changes.** A change must not change the tokens of a greedy or seeded request, with speculation on or
@@ -52,6 +66,7 @@ without speculation, bit for bit.
 | The engine thread (`Worker`) | everything on the GPU | it is the only thread that runs the scheduler |
 | The session writer (`SessionStore._run`) | the slots' KV rows, the checkpoint ring, pinned buffers, its own CUDA stream | `SessionStore.lock` and `cv`; `wait()` before a slot rewrites rows that a save reads; `pinned()` |
 | The direct readers (`engine/weights/direct.py`) | pinned chunk buffers | the `free` and `filled` queues |
+| The row readers of the n-gram table (`NgramTable` in `engine/weights/ple.py`, `ops().ple_gather` in `csrc/ple_io.cpp`) | the caller's output buffer | the call returns only when all its rows are read |
 | Side CUDA streams (`engine/model/fast.py`, `engine/spec/mtp.py`) | the tensors of the main stream | `wait_stream` in both directions |
 | CUDA graphs (`engine/model/fast.py`) | a memory pool | no allocation, no host sync and no new stream inside a capture |
 | Non-blocking copies from pinned host buffers (scheduler masks, sessions, drafter) | the host code that reuses the buffer | the copy must finish before the host writes the buffer again |
@@ -131,6 +146,10 @@ These choices are intentional. Do not report them.
 - The engine loop ends the process on any exception, and systemd restarts it. Report the input that reaches the loop,
   not the exit.
 - `engine/model/qwen35.py` repeats the math of the fast path in plain PyTorch. It is the reference of the kernel tests.
+  `engine/model/qwen4exp.py` and the torch references in `engine/model/{moe,qsa,hc}_kernels.py` do the same for the
+  qwen4_exp family.
+- The MoE prefill quantizes its activations to NVFP4, so its output differs from the MoE decode path by about 2%.
+  Decode and verify must agree bit for bit; prefill and decode need not.
 - The kernels compile for sm_121a only, with `--fmad=false`.
 - The server fetches no URLs. Images arrive as base64.
 - The session writer and the direct readers are daemon threads.

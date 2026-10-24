@@ -1,6 +1,6 @@
 // moe.cu -- decode MoE kernels for qwen4_exp (docs/history/qwen4exp_plan.md section 5.2): expert routing, the expert SwiGLU and
 // down projections on the skinny-GEMM streaming pattern (csrc/skinny.cu), and the fixed-order combine. The bindings are in
-// moe_bind.cpp; engine/model/moe_kernels.py chains them.
+// moe_bind.cpp; engine/model/moe_kernels.py chains them. Tests: tests/test_moe.py; bench: bench/moe_bench.py.
 //
 //   moe_route    logits bf16 [M, NL] (E router columns, then the shared-expert gate at column E) -> the top-10 experts per row
 //   moe_gate_up  h  bf16 [10M, I] = silu(x W_gate^T * gs_g) * (x W_up^T * gs_u), one row per (token, slot) pair

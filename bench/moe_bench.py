@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decode MoE (csrc/moe.cu) weight-streaming rate by the number D of distinct experts in a launch, at the real layer shape
 (E = 512, K = 2560, I = 640: 2.76 MB per expert). The bench cycles over 4 copies of a layer and over 8 expert sets, so
-nothing runs from L2 (LPDDR5x peak ~238 GB/s). Then it times the full layer (router, routing, shared expert, experts,
+nothing runs from L2 (the best measured LPDDR5x rate, ~238 GB/s). Then it times the full layer (router, routing, shared expert, experts,
 combine) with the routing of random router weights, and the prefill path (KernelMoE.prefill: the grouped NVFP4 GEMMs of
 csrc/moe_prefill.cu) per chunk of T tokens, with the time of each step at T = 2048.
 

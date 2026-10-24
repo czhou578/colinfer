@@ -5,9 +5,10 @@ sm_121). It serves the model through an OpenAI-compatible and an Anthropic-compa
 it directly, and it reads images (screenshots, diagrams) with the checkpoint's own vision tower. It is for one person,
 and it runs one request at a time.
 
-This is a research engine for one machine and one model, not a general inference server. It has no paged KV cache, no
-multi-GPU support and no other models. The kernels compile for sm_121a only. The design notes and the dated logs in
-`docs/` record each measurement behind the design.
+This is a research engine for one machine and one served model, not a general inference server. It has no paged KV
+cache and no multi-GPU support. The kernels compile for sm_121a only. The design notes and the dated logs in `docs/`
+record each measurement behind the design. Support for a second model, the MoE model Qwen3.8-Flash-Next, is in
+progress on this branch, and the server does not serve it yet ([below](#qwen38-flash-next-in-progress)).
 
 The memory bandwidth of this chip sets the decode speed. Each decode step reads all the weights from LPDDR5x memory at
 ~238 GB/s, so plain decode cannot go faster than ~14 tok/s. All the speed above this floor comes from speculative
@@ -39,6 +40,8 @@ perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
   GPU work first: an over-commit of the shared memory can power off the machine instead of an out-of-memory error. The
   server does not start with less.
 - Up to 64 GB of disk for the conversation cache (`--session-cache-gb`, under `~/.cache/colinfer/sessions`).
+- Optional, only for the work in progress: the checkpoint `nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB). Only
+  `tools/qwen4exp_reference.py` and `tools/verify_qwen4exp.py` read it. The server does not serve it.
 
 ## Quick start
 
@@ -113,11 +116,52 @@ decision. In short:
   RoPE positions, and the prefix caches tell images apart by a hash of their bytes, so a conversation that sends the
   same screenshot again does not encode it again.
 
+## Qwen3.8-Flash-Next (in progress)
+
+The branch `moe` adds a second model family: `Qwen/Qwen3.8-Flash-Next` (`model_type` `qwen4_exp`), from the
+checkpoint `nvidia/Qwen3.8-Flash-Next-NVFP4`. It is a MoE model with 125B parameters, 6B of them active per token. It
+has 48 layers (36 Gated DeltaNet, 12 with Qwen Sparse Attention), 512 experts (top-10 and one shared expert), a
+4-stream residual (hyper-connections) and a 51 GB n-gram embedding table. **The server does not serve it yet:**
+`python -m engine.server --model nvidia/Qwen3.8-Flash-Next-NVFP4` stops with a clear message before the memory check
+(`engine/model/family.py`).
+
+What exists and is tested:
+
+- **The reference model** in plain PyTorch (`engine/model/qwen4exp.py`). On a tiny model in fp32, it is bit-identical to
+  the `Qwen4ExpForCausalLM` of transformers: one-shot, split, stepwise, with a cache, with eos, with an image.
+- **The loader** (`engine/weights/qwen4exp_loader.py`) stacks the 512 experts of each layer at load time. On the real
+  checkpoint, the reference loads 77.8 GB in 34 s and gives coherent greedy text at about 1 s per token
+  (`tools/qwen4exp_reference.py`, the ground truth of the coming golden test).
+- **The n-gram table** (51.2 GB FP8) stays on disk. `engine/weights/ple.py` hashes the ids and reads the rows on
+  demand. `tools/verify_qwen4exp.py` checks the checkpoint without the GPU. `tools/ple_hotset.py` measures the hot set:
+  an LRU row cache of 0.5 to 5 GB hits 51-68% of the rows on WikiText and 83-90% on TinyStories.
+- **The kernels**, each tested against a PyTorch reference:
+  - MoE decode (`csrc/moe.cu`) streams 208 GB/s at 10 distinct experts and 238 GB/s at 75. A full MoE layer takes
+    196 µs at 1 row, 935 µs at 8 rows and 1635 µs at 16 rows.
+  - MoE prefill (`csrc/moe_prefill.cu`, a CUTLASS grouped NVFP4 GEMM) takes 8.8 ms per layer for a 2,048-token chunk
+    (11.3 ms at 4,096, 16.6 ms at 8,192): a MoE ceiling of 4.8k / 7.5k / 10.3k tok/s.
+  - Sparse attention (`csrc/qsa.cu`): the block selection equals a stable sort and `torch.topk`, ties included. The
+    attention over 2051 keys takes 9.3 µs at T = 1 and 72 µs at T = 8, at any context length.
+  - Hyper-connections (`csrc/hc.cu`): a full gated residual takes 14 / 40 / 74 µs at 1 / 8 / 16 rows.
+  - The GDN kernels take a sigmoid output gate, and the decode attention runs GQA 24/2. The 27B keeps its bits.
+  - The host row reader of the n-gram table (`csrc/ple_io.cpp`) reads about 170k cold rows per second at 128 rows per
+    call.
+- **The startup self-test** covers 22 paths, the new kernels included. memcheck, racecheck (filtered to the engine's
+  kernels) and synccheck are clean on the tests of the new kernels.
+
+What does not exist yet: the decode model on the kernels (the next milestone), prefill of the model, speculation (the
+MTP drafter), the checkpoints and sessions of the new state, the server path, and images.
+
+The plan expects plain decode at about 22 tok/s on the exact BF16 path, and about 49 tok/s with requantized decode
+copies (under the perplexity gate). The public vLLM build decodes 16.9 tok/s on this machine. The engine figures are
+estimates from the bytes per token, not measurements. `docs/history/qwen4exp_plan.md` holds the design, the memory
+budget, the milestones and the dated status log.
+
 ## Repository
 
 | Path | |
 |---|---|
-| `engine/model/qwen35.py` | the model in plain PyTorch: the correctness reference for all kernel tests |
+| `engine/model/qwen35.py` | the dense model (Qwen3.8-27B) in plain PyTorch: the correctness reference for its kernel tests |
 | `engine/model/fast.py` | the decode path: kernel modules, decode state, the INT decode copies |
 | `engine/model/prefill.py` | the prefill path |
 | `engine/model/vision.py` | image input: the vision tower, the image tokens and their multimodal RoPE positions |
@@ -130,6 +174,28 @@ decision. In short:
 | `tools/` | offline artifacts (decode copies, drafter training, low-rank head), checkpoint utilities, the night shift (`night_shift.py`: Claude Code tasks against the server while the machine idles), the bookkeeping of the review harness (`review.py`) |
 | `bench/` | decode / prefill / attention / GEMM / end-to-end benchmarks, nsys trace summaries |
 | `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `night_shift.md` (Claude Code tasks at night), `review.md` (the review harness), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project, and `PLAN.md`, the original plan of 2026-09-30. |
+
+The files of Qwen3.8-Flash-Next (in progress):
+
+| Path | |
+|---|---|
+| `engine/model/family.py` | the model family of a checkpoint by its `model_type`; `check_served` refuses a family that the engine cannot serve yet |
+| `engine/model/qwen4exp.py` | Qwen3.8-Flash-Next in plain PyTorch: the correctness reference of the family |
+| `engine/model/moe_kernels.py`, `qsa_kernels.py`, `hc_kernels.py` | the Python side of the new kernels (`KernelMoE`, the QSA wrappers, `KernelGatedResidual`), their torch references and their self-tests |
+| `engine/weights/qwen4exp_loader.py` | `load_qwen4exp`: the checkpoint into the reference model, with the experts of each layer stacked |
+| `engine/weights/ple.py` | the n-gram hash (`ngram_rows`) and the row reader of the table on disk (`NgramTable`) |
+| `csrc/moe.cu`, `csrc/moe_prefill.cu` | the MoE decode kernels (route, gate-up, down, combine); the grouped NVFP4 GEMM of prefill (CUTLASS) with its gather, SwiGLU and combine kernels |
+| `csrc/qsa.cu` | Qwen Sparse Attention: the indexer prologue, the block keys, the scores, the top-k and the sparse decode attention |
+| `csrc/hc.cu` | the hyper-connection kernels: the low-rank mix and the injection (the grouped norm is in `norm.cu`) |
+| `csrc/attn_tc.cuh`, `csrc/skinny_core.cuh` | shared with the 27B: the tensor-core core of the decode attention (dense and list modes); the dequantization helpers of the skinny GEMM |
+| `csrc/ple_io.cpp` | the host row reader of the n-gram table: a thread pool of preads (`ops().ple_gather`) |
+| `csrc/moe_bind.cpp`, `qsa_bind.cpp`, `hc_bind.cpp` | the Torch bindings of the new kernels; `bindings.cpp` calls `bind_moe`, `bind_qsa` and `bind_hc` |
+| `tools/qwen4exp_reference.py` | greedy text from the reference on the real checkpoint (77.8 GB on the GPU: stop the server first) |
+| `tools/verify_qwen4exp.py` | checks the checkpoint's headers, n-gram buffers, rows and scales without the GPU |
+| `tools/ple_hotset.py` | the hot set of the n-gram table on real text, and the hit rate of a row cache |
+| `bench/moe_bench.py` | the MoE decode stream rate, the full MoE layer, and the MoE prefill per chunk |
+| `tests/test_qwen4exp_small.py`, `test_qwen4exp_loader.py`, `test_ple.py`, `test_ple_io.py`, `test_family.py` | the reference against transformers on a tiny model; the loader and the row readers on synthetic checkpoints (`tests/qwen4exp_ckpt.py`); the refusal |
+| `tests/test_moe.py`, `test_moe_prefill.py`, `test_qsa.py`, `test_hc.py` | the new kernels against their references; the bit identity of each row of the decode kernels for any row count |
 
 ## Testing
 

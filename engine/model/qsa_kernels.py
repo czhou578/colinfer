@@ -11,7 +11,8 @@ ik bf16 [Lmax, 128] (no norm, no RoPE) and the block keys ikb bf16 [Lmax / 4, 12
     out = qsa_attn(q, k, v, sel, nsel, pos_t, ...)
 
 The functions here allocate the outputs and call ops(). The torch references (qsa_select_reference and its helpers)
-follow transformers' Qwen4ExpTextQSAIndexer; the tests compare the kernels with them."""
+follow transformers' Qwen4ExpTextQSAIndexer; tests/test_qsa.py compares the kernels with them. qsa_selftest() is an
+entry of the startup self-test (engine/selftest.py)."""
 from __future__ import annotations
 
 import math
@@ -172,8 +173,8 @@ def _rel(a, b):
 
 
 def qsa_selftest(o, g: torch.Generator) -> dict[str, float]:
-    """Startup self-test of the QSA kernels (engine/selftest.py style): relative errors against torch on a small problem
-    of one slot at position 2500 (625 complete blocks: the top-k path). o: ops(); g: a CUDA generator."""
+    """Startup self-test of the QSA kernels (an entry of engine/selftest.py): relative errors against torch on a small
+    problem of one slot at position 2500 (625 complete blocks: the top-k path). o: ops(); g: a CUDA generator."""
     dev = "cuda"
     res = {}
     L, pos, eps = 2560, 2500, 1e-6

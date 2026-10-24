@@ -99,7 +99,7 @@ tok/s.
 | `engine/model/moe_kernels.py` | `KernelMoE`: routing, expert GEMMs, combine on the kernels of `csrc/moe.cu` |
 | `engine/model/fast_qwen4exp.py` | the decode model on kernels (M1) |
 | `engine/model/prefill_qwen4exp.py` | the prefill path (M1 / M2) |
-| `engine/model/family.py` | `family_of(path)`: dispatch by `model_type` (M1) |
+| `engine/model/family.py` | `check_served(path)` today (a refusal of the family before the memory check); `family_of(path)`, the dispatch by `model_type`, at M1 |
 | `csrc/moe.cu`, `csrc/moe_prefill.cu` | decode MoE kernels; the grouped GEMM path |
 | `csrc/qsa.cu` | indexer prologue, block keys, scores, top-k, sparse decode attention |
 | `csrc/hc.cu` | grouped norm, low-rank mix, injection |

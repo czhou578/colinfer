@@ -12,6 +12,8 @@
 //   gdn_prefill.cu   gdn_prefill (chunked delta rule)
 //   attn_prefill.cu  attn_prefill_fp8
 //   sampling.cu      philox_uniform (sampling), rescore_nvfp4 (low-rank draft head)
+// The kernels of the qwen4_exp family bind in their own files: bind_moe, bind_qsa and bind_hc of moe_bind.cpp, qsa_bind.cpp
+// and hc_bind.cpp, which the module calls.
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 

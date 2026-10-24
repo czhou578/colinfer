@@ -1,6 +1,7 @@
-// moe_bind.cpp -- torch bindings of moe.cu (decode) and moe_prefill.cu (prefill). bindings.cpp calls bind_moe(m) from the module. Kept apart from bindings.cpp so that
-// the kernel files of the qwen4_exp work can be developed in parallel. Each wrapper checks the shapes, dtypes and the
+// moe_bind.cpp -- torch bindings of moe.cu (decode) and moe_prefill.cu (prefill). bindings.cpp calls bind_moe(m) from the
+// module; each kernel file of qwen4_exp has its own binding file. Each wrapper checks the shapes, dtypes and the
 // constraints of the kernels, and launches on the current stream (CUDA graph capture safe: no allocation, no sync).
+// Python module: engine/model/moe_kernels.py.
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 

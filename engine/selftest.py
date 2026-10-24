@@ -1,9 +1,10 @@
-"""Startup self-test of each matmul path.
+"""Startup self-test of each matmul path, and of the kernels of the qwen4_exp family (the entries of
+engine/model/moe_kernels.py, qsa_kernels.py and hc_kernels.py).
 
 A CUTLASS FP4 kernel compiled for the wrong ISA has given wrong answers on sm_121 with no CUDA error. Library upgrades
 can also change the dispatch with no warning. Thus, before the server starts, each path runs a small random problem
 against an fp32 reference built from independently dequantized operands. A mismatch stops the startup. The test takes
-much less than a second.
+about a second.
 """
 from __future__ import annotations
 

@@ -1,6 +1,7 @@
-// qsa_bind.cpp -- torch bindings of qsa.cu. bindings.cpp calls bind_qsa(m) from the module. Kept apart from bindings.cpp so that
-// the kernel files of the qwen4_exp work can be developed in parallel. Each wrapper checks the shapes / dtypes / strides and
-// launches on the current stream, so a CUDA graph can capture each op. Python wrappers: engine/model/qsa_kernels.py.
+// qsa_bind.cpp -- torch bindings of qsa.cu, and of the PLE row reader of ple_io.cpp (ple_gather). bindings.cpp calls
+// bind_qsa(m) from the module; each kernel file of qwen4_exp has its own binding file. Each wrapper checks the shapes /
+// dtypes / strides and launches on the current stream, so a CUDA graph can capture each op (ple_gather is a host function and runs no kernel). Python wrappers:
+// engine/model/qsa_kernels.py.
 #include <c10/cuda/CUDAStream.h>
 #include <string.h>
 #include <torch/extension.h>
