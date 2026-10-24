@@ -12,6 +12,9 @@ residual. The chain of kernels is:
 Each output row is bit-identical for any set of rows in the launch (plain decode, verify and the drafter agree). The
 skip flag of the draft early exit (ops().skinny_skip) gives a zero output.
 
+KernelMoE.prefill(x [T, K]) runs a prefill chunk on csrc/moe_prefill.cu: the (token, slot) pairs sorted by expert
+(prefill_plan) through two CUTLASS grouped NVFP4 GEMMs, one group per expert, with no host synchronization.
+
 moe_reference() is the pure-torch reference (the per-expert loop of transformers, in fp32) for the tests.
 skinny_bf16_selftest() and moe_selftest() are the entries of the startup self-test (engine/selftest.py).
 """
@@ -74,7 +77,8 @@ class KernelMoE:
       sh_gate, sh_up bf16 [Is, K];  sh_down bf16 [K, Is]   the shared expert
     The caller drops its references to sf_gu and sf_dn after the constructor, so that the row-major copies are freed.
 
-    stats=True: self.stats int32 [2] counts the distinct experts of each launch (stats[0]) and the launches (stats[1]).
+    stats=True: self.stats int32 [2] counts the distinct experts of each decode launch (stats[0]) and the launches
+    (stats[1]).
     """
 
     def __init__(self, w_gu, sf_gu, w_dn, sf_dn, gs, in_scale, router_w, shared_gate_w, sh_gate, sh_up, sh_down, max_rows: int = MAX_ROWS,
@@ -97,6 +101,7 @@ class KernelMoE:
         pad = torch.zeros(ROUTER_PAD - 1, K, dtype=torch.bfloat16, device=router_w.device)
         self.router = torch.cat([router_w.bfloat16(), shared_gate_w.bfloat16(), pad]).contiguous()
         self.sh_gate, self.sh_up, self.sh_down = (t.bfloat16().contiguous() for t in (sh_gate, sh_up, sh_down))
+        self.gate_up_one_scale = bool(torch.equal(self.gs[:, 0], self.gs[:, 1]) and torch.equal(self.in_scale[:, 0], self.in_scale[:, 1]))
         self.max_rows = max_rows
         self.stats = torch.zeros(2, dtype=torch.int32, device=w_gu.device) if stats else None
         self.buf = _buffers(w_gu.device, E, K, I, self.Is, max_rows)
@@ -134,10 +139,57 @@ class KernelMoE:
         main.wait_stream(side)
         o.moe_combine(yp, w, sg, shared, y)
 
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """x bf16 [T, K] (a prefill chunk, any T) -> y bf16 [T, K] on the grouped GEMM path of csrc/moe_prefill.cu: the
+        router on cuBLAS, moe_route, then the pairs sorted by expert through two grouped NVFP4 GEMMs, and the combine in
+        slot order. The shared expert runs on cuBLAS in bf16. No host synchronization."""
+        assert self.gate_up_one_scale, "the grouped gate | up GEMM takes one alpha per expert: gate and up need the same scales"
+        o, E, K, I = ops(), self.E, self.K, self.I
+        x = x.reshape(-1, K).contiguous()
+        T = x.shape[0]
+        P = T * TOPK
+        logits = x @ self.router.T
+        ids = torch.empty(T, TOPK, dtype=torch.int32, device=x.device)
+        w = torch.empty(T, TOPK, dtype=torch.float32, device=x.device)
+        sg = torch.empty(T, dtype=torch.float32, device=x.device)
+        o.moe_route(logits, E, ids, w, sg)  # no stats: they count the experts of decode launches
+        order, off, sfo, inv = prefill_plan(ids, E)
+        rows = o.moe_sf_rows(P, E)
+        a = torch.empty(P, K // 2, dtype=torch.uint8, device=x.device)
+        sfa = torch.empty(rows * K // 16, dtype=torch.uint8, device=x.device)
+        o.moe_gather_quant(x, ids, order, off, sfo, self.in_scale, a, sfa)
+        d1 = torch.empty(P, 2 * I, dtype=torch.bfloat16, device=x.device)
+        o.moe_grouped_gemm(0, a, sfa, self.w_gu, self.sf_gu, d1, off, sfo, self.in_scale, self.gs)
+        a2 = torch.empty(P, I // 2, dtype=torch.uint8, device=x.device)
+        sfa2 = torch.empty(rows * I // 16, dtype=torch.uint8, device=x.device)
+        o.moe_swiglu_quant(d1, ids, order, off, sfo, self.in_scale, a2, sfa2)
+        del d1, a, sfa
+        d2 = torch.empty(P, K, dtype=torch.bfloat16, device=x.device)
+        o.moe_grouped_gemm(1, a2, sfa2, self.w_dn, self.sf_dn, d2, off, sfo, self.in_scale, self.gs)
+        shared = (torch.nn.functional.silu(x @ self.sh_gate.T) * (x @ self.sh_up.T)) @ self.sh_down.T
+        y = torch.empty(T, K, dtype=torch.bfloat16, device=x.device)
+        o.moe_combine_prefill(d2, inv, w, sg, shared, y)
+        return y
+
     def last_routing(self, M: int):
         """(logits, ids, w, sg) of the last launch of M rows (views of the shared buffers: valid until the next launch)."""
         b = self.buf
         return b.logits[:M], b.ids[:M], b.w[:M], b.sg[:M]
+
+
+def prefill_plan(ids: torch.Tensor, E: int):
+    """The sorted pairs of a prefill chunk, on the device without a host sync: ids int32 [T, 10] ->
+    order int32 [P] (the pairs sorted by expert, stable: a token's pairs keep the token order), off int32 [E + 1] (the
+    first sorted row of each expert), sfo int32 [E + 1] (the first scale row of each group, the groups padded to 128 rows),
+    inv int32 [P] (the sorted row of each pair)."""
+    flat = ids.reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    off = torch.searchsorted(flat[order], torch.arange(E + 1, dtype=flat.dtype, device=flat.device), out_int32=True)
+    padded = (off[1:] - off[:-1] + 127) // 128 * 128
+    sfo = torch.cat([torch.zeros(1, dtype=torch.int32, device=flat.device), padded.cumsum(0).int()])
+    inv = torch.empty_like(flat)
+    inv[order] = torch.arange(flat.numel(), dtype=flat.dtype, device=flat.device)
+    return order.int(), off, sfo, inv
 
 
 # ------------------------------------------------------------------------------------------------------------ reference
@@ -193,7 +245,7 @@ def random_moe_weights(E: int, K: int, I: int, Is: int | None = None, generator=
     base = torch.tensor([0.1 / K ** 0.5, 0.1 / K ** 0.5, 0.1 / I ** 0.5], device=device)
     gs = base * (0.5 + torch.rand(E, 3, device=device, generator=g))
     gs[:, 1] = gs[:, 0]  # the checkpoint's gate and up share weight_scale_2
-    in_scale = torch.full((E, 3), 0.002, device=device)
+    in_scale = torch.tensor([0.003, 0.003, 0.004], device=device).expand(E, 3).contiguous()  # e4m3 block scales stay below 448
     return dict(w_gu=w_gu, sf_gu=sf_gu, w_dn=w_dn, sf_dn=sf_dn, gs=gs, in_scale=in_scale, router_w=bf16(E, K, fan_in=K),
                 shared_gate_w=bf16(1, K, fan_in=K), sh_gate=bf16(Is, K, fan_in=K), sh_up=bf16(Is, K, fan_in=K), sh_down=bf16(K, Is, fan_in=Is))
 
@@ -219,12 +271,30 @@ def skinny_bf16_selftest(o, g) -> dict:
 
 
 def moe_selftest(o, g) -> dict:
-    """A small decode MoE layer (E = 16, K = 1024, I = 256, M = 3) against the fp32 reference (relative error by name)."""
-    del o  # KernelMoE calls ops() itself
-    wts = random_moe_weights(16, 1024, 256, generator=g)
+    """A small MoE layer (E = 16, K = 1024, I = 256) against references (relative errors by name): the decode path (M = 3)
+    against the fp32 loop, and the grouped gate | up GEMM of the prefill path (T = 6) against the emulation of its NVFP4
+    operands."""
+    from engine.weights.quant_emul import fake_quant_nvfp4_unscaled
+    E, K, I = 16, 1024, 256
+    wts = random_moe_weights(E, K, I, generator=g)
     moe = KernelMoE(**wts)
-    x = torch.randn(3, 1024, device="cuda", generator=g).bfloat16()
+    x = torch.randn(3, K, device="cuda", generator=g).bfloat16()
     y = moe(x)
     logits = moe.last_routing(3)[0].clone()
-    ref = moe_reference(x, **{k: v for k, v in wts.items() if k != "in_scale"}, logits=logits)
-    return {"moe_decode": _rel(y, ref)}
+    res = {"moe_decode": _rel(y, moe_reference(x, **{k: v for k, v in wts.items() if k != "in_scale"}, logits=logits))}
+    T = 6
+    x = torch.randn(T, K, device="cuda", generator=g).bfloat16()
+    ids = torch.stack([torch.randperm(E, device="cuda", generator=g)[:TOPK] for _ in range(T)]).int()
+    order, off, sfo, _ = prefill_plan(ids, E)
+    a = torch.empty(T * TOPK, K // 2, dtype=torch.uint8, device="cuda")
+    sfa = torch.empty(o.moe_sf_rows(T * TOPK, E) * K // 16, dtype=torch.uint8, device="cuda")
+    o.moe_gather_quant(x, ids, order, off, sfo, moe.in_scale, a, sfa)
+    d1 = torch.empty(T * TOPK, 2 * I, dtype=torch.bfloat16, device="cuda")
+    o.moe_grouped_gemm(0, a, sfa, moe.w_gu, moe.sf_gu, d1, off, sfo, moe.in_scale, moe.gs)
+    ref = torch.empty(T * TOPK, 2 * I, device="cuda")
+    for r, p in enumerate(order.tolist()):
+        e, s_in = int(ids.view(-1)[p]), float(moe.in_scale[int(ids.view(-1)[p]), 0])
+        w = dequant_nvfp4(wts["w_gu"][e], wts["sf_gu"][e], moe.gs[e, 0] * s_in, torch.float32)
+        ref[r] = fake_quant_nvfp4_unscaled(x[p // TOPK], s_in).float() @ w.T
+    res["moe_prefill_grouped_gemm"] = _rel(d1, ref)
+    return res

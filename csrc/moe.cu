@@ -148,7 +148,8 @@ __global__ void __launch_bounds__(ROUTE_W * 32) k_route(const __nv_bfloat16* __r
 // ------------------------------------------------------------------------------------------------------------ ownership
 // The pairs of expert e = ids[slot] in increasing pair order into plist; returns their count. Returns -1 when an earlier pair
 // has the same expert (another warp owns e) or when e is out of range. LDCG: read ids through L2 (moe_down reads them before
-// its PDL wait).
+// its PDL wait). The rows of ids hold distinct experts (moe_route makes them so), so the count is at most M <= MAXP. Ids
+// with a repeated expert in a row give wrong rows but no write past plist: the count stops at MAXP.
 template <bool LDCG>
 __device__ __forceinline__ int collect_pairs(const int* __restrict__ ids, int P, int slot, int E, int* plist, int lane) {
     const int e = LDCG ? __ldcg(ids + slot) : ids[slot];
@@ -161,11 +162,12 @@ __device__ __forceinline__ int collect_pairs(const int* __restrict__ ids, int P,
         const uint32_t ge = slot <= b ? 0xffffffffu : slot - b >= 32 ? 0u : 0xffffffffu << (slot - b);
         if (hit & ~ge) return -1;
         const uint32_t mine = hit & ge;
-        if ((mine >> lane) & 1u) plist[n + __popc(mine & ((1u << lane) - 1u))] = p;
+        const int pos = n + __popc(mine & ((1u << lane) - 1u));
+        if (((mine >> lane) & 1u) && pos < MAXP) plist[pos] = p;
         n += __popc(mine);
     }
     __syncwarp();
-    return n;
+    return min(n, MAXP);
 }
 
 // 16 bf16 activations (32 bytes) of a row at k, or zeros

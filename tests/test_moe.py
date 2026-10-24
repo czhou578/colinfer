@@ -283,3 +283,10 @@ def test_real_shape(real):
     assert rel(y, moe_reference(x, **ref_args(wts), logits=logits)) < 5e-3
     for m in (0, 5):
         assert torch.equal(moe(x[m:m + 1])[0], y[m])
+
+
+def test_selftest_entries():
+    from engine.model.moe_kernels import moe_selftest, skinny_bf16_selftest
+    g = torch.Generator(device="cuda").manual_seed(1234)
+    res = {**skinny_bf16_selftest(ops(), g), **moe_selftest(ops(), g)}
+    assert all(v < 5e-3 for v in res.values()), res
