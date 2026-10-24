@@ -674,8 +674,9 @@ def test_main_wires_the_flags(monkeypatch):
     monkeypatch.setattr(build, "meminfo_bytes", lambda key: 1 << 50)  # not the memory that is free now
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: got.update(served=True))
     api.main(["--no-prefix-caching", "--spec", "none", "--slots", "1", "--reasoning-effort", "medium", "--committee-size", "0",
-              "--session-cache-gb", "3", "--no-vision", "--mem-cap-gb", "70"])
+              "--session-cache-gb", "3", "--no-vision", "--mem-cap-gb", "70", "--ngram-cache-gb", "0.5"])
     cfg = got["cfg"]
+    assert cfg.ngram_cache_gb == 0.5
     assert (cfg.checkpoints, cfg.session_cache_gb, cfg.spec, cfg.slots, cfg.vision) == (0, 0, "none", 1, False)  # --no-prefix-caching wins
     assert cfg.mem_cap_bytes == 70 * 10**9 and cfg.committee_size == 0
     D = ServerConfig()
@@ -687,6 +688,7 @@ def test_main_wires_the_flags(monkeypatch):
     api.main(["--session-cache-gb", "0", "--thinking", "off"])
     c = got["cfg"]  # the flags without a value: the defaults of the 27B's family (engine/model/family.py)
     assert (c.slots, c.max_seq_len, c.checkpoints, c.spec, c.vision) == (3, 524288, 32, "mtp", True)
+    assert c.ngram_cache_gb == ServerConfig().ngram_cache_gb == 1.0
     assert got["thinking"] is False and got["committee"] is not None
     # the default cap: the engine's torch peak (89.5e9 with the vision tower) and a margin, not more of the host's memory
     assert got["cfg"].mem_cap_bytes == int(min(95e9, api.torch.cuda.get_device_properties(0).total_memory))

@@ -1,6 +1,6 @@
-"""The model families (engine/model/family.py): the dense family passes, the in-progress MoE family is refused with a
-message that names the plan until its modules exist; the defaults and the memory figures of each family. Run:
-./py -m pytest tests/test_family.py -q"""
+"""The model families (engine/model/family.py): both families pass; the MoE family is refused with a message that names
+the plan when its modules are missing, or while it is in NOT_SERVED_YET; the defaults, the memory figures and the n-gram
+hooks of each family. Run: ./py -m pytest tests/test_family.py -q"""
 import json
 import os
 import shutil
@@ -36,8 +36,13 @@ def test_unknown_type_is_not_refused_here(tmp_path):
     assert check_served(str(tmp_path)) == ""
 
 
-def test_moe_family_is_refused_with_the_plan(tmp_path):
+def test_the_moe_family_is_served(tmp_path):
+    assert check_served(moe_config(tmp_path)) == "qwen4_exp"
+
+
+def test_moe_family_without_its_modules_is_refused_with_the_plan(tmp_path, monkeypatch):
     path = write_config(tmp_path, "qwen4_exp")
+    monkeypatch.setitem(sys.modules, "engine.model.fast_qwen4exp", None)  # the module does not exist
     with pytest.raises(NotImplementedError, match="qwen4_exp.*qwen4exp_plan.md"):
         check_served(path)
     with pytest.raises(NotImplementedError, match="not served yet"):
@@ -46,11 +51,18 @@ def test_moe_family_is_refused_with_the_plan(tmp_path):
         build.load_model(path)
 
 
-def test_server_main_refuses_the_moe_family_before_the_memory_check(tmp_path):
+def test_a_family_in_not_served_yet_is_refused_with_its_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(F, "NOT_SERVED_YET", {"qwen4_exp": "a reason"})
+    with pytest.raises(NotImplementedError, match="not served yet: a reason"):
+        check_served(moe_config(tmp_path))
+
+
+def test_server_main_refuses_the_moe_family_before_the_memory_check(tmp_path, monkeypatch):
     """engine.server's main checks the family right after it resolves the model, before its memory check (which reads the
     dense config and would fail with a KeyError on this family)."""
     from engine.server import api
     path = write_config(tmp_path, "qwen4_exp")
+    monkeypatch.setitem(sys.modules, "engine.model.fast_qwen4exp", None)
     with pytest.raises(SystemExit) as e:
         api.main(["--model", path])
     assert e.value.code == 2  # not NO_MEMORY_EXIT: the family check ran first
@@ -134,24 +146,104 @@ def test_the_moe_family_is_refused_until_its_modules_have_the_names(tmp_path, mo
         check_served(path)
 
 
-def test_the_moe_family_has_its_own_defaults(tmp_path, monkeypatch):
-    """With the modules of the decode model and the prefill, the qwen4_exp family serves: 2 slots of 262144 tokens, 16
-    checkpoints, no speculation, no images; its fixed bytes are the plan's (section 4); the build refuses MTP and a slot
-    length past the native context before the memory check."""
+def moe_state_bytes(path, slots, max_seq_len):
+    """The state of FastState4 from the config alone: per position, the fp8 k and v [2, 256] of each attention layer, its
+    raw indexer key (bf16 128) and a quarter of its block key, and the rotary position (int32 x 3); per slot, the GDN
+    conv windows (bf16 [10240, 3]) and recurrent states (fp32 [48, 128, 128]) and the PLE conv state (bf16 [10240, 9])."""
+    from engine.model.qwen4exp import Qwen4ExpConfig
+    cfg = Qwen4ExpConfig.from_checkpoint(path)
+    n_attn = cfg.layer_types.count("full_attention")
+    n_gdn = len(cfg.layer_types) - n_attn
+    per_pos = n_attn * (2 * 2 * 256 + 128 * 2 + 128 * 2 // 4) + 3 * 4
+    per_slot = n_gdn * (10240 * 3 * 2 + 48 * 128 * 128 * 4) + len(cfg.ple_layers) * 10240 * 9 * 2
+    return slots * (max_seq_len * per_pos + per_slot)
+
+
+def test_the_moe_family_has_its_own_defaults(tmp_path):
+    """The qwen4_exp family serves: 2 slots of 262144 tokens, 16 checkpoints, no speculation, no images, prefill chunks
+    of 4096 tokens with prev2; the memory check counts its fixed bytes, the state and the n-gram row cache; the build
+    refuses MTP and a slot length past the native context before the memory check."""
     path = moe_config(tmp_path)
-    stub_modules(monkeypatch)
-    monkeypatch.setattr(F, "NOT_SERVED_YET", {})  # the round-2 state: the scheduler wiring is done
-    assert check_served(path) == "qwen4_exp"
     fam = family_of(path)
-    assert fam.name == "qwen4_exp" and fam.load("p", "int", print, None, 262144) == ("path", "model")
+    assert fam.name == "qwen4_exp"
     assert fam.defaults == F.Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="none", vision=False)
     assert fam.supports == F.Supports(mtp=False, vision=False, yarn=False, int_copies=False)
-    assert fam.fixed_bytes == F.QWEN4EXP_FIXED_BYTES and 85.4e9 < fam.fixed_bytes < 85.5e9
-    state = 2 * 262144 * (2 * 256 + 128 // 4 * 2) + 2 * 48 * 128 * 128 * 4  # k fp8, ikb bf16 at a row per 4 positions, rec fp32
-    assert fam.state_bytes(path, 2, 262144, "none") == state and build.startup_bytes(path) == F.QWEN4EXP_FIXED_BYTES + state
+    assert fam.prefill_chunk == 4096 and fam.prefill_prev2
+    assert fam.fixed_bytes == F.QWEN4EXP_FIXED_BYTES
+    state = moe_state_bytes(path, 2, 262144)
+    assert fam.state_bytes(path, 2, 262144, "none") == state
+    assert fam.host_bytes(1.0) == 6_250_000 * 176 and fam.host_bytes(0) == 0
+    assert build.startup_bytes(path) == F.QWEN4EXP_FIXED_BYTES + state + 6_250_000 * 176
+    assert build.startup_bytes(path, ngram_cache_gb=0) == F.QWEN4EXP_FIXED_BYTES + state
     with pytest.raises(ValueError, match="no MTP drafter"):
         build.build_engine(path, spec="mtp", selftest=False)
     with pytest.raises(ValueError, match="native context 262144.*no YaRN"):
         build.build_engine(path, max_seq_len=524288, selftest=False)
     with pytest.raises(ValueError, match="no YaRN"):
         build.load_model(path, max_seq_len=524288)
+
+
+def test_the_dense_family_has_no_host_cache(tmp_path):
+    path = dense_config(tmp_path)
+    assert family_of(path).host_bytes(1.0) == 0 and build.startup_bytes(path, ngram_cache_gb=50) == build.startup_bytes(path)
+    assert not family_of(path).prefill_prev2 and family_of(path).prefill_chunk == 2048
+
+
+def test_the_ngram_cache_flag_reaches_the_memory_check(tmp_path):
+    """--ngram-cache-gb counts in the server's memory check, before the CUDA context: a cache that does not fit stops the
+    start with the no-memory exit."""
+    from engine.server import api
+    with pytest.raises(SystemExit) as e:
+        api.main(["--model", moe_config(tmp_path), "--ngram-cache-gb", "1000"])
+    assert e.value.code == api.NO_MEMORY_EXIT
+
+
+def test_prev2_of_pads_a_short_history_with_eos():
+    assert F.prev2_of([], 7) == (7, 7) and F.prev2_of([5], 7) == (7, 5) and F.prev2_of([1, 2, 3], 7) == (2, 3)
+    assert F.prev2_of(torch.tensor([4, 9]), 7) == (4, 9)
+
+
+def test_the_moe_prefill_passes_the_chunk_and_prev2(tmp_path, monkeypatch):
+    """The family's prefill is prefill_qwen4exp.prefill with chunks of 4096 and prev2 from the slot's history (None at
+    a caller that passes none: the start of a sequence)."""
+    import engine.model.prefill_qwen4exp as pq
+    calls = []
+    monkeypatch.setattr(pq, "prefill", lambda model, ids, state, **kw: calls.append(kw) or "logits")
+    fam = family_of(moe_config(tmp_path))
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace(eos_token_id=7))
+    assert fam.prefill(model, "ids", "state", logits=False, prev2=[]) == "logits"
+    fam.prefill(model, "ids", "state", prev2=[1, 2, 3])
+    fam.prefill(model, "ids", "state", chunk=512)
+    assert calls == [dict(chunk=4096, prev2=(7, 7), logits=False), dict(chunk=4096, prev2=(2, 3)), dict(chunk=512, prev2=None)]
+
+
+class FakeFeeder:
+    """PleFeeder.rows_for: the rows of token t are bytes t + 16 * head, after the context; records each call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def rows_for(self, tokens, prev2):
+        self.calls.append((list(tokens), tuple(prev2)))
+        T = len(tokens)
+        rows = torch.zeros(T, 16, 160, dtype=torch.uint8)
+        for i, t in enumerate(tokens):
+            rows[i] = (torch.arange(16, dtype=torch.uint8) * 16 + t).view(16, 1)
+        return rows
+
+
+def test_the_moe_before_replay_fills_the_feed_buffer_of_its_row_count():
+    """before_replay(slot, tokens) reads the rows of the T tokens after the slot's last two tokens, and writes them into
+    the model's feed buffer (1, T): a plain step T = 1, a verify of k drafts T = k + 1."""
+    bufs = {}
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace(eos_token_id=7), feeder=FakeFeeder(),
+                                  feed_buffer=lambda B, T: bufs.setdefault((B, T), torch.full((B, T, 16, 160), 255, dtype=torch.uint8)))
+    hook = F.ngram_before_replay(model)
+    slot = types.SimpleNamespace(tokens=[3])
+    hook(slot, [5])
+    slot.tokens = [3, 5, 9, 11]
+    hook(slot, [12, 13, 14, 15])
+    assert model.feeder.calls == [([5], (7, 3)), ([12, 13, 14, 15], (9, 11))]
+    assert set(bufs) == {(1, 1), (1, 4)}
+    assert torch.equal(bufs[(1, 1)][0], FakeFeeder().rows_for([5], ()))
+    assert torch.equal(bufs[(1, 4)][0], FakeFeeder().rows_for([12, 13, 14, 15], ()))

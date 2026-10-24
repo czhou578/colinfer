@@ -800,9 +800,13 @@ def main(argv=None):
                     help="disk budget of the conversation cache (KV and GDN state of past conversations, restored after an eviction "
                          "or a restart); 0: off")
     ap.add_argument("--no-vision", action="store_true", help="no image input: images become a text note, and the vision tower is not loaded")
+    ap.add_argument("--ngram-cache-gb", type=float, default=D.ngram_cache_gb,
+                    help="qwen4_exp: the host row cache of the n-gram table that the PLE layer reads from the disk (GB of 160-byte rows; "
+                         "0: off). It counts in the memory check. The 27B has no n-gram table")
     ap.add_argument("--mem-cap-gb", type=float, default=95.0,
-                    help="hard cap on this process's GPU memory (torch allocator; GB of 10^9 bytes). The engine reserves 88.6 GB at "
-                         "startup and 89.5 GB with the vision tower; the rest of the unified memory stays for the host (docs/server.md)")
+                    help="hard cap on this process's GPU memory (torch allocator; GB of 10^9 bytes). The 27B reserves 88.6 GB at "
+                         "startup and 89.5 GB with the vision tower, Qwen3.8-Flash-Next 91.2 GB; the rest of the unified memory stays for "
+                         "the host (docs/server.md)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
     ap.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "xhigh"), default="auto",
@@ -830,7 +834,7 @@ def main(argv=None):
         slots = fd.slots if a.slots is None else a.slots
         max_seq_len = fd.max_seq_len if a.max_seq_len is None else a.max_seq_len
         spec = a.spec or fd.spec
-        check_memory(path, slots, max_seq_len, spec)
+        check_memory(path, slots, max_seq_len, spec, a.ngram_cache_gb)
     except NotImplementedError as e:
         log(f"[server] {e}")
         raise SystemExit(2) from None
@@ -850,7 +854,8 @@ def main(argv=None):
                        spec=spec, drafter_weights=a.drafter_weights, decode_weights=a.decode_weights,
                        boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
                        api_key=a.api_key, mem_cap_bytes=mem_cap_bytes, committee_size=a.committee_size, committee_roles=a.committee_roles,
-                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, vision=fd.vision and not a.no_vision)
+                       session_cache_gb=0 if a.no_prefix_caching else a.session_cache_gb, vision=fd.vision and not a.no_vision,
+                       ngram_cache_gb=a.ngram_cache_gb)
     hf = json.load(open(os.path.join(path, "config.json")))
     hf_config = hf.get("text_config", hf)
     gen = json.load(open(os.path.join(path, "generation_config.json"))) if os.path.exists(os.path.join(path, "generation_config.json")) else {}

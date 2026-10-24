@@ -182,13 +182,16 @@ class Scheduler:
     def __init__(self, model: FastQwen35, n_slots: int = 3, max_seq_len: int = 32768, n_checkpoints: int = 32, mtp=None, k: int = 3,
                  prefill_chunk: int = CHUNK, ckpt_interval: int = 8192, metrics: Metrics | None = None,
                  boundary_token: int | None = None, suffix_min: int = 0, prefill_fn=None, prepare_fn=None, before_replay=None,
-                 feed_buffer=None):
+                 feed_buffer=None, prefill_prev2: bool = False):
         """prefill_fn, prepare_fn: the prefill callables of the model's family (engine/model/family.py); None: those of
         engine/model/prefill.py. before_replay (optional): a callable (slot, tokens) that runs right before each decode
         replay, with the token ids of the slot's rows: [y, d1..dk] for a speculative cycle, [y] for a plain step. The
         history of the slot (slot.tokens) does not hold y yet. feed_buffer (optional): a callable (B, T) -> the fixed
-        device buffer that a plain decode graph passes to the model as its third argument."""
+        device buffer that a plain decode graph passes to the model as its third argument. prefill_prev2: each prefill
+        call also gets prev2, the last two tokens of the slot's history before the chunk (fewer at the start of a slot;
+        the n-gram rows of qwen4_exp depend on them)."""
         self.prefill_fn, self.prepare_fn, self.before_replay = prefill_fn, prepare_fn, before_replay
+        self.prefill_prev2 = prefill_prev2
         (prepare_fn or prepare_prefill)(model)
         self.model, self.mtp, self.k = model, mtp, k
         self.suffix_min = suffix_min if mtp is not None else 0  # > 0: suffix-match drafts of at least this match length
@@ -540,13 +543,15 @@ class Scheduler:
         view = self.state.view(b, b + 1)
         view.pos = start
         images = s.req.images
-        img = dict(embeds=self._image_embeds(images, start, start + n), rope_pos=self._rope(images, start, start + n)) if images else {}
+        kw = dict(embeds=self._image_embeds(images, start, start + n), rope_pos=self._rope(images, start, start + n)) if images else {}
         ids = torch.tensor([self._ids(chunk, images)], device=self.dev)
         pf = self.prefill_fn or prefill
+        if self.prefill_prev2:  # the history before the chunk: its last two tokens
+            kw["prev2"] = s.tokens[-2:]
         if self.mtp is not None:  # only the last chunk's logits are read (the first token)
-            logits, H = pf(self.model, ids, view, return_hidden=True, logits=last, **img)
+            logits, H = pf(self.model, ids, view, return_hidden=True, logits=last, **kw)
         else:
-            logits = pf(self.model, ids, view, logits=last, **img)
+            logits = pf(self.model, ids, view, logits=last, **kw)
         s.tokens += chunk
         s.todo = s.todo[len(chunk):]
         if s.sfx is not None:  # the suffix-match index of the history grows on the host while the GPU runs the chunk
