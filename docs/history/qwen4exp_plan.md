@@ -235,6 +235,28 @@ kernel build. The 27B's tests must keep passing in every worktree.
   rows) and `feed_buffer`; the server's `--slots`, `--max-seq-len` and `--spec` default to the family's values. Proof of
   identity for the 27B: two `tests/scheduler_check.py` runs, before and after, wrote the same session files, hash for
   hash (fingerprint 9af270967b6a20e3), and the whole suite passes (592 tests).
-- **Next:** milestone M1, the decode model on the kernels (`engine/model/fast_qwen4exp.py`) and the golden test against
-  `tools/qwen4exp_reference.py`; then the assembly of prefill (M2), the drafter (M3) and the ring / sessions on the new
-  state (M4 round 2).
+- **2026-10-24, M1 merged: the decode model runs the real checkpoint.** `engine/model/fast_qwen4exp.py` (FastState4,
+  Bf16Linear / StackedBf16Linear, KernelGDN4, KernelQSAAttention, KernelPLE in torch ops, KernelMoE, the gated residuals,
+  FastQwen4Exp with forward / verify / commit / feed_buffer). On the real checkpoint (`tests/golden_qwen4exp.py`, one slot,
+  CUDA graph): two of three golden prompts equal the reference for 32 tokens; the third diverges at token 12 where the
+  reference's bf16 margin is 0.125 and its own fp32 logits pick the engine's token (a near-tie; the rule is now a margin
+  below 0.2). The perplexity gate passes: 2.3274 (decode path, token by token) against 2.3335 (the reference, chunked)
+  over 8 windows of 2048 WikiText tokens, ratio 0.9974 (one window cannot resolve 0.5%: the reference moves 2.4% with
+  fp32 expert math). A decode step takes 46.0 ms at 1k context (21.8 tok/s; the plan expected 44); a verify of 8 rows
+  64.2 ms; 78.1 GB on the GPU with a 4096-token slot. The profile: BF16 skinny GEMMs 61% (36.5 ms), experts 18%,
+  hyper-connections 11% + the GEMV 7% (about 10.7 ms: hc_mix streams at about 100 GB/s and bf16_gemv at 150: the
+  cheapest speed-up is to move them to the skinny GEMM), GDN 2%, attention and the indexer under 1%. Limits: the slot
+  length must be a multiple of 16; the kernels fix hidden 2560, hc 4, lowrank 320 and 512 blocks.
+- **2026-10-24, M2 round 1 merged (the prefill pieces).** `csrc/qsa_prefill.cu`: the indexer scores all rows of a chunk in
+  one launch (0.13 / 0.75 / 4.6 ms at prefixes 0 / 16k / 128k for 2048 rows, bit-identical to the decode scores) and the
+  union kernel attends each group of 4 rows over the union of their blocks (2.5 / 13.3 / 15.8 ms per layer at the same
+  prefixes; masked FlashInfer takes 103 ms at 128k, so the union is the default path). `engine/model/prefill_qwen4exp.py`
+  holds the layer functions (tested against the reference modules at the real dims) and the chunk loop; a 4-layer assembly
+  matches the reference within 1.2%. The n-gram feeder (`PleFeeder`, a set-associative C++ row cache of 8 ways): a cold
+  2048-token chunk takes about 78 ms, the warm decode path 0.03 ms, a 2 GB cache hits 48% of the distinct rows on WikiText.
+  The chunk bench (random weights) gives 2489 / 2918 / 3155 tok/s at 2048 / 4096 / 8192 tokens, so the chunk becomes
+  4096 (+17%; 8192 adds 8% and holds the lane for 3 s). `csrc/hc_prefill.cu` cut the hyper-connection prefill from 763 to
+  167 ms per chunk.
+- **Next (round 2):** the prefill assembly on the real checkpoint and long context (M2), the MTP drafter (M3), the ring,
+  the sessions and the server on the new state (M4 round 2). The family stays refused (`NOT_SERVED_YET`) until the
+  end-to-end check passes.
