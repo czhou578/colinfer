@@ -26,6 +26,10 @@ from typing import Callable
 
 PLAN = "docs/history/qwen4exp_plan.md"
 IN_PROGRESS = {"qwen4_exp": "Qwen3.8-Flash-Next"}
+# The families whose serving integration is not finished: check_served refuses them even when their modules exist. Round 2 of
+# M1-M4 (docs/history/qwen4exp_plan.md) removes qwen4_exp from this set when the scheduler feeds the n-gram rows and the
+# end-to-end check passes.
+NOT_SERVED_YET = {"qwen4_exp": "the decode model, the prefill and the kernels exist; the scheduler wiring is in progress"}
 
 # The startup memory of a qwen4_exp engine beyond the slot state (docs/history/qwen4exp_plan.md section 4), at the
 # defaults of the family (16 checkpoints, no drafter, no decode copies): the routed experts (67.95e9), the BF16 rest
@@ -92,9 +96,9 @@ def model_type(path: str) -> str:
 
 
 def _refusal(path: str, t: str) -> NotImplementedError:
-    return NotImplementedError(f"{os.path.basename(path)}: model_type {t!r} ({IN_PROGRESS[t]}) is not served yet. The reference model, the "
-                               f"loader and the kernels exist; the decode model on the kernels is the next milestone ({PLAN}). "
-                               "tools/qwen4exp_reference.py runs the reference on the checkpoint.")
+    why = NOT_SERVED_YET.get(t, "its modules do not exist yet")
+    return NotImplementedError(f"{os.path.basename(path)}: model_type {t!r} ({IN_PROGRESS[t]}) is not served yet: {why} ({PLAN}). "
+                               "tools/qwen4exp_reference.py runs the reference on the checkpoint; tests/golden_qwen4exp.py runs the decode path.")
 
 
 # ------------------------------------------------------------------------------------------------ qwen3_5 (the 27B)
@@ -173,9 +177,11 @@ def family_of(path: str) -> Family:
 
 
 def check_served(path: str) -> str:
-    """The model_type of the checkpoint at `path`. Raises NotImplementedError for a family whose support is in progress
-    and whose modules do not exist yet."""
+    """The model_type of the checkpoint at `path`. Raises NotImplementedError for a family in NOT_SERVED_YET, and for a family
+    whose support is in progress and whose modules do not exist yet."""
     t = model_type(path)
+    if t in NOT_SERVED_YET:
+        raise _refusal(path, t)
     if t in IN_PROGRESS:
         family_of(path)
     return t
