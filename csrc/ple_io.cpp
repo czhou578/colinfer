@@ -12,6 +12,13 @@
 // works too, and returns when all rows are read. The bound function releases the GIL. Python: ops().ple_gather (bound in
 // qsa_bind.cpp). For plain reads, the caller sets posix_fadvise(fd, POSIX_FADV_RANDOM): readahead would read 128 KB per
 // row. Tests: tests/test_ple_io.py.
+//
+// The row cache (ple_cache_*): a set-associative cache of rows in host memory, with a fixed capacity in rows. Each set
+// holds WAYS rows; a row id maps to one set by a hash, and a miss replaces the least recently used way of the set. The
+// rows live in one arena (capacity x row bytes), the ids and the use stamps in two arrays beside it. One mutex guards
+// a cache: a lookup or an insert of n rows takes it once. The feeder of engine/weights/ple.py (PleFeeder) looks up
+// the rows of a chunk, reads the misses with ple_read_rows and inserts them. Python: ops().ple_cache_new and friends
+// (bound in qsa_bind.cpp; the handle frees the cache when Python drops it). Tests: tests/test_ple_feeder.py.
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -19,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -166,4 +174,111 @@ int ple_read_rows(int fd, const int64_t* offsets, uint8_t* out, int64_t n, int64
     job.row = row;
     job.direct = direct;
     return pool->run(job, helpers);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// The row cache.
+struct PleRowCache {
+    int64_t nsets = 0, ways = 0, row = 0;
+    std::vector<int64_t> ids;     // [nsets * ways], -1 = empty
+    std::vector<uint64_t> stamp;  // [nsets * ways], the last use
+    std::vector<uint8_t> data;    // [nsets * ways * row]
+    uint64_t clock = 0;
+    int64_t hits = 0, misses = 0, filled = 0;
+    std::mutex mu;
+};
+
+namespace {
+inline uint64_t mix64(uint64_t x) {  // splitmix64's finalizer: the set of an id
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+}  // namespace
+
+// A cache of at least `capacity` rows of `row` bytes in sets of `ways` (the capacity rounds up to whole sets).
+PleRowCache* ple_cache_create(int64_t capacity, int64_t row, int64_t ways) {
+    auto* c = new PleRowCache();
+    c->ways = std::max<int64_t>(1, ways);
+    c->nsets = std::max<int64_t>(1, (capacity + c->ways - 1) / c->ways);
+    c->row = row;
+    const size_t n = (size_t)(c->nsets * c->ways);
+    c->ids.assign(n, -1);
+    c->stamp.assign(n, 0);
+    c->data.resize(n * (size_t)row);
+    return c;
+}
+
+void ple_cache_destroy(PleRowCache* c) { delete c; }
+
+// out[i] = the row of ids[i] where the cache holds it (miss[i] = 0); else miss[i] = 1 and out[i] is untouched.
+void ple_cache_lookup(PleRowCache* c, const int64_t* ids, int64_t n, uint8_t* out, uint8_t* miss) {
+    std::lock_guard<std::mutex> g(c->mu);
+    int64_t h = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t id = ids[i];
+        const int64_t base = (int64_t)(mix64((uint64_t)id) % (uint64_t)c->nsets) * c->ways;
+        int64_t hit = -1;
+        for (int64_t w = 0; w < c->ways; ++w)
+            if (c->ids[base + w] == id) {
+                hit = base + w;
+                break;
+            }
+        if (hit >= 0 && id >= 0) {
+            memcpy(out + i * c->row, c->data.data() + hit * c->row, c->row);
+            c->stamp[hit] = ++c->clock;
+            miss[i] = 0;
+            ++h;
+        } else {
+            miss[i] = 1;
+        }
+    }
+    c->hits += h;
+    c->misses += n - h;
+}
+
+// Stores the rows of ids (ids < 0 are skipped; an id the cache holds keeps its row): each into an empty way of its set,
+// else in place of the least recently used one.
+void ple_cache_insert(PleRowCache* c, const int64_t* ids, int64_t n, const uint8_t* rows) {
+    std::lock_guard<std::mutex> g(c->mu);
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t id = ids[i];
+        if (id < 0) continue;
+        const int64_t base = (int64_t)(mix64((uint64_t)id) % (uint64_t)c->nsets) * c->ways;
+        int64_t slot = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int64_t w = 0; w < c->ways; ++w) {
+            const int64_t k = base + w;
+            if (c->ids[k] == id) {
+                slot = -2;
+                break;
+            }
+            const uint64_t s = c->ids[k] < 0 ? 0 : c->stamp[k];  // an empty way is the oldest
+            if (s < oldest) {
+                oldest = s;
+                slot = k;
+            }
+        }
+        if (slot < 0) continue;
+        if (c->ids[slot] < 0) ++c->filled;
+        c->ids[slot] = id;
+        c->stamp[slot] = ++c->clock;
+        memcpy(c->data.data() + slot * c->row, rows + i * c->row, c->row);
+    }
+}
+
+// (hits, misses, rows held, capacity in rows)
+void ple_cache_counters(PleRowCache* c, int64_t* out) {
+    std::lock_guard<std::mutex> g(c->mu);
+    out[0] = c->hits;
+    out[1] = c->misses;
+    out[2] = c->filled;
+    out[3] = c->nsets * c->ways;
+}
+
+void ple_cache_reset_counters(PleRowCache* c) {
+    std::lock_guard<std::mutex> g(c->mu);
+    c->hits = c->misses = 0;
 }

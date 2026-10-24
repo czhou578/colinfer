@@ -18,6 +18,11 @@ read is an O_DIRECT preadv of the 4 KB page(s) that hold the row, on a thread po
 from holding 4 KB per 160 B row, and preadv releases the GIL. The value of a row is bf16(e4m3 * scale) (dequant).
 csrc/ple_io.cpp (ops().ple_gather, tests/test_ple_io.py) holds a C++ thread pool for the same row reads; NgramTable does
 not call it. Tests: tests/test_ple.py, on the synthetic checkpoints of tests/qwen4exp_ckpt.py.
+
+PleFeeder serves the engine: the ids of a run of tokens of a slot (ids), and their rows in a pinned buffer (rows_for)
+through a row cache in host memory (C++, csrc/ple_io.cpp: set-associative, a fixed capacity in rows, hit / miss
+counters) and ops().ple_gather for the misses. prefetch starts the rows of the next chunk on a worker thread while the
+GPU runs the current one; the rows_for of the same tokens then waits for it. Tests: tests/test_ple_feeder.py.
 """
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ import functools
 import math
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -247,6 +252,196 @@ class NgramTable:
             self.pool.shutdown(wait=True)
             os.close(self.fd)
             self.fd = -1
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001  interpreter shutdown
+            pass
+
+
+# ------------------------------------------------------------------------------------------------------------ the feeder
+ROW_BYTES = 160  # one n-gram row: 160 e4m3 values
+IMAGE_TOKEN_ID = 248056  # <|image_pad|>: image rows hash as this token
+
+
+def gather_threads(n: int) -> int:
+    """The thread count of a gather of n cold rows: a wakeup costs about 10 us, so a few rows want one or two threads
+    (warm rows come from the page cache or the row cache); a drive read wants many in flight (docs/history/
+    qwen4exp_plan.md section 9: 1 to 2 threads for small warm batches, 64 for cold ones)."""
+    if n <= 8:
+        return 1
+    if n <= 64:
+        return 2
+    if n <= 512:
+        return 8
+    if n <= 4096:
+        return 32
+    return 64
+
+
+class PleFeeder:
+    """The n-gram rows of a slot's tokens for the PLE layer, through a host row cache.
+
+    table: the NgramTable of the checkpoint (its fd and offsets; its own reader is not used). cache_rows: the capacity
+    of the row cache in rows (0: no cache; 2 GB = 12.5M rows). threads: the gather's thread count (None: by the miss
+    count, gather_threads). params: the hash parameters (default: the real config's first PLE layer).
+    buffers: the pinned output buffers that rows_for cycles through.
+
+    ids(tokens, prev2) -> int64 [T, 16]: tokens int [T], prev2 the two tokens before the first one ((eos, eos) at a
+    sequence start); an eos starts a new segment (ngram_rows); ids at or past the vocabulary (the engine's image
+    placeholders) hash as image_token_id.
+    rows_for(tokens, prev2, out=None) -> pinned u8 [T, 16, 160]: into out, or a view of one of `buffers` pinned
+    buffers, valid until `buffers` - 1 more such calls (copy it to the device before that). The warm path (every row in
+    the cache) takes about 0.1 ms at T = 1 to 16 (bench/prefill_chunk_bench.py --ple).
+    prefetch(tokens, prev2, out=None): starts rows_for on a worker thread; the next rows_for of the same tokens and
+    context returns its result (without out, its buffer counts as one of the ring's calls).
+    staging(i, n) / release(i): a pool of pinned buffers for asynchronous copies, each guarded by the event of its
+    last copy (prefill). stats() -> (hits, misses, rows held, capacity) of the cache."""
+
+    def __init__(self, table: NgramTable, cache_rows: int = 0, threads: int | None = None, params: NgramParams | None = None,
+                 image_token_id: int = IMAGE_TOKEN_ID, buffers: int = 3):
+        from engine.kernels import ops
+        if params is None:
+            from engine.model.qwen4exp import Qwen4ExpConfig
+            params = ngram_params(Qwen4ExpConfig(), 0)
+        if table.dim != ROW_BYTES:
+            raise ValueError(f"n-gram rows of {table.dim} bytes, expected {ROW_BYTES}")
+        self.table, self.params, self.threads, self.image_token_id = table, params, threads, image_token_id
+        self._ops = ops()
+        self.cache = self._ops.ple_cache_new(cache_rows, ROW_BYTES, 8) if cache_rows > 0 else None
+        self._bufs: list[torch.Tensor | None] = [None] * max(2, buffers)
+        self._next = 0
+        self._lock = threading.Lock()  # the buffer ring and the pending prefetch
+        self._pending: tuple[tuple, Future] | None = None
+        self._staging: dict[int, tuple[torch.Tensor | None, object]] = {}  # i -> (pinned buffer, the event of its last copy)
+        self._worker = ThreadPoolExecutor(1, thread_name_prefix="ple-prefetch")
+        self.gather_rows = 0  # rows read from the file
+
+    # ---- ids
+    def ids(self, tokens, prev2) -> np.ndarray:
+        p = self.params
+        t = np.asarray(tokens, np.int64).reshape(-1)
+        c = np.asarray(prev2, np.int64).reshape(-1)
+        t = np.where(t >= p.vocab_size, self.image_token_id, t)
+        c = np.where(c >= p.vocab_size, self.image_token_id, c)
+        return ngram_rows(t, c, p)
+
+    # ---- rows
+    def _buffer(self, n: int) -> torch.Tensor:
+        """The next pinned buffer of the ring, with room for n tokens."""
+        with self._lock:
+            i = self._next
+            self._next = (i + 1) % len(self._bufs)
+            b = self._bufs[i]
+            if b is None or b.shape[0] < n:
+                cap = max(n, 2 * b.shape[0] if b is not None else 64)
+                b = torch.empty(cap, self.params.heads, ROW_BYTES, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+                self._bufs[i] = b
+            return b[:n]
+
+    def _gather(self, ids: np.ndarray, out: np.ndarray):
+        """out[i] = the file row of ids[i] (ids unique), through ops().ple_gather."""
+        if ids.size == 0:
+            return
+        offs = torch.from_numpy(self.table.offsets(ids))
+        t = torch.from_numpy(out) if out.flags.c_contiguous else torch.empty(ids.size, ROW_BYTES, dtype=torch.uint8)
+        self._ops.ple_gather(self.table.fd, offs, t, self.table.direct, self.threads or gather_threads(ids.size))
+        if t.data_ptr() != out.ctypes.data:
+            out[:] = t.numpy()
+        with self._lock:
+            self.gather_rows += ids.size
+
+    def _rows(self, tokens, prev2, out: torch.Tensor | None = None) -> torch.Tensor:
+        ids = self.ids(tokens, prev2)
+        T = ids.shape[0]
+        if out is None:
+            out = self._buffer(T)
+        elif out.dtype != torch.uint8 or out.device.type != "cpu" or not out.is_contiguous() or tuple(out.shape) != (T, ids.shape[1], ROW_BYTES):
+            raise ValueError(f"out must be a contiguous CPU uint8 [{T}, {ids.shape[1]}, {ROW_BYTES}] tensor")
+        flat = ids.reshape(-1)
+        uniq, inv = np.unique(flat, return_inverse=True)
+        got = np.empty((uniq.size, ROW_BYTES), np.uint8)
+        if self.cache is not None:
+            u = torch.from_numpy(uniq)
+            miss = self._ops.ple_cache_lookup(self.cache, u, torch.from_numpy(got)).numpy().astype(bool)
+            mi = np.flatnonzero(miss)
+            if mi.size:
+                rows = np.empty((mi.size, ROW_BYTES), np.uint8)
+                self._gather(uniq[mi], rows)
+                got[mi] = rows
+                self._ops.ple_cache_insert(self.cache, torch.from_numpy(uniq[mi]), torch.from_numpy(rows))
+        else:
+            self._gather(uniq, got)
+        np.take(got, inv, axis=0, out=out.numpy().reshape(-1, ROW_BYTES))
+        return out
+
+    @staticmethod
+    def _key(tokens, prev2) -> tuple:
+        return (np.asarray(tokens, np.int64).tobytes(), tuple(int(x) for x in np.asarray(prev2).reshape(-1)))
+
+    def rows_for(self, tokens, prev2, out: torch.Tensor | None = None) -> torch.Tensor:
+        """The rows of tokens (see the class docstring), into out (a CPU u8 [T, 16, 160], pinned for an asynchronous
+        copy) or a buffer of the ring. A pending prefetch of the same tokens and context is waited for, and its tensor
+        returned (out is then unused); a prefetch of other tokens stays pending."""
+        key = self._key(tokens, prev2)
+        with self._lock:
+            pend = self._pending
+            if pend is not None and pend[0] == key:
+                self._pending = None
+            else:
+                pend = None
+        if pend is not None:
+            return pend[1].result()
+        return self._rows(tokens, prev2, out)
+
+    def prefetch(self, tokens, prev2, out: torch.Tensor | None = None):
+        """Starts rows_for(tokens, prev2, out) on the worker thread. A second prefetch first waits for the first."""
+        tokens = np.array(tokens, np.int64, copy=True)
+        prev2 = tuple(int(x) for x in np.asarray(prev2).reshape(-1))
+        with self._lock:
+            pend, self._pending = self._pending, None
+        if pend is not None:
+            pend[1].result()
+        fut = self._worker.submit(self._rows, tokens, prev2, out)
+        with self._lock:
+            self._pending = (self._key(tokens, prev2), fut)
+
+    def staging(self, i: int, n: int) -> torch.Tensor:
+        """Pinned staging buffer i of the pool, u8 [n, 16, 160], for a caller that copies rows to the device without
+        blocking (prefill). It first waits for the copy that release(i) last marked: the host may run ahead of the GPU."""
+        with self._lock:
+            b, ev = self._staging.get(i, (None, None))
+        if ev is not None:
+            ev.synchronize()
+        if b is None or b.shape[0] < n:
+            b = torch.empty(max(n, 64), self.params.heads, ROW_BYTES, dtype=torch.uint8, pin_memory=torch.cuda.is_available())
+        with self._lock:
+            self._staging[i] = (b, None)
+        return b[:n]
+
+    def release(self, i: int):
+        """Marks the end of the device copy out of staging buffer i: an event on the current CUDA stream."""
+        ev = None
+        if torch.cuda.is_available():
+            ev = torch.cuda.Event()
+            ev.record()
+        with self._lock:
+            self._staging[i] = (self._staging[i][0], ev)
+
+    def stats(self, reset: bool = False) -> tuple[int, int, int, int]:
+        """(hits, misses, rows held, capacity) of the row cache (zeros without a cache)."""
+        if self.cache is None:
+            return (0, 0, 0, 0)
+        return tuple(self._ops.ple_cache_stats(self.cache, reset))
+
+    def close(self):
+        with self._lock:
+            pend, self._pending = self._pending, None
+        if pend is not None:
+            pend[1].result()
+        self._worker.shutdown(wait=True)
+        self.cache = None
 
     def __del__(self):
         try:
