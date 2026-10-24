@@ -272,4 +272,19 @@ kernel build. The 27B's tests must keep passing in every worktree.
   chunks, about 5.6 GB of growth during the first long prompts (the warm-up covers it; the reserve is 6 GB), and the
   drafter's wiring (the ring's drafter hidden of 10240, the drafter's ik / ikb / rope_pos rows in the sessions, a k model
   from the distinct-expert count).
-- **Next:** the prefill assembly and long context on the real checkpoint (M2) and the MTP drafter (M3) are in progress.
+- **2026-10-24, M3 merged: exact speculation.** `engine/spec/mtp4.py` (Mtp4, Mtp4State, Mtp4Cycle) is the drafter of the
+  family: the wiring is confirmed from vLLM's source (the projected embedding enters every stream as a plain add; one norm
+  over the whole 10240-wide hidden, then the shared fc_hidden per stream; a per-stream norm in the mixer; the target's
+  lm_head as the draft head over the 64k draft vocabulary). The FP8 block experts become NVFP4 copies on KernelMoE
+  (1.41 GB; requantized once in 7.5 s, then 0.3 to 0.9 s from `~/.cache/colinfer/drafter/quant4-*.safetensors`). The
+  drafter selects its sparse blocks on every row with the target's kernels (vLLM reuses step 0; both are exact under the
+  accept rule). On the real checkpoint (`tests/golden_qwen4exp_spec.py`): the tokens with speculation equal plain decode
+  for k = 1, 2, 3, 4 on the three golden prompts and a 1024-token WikiText prompt, greedy and sampled. Against the
+  46.6 ms plain step: k = 2 gives 2.30 tokens per cycle in 59.5 ms on the golden prompts (38.7 tok/s GPU, 1.80x) and 2.10
+  in 59.7 ms on WikiText (35.1 tok/s, 1.63x); k = 3 reaches 1.94x on code and 1.61x on prose; k = 4 adds nothing. The
+  cost model for the scheduler: cycle_ms = 41.4 + 0.577 x distinct experts + 2.92 x k, with about 10 + 5.5 k distinct
+  experts per layer per verify. Recommendation: k = 2 by default, k up to 3 by acceptance. The drafter adds 1.95 GB and
+  0.355 GB per 262k-token slot. Remaining: the scheduler wiring (Mtp4State in the ring copies and the sessions, the
+  fixed bytes, Supports.mtp, the k model), the low-rank draft head, the early-exit tuning.
+- **Next:** M2 (prefill on the real checkpoint and long context) is in progress; then the drafter's scheduler wiring and
+  the documentation pass.
