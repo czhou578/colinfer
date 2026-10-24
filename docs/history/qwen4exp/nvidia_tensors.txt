@@ -1,0 +1,865 @@
+=== hf_quant_config.json
+{
+  "producer": {
+    "name": "modelopt",
+    "version": "0.46.0.dev281+g73d778422"
+  },
+  "quantization": {
+    "quant_algo": "MIXED_PRECISION",
+    "kv_cache_quant_algo": null,
+    "group_size": 16,
+    "exclude_modules": [
+      "lm_head",
+      "model.language_model.embed_tokens",
+      "model.language_model.hyper_connection_mixer*",
+      "model.language_model.layers.0.attn_hyper_connection*",
+      "model.language_model.layers.0.linear_attn*",
+      "model.language_model.layers.0.mlp.gate",
+      "model.language_model.layers.0.mlp.shared_expert*",
+      "model.language_model.layers.0.mlp.shared_expert_gate",
+      "model.language_model.layers.0.mlp_hyper_connection*",
+      "model.language_model.layers.1.attn_hyper_connection*",
+      "model.language_model.layers.1.linear_attn*",
+      "model.language_model.layers.1.mlp.gate",
+      "model.language_model.layers.1.mlp.shared_expert*",
+      "model.language_model.layers.1.mlp.shared_expert_gate",
+      "model.language_model.layers.1.mlp_hyper_connection*",
+      "model.language_model.layers.10.attn_hyper_connection*",
+      "model.language_model.layers.10.linear_attn*",
+      "model.language_model.layers.10.mlp.gate",
+      "model.language_model.layers.10.mlp.shared_expert*",
+      "model.language_model.layers.10.mlp.shared_expert_gate",
+      "model.language_model.layers.10.mlp_hyper_connection*",
+      "model.language_model.layers.11.attn_hyper_connection*",
+      "model.language_model.layers.11.mlp.gate",
+      "model.language_model.layers.11.mlp.shared_expert*",
+      "model.language_model.layers.11.mlp.shared_expert_gate",
+      "model.language_model.layers.11.mlp_hyper_connection*",
+      "model.language_model.layers.11.self_attn*",
+      "model.language_model.layers.12.attn_hyper_connection*",
+      "model.language_model.layers.12.linear_attn*",
+      "model.language_model.layers.12.mlp.gate",
+      "model.language_model.layers.12.mlp.shared_expert*",
+      "model.language_model.layers.12.mlp.shared_expert_gate",
+      "model.language_model.layers.12.mlp_hyper_connection*",
+      "model.language_model.layers.13.attn_hyper_connection*",
+      "model.language_model.layers.13.linear_attn*",
+      "model.language_model.layers.13.mlp.gate",
+      "model.language_model.layers.13.mlp.shared_expert*",
+      "model.language_model.layers.13.mlp.shared_expert_gate",
+      "model.language_model.layers.13.mlp_hyper_connection*",
+      "model.language_model.layers.14.attn_hyper_connection*",
+      "model.language_model.layers.14.linear_attn*",
+      "model.language_model.layers.14.mlp.gate",
+      "model.language_model.layers.14.mlp.shared_expert*",
+      "model.language_model.layers.14.mlp.shared_expert_gate",
+      "model.language_model.layers.14.mlp_hyper_connection*",
+      "model.language_model.layers.15.attn_hyper_connection*",
+      "model.language_model.layers.15.mlp.gate",
+      "model.language_model.layers.15.mlp.shared_expert*",
+      "model.language_model.layers.15.mlp.shared_expert_gate",
+      "model.language_model.layers.15.mlp_hyper_connection*",
+
+=== index: tensor name patterns (layer index -> N, expert index -> E)
+tensors: 299545 metadata: {'total_size': 132639846394}
+     1  model-shards   lm_head.weight
+     1  model-shards   model.language_model.embed_tokens.weight
+     1  model-shards   model.language_model.hyper_connection_mixer.hc_norm.weight
+     1  model-shards   model.language_model.hyper_connection_mixer.input_mix_weight_down.weight
+     1  model-shards   model.language_model.hyper_connection_mixer.input_mix_weight_up.weight
+    48  model-shards   model.language_model.layers.N.attn_hyper_connection.block_inject_weight.weight
+    48  model-shards   model.language_model.layers.N.attn_hyper_connection.hc_norm.weight
+    48  model-shards   model.language_model.layers.N.attn_hyper_connection.input_mix_weight_down.weight
+    48  model-shards   model.language_model.layers.N.attn_hyper_connection.input_mix_weight_up.weight
+    36  model-shards   model.language_model.layers.N.linear_attn.A_log
+    36  model-shards   model.language_model.layers.N.linear_attn.conv1d.weight
+    36  model-shards   model.language_model.layers.N.linear_attn.dt_bias
+    36  model-shards   model.language_model.layers.N.linear_attn.in_proj_a.weight
+    36  model-shards   model.language_model.layers.N.linear_attn.in_proj_b.weight
+    36  model-shards   model.language_model.layers.N.linear_attn.in_proj_qkv.weight
+    36  model-shards   model.language_model.layers.N.linear_attn.in_proj_z.weight
+    36  model-shards   model.language_model.layers.N.linear_attn.norm.weight
+    36  model-shards   model.language_model.layers.N.linear_attn.out_proj.weight
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.down_proj.input_scale
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.down_proj.weight
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.down_proj.weight_scale
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.down_proj.weight_scale_2
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.gate_proj.input_scale
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.gate_proj.weight
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.gate_proj.weight_scale
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.gate_proj.weight_scale_2
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.up_proj.input_scale
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.up_proj.weight
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.up_proj.weight_scale
+ 24576  model-shards   model.language_model.layers.N.mlp.experts.E.up_proj.weight_scale_2
+    48  model-shards   model.language_model.layers.N.mlp.gate.weight
+    48  model-shards   model.language_model.layers.N.mlp.shared_expert.down_proj.weight
+    48  model-shards   model.language_model.layers.N.mlp.shared_expert.gate_proj.weight
+    48  model-shards   model.language_model.layers.N.mlp.shared_expert.up_proj.weight
+    48  model-shards   model.language_model.layers.N.mlp.shared_expert_gate.weight
+    48  model-shards   model.language_model.layers.N.mlp_hyper_connection.block_inject_weight.weight
+    48  model-shards   model.language_model.layers.N.mlp_hyper_connection.hc_norm.weight
+    48  model-shards   model.language_model.layers.N.mlp_hyper_connection.input_mix_weight_down.weight
+    48  model-shards   model.language_model.layers.N.mlp_hyper_connection.input_mix_weight_up.weight
+     1  model-shards   model.language_model.layers.N.ple.conv1d.weight
+     1  model-shards   model.language_model.layers.N.ple.key_proj.weight
+     1  model-shards   model.language_model.layers.N.ple.norm_conv.weight
+     1  model-shards   model.language_model.layers.N.ple.norm_key.weight
+     1  model-shards   model.language_model.layers.N.ple.norm_query.weight
+     1  model-shards   model.language_model.layers.N.ple.ple_embedding.layer_multipliers
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_0.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_1.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_10.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_100.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_101.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_102.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_103.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_104.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_105.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_106.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_107.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_108.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_109.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_11.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_110.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_111.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_112.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_113.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_114.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_115.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_116.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_117.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_118.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_119.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_12.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_120.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_121.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_122.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_123.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_124.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_125.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_126.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_127.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_13.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_14.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_15.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_16.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_17.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_18.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_19.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_2.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_20.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_21.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_22.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_23.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_24.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_25.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_26.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_27.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_28.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_29.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_3.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_30.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_31.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_32.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_33.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_34.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_35.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_36.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_37.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_38.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_39.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_4.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_40.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_41.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_42.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_43.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_44.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_45.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_46.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_47.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_48.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_49.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_5.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_50.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_51.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_52.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_53.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_54.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_55.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_56.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_57.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_58.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_59.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_6.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_60.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_61.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_62.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_63.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_64.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_65.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_66.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_67.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_68.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_69.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_7.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_70.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_71.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_72.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_73.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_74.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_75.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_76.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_77.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_78.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_79.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_8.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_80.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_81.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_82.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_83.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_84.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_85.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_86.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_87.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_88.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_89.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_9.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_90.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_91.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_92.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_93.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_94.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_95.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_96.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_97.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_98.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_99.weight
+     1  model-fp8-mtp-ple.safetensors model.language_model.layers.N.ple.ple_embedding.ngram_embedding.weight_scale
+     1  model-shards   model.language_model.layers.N.ple.ple_embedding.ngram_heads_offsets
+     1  model-shards   model.language_model.layers.N.ple.ple_embedding.ngram_heads_vocab_sizes
+     1  model-shards   model.language_model.layers.N.ple.value_proj.weight
+    12  model-shards   model.language_model.layers.N.self_attn.indexer.index_qk_proj.weight
+    12  model-shards   model.language_model.layers.N.self_attn.indexer.k_layernorm.weight
+    12  model-shards   model.language_model.layers.N.self_attn.indexer.q_layernorm.weight
+    12  model-shards   model.language_model.layers.N.self_attn.k_norm.weight
+    12  model-shards   model.language_model.layers.N.self_attn.k_proj.weight
+    12  model-shards   model.language_model.layers.N.self_attn.o_proj.weight
+    12  model-shards   model.language_model.layers.N.self_attn.q_norm.weight
+    12  model-shards   model.language_model.layers.N.self_attn.q_proj.weight
+    12  model-shards   model.language_model.layers.N.self_attn.v_proj.weight
+     1  model-shards   model.visual.blocks.0.attn.proj.bias
+     1  model-shards   model.visual.blocks.0.attn.proj.weight
+     1  model-shards   model.visual.blocks.0.attn.qkv.bias
+     1  model-shards   model.visual.blocks.0.attn.qkv.weight
+     1  model-shards   model.visual.blocks.0.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.0.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.0.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.0.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.0.norm1.bias
+     1  model-shards   model.visual.blocks.0.norm1.weight
+     1  model-shards   model.visual.blocks.0.norm2.bias
+     1  model-shards   model.visual.blocks.0.norm2.weight
+     1  model-shards   model.visual.blocks.1.attn.proj.bias
+     1  model-shards   model.visual.blocks.1.attn.proj.weight
+     1  model-shards   model.visual.blocks.1.attn.qkv.bias
+     1  model-shards   model.visual.blocks.1.attn.qkv.weight
+     1  model-shards   model.visual.blocks.1.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.1.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.1.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.1.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.1.norm1.bias
+     1  model-shards   model.visual.blocks.1.norm1.weight
+     1  model-shards   model.visual.blocks.1.norm2.bias
+     1  model-shards   model.visual.blocks.1.norm2.weight
+     1  model-shards   model.visual.blocks.10.attn.proj.bias
+     1  model-shards   model.visual.blocks.10.attn.proj.weight
+     1  model-shards   model.visual.blocks.10.attn.qkv.bias
+     1  model-shards   model.visual.blocks.10.attn.qkv.weight
+     1  model-shards   model.visual.blocks.10.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.10.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.10.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.10.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.10.norm1.bias
+     1  model-shards   model.visual.blocks.10.norm1.weight
+     1  model-shards   model.visual.blocks.10.norm2.bias
+     1  model-shards   model.visual.blocks.10.norm2.weight
+     1  model-shards   model.visual.blocks.11.attn.proj.bias
+     1  model-shards   model.visual.blocks.11.attn.proj.weight
+     1  model-shards   model.visual.blocks.11.attn.qkv.bias
+     1  model-shards   model.visual.blocks.11.attn.qkv.weight
+     1  model-shards   model.visual.blocks.11.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.11.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.11.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.11.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.11.norm1.bias
+     1  model-shards   model.visual.blocks.11.norm1.weight
+     1  model-shards   model.visual.blocks.11.norm2.bias
+     1  model-shards   model.visual.blocks.11.norm2.weight
+     1  model-shards   model.visual.blocks.12.attn.proj.bias
+     1  model-shards   model.visual.blocks.12.attn.proj.weight
+     1  model-shards   model.visual.blocks.12.attn.qkv.bias
+     1  model-shards   model.visual.blocks.12.attn.qkv.weight
+     1  model-shards   model.visual.blocks.12.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.12.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.12.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.12.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.12.norm1.bias
+     1  model-shards   model.visual.blocks.12.norm1.weight
+     1  model-shards   model.visual.blocks.12.norm2.bias
+     1  model-shards   model.visual.blocks.12.norm2.weight
+     1  model-shards   model.visual.blocks.13.attn.proj.bias
+     1  model-shards   model.visual.blocks.13.attn.proj.weight
+     1  model-shards   model.visual.blocks.13.attn.qkv.bias
+     1  model-shards   model.visual.blocks.13.attn.qkv.weight
+     1  model-shards   model.visual.blocks.13.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.13.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.13.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.13.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.13.norm1.bias
+     1  model-shards   model.visual.blocks.13.norm1.weight
+     1  model-shards   model.visual.blocks.13.norm2.bias
+     1  model-shards   model.visual.blocks.13.norm2.weight
+     1  model-shards   model.visual.blocks.14.attn.proj.bias
+     1  model-shards   model.visual.blocks.14.attn.proj.weight
+     1  model-shards   model.visual.blocks.14.attn.qkv.bias
+     1  model-shards   model.visual.blocks.14.attn.qkv.weight
+     1  model-shards   model.visual.blocks.14.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.14.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.14.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.14.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.14.norm1.bias
+     1  model-shards   model.visual.blocks.14.norm1.weight
+     1  model-shards   model.visual.blocks.14.norm2.bias
+     1  model-shards   model.visual.blocks.14.norm2.weight
+     1  model-shards   model.visual.blocks.15.attn.proj.bias
+     1  model-shards   model.visual.blocks.15.attn.proj.weight
+     1  model-shards   model.visual.blocks.15.attn.qkv.bias
+     1  model-shards   model.visual.blocks.15.attn.qkv.weight
+     1  model-shards   model.visual.blocks.15.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.15.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.15.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.15.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.15.norm1.bias
+     1  model-shards   model.visual.blocks.15.norm1.weight
+     1  model-shards   model.visual.blocks.15.norm2.bias
+     1  model-shards   model.visual.blocks.15.norm2.weight
+     1  model-shards   model.visual.blocks.16.attn.proj.bias
+     1  model-shards   model.visual.blocks.16.attn.proj.weight
+     1  model-shards   model.visual.blocks.16.attn.qkv.bias
+     1  model-shards   model.visual.blocks.16.attn.qkv.weight
+     1  model-shards   model.visual.blocks.16.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.16.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.16.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.16.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.16.norm1.bias
+     1  model-shards   model.visual.blocks.16.norm1.weight
+     1  model-shards   model.visual.blocks.16.norm2.bias
+     1  model-shards   model.visual.blocks.16.norm2.weight
+     1  model-shards   model.visual.blocks.17.attn.proj.bias
+     1  model-shards   model.visual.blocks.17.attn.proj.weight
+     1  model-shards   model.visual.blocks.17.attn.qkv.bias
+     1  model-shards   model.visual.blocks.17.attn.qkv.weight
+     1  model-shards   model.visual.blocks.17.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.17.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.17.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.17.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.17.norm1.bias
+     1  model-shards   model.visual.blocks.17.norm1.weight
+     1  model-shards   model.visual.blocks.17.norm2.bias
+     1  model-shards   model.visual.blocks.17.norm2.weight
+     1  model-shards   model.visual.blocks.18.attn.proj.bias
+     1  model-shards   model.visual.blocks.18.attn.proj.weight
+     1  model-shards   model.visual.blocks.18.attn.qkv.bias
+     1  model-shards   model.visual.blocks.18.attn.qkv.weight
+     1  model-shards   model.visual.blocks.18.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.18.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.18.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.18.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.18.norm1.bias
+     1  model-shards   model.visual.blocks.18.norm1.weight
+     1  model-shards   model.visual.blocks.18.norm2.bias
+     1  model-shards   model.visual.blocks.18.norm2.weight
+     1  model-shards   model.visual.blocks.19.attn.proj.bias
+     1  model-shards   model.visual.blocks.19.attn.proj.weight
+     1  model-shards   model.visual.blocks.19.attn.qkv.bias
+     1  model-shards   model.visual.blocks.19.attn.qkv.weight
+     1  model-shards   model.visual.blocks.19.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.19.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.19.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.19.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.19.norm1.bias
+     1  model-shards   model.visual.blocks.19.norm1.weight
+     1  model-shards   model.visual.blocks.19.norm2.bias
+     1  model-shards   model.visual.blocks.19.norm2.weight
+     1  model-shards   model.visual.blocks.2.attn.proj.bias
+     1  model-shards   model.visual.blocks.2.attn.proj.weight
+     1  model-shards   model.visual.blocks.2.attn.qkv.bias
+     1  model-shards   model.visual.blocks.2.attn.qkv.weight
+     1  model-shards   model.visual.blocks.2.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.2.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.2.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.2.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.2.norm1.bias
+     1  model-shards   model.visual.blocks.2.norm1.weight
+     1  model-shards   model.visual.blocks.2.norm2.bias
+     1  model-shards   model.visual.blocks.2.norm2.weight
+     1  model-shards   model.visual.blocks.20.attn.proj.bias
+     1  model-shards   model.visual.blocks.20.attn.proj.weight
+     1  model-shards   model.visual.blocks.20.attn.qkv.bias
+     1  model-shards   model.visual.blocks.20.attn.qkv.weight
+     1  model-shards   model.visual.blocks.20.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.20.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.20.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.20.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.20.norm1.bias
+     1  model-shards   model.visual.blocks.20.norm1.weight
+     1  model-shards   model.visual.blocks.20.norm2.bias
+     1  model-shards   model.visual.blocks.20.norm2.weight
+     1  model-shards   model.visual.blocks.21.attn.proj.bias
+     1  model-shards   model.visual.blocks.21.attn.proj.weight
+     1  model-shards   model.visual.blocks.21.attn.qkv.bias
+     1  model-shards   model.visual.blocks.21.attn.qkv.weight
+     1  model-shards   model.visual.blocks.21.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.21.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.21.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.21.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.21.norm1.bias
+     1  model-shards   model.visual.blocks.21.norm1.weight
+     1  model-shards   model.visual.blocks.21.norm2.bias
+     1  model-shards   model.visual.blocks.21.norm2.weight
+     1  model-shards   model.visual.blocks.22.attn.proj.bias
+     1  model-shards   model.visual.blocks.22.attn.proj.weight
+     1  model-shards   model.visual.blocks.22.attn.qkv.bias
+     1  model-shards   model.visual.blocks.22.attn.qkv.weight
+     1  model-shards   model.visual.blocks.22.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.22.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.22.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.22.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.22.norm1.bias
+     1  model-shards   model.visual.blocks.22.norm1.weight
+     1  model-shards   model.visual.blocks.22.norm2.bias
+     1  model-shards   model.visual.blocks.22.norm2.weight
+     1  model-shards   model.visual.blocks.23.attn.proj.bias
+     1  model-shards   model.visual.blocks.23.attn.proj.weight
+     1  model-shards   model.visual.blocks.23.attn.qkv.bias
+     1  model-shards   model.visual.blocks.23.attn.qkv.weight
+     1  model-shards   model.visual.blocks.23.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.23.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.23.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.23.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.23.norm1.bias
+     1  model-shards   model.visual.blocks.23.norm1.weight
+     1  model-shards   model.visual.blocks.23.norm2.bias
+     1  model-shards   model.visual.blocks.23.norm2.weight
+     1  model-shards   model.visual.blocks.24.attn.proj.bias
+     1  model-shards   model.visual.blocks.24.attn.proj.weight
+     1  model-shards   model.visual.blocks.24.attn.qkv.bias
+     1  model-shards   model.visual.blocks.24.attn.qkv.weight
+     1  model-shards   model.visual.blocks.24.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.24.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.24.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.24.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.24.norm1.bias
+     1  model-shards   model.visual.blocks.24.norm1.weight
+     1  model-shards   model.visual.blocks.24.norm2.bias
+     1  model-shards   model.visual.blocks.24.norm2.weight
+     1  model-shards   model.visual.blocks.25.attn.proj.bias
+     1  model-shards   model.visual.blocks.25.attn.proj.weight
+     1  model-shards   model.visual.blocks.25.attn.qkv.bias
+     1  model-shards   model.visual.blocks.25.attn.qkv.weight
+     1  model-shards   model.visual.blocks.25.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.25.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.25.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.25.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.25.norm1.bias
+     1  model-shards   model.visual.blocks.25.norm1.weight
+     1  model-shards   model.visual.blocks.25.norm2.bias
+     1  model-shards   model.visual.blocks.25.norm2.weight
+     1  model-shards   model.visual.blocks.26.attn.proj.bias
+     1  model-shards   model.visual.blocks.26.attn.proj.weight
+     1  model-shards   model.visual.blocks.26.attn.qkv.bias
+     1  model-shards   model.visual.blocks.26.attn.qkv.weight
+     1  model-shards   model.visual.blocks.26.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.26.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.26.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.26.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.26.norm1.bias
+     1  model-shards   model.visual.blocks.26.norm1.weight
+     1  model-shards   model.visual.blocks.26.norm2.bias
+     1  model-shards   model.visual.blocks.26.norm2.weight
+     1  model-shards   model.visual.blocks.3.attn.proj.bias
+     1  model-shards   model.visual.blocks.3.attn.proj.weight
+     1  model-shards   model.visual.blocks.3.attn.qkv.bias
+     1  model-shards   model.visual.blocks.3.attn.qkv.weight
+     1  model-shards   model.visual.blocks.3.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.3.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.3.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.3.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.3.norm1.bias
+     1  model-shards   model.visual.blocks.3.norm1.weight
+     1  model-shards   model.visual.blocks.3.norm2.bias
+     1  model-shards   model.visual.blocks.3.norm2.weight
+     1  model-shards   model.visual.blocks.4.attn.proj.bias
+     1  model-shards   model.visual.blocks.4.attn.proj.weight
+     1  model-shards   model.visual.blocks.4.attn.qkv.bias
+     1  model-shards   model.visual.blocks.4.attn.qkv.weight
+     1  model-shards   model.visual.blocks.4.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.4.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.4.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.4.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.4.norm1.bias
+     1  model-shards   model.visual.blocks.4.norm1.weight
+     1  model-shards   model.visual.blocks.4.norm2.bias
+     1  model-shards   model.visual.blocks.4.norm2.weight
+     1  model-shards   model.visual.blocks.5.attn.proj.bias
+     1  model-shards   model.visual.blocks.5.attn.proj.weight
+     1  model-shards   model.visual.blocks.5.attn.qkv.bias
+     1  model-shards   model.visual.blocks.5.attn.qkv.weight
+     1  model-shards   model.visual.blocks.5.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.5.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.5.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.5.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.5.norm1.bias
+     1  model-shards   model.visual.blocks.5.norm1.weight
+     1  model-shards   model.visual.blocks.5.norm2.bias
+     1  model-shards   model.visual.blocks.5.norm2.weight
+     1  model-shards   model.visual.blocks.6.attn.proj.bias
+     1  model-shards   model.visual.blocks.6.attn.proj.weight
+     1  model-shards   model.visual.blocks.6.attn.qkv.bias
+     1  model-shards   model.visual.blocks.6.attn.qkv.weight
+     1  model-shards   model.visual.blocks.6.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.6.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.6.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.6.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.6.norm1.bias
+     1  model-shards   model.visual.blocks.6.norm1.weight
+     1  model-shards   model.visual.blocks.6.norm2.bias
+     1  model-shards   model.visual.blocks.6.norm2.weight
+     1  model-shards   model.visual.blocks.7.attn.proj.bias
+     1  model-shards   model.visual.blocks.7.attn.proj.weight
+     1  model-shards   model.visual.blocks.7.attn.qkv.bias
+     1  model-shards   model.visual.blocks.7.attn.qkv.weight
+     1  model-shards   model.visual.blocks.7.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.7.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.7.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.7.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.7.norm1.bias
+     1  model-shards   model.visual.blocks.7.norm1.weight
+     1  model-shards   model.visual.blocks.7.norm2.bias
+     1  model-shards   model.visual.blocks.7.norm2.weight
+     1  model-shards   model.visual.blocks.8.attn.proj.bias
+     1  model-shards   model.visual.blocks.8.attn.proj.weight
+     1  model-shards   model.visual.blocks.8.attn.qkv.bias
+     1  model-shards   model.visual.blocks.8.attn.qkv.weight
+     1  model-shards   model.visual.blocks.8.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.8.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.8.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.8.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.8.norm1.bias
+     1  model-shards   model.visual.blocks.8.norm1.weight
+     1  model-shards   model.visual.blocks.8.norm2.bias
+     1  model-shards   model.visual.blocks.8.norm2.weight
+     1  model-shards   model.visual.blocks.9.attn.proj.bias
+     1  model-shards   model.visual.blocks.9.attn.proj.weight
+     1  model-shards   model.visual.blocks.9.attn.qkv.bias
+     1  model-shards   model.visual.blocks.9.attn.qkv.weight
+     1  model-shards   model.visual.blocks.9.mlp.linear_fc1.bias
+     1  model-shards   model.visual.blocks.9.mlp.linear_fc1.weight
+     1  model-shards   model.visual.blocks.9.mlp.linear_fc2.bias
+     1  model-shards   model.visual.blocks.9.mlp.linear_fc2.weight
+     1  model-shards   model.visual.blocks.9.norm1.bias
+     1  model-shards   model.visual.blocks.9.norm1.weight
+     1  model-shards   model.visual.blocks.9.norm2.bias
+     1  model-shards   model.visual.blocks.9.norm2.weight
+     1  model-shards   model.visual.merger.linear_fc1.bias
+     1  model-shards   model.visual.merger.linear_fc1.weight
+     1  model-shards   model.visual.merger.linear_fc2.bias
+     1  model-shards   model.visual.merger.linear_fc2.weight
+     1  model-shards   model.visual.merger.norm.bias
+     1  model-shards   model.visual.merger.norm.weight
+     1  model-shards   model.visual.patch_embed.proj.bias
+     1  model-shards   model.visual.patch_embed.proj.weight
+     1  model-shards   model.visual.pos_embed.weight
+     1  model-shards   mtp.fc_embedding.weight
+     1  model-shards   mtp.fc_hidden.weight
+     1  model-shards   mtp.hyper_connection_mixer.hc_norm.weight
+     1  model-shards   mtp.hyper_connection_mixer.input_mix_weight_down.weight
+     1  model-shards   mtp.hyper_connection_mixer.input_mix_weight_up.weight
+     1  model-shards   mtp.layers.N.attn_hyper_connection.block_inject_weight.weight
+     1  model-shards   mtp.layers.N.attn_hyper_connection.hc_norm.weight
+     1  model-shards   mtp.layers.N.attn_hyper_connection.input_mix_weight_down.weight
+     1  model-shards   mtp.layers.N.attn_hyper_connection.input_mix_weight_up.weight
+   512  model-fp8-mtp-ple.safetensors mtp.layers.N.mlp.experts.E.down_proj.weight
+   512  model-fp8-mtp-ple.safetensors mtp.layers.N.mlp.experts.E.down_proj.weight_scale_inv
+   512  model-fp8-mtp-ple.safetensors mtp.layers.N.mlp.experts.E.gate_proj.weight
+   512  model-fp8-mtp-ple.safetensors mtp.layers.N.mlp.experts.E.gate_proj.weight_scale_inv
+   512  model-fp8-mtp-ple.safetensors mtp.layers.N.mlp.experts.E.up_proj.weight
+   512  model-fp8-mtp-ple.safetensors mtp.layers.N.mlp.experts.E.up_proj.weight_scale_inv
+     1  model-shards   mtp.layers.N.mlp.gate.weight
+     1  model-shards   mtp.layers.N.mlp.shared_expert.down_proj.weight
+     1  model-shards   mtp.layers.N.mlp.shared_expert.gate_proj.weight
+     1  model-shards   mtp.layers.N.mlp.shared_expert.up_proj.weight
+     1  model-shards   mtp.layers.N.mlp.shared_expert_gate.weight
+     1  model-shards   mtp.layers.N.mlp_hyper_connection.block_inject_weight.weight
+     1  model-shards   mtp.layers.N.mlp_hyper_connection.hc_norm.weight
+     1  model-shards   mtp.layers.N.mlp_hyper_connection.input_mix_weight_down.weight
+     1  model-shards   mtp.layers.N.mlp_hyper_connection.input_mix_weight_up.weight
+     1  model-shards   mtp.layers.N.self_attn.indexer.index_qk_proj.weight
+     1  model-shards   mtp.layers.N.self_attn.indexer.k_layernorm.weight
+     1  model-shards   mtp.layers.N.self_attn.indexer.q_layernorm.weight
+     1  model-shards   mtp.layers.N.self_attn.k_norm.weight
+     1  model-shards   mtp.layers.N.self_attn.k_proj.weight
+     1  model-shards   mtp.layers.N.self_attn.o_proj.weight
+     1  model-shards   mtp.layers.N.self_attn.q_norm.weight
+     1  model-shards   mtp.layers.N.self_attn.q_proj.weight
+     1  model-shards   mtp.layers.N.self_attn.v_proj.weight
+     1  model-shards   mtp.pre_fc_norm_embedding.weight
+     1  model-shards   mtp.pre_fc_norm_hidden.weight
+
+=== safetensors headers (name dtype shape) of 3 files
+--- model-00001-of-00010.safetensors: 12327 tensors
+    1  I64   (3,)                         model.language_model.layers.N.ple.ple_embedding.layer_multipliers
+    1  I64   (16,)                        model.language_model.layers.N.ple.ple_embedding.ngram_heads_offsets
+    1  I64   (16,)                        model.language_model.layers.N.ple.ple_embedding.ngram_heads_vocab_sizes
+ 1024  F32   ()                           model.language_model.layers.N.mlp.experts.E.down_proj.input_scale
+ 1024  F32   ()                           model.language_model.layers.N.mlp.experts.E.down_proj.weight_scale_2
+ 1024  F32   ()                           model.language_model.layers.N.mlp.experts.E.gate_proj.input_scale
+ 1024  F32   ()                           model.language_model.layers.N.mlp.experts.E.gate_proj.weight_scale_2
+ 1024  F32   ()                           model.language_model.layers.N.mlp.experts.E.up_proj.input_scale
+ 1024  F32   ()                           model.language_model.layers.N.mlp.experts.E.up_proj.weight_scale_2
+    1  BF16  (4, 10240)                   model.language_model.layers.N.attn_hyper_connection.block_inject_weight.weight
+    1  BF16  (10240,)                     model.language_model.layers.N.attn_hyper_connection.hc_norm.weight
+    1  BF16  (320, 10240)                 model.language_model.layers.N.attn_hyper_connection.input_mix_weight_down.weight
+    1  BF16  (10240, 320)                 model.language_model.layers.N.attn_hyper_connection.input_mix_weight_up.weight
+    2  BF16  (48,)                        model.language_model.layers.N.linear_attn.A_log
+    2  BF16  (10240, 1, 4)                model.language_model.layers.N.linear_attn.conv1d.weight
+    2  BF16  (48,)                        model.language_model.layers.N.linear_attn.dt_bias
+    2  BF16  (48, 2560)                   model.language_model.layers.N.linear_attn.in_proj_a.weight
+    2  BF16  (48, 2560)                   model.language_model.layers.N.linear_attn.in_proj_b.weight
+    2  BF16  (10240, 2560)                model.language_model.layers.N.linear_attn.in_proj_qkv.weight
+    2  BF16  (6144, 2560)                 model.language_model.layers.N.linear_attn.in_proj_z.weight
+    2  BF16  (128,)                       model.language_model.layers.N.linear_attn.norm.weight
+    2  BF16  (2560, 6144)                 model.language_model.layers.N.linear_attn.out_proj.weight
+    2  BF16  (512, 2560)                  model.language_model.layers.N.mlp.gate.weight
+    2  BF16  (2560, 640)                  model.language_model.layers.N.mlp.shared_expert.down_proj.weight
+    2  BF16  (640, 2560)                  model.language_model.layers.N.mlp.shared_expert.gate_proj.weight
+    2  BF16  (640, 2560)                  model.language_model.layers.N.mlp.shared_expert.up_proj.weight
+    2  BF16  (1, 2560)                    model.language_model.layers.N.mlp.shared_expert_gate.weight
+    1  BF16  (4, 10240)                   model.language_model.layers.N.mlp_hyper_connection.block_inject_weight.weight
+    1  BF16  (10240,)                     model.language_model.layers.N.mlp_hyper_connection.hc_norm.weight
+    1  BF16  (320, 10240)                 model.language_model.layers.N.mlp_hyper_connection.input_mix_weight_down.weight
+    1  BF16  (10240, 320)                 model.language_model.layers.N.mlp_hyper_connection.input_mix_weight_up.weight
+ 1024  F8_E4M3 (2560, 40)                   model.language_model.layers.N.mlp.experts.E.down_proj.weight_scale
+ 1024  F8_E4M3 (640, 160)                   model.language_model.layers.N.mlp.experts.E.gate_proj.weight_scale
+ 1024  F8_E4M3 (640, 160)                   model.language_model.layers.N.mlp.experts.E.up_proj.weight_scale
+ 1024  U8    (2560, 320)                  model.language_model.layers.N.mlp.experts.E.down_proj.weight
+ 1024  U8    (640, 1280)                  model.language_model.layers.N.mlp.experts.E.gate_proj.weight
+ 1024  U8    (640, 1280)                  model.language_model.layers.N.mlp.experts.E.up_proj.weight
+--- model-00002-of-00010.safetensors: 38725 tensors
+ 3214  F32   ()                           model.language_model.layers.N.mlp.experts.E.down_proj.input_scale
+ 3214  F32   ()                           model.language_model.layers.N.mlp.experts.E.down_proj.weight_scale_2
+ 3214  F32   ()                           model.language_model.layers.N.mlp.experts.E.gate_proj.input_scale
+ 3214  F32   ()                           model.language_model.layers.N.mlp.experts.E.gate_proj.weight_scale_2
+ 3214  F32   ()                           model.language_model.layers.N.mlp.experts.E.up_proj.input_scale
+ 3214  F32   ()                           model.language_model.layers.N.mlp.experts.E.up_proj.weight_scale_2
+    7  BF16  (4, 10240)                   model.language_model.layers.N.attn_hyper_connection.block_inject_weight.weight
+    7  BF16  (10240,)                     model.language_model.layers.N.attn_hyper_connection.hc_norm.weight
+    7  BF16  (320, 10240)                 model.language_model.layers.N.attn_hyper_connection.input_mix_weight_down.weight
+    7  BF16  (10240, 320)                 model.language_model.layers.N.attn_hyper_connection.input_mix_weight_up.weight
+    7  BF16  (4, 10240)                   model.language_model.layers.N.mlp_hyper_connection.block_inject_weight.weight
+    7  BF16  (10240,)                     model.language_model.layers.N.mlp_hyper_connection.hc_norm.weight
+    7  BF16  (320, 10240)                 model.language_model.layers.N.mlp_hyper_connection.input_mix_weight_down.weight
+    7  BF16  (10240, 320)                 model.language_model.layers.N.mlp_hyper_connection.input_mix_weight_up.weight
+    1  BF16  (10240, 1, 4)                model.language_model.layers.N.ple.conv1d.weight
+    1  BF16  (10240, 2560)                model.language_model.layers.N.ple.key_proj.weight
+    1  BF16  (10240,)                     model.language_model.layers.N.ple.norm_conv.weight
+    1  BF16  (10240,)                     model.language_model.layers.N.ple.norm_key.weight
+    1  BF16  (10240,)                     model.language_model.layers.N.ple.norm_query.weight
+    1  BF16  (2560, 2560)                 model.language_model.layers.N.ple.value_proj.weight
+    5  BF16  (48,)                        model.language_model.layers.N.linear_attn.A_log
+    5  BF16  (10240, 1, 4)                model.language_model.layers.N.linear_attn.conv1d.weight
+    5  BF16  (48,)                        model.language_model.layers.N.linear_attn.dt_bias
+    5  BF16  (48, 2560)                   model.language_model.layers.N.linear_attn.in_proj_a.weight
+    5  BF16  (48, 2560)                   model.language_model.layers.N.linear_attn.in_proj_b.weight
+    5  BF16  (10240, 2560)                model.language_model.layers.N.linear_attn.in_proj_qkv.weight
+    5  BF16  (6144, 2560)                 model.language_model.layers.N.linear_attn.in_proj_z.weight
+    5  BF16  (128,)                       model.language_model.layers.N.linear_attn.norm.weight
+    5  BF16  (2560, 6144)                 model.language_model.layers.N.linear_attn.out_proj.weight
+    7  BF16  (512, 2560)                  model.language_model.layers.N.mlp.gate.weight
+    6  BF16  (2560, 640)                  model.language_model.layers.N.mlp.shared_expert.down_proj.weight
+    6  BF16  (640, 2560)                  model.language_model.layers.N.mlp.shared_expert.gate_proj.weight
+    6  BF16  (640, 2560)                  model.language_model.layers.N.mlp.shared_expert.up_proj.weight
+    6  BF16  (1, 2560)                    model.language_model.layers.N.mlp.shared_expert_gate.weight
+    2  BF16  (640, 2560)                  model.language_model.layers.N.self_attn.indexer.index_qk_proj.weight
+    2  BF16  (128,)                       model.language_model.layers.N.self_attn.indexer.k_layernorm.weight
+    2  BF16  (128,)                       model.language_model.layers.N.self_attn.indexer.q_layernorm.weight
+    2  BF16  (256,)                       model.language_model.layers.N.self_attn.k_norm.weight
+    2  BF16  (512, 2560)                  model.language_model.layers.N.self_attn.k_proj.weight
+    2  BF16  (2560, 6144)                 model.language_model.layers.N.self_attn.o_proj.weight
+    2  BF16  (256,)                       model.language_model.layers.N.self_attn.q_norm.weight
+    2  BF16  (12288, 2560)                model.language_model.layers.N.self_attn.q_proj.weight
+    2  BF16  (512, 2560)                  model.language_model.layers.N.self_attn.v_proj.weight
+ 3214  F8_E4M3 (2560, 40)                   model.language_model.layers.N.mlp.experts.E.down_proj.weight_scale
+ 3214  F8_E4M3 (640, 160)                   model.language_model.layers.N.mlp.experts.E.gate_proj.weight_scale
+ 3214  F8_E4M3 (640, 160)                   model.language_model.layers.N.mlp.experts.E.up_proj.weight_scale
+ 3214  U8    (2560, 320)                  model.language_model.layers.N.mlp.experts.E.down_proj.weight
+ 3215  U8    (640, 1280)                  model.language_model.layers.N.mlp.experts.E.gate_proj.weight
+ 3214  U8    (640, 1280)                  model.language_model.layers.N.mlp.experts.E.up_proj.weight
+--- model-00010-of-00010.safetensors: 20 tensors
+    1  BF16  (512, 2560)                  mtp.layers.N.mlp.gate.weight
+    1  BF16  (2560, 640)                  mtp.layers.N.mlp.shared_expert.down_proj.weight
+    1  BF16  (640, 2560)                  mtp.layers.N.mlp.shared_expert.gate_proj.weight
+    1  BF16  (640, 2560)                  mtp.layers.N.mlp.shared_expert.up_proj.weight
+    1  BF16  (1, 2560)                    mtp.layers.N.mlp.shared_expert_gate.weight
+    1  BF16  (4, 10240)                   mtp.layers.N.mlp_hyper_connection.block_inject_weight.weight
+    1  BF16  (10240,)                     mtp.layers.N.mlp_hyper_connection.hc_norm.weight
+    1  BF16  (320, 10240)                 mtp.layers.N.mlp_hyper_connection.input_mix_weight_down.weight
+    1  BF16  (10240, 320)                 mtp.layers.N.mlp_hyper_connection.input_mix_weight_up.weight
+    1  BF16  (640, 2560)                  mtp.layers.N.self_attn.indexer.index_qk_proj.weight
+    1  BF16  (128,)                       mtp.layers.N.self_attn.indexer.k_layernorm.weight
+    1  BF16  (128,)                       mtp.layers.N.self_attn.indexer.q_layernorm.weight
+    1  BF16  (256,)                       mtp.layers.N.self_attn.k_norm.weight
+    1  BF16  (512, 2560)                  mtp.layers.N.self_attn.k_proj.weight
+    1  BF16  (2560, 6144)                 mtp.layers.N.self_attn.o_proj.weight
+    1  BF16  (256,)                       mtp.layers.N.self_attn.q_norm.weight
+    1  BF16  (12288, 2560)                mtp.layers.N.self_attn.q_proj.weight
+    1  BF16  (512, 2560)                  mtp.layers.N.self_attn.v_proj.weight
+    1  BF16  (2560,)                      mtp.pre_fc_norm_embedding.weight
+    1  BF16  (10240,)                     mtp.pre_fc_norm_hidden.weight
+--- model-fp8-mtp-ple.safetensors: 3201 tensors
+    1  BF16  (1,)                         model.language_model.layers.N.ple.ple_embedding.ngram_embedding.weight_scale
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_0.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_1.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_2.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_3.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_4.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_5.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_6.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_7.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_8.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_9.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_10.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_11.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_12.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_13.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_14.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_15.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_16.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_17.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_18.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_19.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_20.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_21.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_22.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_23.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_24.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_25.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_26.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_27.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_28.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_29.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_30.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_31.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_32.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_33.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_34.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_35.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_36.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_37.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_38.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_39.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_40.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_41.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_42.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_43.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_44.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_45.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_46.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_47.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_48.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_49.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_50.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_51.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_52.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_53.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_54.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_55.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_56.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_57.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_58.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_59.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_60.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_61.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_62.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_63.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_64.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_65.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_66.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_67.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_68.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_69.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_70.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_71.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_72.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_73.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_74.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_75.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_76.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_77.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_78.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_79.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_80.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_81.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_82.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_83.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_84.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_85.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_86.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_87.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_88.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_89.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_90.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_91.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_92.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_93.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_94.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_95.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_96.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_97.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_100.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_101.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_98.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_99.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_102.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_103.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_104.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_105.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_106.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_107.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_108.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_109.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_110.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_111.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_112.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_113.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_114.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_115.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_116.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_117.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_118.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_119.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_120.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_121.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_122.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_123.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_124.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_125.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_126.weight
+    1  F8_E4M3 (2500012, 160)               model.language_model.layers.N.ple.ple_embedding.ngram_embedding.shard_127.weight
+  512  BF16  (5, 20)                      mtp.layers.N.mlp.experts.E.gate_proj.weight_scale_inv
+  512  BF16  (5, 20)                      mtp.layers.N.mlp.experts.E.up_proj.weight_scale_inv
+  512  F8_E4M3 (640, 2560)                  mtp.layers.N.mlp.experts.E.gate_proj.weight
+  512  F8_E4M3 (640, 2560)                  mtp.layers.N.mlp.experts.E.up_proj.weight
+  512  BF16  (20, 5)                      mtp.layers.N.mlp.experts.E.down_proj.weight_scale_inv
+  512  F8_E4M3 (2560, 640)                  mtp.layers.N.mlp.experts.E.down_proj.weight

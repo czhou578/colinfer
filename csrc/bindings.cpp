@@ -521,6 +521,12 @@ torch::Tensor rescore_nvfp4(torch::Tensor x, torch::Tensor w, torch::Tensor sf, 
 }
 
 // ===================================================================================================== module
+// The kernel files of the qwen4_exp work (moe.cu, qsa.cu, hc.cu) bind themselves in moe_bind.cpp, qsa_bind.cpp and hc_bind.cpp,
+// so that they can be developed in parallel with this file.
+void bind_moe(pybind11::module_& m);
+void bind_qsa(pybind11::module_& m);
+void bind_hc(pybind11::module_& m);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // decode linears
     m.def("skinny_nvfp4", &skinny_nvfp4, "tensor-core NVFP4 x bf16 skinny GEMM, M <= 16", py::arg("x"), py::arg("w"), py::arg("sf"),
@@ -571,6 +577,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // sampling and drafting
     m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (position-keyed sampling)", py::arg("seed"), py::arg("offset"), py::arg("out"));
     m.def("rescore_nvfp4", &rescore_nvfp4, "exact logits of candidate rows of an NVFP4 matrix (low-rank draft head)", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gs"), py::arg("cand"));
+    // qwen4_exp: MoE, sparse attention and hyper-connection kernels
+    bind_moe(m);
+    bind_qsa(m);
+    bind_hc(m);
     // the model dimensions the kernels are compiled for (csrc/shapes.h): engine/model/fast.py checks a checkpoint against them
     m.attr("HEAD_DIM") = HEAD_DIM;
     m.attr("GDN_DK") = GDN_DK;
