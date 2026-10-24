@@ -257,6 +257,19 @@ kernel build. The 27B's tests must keep passing in every worktree.
   The chunk bench (random weights) gives 2489 / 2918 / 3155 tok/s at 2048 / 4096 / 8192 tokens, so the chunk becomes
   4096 (+17%; 8192 adds 8% and holds the lane for 3 s). `csrc/hc_prefill.cu` cut the hyper-connection prefill from 763 to
   167 ms per chunk.
-- **Next (round 2):** the prefill assembly on the real checkpoint and long context (M2), the MTP drafter (M3), the ring,
-  the sessions and the server on the new state (M4 round 2). The family stays refused (`NOT_SERVED_YET`) until the
-  end-to-end check passes.
+- **2026-10-24, M4 round 2 merged: the server serves Qwen3.8-Flash-Next.** The qwen4_exp family loads the decode model,
+  attaches the n-gram feeder (`--ngram-cache-gb`, default 1.0 = 6.25M rows), prefills in 4096-token chunks with the slot's
+  previous two tokens, and fills the n-gram row buffer before each replay. `tests/scheduler_check_qwen4exp.py` on the real
+  checkpoint: startup 36 s; MemAvailable falls 94.7 GB after the build (state 8.7, row cache 1.1, the rest 84.9; the fixed
+  bytes of the family are the measured 87e9); the three golden prompts give 32 tokens equal to the reference through the
+  prefill, at 18.7 to 19.3 tok/s with a TTFT of 0.1 to 0.3 s; a 4676-token second turn reuses 4655 tokens (TTFT 0.128 s
+  against 1.746 s from scratch); a second slot keeps the first conversation cached; a 7398-token conversation restores
+  from disk in 0.161 s with identical output; a 6375-token prompt prefills in two chunks at 1624 tok/s. The server
+  (`--port 8011`): ready in 42 s, 88.5 GB allocated, streaming chat, `/v1/messages`, `reasoning_effort`, `/metrics` all
+  answer; 19 to 20 tok/s plain decode (the per-step host row read with 23% cache misses costs the difference to the 46 ms
+  graph step). The 27B is byte-identical (the session digest d4f42e84... of round 1 again). `NOT_SERVED_YET` is empty.
+  Open: the decode speed (the row reads; the hyper-connections on the skinny GEMM), a row prefetch between the scheduler's
+  chunks, about 5.6 GB of growth during the first long prompts (the warm-up covers it; the reserve is 6 GB), and the
+  drafter's wiring (the ring's drafter hidden of 10240, the drafter's ik / ikb / rope_pos rows in the sessions, a k model
+  from the distinct-expert count).
+- **Next:** the prefill assembly and long context on the real checkpoint (M2) and the MTP drafter (M3) are in progress.
