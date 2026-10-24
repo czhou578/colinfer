@@ -170,6 +170,11 @@ or anything that reaches outside the worktree.
 > `kill_below_gb` guard kills the task when the available memory falls under its limit, but a single large allocation
 > can get past it. For this repository, allow `tests/check.sh --quick` and `uv run pytest tests/` only.
 
+**The Stop hook.** This repository has a Stop hook that runs ruff and pytest when a turn of Claude Code ends with
+changed code (`docs/review.md`). The night shift sets `COLINFER_STOP_CHECK=0`, so the hook does not run in a task. To
+let the hook check the work of a task, set `COLINFER_STOP_CHECK = "1"` in the `env` of the task. Each check then takes
+about a minute, and a failed check sends the model back to fix it, up to three times.
+
 **Memory.** A task starts only with `min_free_gb` available (`MemAvailable`; the GPU allocations of the server count,
 since the memory is unified). A running task is killed below `kill_below_gb`.
 

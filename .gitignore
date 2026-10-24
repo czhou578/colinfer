@@ -23,3 +23,6 @@ cufile.log
 
 # parity harness outputs (large .pt files)
 tests/parity_out/
+
+# review harness (docs/review.md): the scratch of each run, with its repros and eval worktrees
+.review/runs/

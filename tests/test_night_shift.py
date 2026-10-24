@@ -24,7 +24,7 @@ argv = sys.argv[1:]
 prompt = argv[argv.index("-p") + 1]
 with open(os.environ["FAKE_CLAUDE_LOG"], "w") as f:
     json.dump({{"argv": argv, "cwd": os.getcwd(),
-               "env": {{k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_")) or k == "EXTRA"}}}}, f)
+               "env": {{k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_", "COLINFER_")) or k == "EXTRA"}}}}, f)
 emit = lambda **o: print(json.dumps(o), flush=True)
 emit(type="system", subtype="init", session_id="sess-1")
 if "EDIT" in prompt:
@@ -135,7 +135,7 @@ def test_done_and_no_changes(env):
     assert os.path.realpath(log["cwd"]) == os.path.realpath(r1.tree)
     e = log["env"]
     assert e["ANTHROPIC_BASE_URL"] == env.settings.server and e["ANTHROPIC_MODEL"] == "qwen3.8-27b" and e["ANTHROPIC_AUTH_TOKEN"] == "colinfer"
-    assert e["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0" and e["EXTRA"] == "1"
+    assert e["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0" and e["EXTRA"] == "1" and e["COLINFER_STOP_CHECK"] == "0"  # no Stop hook
     # the report and the per-task record
     with open(os.path.join(s.run_dir, "report.md")) as f:
         rep = f.read()

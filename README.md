@@ -80,6 +80,8 @@ under systemd. `docs/claude_code.md` tells you how to use the model from Claude 
 CLI: a local gateway (`engine/server/gateway.py`, `deploy/colinfer-gateway.service`) puts Claude and Qwen in one model
 picker. `docs/night_shift.md` runs a list of Claude Code tasks against the server at night, each on its own branch
 (`tools/night_shift.py`).
+`docs/review.md` reviews a finished feature with `/reviewing-features` in Claude Code: parallel finders for slop, security
+and races, refuters, fixes and capped re-review rounds (`REVIEW.md`, `.claude/`, `tools/review.py`).
 
 ## How it works
 
@@ -123,9 +125,9 @@ decision. In short:
 | `engine/weights/` | checkpoint loading and dequantization (`loader.py`), weight quantizers (`quantize.py`), the fake NVFP4 activation quantization that the kernel tests compare against (`quant_emul.py`) |
 | `csrc/` | CUDA kernels and their Torch bindings (`bindings.cpp`). CUTLASS is a submodule in `csrc/third_party`. |
 | `tests/` | unit tests (`pytest tests/`) and end-to-end checks (`golden.py`, `scheduler_check.py`, `perplexity.py`, ...) |
-| `tools/` | offline artifacts (decode copies, drafter training, low-rank head), checkpoint utilities, the night shift (`night_shift.py`: Claude Code tasks against the server while the machine idles) |
+| `tools/` | offline artifacts (decode copies, drafter training, low-rank head), checkpoint utilities, the night shift (`night_shift.py`: Claude Code tasks against the server while the machine idles), the bookkeeping of the review harness (`review.py`) |
 | `bench/` | decode / prefill / attention / GEMM / end-to-end benchmarks, nsys trace summaries |
-| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `night_shift.md` (Claude Code tasks at night), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project, and `PLAN.md`, the original plan of 2026-09-30. |
+| `docs/` | `architecture.md` (the current design), `server.md` (how to run the server), `claude_code.md` (how to connect Claude Code), `night_shift.md` (Claude Code tasks at night), `review.md` (the review harness), `checkpoints.md` (the checkpoints on this machine). `history/` holds the dated logs and measurements of the project, and `PLAN.md`, the original plan of 2026-09-30. |
 
 ## Testing
 

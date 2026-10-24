@@ -1,0 +1,2 @@
+# The ledger of the review harness only grows (tools/review.py): two branches append to it without a conflict.
+.review/ledger.jsonl merge=union
