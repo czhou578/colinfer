@@ -1,5 +1,5 @@
 """The bookkeeping of the review harness (tools/review.py) on a small git repository per test: the scope of a run, the
-snapshots, the ledger and the eval score."""
+checks and the Stop hook, the export, the snapshots, the ledger and the eval score."""
 import json
 import os
 
@@ -28,12 +28,69 @@ def write(repo, name, text):
         f.write(text)
 
 
+def read(repo, name):
+    with open(os.path.join(repo, name)) as f:
+        return f.read()
+
+
+def with_checks(repo, **kw):
+    """REVIEW.md with a Checks section: one bullet per key (an underscore stands for a dash), the values in backticks."""
+    bullets = [f"- `{k.replace('_', '-')}`: " + ", ".join(f"`{x}`" for x in (v if isinstance(v, (list, tuple)) else [v]))
+               for k, v in kw.items()]
+    write(repo, "REVIEW.md", REVIEW_MD + "\n## Checks\n\nThe hook reads this section.\n\n" + "\n".join(bullets) + "\n")
+
+
 def finding(**kw):
     return {"lens": "security", "severity": "high", "file": "a.py", "title": "t", "bug_class": "c"} | kw
 
 
 def test_skip_paths_come_from_the_skip_section_only(repo):
     assert rv.skip_paths(repo) == [".review", "vendor", "*.lock"]
+    with_checks(repo, code=["a.py"], lint="true")
+    assert rv.skip_paths(repo) == [".review", "vendor", "*.lock"]  # the bullets of the Checks section are not paths
+
+
+def test_checks_come_from_the_checks_section(repo):
+    assert rv.checks(repo) == {}
+    with_checks(repo, code=["a.py", "src"], lint="ruff check .", test="pytest -q -x", full="make check",
+                full_for=["src/core", "*.cu"], min_gb="16")
+    assert rv.checks(repo) == {"code": ["a.py", "src"], "lint": "ruff check .", "test": "pytest -q -x", "full": "make check",
+                               "full-for": ["src/core", "*.cu"], "min-gb": 16.0}
+    with_checks(repo, lint="true", min_gb="sixteen")
+    with pytest.raises(rv.ReviewError, match="min-gb"):
+        rv.checks(repo)
+
+
+def test_init_writes_the_contract_and_the_git_lines(tmp_path):
+    r = make_repo(str(tmp_path / "repo"))
+    write(r, ".gitignore", "*.pyc")  # no final newline
+    done = rv.init(r)
+    assert done[0].startswith("REVIEW.md: written") and rv.checks(r) == {}  # the template's example is not a live Checks section
+    assert read(r, ".gitignore") == "*.pyc\n.review/runs/\n.review/cache/\n"
+    assert read(r, ".gitattributes") == ".review/ledger.jsonl merge=union\n"
+    assert rv.init(r) == ["REVIEW.md exists: left as it is"]  # a second init changes nothing
+    assert read(r, ".gitignore").count(".review/runs/") == 1
+
+
+def test_export_copies_the_harness_and_adds_the_stop_hook(tmp_path):
+    src = os.path.dirname(os.path.dirname(os.path.abspath(rv.__file__)))  # this repository
+    target = make_repo(str(tmp_path / "other"))
+    write(target, ".claude/settings.json", json.dumps({"permissions": {"allow": ["Bash(ls *)"]}}))
+    done = rv.export(src, target)
+    for rel in (".claude/agents/refuter.md", ".claude/skills/reviewing-features/SKILL.md", ".claude/review/slop-detector.md",
+                ".claude/review/REVIEW.template.md", ".claude/hooks/quick-check.sh", "tools/review.py", "REVIEW.md"):
+        assert os.path.isfile(os.path.join(target, rel)), rel
+    assert os.access(os.path.join(target, ".claude/hooks/quick-check.sh"), os.X_OK)
+    settings = json.loads(read(target, ".claude/settings.json"))
+    assert settings["permissions"] == {"allow": ["Bash(ls *)"]} and settings["hooks"]["Stop"] == [{"hooks": [rv.STOP_HOOK]}]
+    assert any(x.startswith("REVIEW.md: written") for x in done) and ".review/runs/" in read(target, ".gitignore")
+    write(target, "REVIEW.md", "# mine\n")
+    rv.export(src, target)  # a second export keeps REVIEW.md and adds no second hook
+    assert read(target, "REVIEW.md") == "# mine\n" and len(json.loads(read(target, ".claude/settings.json"))["hooks"]["Stop"]) == 1
+    with pytest.raises(rv.ReviewError, match="this repository"):
+        rv.export(src, src)
+    with pytest.raises(rv.ReviewError, match="not a git repository"):
+        rv.export(src, str(tmp_path / "nowhere"))
 
 
 def test_snapshot_sees_untracked_files_and_leaves_the_index(repo):
@@ -74,6 +131,64 @@ def test_nothing_to_review_names_a_base(repo):
     assert [f["path"] for f in rv.scope(repo)["files"]] == ["a.py"]
 
 
+def test_gate_selects_the_full_check_for_its_paths(repo):
+    with_checks(repo, lint="true", test="true", full="make check", full_for=["src/core", "*.cu"])
+    write(repo, "a.py", "x = 2\n")
+    assert rv.gate(repo, rv.scope(repo)["run"]) == "quick"
+    write(repo, "k.cu", "__global__\n")
+    assert rv.gate(repo, rv.scope(repo)["run"]) == "full: make check"  # the glob
+    os.remove(os.path.join(repo, "k.cu"))
+    write(repo, "src/core/k.py", "y = 1\n")
+    assert rv.gate(repo, rv.scope(repo)["run"]) == "full: make check"  # a file under the directory
+    write(repo, "REVIEW.md", REVIEW_MD)
+    assert rv.gate(repo, rv.scope(repo)["run"]).startswith("none")
+
+
+def test_check_runs_lint_then_tests_and_records_a_pass(repo):
+    with_checks(repo, code=["a.py", "missing"], lint="echo linted", test="echo tested")
+    rc, out = rv.run_check(repo)
+    assert rc == 0 and "linted" in out and "tested" in out
+    assert read(repo, ".review/cache/passed") == rv.snapshot(repo, ("a.py",))  # a code path that matches nothing is left out
+    with_checks(repo, lint="echo linted", test="echo broken; exit 1")
+    rc, out = rv.run_check(repo)
+    assert rc == 1 and "broken" in out and read(repo, ".review/cache/last.log") == out
+    with_checks(repo, lint="exit 1", test="echo tested")
+    rc, out = rv.run_check(repo)
+    assert rc == 1 and "tested" not in out  # the tests do not run after a lint failure
+    with_checks(repo, lint="echo linted", test="echo tested", min_gb="1000000")
+    rc, out = rv.run_check(repo)
+    assert rc == 3 and "did not run" in out and "tested" not in out
+    write(repo, "REVIEW.md", REVIEW_MD)
+    with pytest.raises(rv.ReviewError, match="Checks"):
+        rv.run_check(repo)
+
+
+def test_the_stop_hook_blocks_a_failing_check_at_most_three_times(repo):
+    def hook(active=False, **env):
+        return rv.stop_hook(repo, {"stop_hook_active": active}, env)
+    with_checks(repo, code=["a.py"], lint="true", test="exit 1")
+    assert hook() == (0, "", "")  # the code equals HEAD
+    write(repo, "a.py", "x = 2\n")
+    assert hook(REVIEW_STOP_CHECK="0") == (0, "", "")  # the kill switch
+    rc, out, err = hook()
+    assert rc == 2 and out == "" and "Fix the cause" in err and "$ exit 1" in err
+    assert read(repo, ".review/cache/blocks") == "1"
+    assert hook(active=True)[0] == 2 and hook(active=True)[0] == 2 and read(repo, ".review/cache/blocks") == "3"
+    rc, out, err = hook(active=True)
+    assert rc == 0 and err == "" and "still failing after 3 attempts" in json.loads(out)["systemMessage"]
+    assert hook()[0] == 2 and read(repo, ".review/cache/blocks") == "1"  # a new turn: the count starts again
+    with_checks(repo, code=["a.py"], lint="true", test="exit 1", min_gb="1000000")
+    rc, out, err = hook()
+    assert rc == 0 and "did not run" in json.loads(out)["systemMessage"]  # too little memory: a message, no block
+    with_checks(repo, code=["a.py"], lint="true", test="true")
+    assert hook() == (0, "", "") and read(repo, ".review/cache/passed") == rv.snapshot(repo, ("a.py",))
+    with_checks(repo, code=["a.py"], lint="true", test="exit 1")
+    assert hook() == (0, "", "")  # the same code as the last pass: the check does not run again
+    write(repo, "a.py", "x = 3\n")
+    write(repo, "REVIEW.md", REVIEW_MD)
+    assert hook() == (0, "", "")  # no Checks section: nothing to do
+
+
 def test_the_last_decision_wins(repo):
     ids = rv.add(repo, "r1", [finding(title="first"), finding(lens="slop", severity="low", title="second")])
     assert ids == ["r1.1", "r1.2"]
@@ -105,6 +220,7 @@ def test_known_lists_the_run_and_the_unfixed_earlier_findings_on_its_files(repo)
 
 def test_diff_refuses_an_option_in_place_of_a_snapshot(repo, monkeypatch):
     monkeypatch.chdir(repo)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     out = os.path.join(repo, "written")
     with pytest.raises(rv.ReviewError):
         rv.main(["diff", "--", f"--output={out}", "HEAD"])

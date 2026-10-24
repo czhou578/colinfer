@@ -242,7 +242,7 @@ def claude_env(settings: Settings, task: Task) -> dict[str, str]:
     env.update(ANTHROPIC_BASE_URL=settings.server, ANTHROPIC_AUTH_TOKEN=key, ANTHROPIC_API_KEY=key, ANTHROPIC_MODEL=model,
                ANTHROPIC_DEFAULT_OPUS_MODEL=model, ANTHROPIC_DEFAULT_SONNET_MODEL=model, ANTHROPIC_DEFAULT_HAIKU_MODEL=model,
                CLAUDE_CODE_ATTRIBUTION_HEADER="0", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1",
-               COLINFER_STOP_CHECK="0")  # this repository's Stop hook (docs/review.md): a task's env can set it to 1
+               REVIEW_STOP_CHECK="0")  # the Stop hook of the review harness (docs/review.md): a task's env can set it to 1
     env.update({k: os.path.expanduser(str(v)) for k, v in task.env.items()})
     return env
 

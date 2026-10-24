@@ -1,25 +1,35 @@
 """The bookkeeping of the review harness (.claude/skills/reviewing-features/SKILL.md, docs/review.md). The model does the
 judgment: the finders, the refuters and the fixes. This script does the parts that must give the same answer each time:
-the scope of a review, the snapshots of the working tree, the ledger of findings and the score of the eval set.
+the scope of a review, the checks, the snapshots of the working tree, the ledger of findings and the score of the eval
+set. Run it from inside the repository under review.
 
-  python3 tools/review.py scope [BASE]                 # a new run: .review/runs/<run>/scope.json and diff.patch
-  python3 tools/review.py snapshot [--paths P ...]     # a hash of the working tree, untracked files included
-  python3 tools/review.py diff A B                     # the diff between two snapshots, without the skipped paths
+  python3 tools/review.py init                           # REVIEW.md from the template; the .review lines of .gitignore and .gitattributes
+  python3 tools/review.py export TARGET                  # copy the harness into another repository, and init it there
+  python3 tools/review.py scope [BASE]                   # a new run: .review/runs/<run>/scope.json and diff.patch
+  python3 tools/review.py gate RUN                       # the check that the run needs: "quick", "full: <command>" or "none"
+  python3 tools/review.py check                          # the quick check: the lint and test commands of REVIEW.md; records a pass
+  python3 tools/review.py stop-hook                      # the Stop hook of Claude Code: the quick check when the code changed
+  python3 tools/review.py snapshot [--paths P ...]       # a hash of the working tree, untracked files included
+  python3 tools/review.py diff A B                       # the diff between two snapshots, without the skipped paths
   python3 tools/review.py add RUN FINDINGS.json [--round N]   # append findings to the ledger; prints their ids
-  python3 tools/review.py decide ID DECISION [NOTE]    # what happened to a finding: one of DECISIONS
-  python3 tools/review.py known [RUN]                  # the findings that the finders must not report again
-  python3 tools/review.py stats                        # the decisions per lens: how noisy each lens is
-  python3 tools/review.py recurring                    # bug classes fixed in two or more runs: candidates for a rule
-  python3 tools/review.py eval-setup [--baseline]      # a run with one worktree per case of .review/evals/cases.jsonl
-  python3 tools/review.py eval-score RUN               # the score of that run's results.json; removes its worktrees
+  python3 tools/review.py decide ID DECISION [NOTE]      # what happened to a finding: one of DECISIONS
+  python3 tools/review.py known [RUN]                    # the findings that the finders must not report again
+  python3 tools/review.py stats                          # the decisions per lens: how noisy each lens is
+  python3 tools/review.py recurring                      # bug classes fixed in two or more runs: candidates for a rule
+  python3 tools/review.py eval-setup [--baseline]        # a run with one worktree per case of .review/evals/cases.jsonl
+  python3 tools/review.py eval-score RUN                 # the score of that run's results.json; removes its worktrees
 
-The ledger (.review/ledger.jsonl) only grows: a decision is a new line for the same id, and the last line wins. Thus two
-branches that both append to it merge without a conflict (.gitattributes: merge=union).
+The harness is generic: the files of HARNESS, and this script. REVIEW.md at the root of the repository is the contract
+of the project (.claude/review/REVIEW.template.md). Its "Skip" section lists the paths that no diff shows. Its "Checks"
+section gives the code paths and the check commands. The ledger (.review/ledger.jsonl) only grows: a decision is a new
+line for the same id, and the last line wins. Thus two branches that both append to it merge without a conflict
+(.gitattributes: merge=union).
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import os
@@ -29,16 +39,26 @@ import subprocess
 import sys
 import tempfile
 
+SCRIPT_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repository that holds this copy of the script
+# The files of the harness. `export` copies them into another repository; the project-specific text stays in REVIEW.md.
+HARNESS = (".claude/agents", ".claude/skills/reviewing-features", ".claude/review", ".claude/hooks/quick-check.sh", "tools/review.py")
+TEMPLATE = os.path.join(SCRIPT_REPO, ".claude/review/REVIEW.template.md")
+STOP_HOOK = {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/quick-check.sh", "args": ["--stop-hook"], "timeout": 900}
+# The text of the reviewers. An eval score compares with an earlier one only when this text is the same.
+PROMPT_FILES = ("REVIEW.md", ".claude/review", ".claude/agents", ".claude/skills/reviewing-features")
 LEDGER = ".review/ledger.jsonl"
 RUNS = ".review/runs"
+CACHE = ".review/cache"  # the state of the Stop hook: the fingerprint of the last pass, its log, the block count
 CASES = ".review/evals/cases.jsonl"
 HISTORY = ".review/evals/history.jsonl"
+GIT_IGNORE = (".review/runs/", ".review/cache/")
+GIT_ATTRIBUTES = ".review/ledger.jsonl merge=union"
+STOP_SWITCH = "REVIEW_STOP_CHECK"  # =0 turns the Stop hook off
+MAX_BLOCKS = 3  # the Stop hook blocks the end of a turn at most this often in a row
 LENSES = ("slop", "security", "memrace")
 SEVERITIES = ("critical", "high", "medium", "low")
 DECISIONS = ("open", "fixed", "wrong", "intentional", "not-worth-it", "backlog")
 DISMISSED = ("wrong", "intentional", "not-worth-it")
-# The text of the reviewers. An eval score compares with an earlier one only when this text is the same.
-PROMPT_FILES = ("REVIEW.md", ".claude/review", ".claude/agents", ".claude/skills/reviewing-features")
 BASELINE = "baseline"  # the prompt_hash of a run of Claude without the harness (eval-mode.md)
 
 
@@ -65,19 +85,100 @@ def now() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
-# ------------------------------------------------------------------------------------------------------ scope and diffs
+def read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+# -------------------------------------------------------------------------------------------------------------- REVIEW.md
+def section(repo: str, title: str) -> str:
+    """The text of the "## <title>" section of REVIEW.md, or "" when the file or the section does not exist."""
+    m = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", read(os.path.join(repo, "REVIEW.md")), re.M | re.S)
+    return m.group(1) if m else ""
+
+
 def skip_paths(repo: str) -> list[str]:
     """The paths in the "## Skip" section of REVIEW.md, one `path` per bullet, and .review itself. No diff of the
     harness shows them, so no finder reads them."""
+    return [".review", *re.findall(r"^- `([^`]+)`", section(repo, "Skip"), re.M)]
+
+
+def checks(repo: str) -> dict:
+    """The "## Checks" section of REVIEW.md: one bullet per key, each value in backticks. `code` and `full-for` are
+    lists of paths, `lint`, `test` and `full` are commands, `min-gb` is a number. {} without the section."""
+    out: dict = {}
+    for key, rest in re.findall(r"^- `([a-z-]+)`:(.*)$", section(repo, "Checks"), re.M):
+        values = re.findall(r"`([^`]*)`", rest)
+        if key in ("code", "full-for"):
+            out[key] = values
+        elif key == "min-gb":
+            try:
+                out[key] = float(values[0]) if values else None
+            except ValueError:
+                raise ReviewError(f"REVIEW.md, Checks: min-gb must be a number in backticks, not {values[0]!r}") from None
+        elif values:
+            out[key] = values[0]
+    return out
+
+
+def init(repo: str) -> list[str]:
+    """REVIEW.md from the template, when the repository has none, and the .review lines of .gitignore and
+    .gitattributes. Returns one line per file, with what happened to it."""
+    done = []
+    target = os.path.join(repo, "REVIEW.md")
+    if os.path.exists(target):
+        done.append("REVIEW.md exists: left as it is")
+    else:
+        shutil.copyfile(TEMPLATE, target)
+        done.append("REVIEW.md: written from the template; fill in each section")
+    for name, lines in ((".gitignore", GIT_IGNORE), (".gitattributes", (GIT_ATTRIBUTES,))):
+        path = os.path.join(repo, name)
+        have = read(path)
+        missing = [x for x in lines if x not in have.splitlines()]
+        if missing:
+            with open(path, "a") as f:
+                f.write(("" if not have or have.endswith("\n") else "\n") + "\n".join(missing) + "\n")
+            done.append(f"{name}: added {', '.join(missing)}")
+    return done
+
+
+def export(repo: str, target: str) -> list[str]:
+    """Copies the files of the harness (HARNESS) from this repository into another one, adds the Stop hook to its
+    .claude/settings.json, and runs init there. It overwrites the harness files of the target, and never its REVIEW.md
+    or its ledger. Returns one line per step."""
     try:
-        with open(os.path.join(repo, "REVIEW.md")) as f:
-            text = f.read()
-    except FileNotFoundError:
-        text = ""
-    m = re.search(r"^## Skip\n(.*?)(?=^## |\Z)", text, re.M | re.S)
-    return [".review", *(re.findall(r"^- `([^`]+)`", m.group(1), re.M) if m else [])]
+        target = git(os.path.abspath(target), "rev-parse", "--show-toplevel")
+    except ReviewError:
+        raise ReviewError(f"{target} is not a git repository") from None
+    if os.path.samefile(target, repo):
+        raise ReviewError("the target is this repository: pass the path of another one")
+    for rel in HARNESS:
+        src, dst = os.path.join(repo, rel), os.path.join(target, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)  # keeps the executable bit of the hook
+    done = [f"copied {', '.join(HARNESS)} into {target}"]
+    path = os.path.join(target, ".claude/settings.json")
+    try:
+        settings = json.loads(read(path) or "{}")
+    except json.JSONDecodeError as e:
+        raise ReviewError(f"{path} is not valid JSON ({e}): add the Stop hook of docs/review.md yourself") from None
+    stops = settings.setdefault("hooks", {}).setdefault("Stop", [])
+    if not any(h.get("command") == STOP_HOOK["command"] for group in stops for h in group.get("hooks", [])):
+        stops.append({"hooks": [dict(STOP_HOOK)]})
+        with open(path, "w") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+        done.append(".claude/settings.json: added the Stop hook")
+    return done + init(target)
 
 
+# ------------------------------------------------------------------------------------------------------ scope and diffs
 def pathspec(repo: str) -> list[str]:
     return ["--", ".", *(f":(exclude){p}" for p in skip_paths(repo))]
 
@@ -155,6 +256,103 @@ def load_scope(repo: str, run: str) -> dict:
             return json.load(f)
     except FileNotFoundError:
         raise ReviewError(f"no run {run} in {RUNS}") from None
+
+
+# ---------------------------------------------------------------------------------------------------------------- checks
+def matches(path: str, pattern: str) -> bool:
+    """A path of the scope against an entry of `full-for`: the entry itself, a path under it, or a glob."""
+    p = pattern.rstrip("/")
+    return path == p or path.startswith(p + "/") or fnmatch.fnmatch(path, pattern)
+
+
+def gate(repo: str, run: str) -> str:
+    """The check that a run needs: "full: <command>" when a file of the scope matches `full-for`, else "quick"."""
+    cfg = checks(repo)
+    if not cfg:
+        return "none: REVIEW.md has no Checks section"
+    if cfg.get("full") and any(matches(f["path"], p) for f in load_scope(repo, run)["files"] for p in cfg.get("full-for", [])):
+        return f"full: {cfg['full']}"
+    return "quick"
+
+
+def code_paths(repo: str, cfg: dict) -> tuple[str, ...]:
+    """The `code` paths of the Checks section that exist, on disk or in the index: the fingerprint of the Stop hook. A
+    path that matches nothing would fail `git add`. () means the whole tree."""
+    return tuple(p for p in cfg.get("code", []) if os.path.exists(os.path.join(repo, p)) or git(repo, "ls-files", "--", p))
+
+
+def available_gb() -> float | None:
+    """MemAvailable of /proc/meminfo in GB, or None where the file does not exist."""
+    for line in read("/proc/meminfo").splitlines():
+        if line.startswith("MemAvailable"):
+            return int(line.split()[1]) / 1048576
+    return None
+
+
+def run_check(repo: str) -> tuple[int, str]:
+    """The quick check of the Checks section: the lint command, then the test command, each through a shell at the root
+    of the repository. Returns the exit status and the output: 0 passed, 1 failed, 3 the tests did not run because less
+    than `min-gb` of memory is available. On a pass, records the fingerprint of the code paths (taken before the check),
+    so the Stop hook does not run the check again on the same code. Writes the output to .review/cache/last.log."""
+    cfg = checks(repo)
+    if not cfg:
+        raise ReviewError("REVIEW.md has no Checks section: see .claude/review/REVIEW.template.md")
+    fingerprint = snapshot(repo, code_paths(repo, cfg))
+    out, rc = [], 0
+    for key in ("lint", "test"):
+        cmd = cfg.get(key)
+        if not cmd:
+            continue
+        gb = available_gb() if key == "test" and cfg.get("min-gb") is not None else None
+        if gb is not None and gb < cfg["min-gb"]:
+            out.append(f"quick-check: the tests did not run, {gb:.0f} GB of memory available (they need {cfg['min-gb']:.0f} GB)")
+            rc = 3
+            break
+        r = subprocess.run(cmd, shell=True, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out.append(f"$ {cmd}\n{r.stdout}")
+        if r.returncode:
+            rc = 1
+            break
+    text = "\n".join(out)
+    cache = os.path.join(repo, CACHE)
+    os.makedirs(cache, exist_ok=True)
+    with open(os.path.join(cache, "last.log"), "w") as f:
+        f.write(text)
+    if rc == 0:
+        with open(os.path.join(cache, "passed"), "w") as f:
+            f.write(fingerprint)
+    return rc, text
+
+
+def stop_hook(repo: str, payload: dict, env: dict) -> tuple[int, str, str]:
+    """The Stop hook of Claude Code: (exit status, stdout, stderr). Exit 2, with the failure on stderr, blocks the end
+    of the turn. The hook does nothing with REVIEW_STOP_CHECK=0, without a Checks section, when the code paths equal
+    HEAD, or when they equal the code of the last pass. It blocks at most MAX_BLOCKS times in a row (the payload's
+    stop_hook_active tells a repeated end of the same turn); then the turn ends with a message."""
+    if env.get(STOP_SWITCH, "1") == "0":
+        return 0, "", ""
+    cfg = checks(repo)
+    if not cfg:
+        return 0, "", ""
+    paths = code_paths(repo, cfg)
+    if not git(repo, "status", "--porcelain", "--", *(paths or ["."])):
+        return 0, "", ""
+    cache = os.path.join(repo, CACHE)
+    if snapshot(repo, paths) == read(os.path.join(cache, "passed")):
+        return 0, "", ""
+    blocks = int(read(os.path.join(cache, "blocks")) or 0) if payload.get("stop_hook_active") else 0  # a new turn starts the count again
+    if blocks >= MAX_BLOCKS:
+        msg = f"quick-check: still failing after {MAX_BLOCKS} attempts; the turn ends. Output: {CACHE}/last.log"
+        return 0, json.dumps({"systemMessage": msg}), ""
+    rc, out = run_check(repo)
+    if rc == 0:
+        return 0, "", ""
+    if rc == 3:
+        return 0, json.dumps({"systemMessage": out.splitlines()[-1]}), ""
+    with open(os.path.join(cache, "blocks"), "w") as f:
+        f.write(str(blocks + 1))
+    tail = "\n".join(out.splitlines()[-60:])
+    return 2, "", f"quick-check failed (lint, then tests). Fix the cause before you end the turn. The last lines of the output:\n{tail}\n"
 
 
 # ---------------------------------------------------------------------------------------------------------------- ledger
@@ -247,6 +445,7 @@ def recurring(repo: str, min_runs: int = 2) -> list[str]:
 
 # ------------------------------------------------------------------------------------------------------------------ eval
 def prompt_hash(repo: str) -> str:
+    """A hash of the text of the reviewers (PROMPT_FILES)."""
     h = hashlib.sha256()
     for p in PROMPT_FILES:
         full = os.path.join(repo, p)
@@ -266,7 +465,7 @@ def eval_setup(repo: str, baseline: bool = False) -> dict:
         with open(os.path.join(repo, CASES)) as f:
             cases = [json.loads(x) for x in f if x.strip()]
     except FileNotFoundError:
-        raise ReviewError(f"no eval set: write the cases into {CASES} (docs/review.md)") from None
+        raise ReviewError(f"no eval set: write the cases into {CASES} (docs/review.md, section 6)") from None
     run, d = new_run(repo)
     for c in cases:
         c["dir"] = os.path.join(os.path.relpath(d, repo), "trees", c["name"])
@@ -336,11 +535,18 @@ def eval_score(repo: str, run: str) -> list[str]:
 
 
 # ------------------------------------------------------------------------------------------------------------------ main
-def main(argv=None):
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="the bookkeeping of the review harness (docs/review.md)")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="REVIEW.md from the template, and the .review lines of .gitignore and .gitattributes")
+    p = sub.add_parser("export", help="copy the harness into another repository, and init it there")
+    p.add_argument("target")
     p = sub.add_parser("scope", help="a new run: the files and the diff against BASE (default: the merge base with main)")
     p.add_argument("base", nargs="?")
+    p = sub.add_parser("gate", help="the check that a run needs: quick, full: <command>, or none")
+    p.add_argument("run")
+    sub.add_parser("check", help="the quick check of REVIEW.md: the lint command, then the test command")
+    sub.add_parser("stop-hook", help="the Stop hook of Claude Code: the hook's JSON on stdin; exit 2 blocks the end of the turn")
     p = sub.add_parser("snapshot", help="a hash of the working tree, untracked files included")
     p.add_argument("--paths", nargs="+", default=[])
     p = sub.add_parser("diff", help="the diff between two snapshots, without the skipped paths")
@@ -363,11 +569,35 @@ def main(argv=None):
     p = sub.add_parser("eval-score", help="score an eval run's results.json; removes its worktrees")
     p.add_argument("run")
     a = ap.parse_args(argv)
-    repo = git(os.getcwd(), "rev-parse", "--show-toplevel")
-    if a.cmd == "scope":
+    try:
+        repo = git(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), "rev-parse", "--show-toplevel")
+    except ReviewError:
+        if a.cmd == "stop-hook":
+            return 0  # not a repository: nothing to check
+        raise
+    if a.cmd == "init":
+        print("\n".join(init(repo)))
+    elif a.cmd == "export":
+        print("\n".join(export(repo, a.target)))
+    elif a.cmd == "scope":
         s = scope(repo, a.base)
         print(f"run {s['run']}: {len(s['files'])} files, +{s['added']} -{s['removed']} lines against {s['base'][:9]} ({s['base_ref']})")
         print(f"  {s['dir']}/scope.json, {s['dir']}/diff.patch; snapshot {s['snapshot']}")
+    elif a.cmd == "gate":
+        print(gate(repo, a.run))
+    elif a.cmd == "check":
+        rc, out = run_check(repo)
+        sys.stdout.write(out)
+        return rc
+    elif a.cmd == "stop-hook":
+        try:
+            payload = json.load(sys.stdin)
+        except (json.JSONDecodeError, OSError):
+            payload = {}
+        rc, out, err = stop_hook(repo, payload if isinstance(payload, dict) else {}, dict(os.environ))
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        return rc
     elif a.cmd == "snapshot":
         print(snapshot(repo, tuple(a.paths)))
     elif a.cmd == "diff":
@@ -388,11 +618,12 @@ def main(argv=None):
         lines = {"known": lambda: known(repo, a.run), "stats": lambda: stats(repo), "recurring": lambda: recurring(repo),
                  "eval-score": lambda: eval_score(repo, a.run)}[a.cmd]()
         print("\n".join(lines) if lines else "(none)")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except ReviewError as e:
         print(f"review.py: {e}", file=sys.stderr)
         sys.exit(1)

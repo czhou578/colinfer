@@ -1,7 +1,7 @@
 # Review rules
 
 The reviewers of colinfer read this file: the finders and the refuters of the `reviewing-features` skill
-(`.claude/agents/`), and later the review of pull requests on GitHub. It tells a reviewer what failure looks like in
+(`.claude/agents/`, see `docs/review.md`), and later the review of pull requests on GitHub. It tells a reviewer what failure looks like in
 this repository. Keep it short. This file is complete in itself: no section sends you to a further file.
 
 ## Contents
@@ -10,10 +10,14 @@ this repository. Keep it short. This file is complete in itself: no section send
 - [What failure looks like here](#what-failure-looks-like-here): the six failures, in order of cost
 - [Concurrency map](#concurrency-map): the threads and streams, and what they share
 - [Trust boundaries](#trust-boundaries)
+- [Conventions](#conventions): what the slop lens checks a patch against
+- [Security checklist](#security-checklist): what the security lens traces first
+- [Repro](#repro): how the memrace verifier runs a test on this machine
 - [Not findings](#not-findings): the intentional choices
 - [Severity](#severity), [Feasibility](#feasibility), [Triage](#triage)
 - [Evidence](#evidence): what a finding must cite
 - [Skip](#skip): the paths that no reviewer reads
+- [Checks](#checks): the check commands, for the gate of a review and the Stop hook
 
 ## What colinfer is
 
@@ -59,6 +63,63 @@ without speculation, bit for bit.
 - **Trusted:** the checkpoints in the Hugging Face cache, the command-line flags, the night-shift task file.
 - **The engine's own files:** the session cache and the prepared directory under `~/.cache/colinfer`. The engine
   wrote them, but a damaged file must fail its read, not the server.
+
+## Conventions
+
+The slop lens checks a patch against these conventions. Several commits removed duplication on purpose: one definition
+of the kernel shapes (`csrc/shapes.h`), one `build_engine()` for the server, the checks and the benchmarks
+(`engine/runtime/build.py`), one `MODEL`, one timing loop, the server's defaults in `ServerConfig`
+(`engine/server/worker.py`). A patch that adds a second copy of one of these is a finding.
+
+- Client errors are 400s. Server bugs are 500s with a traceback.
+- A comment tells why, not what. Module docstrings and docs use ASD-STE100 style (short sentences, active voice).
+- The tests run the real code on stubs (`tests/test_scheduler.py` `StubModel`, `tests/test_api.py` `FakeWorker`). A
+  test that only checks that a mock was called is a finding.
+- A flag that never changes on this machine is a finding (a commit removed ten of them).
+
+## Security checklist
+
+The security lens traces these first, in this order.
+
+1. **Client values that reach the engine thread.** A value from a request body that reaches the engine thread or the
+   GPU without a check in the HTTP layer (`engine/server/api.py`, `openai.py`, `anthropic.py`): token ids, sampling
+   values, sizes, stop lists, tool schemas, JSON schemas, and the `int()` and `float()` of JSON values (`Infinity`
+   parses).
+2. **A cost without a limit from one request.** Memory first (failure 3), then time: the grammar compile of a JSON
+   schema, the template render, the decode of an image, the prefill of a long prompt. The limits are `max_queue`, `max_body_bytes`, the prompt text (`max_text_bytes`),
+   `max_output_tokens`, `max_request_seconds`, `image_max_pixels` and the context length. Look for a path around them.
+3. **Images.** The decode of client bytes with PIL: a decompression bomb, a size check after the decode instead of
+   before, a format that PIL should not open.
+4. **The gateway.** The `authorization` and `x-api-key` headers go to api.anthropic.com only, never to the local
+   server, never into a log. Routing by model name, the hop-by-hop headers, `follow_redirects=False`, the bind address.
+5. **Authentication and exposure.** The `--api-key` check (constant-time, which paths it covers), the bind address,
+   CORS, and what `/health`, `/metrics` and `/v1/status` show.
+6. **Files.** A path made from request data. The temporary file and rename of the session cache. `torch.load` without
+   `weights_only=True`, `np.load(allow_pickle=True)`, `pickle`.
+7. **Subprocesses.** `tools/night_shift.py` builds argument lists without a shell. Look for a shell, for task text in
+   a place where it becomes an option, for permission rules that widen, for `--dangerously-skip-permissions`, and for
+   keys in an environment or a log.
+8. **Logs.** A request body, a header or a key in a log line.
+
+## Repro
+
+The memrace verifier writes a repro test for one leak or race, and runs it. These are its limits on this machine.
+
+> **CAUTION:** The GPU and the host share 128 GB of unified memory. An over-commit powers off the machine without an
+> out-of-memory error. Before each command that uses the GPU, check the memory:
+> `awk '/MemAvailable/ {if ($2 < 16 * 1024 * 1024) {print "memory: " int($2 / 1048576) " GB available"; exit 1}}' /proc/meminfo && <command>`.
+> Never load the real model: no `build_engine`, no `tests/golden.py`, no `tests/scheduler_check.py`, no
+> `tests/check.sh` without `--quick`. Run one verifier at a time, and none while `tests/check.sh` runs.
+
+- The interpreter is `.venv/bin/python`: `.venv/bin/python -m pytest <file> -q -x`, so that a sanitizer wraps Python
+  and not `uv`.
+- Reuse the stubs: `StubModel`, `stub_prefill`, `Checked` and `prompt` of `tests/test_scheduler.py`, the `make`
+  fixture pattern of `tests/test_sessions.py`, `FakeWorker` and `client` of `tests/test_api.py`. The package `tests`
+  imports from any directory.
+- To hold a thread at a critical point, gate it with a `threading.Event` through `monkeypatch`, as
+  `test_a_ring_buffer_is_not_reused_while_its_save_is_pending` in `tests/test_sessions.py` does.
+- Each tool of the verifier's table was tested on this machine (GB10, CUDA 13.0, torch 2.14) on 2026-10-16: each one
+  caught a planted bug and passed the fixed version.
 
 ## Not findings
 
@@ -129,3 +190,15 @@ did not introduce goes to the backlog.
 - `docs/history`
 - `tests/golden`
 - `*.npy`
+
+## Checks
+
+`.claude/hooks/quick-check.sh`, the gate of a review and the Stop hook read this section. The full check loads the model and
+needs about 105 GB of free memory: stop the server first.
+
+- `code`: `engine`, `tests`, `tools`, `bench`, `csrc`, `pyproject.toml`
+- `lint`: `uv run ruff check engine tests tools bench`
+- `test`: `uv run pytest tests/ -q -x`
+- `full`: `tests/check.sh`
+- `full-for`: `engine/model`, `engine/spec`, `engine/runtime`, `engine/weights`, `csrc`
+- `min-gb`: `16`
