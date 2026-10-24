@@ -5,6 +5,7 @@
 // The weights stay in the layout of the checkpoint, the same tensors that the CUTLASS prefill GEMM reads:
 //   NVFP4  packed e2m1 [N, K/2] + e4m3 block scales [N, K/16] + fp32 global scale
 //   FP8    e4m3 [N, K] + per-tensor or per-row fp32 scale
+//   BF16   bf16 [N, K] (the router and the shared expert of qwen4_exp, which the checkpoint stores in BF16)
 // The dequantization into bf16 is exact (e2m1 x e4m3 has <= 5 significant bits), and the product runs on
 // mma.sync.m16n8k16 bf16 x bf16 -> fp32. Thus 16 activation rows cost about the same as 1 row: the weight stream, not the
 // math, sets the speed of the kernel. All decode linears run here: plain decode (1-3 rows), the speculative verify (up to
@@ -28,6 +29,9 @@
 // same few KB, from L1 / L2). The order is fixed, so each output row is bit-identical for any M: the rows >= M are zeros
 // and never touch the other rows.
 //
+// BF16: a 256-byte run is 128 k, so a chunk is 128 k (K % 128 == 0). In group S, lane t takes the 16 bf16 at 64S + 16q
+// (32 contiguous scratch bytes): the same k permutation as the other formats, and no conversion.
+//
 // INT6 / INT5 (tools/int6_requant.py): w = (c - 32 | 16) * e4m3 block scale (16 k) * global scale. c is a 6- or 5-bit
 // code in two planes. The low 4 bits are exactly like the nibbles of NVFP4, so they stream and land in the scratch the
 // same way. The high 2 (1) bits are a [N, K/4] ([N, K/8]) plane, 128 (64) B per row per chunk.
@@ -45,19 +49,20 @@
 
 #include "common.cuh"
 #include "pdl.cuh"
+#include "skinny_core.cuh"
 
 namespace skinny {
 using namespace cc;
 
-enum Fmt { NVFP4 = 0, FP8 = 1, INT6 = 2, INT5 = 3 };
+enum Fmt { NVFP4 = 0, FP8 = 1, INT6 = 2, INT5 = 3, BF16 = 4 };
 
 constexpr int WARPS = 4;  // warps per block (each 16 weight rows, or 8 gate + 8 up rows)
 
 template <int F> struct Cfg {
-    static constexpr bool BLK = F != FP8;                 // block-scaled (NVFP4, INT6): 4-bit plane, e4m3 scales per 16 k
-    static constexpr int KC = BLK ? 512 : 256;            // k per chunk: 256 weight bytes per row
+    static constexpr bool BLK = F != FP8 && F != BF16;    // block-scaled (NVFP4, INT6): 4-bit plane, e4m3 scales per 16 k
+    static constexpr int KC = BLK ? 512 : F == BF16 ? 128 : 256;  // k per chunk: 256 weight bytes per row
     static constexpr int GROUPS = KC / 64;
-    static constexpr int ROWB = BLK ? 288 : 320;          // scratch row stride: conflict-free fragment reads
+    static constexpr int ROWB = BLK ? 288 : F == BF16 ? 272 : 320;  // scratch row stride: conflict-free fragment reads
     static constexpr int SCH = 4;                         // chunks per scale load (128 B per row)
     static constexpr bool INT = F == INT6 || F == INT5;
     static constexpr int HB = F == INT6 ? 2 : 1;          // INT6 / INT5: high bits per code
@@ -65,24 +70,6 @@ template <int F> struct Cfg {
     static constexpr int ROWH = HC + 16;                  // its scratch row (+ pad: conflict-free fragment reads)
     static constexpr int SCRATCH = 16 * ROWB + (BLK ? 16 * 128 : 0) + (INT ? 16 * ROWH : 0);
 };
-
-__device__ __forceinline__ uint32_t h2_to_bf2(__half2 h) {
-    const float2 f = __half22float2(h);
-    const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
-    return *reinterpret_cast<const uint32_t*>(&b);
-}
-
-// two e2m1 (one byte) times an f16 block scale -> bf16x2, exact
-__device__ __forceinline__ uint32_t fp4x2_scaled(uint32_t byte, __half2 scale) {
-    __half2_raw r = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)byte, __NV_E2M1);
-    return h2_to_bf2(__hmul2(*reinterpret_cast<__half2*>(&r), scale));
-}
-
-// two e4m3 -> bf16x2, exact
-__device__ __forceinline__ uint32_t fp8x2_bf(uint32_t two) {
-    __half2_raw r = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)two, __NV_E4M3);
-    return h2_to_bf2(*reinterpret_cast<__half2*>(&r));
-}
 
 // two (4 + HB)-bit codes (low nibbles in `lo`'s two halves, high fields in hb's bits 0..HB-1 and HB..2HB-1) times a
 // bf16x2 block scale -> bf16x2. Codes are q + 2^(3 + HB).
@@ -94,17 +81,6 @@ __device__ __forceinline__ uint32_t intx2_scaled(uint32_t lo, uint32_t hb, __nv_
     const __nv_bfloat162 q = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&w), __float2bfloat162_rn(128.f + (1 << (3 + HB))));
     const __nv_bfloat162 r = __hmul2(q, sc);
     return *reinterpret_cast<const uint32_t*>(&r);
-}
-
-__device__ __forceinline__ __nv_bfloat162 e4m3_to_bf2(uint32_t byte) {
-    __half_raw r = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)byte, __NV_E4M3);
-    return __float2bfloat162_rn(__half2float(*reinterpret_cast<__half*>(&r)));
-}
-
-__device__ __forceinline__ __half2 e4m3_to_h2(uint32_t byte) {
-    __half_raw r = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)byte, __NV_E4M3);
-    const __half h = *reinterpret_cast<__half*>(&r);
-    return __halves2half2(h, h);
 }
 
 template <typename T> __device__ __forceinline__ T zero_of() {
@@ -144,7 +120,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
     uint8_t* wsc = smem + warp * C::SCRATCH;  // [16 rows][ROWB]: one chunk in fragment-friendly layout
     uint8_t* ssc = wsc + 16 * C::ROWB;        // NVFP4 / INT6: [16 rows][128]: block scales of 4 chunks
     uint8_t* hsc = ssc + 16 * 128;            // INT6: [16 rows][ROWH]: high-bit plane of the chunk
-    const size_t rowbytes = C::BLK ? K / 2 : K;
+    const size_t rowbytes = C::BLK ? K / 2 : F == BF16 ? 2 * (size_t)K : K;
     const int chunks = K / C::KC;
     // this item's chunk range; block-scaled ranges start on a scale load boundary (multiples of SCH chunks)
     const int unit = C::BLK ? C::SCH : 1, units = (chunks + unit - 1) / unit;
@@ -253,6 +229,15 @@ __global__ void __launch_bounds__(WARPS * 32) k_skinny(const __nv_bfloat16* __re
                         const uint32_t a[4] = {lw[2 * jj], hw[2 * jj], lw[2 * jj + 1], hw[2 * jj + 1]};
                         mma_bf16(acc[j], a, intx2_scaled<C::HB>(two & 0xff, h, sc), intx2_scaled<C::HB>(two >> 8, h >> (2 * C::HB), sc));
                     }
+                } else if constexpr (F == BF16) {
+                    const uint4* wp = reinterpret_cast<const uint4*>(rowp + 128 * S + 32 * q);
+                    const uint4 w0 = wp[0], w1 = wp[1];
+                    const uint32_t ww[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+                    for (int jj = 0; jj < 4; ++jj) {
+                        const uint32_t a[4] = {lw[2 * jj], hw[2 * jj], lw[2 * jj + 1], hw[2 * jj + 1]};
+                        mma_bf16(acc[j], a, ww[2 * jj], ww[2 * jj + 1]);
+                    }
                 } else {
                     const uint4 wv = *reinterpret_cast<const uint4*>(rowp + 64 * S + 16 * q);
                     const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
@@ -354,7 +339,7 @@ static const int* g_skip = nullptr;
 // scale unit (4 chunks; 1 for FP8) per split.
 inline int splits_for(int F, bool swiglu, int N, int K) {
     const int tiles = (N + (swiglu ? 8 : 16) - 1) / (swiglu ? 8 : 16);
-    const int kc = F == FP8 ? 256 : 512, unit = F == FP8 ? 1 : 4;
+    const int kc = F == FP8 ? 256 : F == BF16 ? 128 : 512, unit = F == FP8 || F == BF16 ? 1 : 4;
     const int units = (K / kc + unit - 1) / unit;
     const int maxs = units * unit;
     const int S = (ITEMS + tiles - 1) / tiles;
@@ -392,6 +377,7 @@ cudaError_t launch(const void* x, int M, int N, int K, const void* w, const void
 }  // namespace skinny
 
 void skinny_set_skip(const int* p) { skinny::g_skip = p; }
+const int* skinny_skip_flag() { return skinny::g_skip; }
 
 // workspace floats a call needs (0: no split); the caller passes a buffer of that size as ws
 int skinny_ws_floats(int fmt, bool swiglu, int M, int N, int K) {
@@ -425,4 +411,17 @@ cudaError_t launch_skinny_fp8(const void* x, const void* w, float scale, const f
                               int K, float* ws, cudaStream_t st) {
     using namespace skinny;
     return launch<FP8, false, __nv_bfloat16>(x, M, N, K, w, nullptr, scale, row_scale, nullptr, nullptr, 0.f, residual, out, ws, st);
+}
+
+// BF16 W [N, K] (bf16 or fp32 out); SwiGLU: out bf16 = silu(x Wg^T) * (x Wu^T)
+cudaError_t launch_skinny_bf16(const void* x, const void* w, const void* residual, void* out, bool out_fp32, int M, int N, int K, float* ws,
+                               cudaStream_t st) {
+    using namespace skinny;
+    return out_fp32 ? launch<BF16, false, float>(x, M, N, K, w, nullptr, 1.f, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st)
+                    : launch<BF16, false, __nv_bfloat16>(x, M, N, K, w, nullptr, 1.f, nullptr, nullptr, nullptr, 0.f, residual, out, ws, st);
+}
+
+cudaError_t launch_skinny_swiglu_bf16(const void* x, const void* wg, const void* wu, void* out, int M, int N, int K, float* ws, cudaStream_t st) {
+    using namespace skinny;
+    return launch<BF16, true, __nv_bfloat16>(x, M, N, K, wg, nullptr, 1.f, nullptr, wu, nullptr, 1.f, nullptr, out, ws, st);
 }

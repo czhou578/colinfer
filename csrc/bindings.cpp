@@ -2,7 +2,8 @@
 // Python calls them as engine.kernels.ops().<name>. Each wrapper checks the shapes / dtypes / strides and launches on the
 // current stream, so a CUDA graph can capture each op. The sections follow the source files:
 //
-//   skinny.cu        decode linears: skinny_nvfp4 / skinny_swiglu / skinny_int / skinny_fp8, skinny_skip
+//   skinny.cu        decode linears: skinny_nvfp4 / skinny_swiglu / skinny_int / skinny_fp8 / skinny_bf16 / skinny_swiglu_bf16,
+//                    skinny_skip
 //   gemv.cu, norm.cu bf16_gemv (tiny projections), rmsnorm
 //   attn_decode.cu   attn_prologue (q/k norm + RoPE + KV write), attn_decode (multi-row tensor-core attention)
 //   gdn_step.cu      gdn_conv, gdn_conv_commit, gdn_delta (Gated DeltaNet decode / verify / commit)
@@ -52,6 +53,8 @@ cudaError_t launch_skinny_swiglu(const void*, const void*, const void*, float, c
 cudaError_t launch_skinny_fp8(const void*, const void*, float, const float*, const void*, void*, int, int, int, float*, cudaStream_t);
 cudaError_t launch_skinny_int(int, const void*, const void*, const void*, const void*, float, const void*, void*, int, int, int, float*,
                               cudaStream_t);
+cudaError_t launch_skinny_bf16(const void*, const void*, const void*, void*, bool, int, int, int, float*, cudaStream_t);
+cudaError_t launch_skinny_swiglu_bf16(const void*, const void*, const void*, void*, int, int, int, float*, cudaStream_t);
 int skinny_ws_floats(int, bool, int, int, int);
 void skinny_set_skip(const int*);
 
@@ -63,10 +66,10 @@ static float* skinny_ws(int fmt, bool swiglu, const torch::Tensor& x, int64_t N,
     return hold.data_ptr<float>();
 }
 
-static void check_skinny(const torch::Tensor& x, const torch::Tensor& out, int64_t N, int64_t K) {
+static void check_skinny(const torch::Tensor& x, const torch::Tensor& out, int64_t N, int64_t K, int64_t kmul = 256) {
     CHECK_CUDA_TENSOR(x, torch::kBFloat16);
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 16 && x.size(1) == K && K % 256 == 0 && N % 8 == 0,
-                "skinny GEMM: x [M <= 16, K], K % 256 == 0 (512 for block-scaled weights), N % 8 == 0");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 16 && x.size(1) == K && K % kmul == 0 && N % 8 == 0,
+                "skinny GEMM: x [M <= 16, K], K % ", kmul, " == 0 (512 for block-scaled weights), N % 8 == 0");
     TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == x.size(0) && out.size(1) == N, "out must be [M, N]");
     TORCH_CHECK(out.scalar_type() == torch::kBFloat16 || out.scalar_type() == torch::kFloat32, "out must be bf16 or fp32");
 }
@@ -146,6 +149,31 @@ void skinny_fp8(torch::Tensor x, torch::Tensor w, double scale, c10::optional<to
     float* ws = skinny_ws(1, false, x, N, K, hold);
     CHECK_LAUNCH(launch_skinny_fp8(x.data_ptr(), w.data_ptr(), (float)scale, rs, residual_ptr(residual, out), out.data_ptr(), x.size(0), N, K, ws,
                                    stream()));
+}
+
+// BF16 W [N, K] (the router and the shared expert of qwen4_exp): out [M, N] (bf16 or fp32) = x W^T (+ residual). K % 128 == 0.
+void skinny_bf16(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> residual, torch::Tensor out) {
+    CHECK_CUDA_TENSOR(w, torch::kBFloat16);
+    TORCH_CHECK(w.dim() == 2, "w must be bf16 [N, K]");
+    const int64_t N = w.size(0), K = w.size(1);
+    check_skinny(x, out, N, K, 128);
+    torch::Tensor hold;
+    float* ws = skinny_ws(4, false, x, N, K, hold);
+    CHECK_LAUNCH(launch_skinny_bf16(x.data_ptr(), w.data_ptr(), residual_ptr(residual, out), out.data_ptr(), out.scalar_type() == torch::kFloat32,
+                                    x.size(0), N, K, ws, stream()));
+}
+
+// out bf16 [M, N] = silu(x Wg^T) * (x Wu^T), both BF16 [N, K] (the shared expert's gate and up in one weight pass). K % 128 == 0.
+void skinny_swiglu_bf16(torch::Tensor x, torch::Tensor wg, torch::Tensor wu, torch::Tensor out) {
+    CHECK_CUDA_TENSOR(wg, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(wu, torch::kBFloat16);
+    TORCH_CHECK(wg.dim() == 2 && wu.sizes() == wg.sizes(), "gate / up: bf16 [N, K], the same shape");
+    const int64_t N = wg.size(0), K = wg.size(1);
+    check_skinny(x, out, N, K, 128);
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "out must be bf16");
+    torch::Tensor hold;
+    float* ws = skinny_ws(4, true, x, N, K, hold);
+    CHECK_LAUNCH(launch_skinny_swiglu_bf16(x.data_ptr(), wg.data_ptr(), wu.data_ptr(), out.data_ptr(), x.size(0), N, K, ws, stream()));
 }
 
 // Skinny GEMMs launched (or captured) while a flag is set return at once, writing zeros, whenever the int32 it points to
@@ -536,6 +564,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("sf"), py::arg("gscale"), py::arg("residual"), py::arg("out"));
     m.def("skinny_fp8", &skinny_fp8, "tensor-core FP8 x bf16 skinny GEMM, M <= 16", py::arg("x"), py::arg("w"), py::arg("scale"),
           py::arg("residual"), py::arg("out"), py::arg("row_scale") = py::none());
+    m.def("skinny_bf16", &skinny_bf16, "tensor-core BF16 x bf16 skinny GEMM, M <= 16, K % 128 == 0", py::arg("x"), py::arg("w"),
+          py::arg("residual"), py::arg("out"));
+    m.def("skinny_swiglu_bf16", &skinny_swiglu_bf16, "tensor-core silu(x Wg^T) * (x Wu^T), BF16 weights, M <= 16", py::arg("x"), py::arg("wg"),
+          py::arg("wu"), py::arg("out"));
     m.def("skinny_skip", &skinny_skip, "skinny GEMMs launched from now on return early while *flag != 0 (None: never)", py::arg("flag"));
     m.def("bf16_gemv", &bf16_gemv, "bf16-weight GEMV, M <= 8", py::arg("x"), py::arg("w"), py::arg("out"));
     m.def("rmsnorm", &rmsnorm, "zero-centered RMSNorm (1 + w)", py::arg("x"), py::arg("w"), py::arg("eps"), py::arg("out"));
