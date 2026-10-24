@@ -225,5 +225,16 @@ kernel build. The 27B's tests must keep passing in every worktree.
   racecheck (filtered to the engine's kernels) and synccheck are clean. The startup self-test covers 22 paths. Open:
   the model must record `rope_pos` rows before `qsa_block_keys` when an image is in the context; `qsa_topk` at long
   context; the thread count of the row reader (small warm batches want 1 to 2 threads, cold batches 64).
-- **Next:** milestone M1, the decode model on the kernels (`engine/model/fast_qwen4exp.py`), the family dispatch and
-  the golden test against `tools/qwen4exp_reference.py`.
+- **2026-10-24, M4 round 1 merged (the family and the state hooks).** `engine/model/family.py` dispatches by `model_type`:
+  `Family(load, new_state, state_bytes, fixed_bytes, prefill, prepare_prefill, defaults, supports, before_replay, feed_buffer)`;
+  the qwen3_5 family wraps today's code, the qwen4_exp family imports `fast_qwen4exp` / `prefill_qwen4exp` lazily (defaults
+  2 slots x 262,144, 16 checkpoints, no drafter, no images, no YaRN; fixed bytes 85.5e9 with the weights). The states expose
+  `kv_tensors()` (per-position tensors, time on dim 2; a tensor with L / r rows is one row per r positions) and
+  `snap_tensors()`; the checkpoint ring, `_copy_kv`, the slot reset and the session files iterate over them. The scheduler
+  takes `prefill_fn`, `prepare_fn`, `before_replay(slot, tokens)` (called right before each replay with the tokens of the
+  rows) and `feed_buffer`; the server's `--slots`, `--max-seq-len` and `--spec` default to the family's values. Proof of
+  identity for the 27B: two `tests/scheduler_check.py` runs, before and after, wrote the same session files, hash for
+  hash (fingerprint 9af270967b6a20e3), and the whole suite passes (592 tests).
+- **Next:** milestone M1, the decode model on the kernels (`engine/model/fast_qwen4exp.py`) and the golden test against
+  `tools/qwen4exp_reference.py`; then the assembly of prefill (M2), the drafter (M3) and the ring / sessions on the new
+  state (M4 round 2).
