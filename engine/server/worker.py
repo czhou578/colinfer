@@ -19,6 +19,7 @@ from typing import Literal
 
 import torch
 
+from engine.model.family import NGRAM_CACHE_GB
 from engine.model.vision import Image
 from engine.runtime.build import MODEL, build_engine
 from engine.runtime.metrics import Metrics
@@ -58,6 +59,7 @@ class ServerConfig:
     mem_cap_bytes: int = 0
     session_cache_gb: float = 64.0  # the disk cache of conversations (engine/runtime/sessions.py); 0: off
     session_dir: str = SESSION_ROOT
+    ngram_cache_gb: float = NGRAM_CACHE_GB  # qwen4_exp: the host row cache of the n-gram table (engine/weights/ple.py); 0: off
     vision: bool = True             # image input, when the checkpoint has a vision tower (engine/model/vision.py)
     vision_preload: bool = False    # load the tower's weights at startup and warm up the image path (default: on the first image)
     image_max_pixels: int = 2048 * 2048  # images are resized to at most this many pixels (one token per 32 x 32)
@@ -92,7 +94,7 @@ class Worker(threading.Thread):
         sched, self.startup = build_engine(c.model, slots=c.slots, max_seq_len=c.max_seq_len, checkpoints=c.checkpoints, spec=c.spec, k=c.k,
                                            drafter_weights=c.drafter_weights, suffix_drafts=c.suffix_drafts, decode_weights=c.decode_weights,
                                            boundary=c.boundary_token, selftest=c.selftest, vision=c.vision, vision_preload=c.vision_preload,
-                                           metrics=self.metrics, log=log)
+                                           ngram_cache_gb=c.ngram_cache_gb, metrics=self.metrics, log=log)
         # the values of the family's defaults, for the log below and the HTTP layer (build_app reads max_seq_len)
         c.slots, c.max_seq_len, c.checkpoints = sched.n_slots, sched.max_seq_len, sched.n_checkpoints
         c.spec = "mtp" if sched.mtp is not None else "none"

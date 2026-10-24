@@ -268,3 +268,93 @@ def test_a_state_with_extra_tensors_restores_from_disk(make_ext):
     sched.store.flush()
     p3 = p2 + r2.output + prompt(rng, 7)
     assert run_ext(make_ext(), p3).reused == len(p2) + len(r2.output) - 1  # a restart: a new engine, the same directory
+
+
+# ------------------------------------------------------------------------------------------------ qwen4_exp on a small model
+@pytest.fixture(scope="module")
+def small4(tmp_path_factory):
+    """The small random qwen4_exp model of tests/test_fast_qwen4exp.py on the kernels, with the family's hooks: its n-gram
+    table written to a file and read through a PleFeeder (model.feeder), the family's prefill (chunks with prev2), the
+    before_replay that fills the feed buffer."""
+    import copy
+    import shutil
+
+    from engine.model import family as F
+    from engine.model.fast_qwen4exp import to_fast4
+    from engine.weights.ple import NgramTable, PleFeeder
+    from tests.qwen4exp_ckpt import ngram_shards, write_safetensors
+    from tests.test_fast_qwen4exp import build_reference
+    d = tmp_path_factory.mktemp("small4")
+    shutil.copy(os.path.join(os.path.dirname(__file__), "data", "qwen4exp_config.json"), d / "config.json")
+    fam = F.family_of(str(d))
+    fast = to_fast4(copy.deepcopy(build_reference()))
+    ple = fast.ple_layer()
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    path = str(d / "model-fp8-mtp-ple.safetensors")
+    table = torch.from_numpy(ple.table.data).view(torch.float8_e4m3fn)
+    write_safetensors(path, [(prefix + ".weight_scale", torch.tensor([ple.table.scale], dtype=torch.bfloat16))] +
+                      ngram_shards(table, 4, [2, 0, 3, 1], prefix))
+    nt = NgramTable(path, prefix)
+    fast.feeder = PleFeeder(nt, 4096, params=ple.params, image_token_id=fast.cfg.image_token_id)
+    yield fast, fam
+    fast.feeder.close()
+    nt.close()
+
+
+def make4(small4, store_dir=None):
+    """A scheduler of 2 slots of 512 tokens on the small qwen4_exp model with the family's callables, as build_engine
+    makes it, and a store of 64-token blocks in store_dir (None: no store)."""
+    fast, fam = small4
+    sched = Checked(fast, n_slots=2, max_seq_len=512, n_checkpoints=4, prefill_chunk=64, ckpt_interval=10**6, prefill_fn=fam.prefill,
+                    prepare_fn=fam.prepare_prefill, before_replay=fam.before_replay(fast), feed_buffer=fam.feed_buffer(fast),
+                    prefill_prev2=fam.prefill_prev2)
+    if store_dir is not None:
+        with torch.inference_mode():
+            sched.store = SessionStore(sched.state, None, {"model": "small4", "drafter": "none"}, 10**9, str(store_dir), block=BLOCK,
+                                       min_tokens=BLOCK, log=lambda *a: None)
+        sched.store.min_gain = 16
+    return sched
+
+
+def test_a_qwen4exp_state_restores_from_disk_byte_for_byte(small4, tmp_path):
+    """On the small qwen4_exp model: a conversation of 150 tokens (three prefill chunks, the n-gram rows through the
+    feeder) and its reply go to disk; after a restart (a zeroed state, a new store on the same directory), the next turn
+    restores the reply end from disk. The slot then holds the bytes it held: the rows of every kv_tensors() tensor (k, v,
+    raw and block indexer keys at one row per 4 positions, rotary positions) and every snap_tensors() tensor (GDN, PLE
+    conv). The next turn's greedy output equals the one after a restore from memory."""
+    rng = random.Random(40)
+    sched = make4(small4, tmp_path)
+    p1 = [rng.randrange(4, 1000) for _ in range(150)]
+    r1 = sched.run([S.Request(p1, max_new_tokens=12)])[0]
+    sched.store.flush()
+    b, n = r1.slot, len(p1) + len(r1.output) - 1  # the reply end: the last output token was never fed
+    st = sched.state
+    assert n % 4 and n > 2 * BLOCK  # a partial block, and a partial group of 4 positions in it
+    kv = [t[b, :, :-(-n // r)].clone() for t, r in zip(st.kv_tensors(), st.kv_ratios())]
+    snap = [t[b].clone() for t in st.snap_tensors()]
+    assert all(x.view(torch.uint8).any() for x in kv + snap)
+    sched.store = None
+    del sched
+    sched = make4(small4, tmp_path)  # a restart: nothing in memory, the same directory
+    with torch.inference_mode():
+        sched.state.reset()
+    p2 = p1 + r1.output + [rng.randrange(4, 1000) for _ in range(20)]
+    req = sched.submit(S.Request(p2, max_new_tokens=12))
+    with torch.inference_mode():
+        sched._admit()
+    s = sched.slots[req.slot]
+    assert req.reused == n and sched.store.stats["restores"] == 1 and sched.metrics.disk_tokens.get() == n
+    st = sched.state
+    for t, r, w in zip(st.kv_tensors(), st.kv_ratios(), kv):
+        assert torch.equal(t[s.idx, :, :-(-n // r)].view(torch.uint8), w.view(torch.uint8)), t.shape
+    for t, w in zip(st.snap_tensors(), snap):
+        assert torch.equal(t[s.idx], w), t.shape
+    while sched.busy():
+        sched.step()
+    sched.store.flush()
+    sched.store = None
+    del sched
+    ref = make4(small4)  # the same two turns, turn 2 restored from memory
+    assert ref.run([S.Request(p1, max_new_tokens=12)])[0].output == r1.output
+    rm = ref.run([S.Request(p2, max_new_tokens=12)])[0]
+    assert rm.reused == n and rm.output == req.output

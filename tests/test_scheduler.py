@@ -478,3 +478,80 @@ def test_random_conversations_on_a_state_with_extra_tensors_stay_exact(make_ext,
         r = sched.run([S.Request(p, max_new_tokens=rng.choice((3, 20)))])[0]
         assert r.output == ext_reference(p, r.max_new_tokens), kind
         done.append((p, r.output))
+
+
+def test_each_prefill_chunk_gets_the_two_tokens_before_it(make_ext):
+    """With prefill_prev2 (qwen4_exp), the scheduler passes prev2 = the last two tokens of the slot's history before each
+    chunk: none at a slot's start, then the end of the previous chunk, or of the restored checkpoint."""
+    calls = []
+
+    def prefill(model, ids, state, prev2=None, **kw):
+        calls.append((state.pos, list(prev2)))
+        return ext_prefill(model, ids, state, **kw)
+    sched, rng = make_ext(prefill_chunk=64, ckpt_interval=10**6), random.Random(21)
+    sched.prefill_fn, sched.prefill_prev2 = prefill, True
+    p1 = prompt(rng, 140)  # chunks of 64 and 76 tokens (the scheduler finishes a prompt of 5 / 4 chunks or less in one)
+    r1 = sched.run([S.Request(p1, max_new_tokens=5)])[0]
+    assert calls == [(0, []), (64, p1[62:64])] and r1.output == ext_reference(p1, 5)
+    calls.clear()
+    p2 = p1 + r1.output + prompt(rng, 10)
+    r2 = sched.run([S.Request(p2, max_new_tokens=5)])[0]
+    n = len(p1) + len(r1.output) - 1
+    assert r2.reused == n and calls == [(n, p2[n - 2:n])] and r2.output == ext_reference(p2, 5)
+
+
+# ------------------------------------------------------------------------------------------------ the qwen4_exp state
+class State4Model:
+    """A stand-in for FastQwen4Exp on the real FastState4 of Qwen3.8-Flash-Next (its config's shapes, a short slot): a
+    decode step only moves the positions. The test fills the state itself."""
+    prefill_ready = False
+
+    def __init__(self, L):
+        from engine.model.qwen4exp import Qwen4ExpConfig
+        self.cfg, self.L = Qwen4ExpConfig(), L
+
+    def new_state(self, batch, max_seq_len):
+        from engine.model.fast_qwen4exp import FastState4
+        return FastState4(self.cfg, batch, max_seq_len, "cuda")
+
+    def __call__(self, tok, state, feed=None):
+        state.pos_t += state.active
+        return torch.zeros(tok.shape[0], 8, device="cuda")
+
+
+@torch.inference_mode()
+def test_the_ring_snapshots_and_restores_the_qwen4exp_state():
+    """The checkpoint ring on FastState4 at the real shapes: one buffer per snap_tensors() tensor (36 GDN conv windows
+    and recurrent states, then the PLE conv state; 115.6 MB per snapshot). A restore into the other slot gives it the
+    snapshot and the rows of every kv_tensors() tensor (k, v, raw and block indexer keys, rotary positions)."""
+    Lm, n = 64, 22  # 22 positions: 6 rows of block keys, the last one partial
+    sched = S.Scheduler(State4Model(Lm), n_slots=2, max_seq_len=Lm, n_checkpoints=3, prepare_fn=lambda m: None)
+    st = sched.state
+    snap = st.snap_tensors()
+    assert len(sched.ring) == len(snap) == 36 + 36 + 1
+    assert [(r.shape[1:], r.dtype) for r in sched.ring] == [(t.shape[1:], t.dtype) for t in snap]
+    assert sum(r[0].nbytes for r in sched.ring) == 36 * (10240 * 3 * 2 + 48 * 128 * 128 * 4) + 10240 * 9 * 2
+    g = torch.Generator(device="cuda").manual_seed(4)
+
+    def fill(t):
+        if t.dtype == torch.float8_e4m3fn:
+            t.view(torch.uint8).copy_(torch.randint(0, 120, t.shape, device="cuda", dtype=torch.uint8, generator=g))
+        elif t.dtype == torch.int32:
+            t.copy_(torch.randint(0, 1000, t.shape, device="cuda", dtype=torch.int32, generator=g))
+        else:
+            t.copy_(torch.randn(t.shape, device="cuda", generator=g))
+    for t in st.kv_tensors() + snap:
+        fill(t)
+    s0, s1 = sched.slots
+    s0.tokens = list(range(n))
+    want_snap = [t[0].clone() for t in snap]
+    want_kv = [t[0, :, :-(-n // r)].clone() for t, r in zip(st.kv_tensors(), st.kv_ratios())]
+    sched._snapshot(s0)
+    c = sched.ckpts[0]
+    for t in snap:  # the live state moves on
+        fill(t)
+    sched._restore(s1, c, 0)
+    assert all(torch.equal(t[1], w) for t, w in zip(snap, want_snap))
+    assert all(torch.equal(t[1, :, :w.shape[1]].view(torch.uint8), w.view(torch.uint8)) for t, w in zip(st.kv_tensors(), want_kv))
+    assert [w.shape[1] for w in want_kv] == [n] * 36 + [6] * 12 + [n]  # k / v pairs and raw keys, block keys (12 layers), rope_pos
+    assert s1.tokens == s0.tokens and int(st.pos_t[1]) == n

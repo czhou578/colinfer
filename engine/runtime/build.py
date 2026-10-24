@@ -21,7 +21,7 @@ import time
 from typing import Literal
 
 from engine.kernels import ops
-from engine.model.family import Family, check_served, family_of
+from engine.model.family import NGRAM_CACHE_GB, Family, check_served, family_of
 from engine.model.fast import attach_decode_copies, load_fast_model, to_fast
 from engine.model.qwen35 import apply_yarn, yarn_attention_factor
 from engine.model.vision import VisionTower, vision_available
@@ -50,13 +50,14 @@ def check_seq_len(path: str, fam: Family, max_seq_len: int | None) -> None:
 
 
 def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print, prep: Prepared | None | str = "auto",
-               max_seq_len: int | None = None):
+               max_seq_len: int | None = None, ngram_cache_gb: float = NGRAM_CACHE_GB):
     """(checkpoint directory, the model on the kernel decode path), through the loader of the checkpoint's family
     (engine/model/family.py). decode_weights: "int" streams the INT6 / INT5 decode copies of the attention / GDN
     projections from the prepared directory (tools/prepare.py) when it has them; "checkpoint" streams the checkpoint's
     weights. prep: the manifest of the prepared directory ("auto": read it). max_seq_len: the slot length the model will
     run at; past the checkpoint's native context, YaRN scales its rope by the ratio (engine/model/qwen35.py apply_yarn),
-    as Qwen documents for its models. A family without YaRN raises ValueError there."""
+    as Qwen documents for its models. A family without YaRN raises ValueError there. ngram_cache_gb: the n-gram row
+    cache of qwen4_exp (engine/model/family.py attach_feeder)."""
     if decode_weights not in ("int", "checkpoint"):
         raise ValueError(f"decode_weights: int or checkpoint, not {decode_weights!r}")
     path = resolve(path_or_repo)
@@ -65,7 +66,7 @@ def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print
     check_seq_len(path, fam, max_seq_len)
     if prep == "auto":
         prep = read_prepared(path)
-    return fam.load(path, decode_weights, log, prep, max_seq_len)
+    return fam.load(path, decode_weights, log, prep, max_seq_len, ngram_cache_gb)
 
 
 def load_dense_model(path: str, decode_weights: str, log, prep: Prepared | None, max_seq_len: int | None):
@@ -147,18 +148,21 @@ def process_rss_bytes() -> int:
     return 0
 
 
-def startup_bytes(path: str, slots: int | None = None, max_seq_len: int | None = None, spec: str | None = None) -> int:
+def startup_bytes(path: str, slots: int | None = None, max_seq_len: int | None = None, spec: str | None = None,
+                  ngram_cache_gb: float = NGRAM_CACHE_GB) -> int:
     """The unified memory that the engine takes at startup: the state of the slots (the KV cache and the GDN state,
     and the drafter's with spec mtp), built on the meta device, plus the fixed bytes of the family (the 27B:
-    ENGINE_FIXED_BYTES). Other flags than the defaults take less. None: the default of the family. The state shapes are
-    the Scheduler's: it builds them with the family's new_state (model.new_state) and MtpState."""
+    ENGINE_FIXED_BYTES) and its host caches (qwen4_exp: the n-gram row cache of ngram_cache_gb). Other flags than the
+    defaults take less. None: the default of the family. The state shapes are the Scheduler's: it builds them with the
+    family's new_state (model.new_state) and MtpState."""
     fam = family_of(path)
     d = fam.defaults
     slots, max_seq_len, spec = d.slots if slots is None else slots, d.max_seq_len if max_seq_len is None else max_seq_len, spec or d.spec
-    return fam.fixed_bytes + fam.state_bytes(path, slots, max_seq_len, spec)
+    return fam.fixed_bytes + fam.state_bytes(path, slots, max_seq_len, spec) + fam.host_bytes(ngram_cache_gb)
 
 
-def check_memory(path: str, slots: int | None = None, max_seq_len: int | None = None, spec: str | None = None) -> None:
+def check_memory(path: str, slots: int | None = None, max_seq_len: int | None = None, spec: str | None = None,
+                 ngram_cache_gb: float = NGRAM_CACHE_GB) -> None:
     """Raises NotEnoughMemory when the startup memory and GROWTH_RESERVE_BYTES exceed MemAvailable. It reads only the
     checkpoint's config.json and builds no tensor, so it runs before the CUDA context and the weights. The memory that
     this process holds already counts as available: ENGINE_FIXED_BYTES is the fall of MemAvailable from a fresh process,
@@ -166,7 +170,7 @@ def check_memory(path: str, slots: int | None = None, max_seq_len: int | None = 
     family."""
     d = family_of(path).defaults
     slots, max_seq_len = d.slots if slots is None else slots, d.max_seq_len if max_seq_len is None else max_seq_len
-    need = startup_bytes(path, slots, max_seq_len, spec) + GROWTH_RESERVE_BYTES
+    need = startup_bytes(path, slots, max_seq_len, spec, ngram_cache_gb) + GROWTH_RESERVE_BYTES
     avail = meminfo_bytes("MemAvailable") + process_rss_bytes()
     if need > avail:
         raise NotEnoughMemory(f"the engine needs about {need / 1e9:.0f} GB of memory ({slots} slots x {max_seq_len} tokens, with "
@@ -177,14 +181,15 @@ def check_memory(path: str, slots: int | None = None, max_seq_len: int | None = 
 def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: int | None = None, checkpoints: int | None = None,
                  spec: str | None = None, k: int = 7, drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int",
                  boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, vision: bool | None = None, vision_preload: bool = False,
-                 metrics=None, log=print):
+                 ngram_cache_gb: float = NGRAM_CACHE_GB, metrics=None, log=print):
     """The scheduler with its model, as `python -m engine.server` builds it from the same flags (the defaults are the
     server's). slots, max_seq_len, checkpoints, spec, vision: None takes the default of the checkpoint's family
     (engine/model/family.py; the 27B: 3 slots of 524288 tokens, 32 checkpoints, spec mtp, vision on). spec: "mtp" or
     "none". boundary: the message-boundary token id, "auto" (the checkpoint's) or None. vision: image input
     (engine/model/vision.py) when the family supports it and the checkpoint has a vision tower; its 0.92 GB of weights
-    load on the first image, or at startup with vision_preload. Before the CUDA context, check_memory raises
-    NotEnoughMemory when the engine does not fit in MemAvailable.
+    load on the first image, or at startup with vision_preload. ngram_cache_gb: the n-gram row cache of qwen4_exp (host
+    memory; the 27B has none). Before the CUDA context, check_memory raises NotEnoughMemory when the engine does not
+    fit in MemAvailable.
     Returns (scheduler, the startup seconds of each phase). scheduler.fingerprint names what the cached state depends
     on (the checkpoint, the decode weights, the drafter), for the disk cache (engine/runtime/sessions.py)."""
     if spec not in ("mtp", "none", None):
@@ -201,14 +206,14 @@ def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: i
     if spec == "mtp" and not fam.supports.mtp:
         raise ValueError(f"spec mtp: the engine has no MTP drafter for the {fam.name} family yet (spec none)")
     check_seq_len(path, fam, max_seq_len)
-    check_memory(path, slots, max_seq_len, spec)  # before the CUDA context and the weights
+    check_memory(path, slots, max_seq_len, spec, ngram_cache_gb)  # before the CUDA context and the weights
     t0 = time.perf_counter()
     ops()  # build / load the CUDA extension
     t1 = time.perf_counter()
     prep = read_prepared(path)  # a manifest that names a missing file stops the start here
     log(f"[engine] prepared directory: {prep.dir} (made {prep.made})" if prep is not None else
         "[engine] no prepared directory (tools/prepare.py): the checkpoint alone")
-    path, m = fam.load(path, decode_weights, log, prep, max_seq_len)
+    path, m = fam.load(path, decode_weights, log, prep, max_seq_len, ngram_cache_gb)
     mtp = load_drafter(m, path, drafter_weights, log, prep) if spec == "mtp" else None
     release_buffers()  # the direct reader's pinned staging buffers (engine/weights/direct.py)
     if boundary == "auto":
@@ -221,12 +226,16 @@ def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: i
         run_selftest(verbose=True)  # refuses to start if any matmul path is numerically wrong
     sched = Scheduler(m, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=k, metrics=metrics,
                       boundary_token=boundary, suffix_min=suffix_drafts, prefill_fn=fam.prefill, prepare_fn=fam.prepare_prefill,
-                      before_replay=fam.before_replay(m), feed_buffer=fam.feed_buffer(m))
+                      before_replay=fam.before_replay(m), feed_buffer=fam.feed_buffer(m), prefill_chunk=fam.prefill_chunk,
+                      prefill_prev2=fam.prefill_prev2)
     sched.family = fam.name
     if tower is not None:
         sched.vision, sched.image_pad = tower, json.load(open(os.path.join(path, "config.json")))["image_token_id"]
     int_copies = fam.supports.int_copies and decode_weights == "int" and prep is not None and prep.decode
     sched.fingerprint = dict(model=os.path.basename(path), decode=[_file_id(f) for f in prep.decode] if int_copies else "checkpoint",
                              drafter=None if mtp is None else (_file_id(mtp.weights) if mtp.weights else "checkpoint"))
+    feeder = getattr(m, "feeder", None)
+    if feeder is not None:  # qwen4_exp: the n-gram rows are part of every cached state
+        sched.fingerprint.update(drafter="none" if mtp is None else sched.fingerprint["drafter"], ngram=_file_id(feeder.table.path))
     t3 = time.perf_counter()
     return sched, dict(kernels_s=round(t1 - t0, 1), weights_s=round(t2 - t1, 1), graphs_selftest_s=round(t3 - t2, 1))
