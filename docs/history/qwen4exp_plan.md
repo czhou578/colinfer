@@ -286,5 +286,18 @@ kernel build. The 27B's tests must keep passing in every worktree.
   experts per layer per verify. Recommendation: k = 2 by default, k up to 3 by acceptance. The drafter adds 1.95 GB and
   0.355 GB per 262k-token slot. Remaining: the scheduler wiring (Mtp4State in the ring copies and the sessions, the
   fixed bytes, Supports.mtp, the k model), the low-rank draft head, the early-exit tuning.
-- **Next:** M2 (prefill on the real checkpoint and long context) is in progress; then the drafter's scheduler wiring and
-  the documentation pass.
+- **2026-10-24, M2 round 2 merged: prefill and long context on the real checkpoint.** With the prompt through the prefill,
+  all three golden prompts give 32 tokens equal to the reference; a 3000-token prompt gives the same 16 greedy tokens as
+  the token-by-token decode path (1.3 s of prefill against 141 s). The last-token logits of prefill and decode differ by
+  10 to 15% in relative L2: the MoE prefill quantizes its activations to NVFP4, and a small input change can flip one of
+  the top-10 of 512 experts; with the decode MoE swapped in, the difference is 5 to 10%. The chunk is 4096: it is 6 to 13%
+  faster than 2048 (2760 to 2810 tok/s at prefixes 0 to 8k; about 2500 tok/s at 16k to 60k with cold rows), and one call
+  per chunk equals one call bit for bit. On real text the union of the selected blocks of a 4-row group is 3100 to 3700
+  keys (12.8 / 15.0 ms per layer at prefixes 8k / 64k; the masked path takes 21 / 108 ms). Passkey (`tests/
+  passkey_qwen4exp.py`): 9 of 9 at 16k, 32k and 64k, prefill 7 to 34 s. Perplexity through the prefill
+  (`tests/perplexity.py --engine qwen4exp`): 2.3438 on the 8 golden windows (ratio 1.0044 against the reference's
+  2.3335, within the gate) and 2.2186 on one 16k window (more context helps). The feeder's hit rate: 50% on the golden
+  prompts, 94% on the passkey runs. The hyper-connection speed-up was tried and reverted: bf16_gemv matches the skinny
+  GEMM at M <= 8, and a wider hc_mix changed the decode step by nothing; the profiler's per-kernel times are inflated by
+  the PDL overlap.
+- **Next:** the drafter's scheduler wiring (M4c) is in progress; then the documentation pass.
