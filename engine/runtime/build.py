@@ -60,6 +60,7 @@ def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print
     if decode_weights not in ("int", "checkpoint"):
         raise ValueError(f"decode_weights: int or checkpoint, not {decode_weights!r}")
     path = resolve(path_or_repo)
+    check_served(path)
     fam = family_of(path)  # a family the engine cannot serve yet raises NotImplementedError
     check_seq_len(path, fam, max_seq_len)
     if prep == "auto":
