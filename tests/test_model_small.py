@@ -171,22 +171,25 @@ def test_yarn_model_matches_hf_yarn(ids):
         apply_yarn(m, 2.0)  # not twice
 
 
-def test_config_reads_a_yarn_checkpoint(tmp_path):
+@pytest.mark.parametrize("rope", [{"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024},
+                                  {"rope_type": "linear", "factor": 2.0}])
+def test_config_refuses_a_checkpoint_with_scaled_rope(tmp_path, rope):
+    """The engine adds YaRN itself past the native context (apply_yarn). A checkpoint with scaled rope is refused."""
     import json
-    c = yarn_cfg()
+    c = tiny_cfg()
     t = {"hidden_size": c.hidden_size, "intermediate_size": c.intermediate_size, "num_hidden_layers": c.num_hidden_layers,
          "layer_types": c.layer_types, "num_attention_heads": c.num_attention_heads, "num_key_value_heads": c.num_key_value_heads,
          "head_dim": c.head_dim, "linear_num_key_heads": c.linear_num_key_heads, "linear_num_value_heads": c.linear_num_value_heads,
          "linear_key_head_dim": c.linear_key_head_dim, "linear_value_head_dim": c.linear_value_head_dim,
          "linear_conv_kernel_dim": c.linear_conv_kernel_dim, "rms_norm_eps": c.rms_norm_eps, "vocab_size": c.vocab_size,
-         "max_position_embeddings": 4096, "rope_parameters": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024,
-                                                               "rope_theta": 1e4, "partial_rotary_factor": 0.25, "mrope_section": [1, 1, 2]}}
+         "max_position_embeddings": 4096, "rope_parameters": {"rope_type": "default", "rope_theta": 1e4, "partial_rotary_factor": 0.25,
+                                                               "mrope_section": [1, 1, 2]}}
     (tmp_path / "config.json").write_text(json.dumps({"text_config": t}))
     got = Qwen35Config.from_checkpoint(str(tmp_path))
-    assert (got.yarn_factor, got.max_position_embeddings, got.rope_theta) == (4.0, 1024, 1e4)
-    t["rope_parameters"] = {"rope_type": "linear", "factor": 2.0, "rope_theta": 1e4}
+    assert (got.yarn_factor, got.max_position_embeddings, got.rope_theta) == (1.0, 4096, 1e4)
+    t["rope_parameters"] |= rope
     (tmp_path / "config.json").write_text(json.dumps({"text_config": t}))
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError, match=rope["rope_type"]):
         Qwen35Config.from_checkpoint(str(tmp_path))
 
 

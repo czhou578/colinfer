@@ -7,6 +7,7 @@
 #   journalctl --user -u colinfer -f              # logs (one line per finished request)
 # The engine holds ~88 GB of the 121 GB unified memory for as long as it runs (weights 20.2 GB, INT copies 5.2 GB,
 # KV 3 x 524k tokens 51.5 GB, checkpoint ring 4.9 GB, drafter ~4 GB). Stop it before you use the GPU for other work.
+# ExecStart uses the server's defaults (slots, tokens per slot, memory cap): docs/server.md lists them and the memory.
 [Unit]
 Description=colin-inference-engine: Qwen3.8-27B NVFP4, OpenAI and Anthropic APIs on 127.0.0.1:8000
 After=network.target
@@ -15,10 +16,12 @@ After=network.target
 Type=simple
 WorkingDirectory=%h/Projects/colin-inference-engine
 Environment=PYTHONUNBUFFERED=1
-ExecStart=%h/Projects/colin-inference-engine/.venv/bin/python -m engine.server --host 127.0.0.1 --port 8000 --max-seq-len 524288 --mem-cap-gb 105
+ExecStart=%h/Projects/colin-inference-engine/.venv/bin/python -m engine.server --host 127.0.0.1 --port 8000
 # any engine failure (CUDA error, OOM against the cap) exits the process; come back in a few seconds
 Restart=on-failure
 RestartSec=5
+# exit status 3: not enough free memory to start (engine/server/api.py NO_MEMORY_EXIT); a restart does not help
+RestartPreventExitStatus=3
 TimeoutStartSec=300
 TimeoutStopSec=30
 KillSignal=SIGINT

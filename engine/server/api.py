@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import hmac
 import inspect
 import json
@@ -25,12 +26,14 @@ import os
 import random
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import jinja2
 import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+from engine.runtime.build import NotEnoughMemory, check_memory
 from engine.runtime.grammar import Grammars
 from engine.runtime.scheduler import Request as EngineRequest
 from engine.server import anthropic as anth
@@ -42,6 +45,7 @@ from engine.server.worker import ServerConfig, Stream, Worker
 from engine.weights.loader import resolve
 
 PING_S = 10.0  # seconds between the keep-alive events of a stream that has no output yet (the queue, a long prefill)
+NO_MEMORY_EXIT = 3  # the exit status of a start without the memory; deploy/colinfer.service does not restart on it
 
 
 def log(*a):
@@ -82,8 +86,12 @@ class ApiKey:
 
 
 class BadRequest(Exception):
-    """The client's error (a 400). The endpoints turn only this into an error reply; any other exception is a bug of the
-    server, which the app's handler logs and answers with a 500."""
+    """The client's error: a 400, or the HTTP status in `code`. The endpoints turn only this into an error reply; any
+    other exception is a bug of the server, which the app's handler logs and answers with a 500."""
+
+    def __init__(self, msg: str, code: int = 400):
+        super().__init__(msg)
+        self.code = code
 
 
 class Busy(Exception):
@@ -119,6 +127,14 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     if cfg.api_key:
         app.add_middleware(ApiKey, key=cfg.api_key)
     max_len, margin = cfg.max_seq_len, worker.sched.margin
+    # the prompt text is checked before its tokenize, not only its tokens after it: the tokenize holds host memory in
+    # proportion to the text (1 GB for 4M digits, one token each). The limit counts bytes of UTF-8: a byte-level BPE token
+    # covers at least one byte, and a rare 4-byte character is up to 4 tokens. Text and code use 2 to 4 bytes per token
+    max_text_bytes = 8 * max_len
+    heavy = ThreadPoolExecutor(1, thread_name_prefix="heavy")  # one tokenize or image decode at a time, for the same reason
+    # the queue check of make_request comes after the body, the images and the render, so this bound holds the memory of the
+    # requests before it (engine/runtime/build.py GROWTH_RESERVE_BYTES counts them)
+    admit = asyncio.Semaphore(cfg.max_queue + 1)
     vocab = hf_config["vocab_size"]  # rows of the embedding: a token id beyond it is a device-side assert, fatal to the engine
     vision = getattr(worker.sched, "vision", None) is not None  # image input (engine/server/images.py)
     improc = img.ImageProcessor(resolve(cfg.model), cfg.image_max_pixels) if vision else None
@@ -128,13 +144,47 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
     reserved_kwargs = set(inspect.signature(tokenizer.apply_chat_template).parameters) - {"self", "kwargs"}
 
     async def json_body(request: Request) -> dict:
+        """The body as a JSON object. The render and the tokenize hold host memory in proportion to the body, so a body
+        past cfg.max_body_bytes is a 413, and the server stops reading it at the limit."""
+        limit = cfg.max_body_bytes
+
+        def too_large():  # a new exception at each raise: a stored one and this frame's traceback hold `raw` in a cycle
+            return BadRequest(f"the request body is larger than {limit} bytes", 413)
+        n = request.headers.get("content-length", "")
+        if n.isdigit() and int(n) > limit:
+            raise too_large()
+        raw, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > limit:
+                raise too_large()
+            raw.append(chunk)
         try:
-            b = await request.json()
+            b = json.loads(b"".join(raw))
         except ValueError:
             raise BadRequest("the body is not valid JSON") from None
         if not isinstance(b, dict):
             raise BadRequest("the body must be a JSON object")
         return b
+
+    def admitted(endpoint):
+        """Bounds the requests between the body read and the submit to cfg.max_queue + 1. The next one gets the Busy reply
+        of its API before the server reads its body."""
+        @functools.wraps(endpoint)
+        async def wrapper(request: Request):
+            if admit.locked():
+                msg = f"the server is busy: {cfg.max_queue + 1} requests are between the body read and the queue"
+                return _anth_error(msg, 529) if _is_anthropic(request.url.path) else _error(msg, 503)
+            async with admit:
+                return await endpoint(request)
+        return wrapper
+
+    async def encode_text(text: str, encode) -> list[int]:
+        """The token ids of a prompt text: the byte check, then `encode` on the heavy thread."""
+        n = len(text) if text.isascii() else len(text.encode())
+        if n > max_text_bytes:
+            raise BadRequest(f"prompt is too long: {n} bytes of text > {max_text_bytes} maximum")
+        return await asyncio.get_running_loop().run_in_executor(heavy, encode, text)
 
     def body_of(raw: dict) -> dict:
         b = dict(raw)
@@ -290,13 +340,14 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         if reserved_kwargs & set(kw):
             raise BadRequest(f"chat_template_kwargs cannot set {sorted(reserved_kwargs & set(kw))}")
         try:
-            images = [await asyncio.to_thread(improc.load, x) for x in blobs]
+            images = [await asyncio.get_running_loop().run_in_executor(heavy, improc.load, x) for x in blobs]
         except ValueError as e:
             raise BadRequest(str(e)) from None
         try:
-            prompt = await asyncio.to_thread(fmt.render, msgs, tools, **kw)
+            text = await asyncio.to_thread(fmt.text, msgs, tools, **kw)
         except jinja2.TemplateError as e:
             raise BadRequest(f"chat template: {e}") from None
+        prompt = await encode_text(text, fmt.encode)
         if images:
             try:
                 prompt = img.expand(prompt, images, worker.sched.image_pad, vocab)
@@ -369,7 +420,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                         return
                     except (BadRequest, Busy) as e:
                         finished = True
-                        for x in on_error(str(e), busy_code if isinstance(e, Busy) else 400):
+                        for x in on_error(str(e), busy_code if isinstance(e, Busy) else e.code):
                             yield x
                         return
                 while True:
@@ -428,6 +479,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
 
     # -------------------------------------------------------------------------------------- chat completions
     @app.post("/v1/chat/completions")
+    @admitted
     async def chat(request: Request):
         try:
             b = body_of(await json_body(request))
@@ -451,7 +503,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 req = make_request(b, prompt, st, n_top, images, await constraint(spec, prompt))
             include_usage, want_ids = include_usage_of(b), bool(b.get("return_token_ids"))
         except BadRequest as e:
-            return _error(str(e))
+            return _error(str(e), e.code)
         except Busy as e:
             return _error(str(e), 503)
         rid = "chatcmpl-" + uuid.uuid4().hex
@@ -528,7 +580,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         except Failed as e:
             return _error(e.msg, e.code)
         except BadRequest as e:
-            return _error(str(e))
+            return _error(str(e), e.code)
         except Busy as e:
             return _error(str(e), 503)
         msg, lps = oai.chat_message(events)
@@ -543,6 +595,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
 
     # -------------------------------------------------------------------------------------- completions
     @app.post("/v1/completions")
+    @admitted
     async def completions(request: Request):
         try:
             b = body_of(await json_body(request))
@@ -550,7 +603,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             if isinstance(p, list) and len(p) == 1 and isinstance(p[0], (str, list)):
                 p = p[0]
             if isinstance(p, str):
-                prompt = await asyncio.to_thread(tokenizer.encode, p, add_special_tokens=False)
+                prompt = await encode_text(p, lambda t: tokenizer.encode(t, add_special_tokens=False))
             elif isinstance(p, list) and p and all(isinstance(t, int) for t in p):
                 prompt = list(p)
             else:
@@ -564,7 +617,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             req = make_request(b, prompt, st, n_top, constraint=cons)
             include_usage = include_usage_of(b)
         except BadRequest as e:
-            return _error(str(e))
+            return _error(str(e), e.code)
         except Busy as e:
             return _error(str(e), 503)
         rid = "cmpl-" + uuid.uuid4().hex
@@ -607,15 +660,17 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
             raise BadRequest(str(e)) from None
 
     @app.post("/v1/messages/count_tokens")
+    @admitted
     async def count_tokens(request: Request):
         try:
             msgs, tools, kw = convert_messages(await json_body(request))
             prompt, _ = await render(msgs, tools, kw)
         except BadRequest as e:
-            return _anth_error(str(e))
+            return _anth_error(str(e), e.code)
         return {"input_tokens": len(prompt)}
 
     @app.post("/v1/messages")
+    @admitted
     async def messages(request: Request):
         try:
             b = await json_body(request)
@@ -632,7 +687,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
                 st = Stream(asyncio.get_running_loop(), tokenizer, parser)
                 req = make_request(b, prompt, st, None, images, await constraint(spec, prompt))
         except BadRequest as e:
-            return _anth_error(str(e))
+            return _anth_error(str(e), e.code)
         except Busy as e:
             return _anth_error(str(e), 529)
         mid = "msg_" + uuid.uuid4().hex[:24]
@@ -674,7 +729,7 @@ def build_app(worker: Worker, tokenizer, served_name: str, gen_defaults: dict, h
         except Failed as e:
             return _anth_error(e.msg, e.code)
         except BadRequest as e:
-            return _anth_error(str(e))
+            return _anth_error(str(e), e.code)
         except Busy as e:
             return _anth_error(str(e), 529)
         for _, ev, _, _ in events:
@@ -739,7 +794,9 @@ def main(argv=None):
                     help="disk budget of the conversation cache (KV and GDN state of past conversations, restored after an eviction "
                          "or a restart); 0: off")
     ap.add_argument("--no-vision", action="store_true", help="no image input: images become a text note, and the vision tower is not loaded")
-    ap.add_argument("--mem-cap-gb", type=float, default=105.0, help="hard cap on this process's GPU memory (torch allocator)")
+    ap.add_argument("--mem-cap-gb", type=float, default=95.0,
+                    help="hard cap on this process's GPU memory (torch allocator; GB of 10^9 bytes). The engine reserves 88.6 GB at "
+                         "startup and 89.5 GB with the vision tower; the rest of the unified memory stays for the host (docs/server.md)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
     ap.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "xhigh"), default="auto",
@@ -760,16 +817,21 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         raise SystemExit(f"--committee-roles: {e}") from None
     t0 = time.perf_counter()
+    path = resolve(a.model)
+    try:  # before the CUDA context and the slow imports: it reads only config.json, so a refused start costs little
+        check_memory(path, a.slots, a.max_seq_len, a.spec)
+    except NotEnoughMemory as e:
+        log(f"[server] {e}")
+        raise SystemExit(NO_MEMORY_EXIT) from None
     total = torch.cuda.get_device_properties(0).total_memory
     mem_cap_bytes = int(min(a.mem_cap_gb * 1e9, total))
     torch.cuda.set_per_process_memory_fraction(mem_cap_bytes / total)
     log(f"[server] GPU memory cap {mem_cap_bytes / 1e9:.0f} GB of {total / 1e9:.0f} GB")
 
     from transformers import AutoTokenizer  # a slow import: after the memory cap is set, so a crash here is cheap
-    path = resolve(a.model)
     tokenizer = AutoTokenizer.from_pretrained(path)
-    # the values without a flag (the queue depth, the request time cap, the checkpoint ring, the draft lengths, the image
-    # size, the cache directory) are the defaults of ServerConfig
+    # the values without a flag (the queue depth, the request time cap, the body size, the checkpoint ring, the draft lengths,
+    # the image size, the cache directory) are the defaults of ServerConfig
     cfg = ServerConfig(model=a.model, slots=a.slots, max_seq_len=a.max_seq_len, checkpoints=0 if a.no_prefix_caching else D.checkpoints,
                        spec=a.spec, drafter_weights=a.drafter_weights, decode_weights=a.decode_weights,
                        boundary_token=ChatFormat(tokenizer).im_start, selftest=not a.no_selftest, warmup=not a.no_warmup,
@@ -783,6 +845,9 @@ def main(argv=None):
     worker = Worker(cfg, log)
     worker.start()
     worker.ready.wait()
+    if isinstance(worker.error, NotEnoughMemory):  # build_engine checks again, after the CUDA context: the same exit
+        log(f"[server] {worker.error}")
+        raise SystemExit(NO_MEMORY_EXIT)
     if worker.error is not None:
         raise SystemExit(f"engine failed to start: {worker.error!r}")
     thinking = {"auto": None, "on": True, "off": False}[a.thinking]

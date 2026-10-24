@@ -60,9 +60,8 @@ class Qwen35Config:
         c = json.load(open(os.path.join(path, "config.json")))
         t = c.get("text_config", c)
         rp = t.get("rope_parameters", {})
-        if rp.get("rope_type", "default") not in ("default", "yarn"):
-            raise NotImplementedError(f"rope_type {rp['rope_type']!r}: only default and yarn are implemented")
-        yarn = rp.get("rope_type") == "yarn"  # a checkpoint that ships with YaRN: its native context is the original one
+        if rp.get("rope_type", "default") != "default":  # the engine adds YaRN itself, past the native context (apply_yarn)
+            raise NotImplementedError(f"rope_type {rp['rope_type']!r}: only the default rope is implemented")
         return cls(
             hidden_size=t["hidden_size"],
             intermediate_size=t["intermediate_size"],
@@ -80,8 +79,7 @@ class Qwen35Config:
             linear_conv_kernel_dim=t["linear_conv_kernel_dim"],
             rms_norm_eps=t["rms_norm_eps"],
             vocab_size=t["vocab_size"],
-            max_position_embeddings=rp["original_max_position_embeddings"] if yarn else t.get("max_position_embeddings", 262144),
-            yarn_factor=float(rp["factor"]) if yarn else 1.0,
+            max_position_embeddings=t.get("max_position_embeddings", 262144),
             tie_word_embeddings=t.get("tie_word_embeddings", c.get("tie_word_embeddings", False)),
             mrope_section=list(rp.get("mrope_section", [11, 11, 10])),
             mrope_interleaved=bool(rp.get("mrope_interleaved", False)),

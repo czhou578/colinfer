@@ -15,7 +15,12 @@ With a warm page cache, startup takes about 25 s:
 - 12 s for the self-test and the graph capture
 - 3 s for the warm-up
 
-Then the process holds about 88 GB of the 121 GB unified memory until it exits.
+Then the process holds about 88 GB of the 121 GB unified memory until it exits. Before the server creates the CUDA
+context, it compares its estimate of this memory with `MemAvailable`. The estimate adds a reserve of 6 GB for the growth
+after startup: the vision tower, a tokenize or an image decode, and the request bodies before the queue. At the defaults, the server needs about 101 GB. When
+the estimate does not fit, the server logs the two figures and exits with status 3. The systemd unit
+(`deploy/colinfer.service`) does not restart on this status. `engine/runtime/build.py` (`check_memory`) holds the
+estimate, and `build_engine` makes the same check for the end-to-end checks and the benchmarks.
 
 | Flag | Default | |
 |---|---|---|
@@ -29,7 +34,7 @@ Then the process holds about 88 GB of the 121 GB unified memory until it exits.
 | `--no-prefix-caching` | off | Never reuse a prompt prefix: no checkpoint ring, no conversation cache on disk. Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
 | `--no-vision` | off | No image input. Images then become a short text note. |
-| `--mem-cap-gb` | 105 | A hard cap on the torch allocator. Past the cap, the allocator raises an error, and the process exits and restarts. The engine allocates about 88 GB at startup. |
+| `--mem-cap-gb` | 95 | A hard cap on the torch allocator, in GB of 10^9 bytes. Past the cap, the allocator raises an error, and the process exits and restarts. Torch reserves 88.6 GB at startup and 89.5 GB after the first image. The cap does not bound the CUDA context, the pinned host buffers, the Python process or the OS. Thus the cap leaves about 36 GB of the 130.7 GB of `MemTotal` for them. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
 | `--committee-size` | 3, or the roles of the file | Members of a committee reply (a request that names the model `<name>-committee`, see "Committee mode" below). 0 turns the alias off. |
@@ -41,6 +46,13 @@ These values have no flag. They are the defaults of `ServerConfig` in `engine/se
 
 - The queue holds 8 waiting requests. Past that, a request gets a 503 (`/v1/messages`: 529, `overloaded_error`), which
   Hermes Agent and Claude Code retry.
+- A request body is at most 32 MB, the request limit of the Anthropic API: the JSON with the messages and the base64
+  images. A larger body gets a 413 (`/v1/messages`: `request_too_large`), and the server stops reading it at the limit.
+- The text of a prompt, as the chat template renders it, is at most 8 bytes of UTF-8 per token of the slot: 4,194,304
+  at the default. A longer text gets the 400 `prompt is too long` before the tokenize, which holds host memory in
+  proportion to the text. Text and code use 2 to 4 bytes per token, so a prompt that fits the slot fits this limit.
+- At most 9 requests, the queue depth plus one, are between the body read and the queue at once. The next one gets the
+  busy reply before the server reads its body. The tokenizes and the image decodes run one at a time.
 - A request ends 1,800 s after it arrived, running or still in the queue, with `finish_reason` `length` (`stop_reason`
   `max_tokens`). There is no other cap on the output tokens: a request can use the room left in its slot.
 - The prefix-checkpoint ring holds 32 snapshots of 154 MB. The server allocates it at startup.

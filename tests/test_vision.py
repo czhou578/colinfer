@@ -191,6 +191,63 @@ def test_image_processor_and_expansion():
         images.expand([1, 99], [a, b], 99, 1000)
 
 
+def png_header(w, h):
+    """A PNG of a few bytes whose header claims w x h pixels: it has no pixel data."""
+    import struct
+    import zlib
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IEND", b"")
+
+
+def test_image_processor_rejects_a_large_image_before_the_decode(tmp_path):
+    import json
+
+    from engine.server import images
+    cfg = {"size": {"shortest_edge": 65536, "longest_edge": 16777216}, "patch_size": 16, "temporal_patch_size": 2,
+           "merge_size": 2, "image_mean": [0.5] * 3, "image_std": [0.5] * 3}
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(cfg))
+    # 8000 x 8000 is above the cap (8 x 2048 x 2048) and below PIL's bomb limits: only the cap stops its decode
+    proc = images.ImageProcessor(str(tmp_path))
+    big = png_header(8000, 8000)
+    for f in (lambda: proc.load(big), lambda: proc.patches(big, (1, 128, 128))):
+        with pytest.raises(ValueError, match=r"image of 8000 x 8000 pixels: it must have at most 33,554,432 pixels"):
+            f()
+    # the cap is DECODE_FACTOR x max_pixels: an image at the cap loads, one row more does not
+    proc = images.ImageProcessor(str(tmp_path), max_pixels=65536)
+    assert proc.load(png("red", (1024, 512))).grid[0] == 1
+    with pytest.raises(ValueError, match="at most 524,288 pixels"):
+        proc.load(png("red", (1024, 513)))
+
+
+def test_image_processor_opens_only_the_formats_of_the_apis(tmp_path):
+    """Pillow opens many formats. Some decode inside open(), before any size check (an ICO), or run a program on the
+    client's bytes (an EPS, in Ghostscript). The processor opens only PNG, JPEG, WEBP and GIF, the image inputs of
+    both APIs."""
+    import io
+    import json
+
+    import PIL.Image
+
+    from engine.server import images
+    cfg = {"size": {"shortest_edge": 65536, "longest_edge": 16777216}, "patch_size": 16, "temporal_patch_size": 2,
+           "merge_size": 2, "image_mean": [0.5] * 3, "image_std": [0.5] * 3}
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(cfg))
+    proc = images.ImageProcessor(str(tmp_path))
+
+    def saved(fmt):
+        buf = io.BytesIO()
+        PIL.Image.new("RGB", (64, 64), "red").save(buf, format=fmt)
+        return buf.getvalue()
+    for fmt in images.FORMATS:
+        assert proc.load(saved(fmt)).grid[0] == 1, fmt
+    with pytest.raises(ValueError, match="cannot read the image"):
+        proc.load(saved("ICO"))
+    with pytest.raises(ValueError, match="cannot read the image"):  # an EPS header: Pillow would run Ghostscript on its load
+        proc.load(b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 64 64\n")
+
+
 # ------------------------------------------------------------------------------------------------ the scheduler
 PAD = 5  # the stub's image pad token
 

@@ -69,8 +69,9 @@ def template_kwargs(b: dict, default_thinking: bool | None, default_effort: str 
 
 
 class ChatFormat:
-    """The chat template of the checkpoint and the ids of its control tokens. The server renders every prompt through
-    render(); the tools and the checks use the same object (from_checkpoint), so their prompts are the server's."""
+    """The chat template of the checkpoint and the ids of its control tokens. The server renders a prompt with text() and
+    then encode(), with its length check between them; render() is the two together. The tools and the checks use the
+    same object (from_checkpoint), so their prompts are the server's."""
 
     def __init__(self, tokenizer):
         self.tok = tokenizer
@@ -82,7 +83,7 @@ class ChatFormat:
         self.im_start_str = "<|im_start|>"  # the text of the message boundary: render() encodes a prompt per message
         self._segments: collections.OrderedDict[str, np.ndarray] = collections.OrderedDict()  # segment text -> ids, LRU
         self._cached = 0  # ids in _segments
-        self._lock = threading.Lock()  # render() runs on the server's worker threads
+        self._lock = threading.Lock()  # encode() runs on a worker thread of the server; the lock guards the segment cache
 
     @classmethod
     def from_checkpoint(cls, path_or_repo: str = MODEL) -> ChatFormat:
@@ -91,10 +92,13 @@ class ChatFormat:
         return cls(AutoTokenizer.from_pretrained(resolve(path_or_repo)))
 
     def render(self, messages: list[dict], tools: list | None = None, **template_kwargs) -> list[int]:
+        return self.encode(self.text(messages, tools, **template_kwargs))
+
+    def text(self, messages: list[dict], tools: list | None = None, **template_kwargs) -> str:
+        """The chat as the template renders it, before the tokenize."""
         msgs = [_normalize_message(m) for m in messages]
         kw = {k: v for k, v in template_kwargs.items() if v is not None}
-        text = self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=True, tokenize=False, **kw)
-        return self.encode(text)
+        return self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=True, tokenize=False, **kw)
 
     def encode(self, text: str) -> list[int]:
         """The token ids of a rendered prompt. The text is split into its messages (each from its <|im_start|>): the

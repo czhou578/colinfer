@@ -35,8 +35,9 @@ perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
 - [uv](https://docs.astral.sh/uv/). It installs Python 3.12 and the pinned dependencies.
 - The checkpoint `nvidia/Qwen3.8-27B-NVFP4` (21.9 GB) from Hugging Face. The optional INT decode copies (below) also
   need the BF16 checkpoint `Qwen/Qwen3.8-27B` (55.6 GB).
-- About 65 GB of free unified memory while the server runs. Stop other GPU work first: an over-commit of the shared
-  memory can power off the machine instead of an out-of-memory error.
+- About 105 GB of free unified memory (in units of 10^9 bytes, as `--mem-cap-gb`) while the server runs. Stop other
+  GPU work first: an over-commit of the shared memory can power off the machine instead of an out-of-memory error. The
+  server does not start with less.
 - Up to 64 GB of disk for the conversation cache (`--session-cache-gb`, under `~/.cache/colinfer/sessions`).
 
 ## Quick start
@@ -81,7 +82,8 @@ CLI: a local gateway (`engine/server/gateway.py`, `deploy/colinfer-gateway.servi
 picker. `docs/night_shift.md` runs a list of Claude Code tasks against the server at night, each on its own branch
 (`tools/night_shift.py`).
 `docs/review.md` reviews a finished feature with `/reviewing-features` in Claude Code: parallel finders for slop, security
-and races, refuters, fixes and capped re-review rounds (`REVIEW.md`, `.claude/`, `tools/review.py`).
+and races, refuters, fixes and capped re-review rounds (`REVIEW.md`, `.claude/`, `tools/review.py`). The harness is
+generic: `python3 tools/review.py export <repo>` copies it into another repository, and `REVIEW.md` tells it what colinfer is.
 
 ## How it works
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""End-to-end checks of engine/runtime/scheduler.py on the real model (needs ~40 GB of GPU memory).
+"""End-to-end checks of engine/runtime/scheduler.py on the real model, as the server builds it (needs ~90 GB of memory).
+
+The engine is the server's: 3 slots of 524288 tokens, thus the rope with YaRN x2 (engine/runtime/build.py load_model).
+Plain decode and MTP share that model, so a wrong rope gives the same wrong tokens to both. Thus check 0 reads the rope
+itself: the kernels use the YaRN frequencies, and the drafter's q norm carries the attention factor.
 
 The reference is a plain-decode scheduler (no speculation), with each request alone. The MTP scheduler must give the
 same greedy tokens:
@@ -24,6 +28,8 @@ More checks:
      gives the tokens of plain decode under the same grammar; a forced tool call parses, with typed arguments; with
      reasoning on, the JSON follows the free reasoning.
  10. speed: MTP tok/s per prompt (Phase 4 numbers: 32.4 tok/s mean at T=0)
+ 11. the counts of each request (cycles, drafted and accepted tokens; the server's log and timings read them) sum to
+     the metrics
    uv run python tests/scheduler_check.py
 """
 import io
@@ -36,13 +42,15 @@ import time
 
 import torch
 
+from engine.model.qwen35 import rope_inv_freq, yarn_attention_factor
 from engine.runtime.build import build_engine
 from engine.runtime.grammar import Grammars
 from engine.runtime.scheduler import Request, Scheduler
 from engine.runtime.sessions import SessionStore
 from engine.server.chat import ChatFormat, parse_tool_call
 from engine.server.images import ImageProcessor, expand
-from engine.weights.loader import MODEL, resolve
+from engine.weights.direct import read_tensors, release_buffers
+from engine.weights.loader import MODEL, resolve, weight_map
 
 CODE = '''def parse_config(path):
     with open(path) as f:
@@ -78,12 +86,52 @@ def main():
     def chat_ids(msgs):
         return fmt.render(msgs, enable_thinking=False)
     t0 = time.perf_counter()
-    # the speculative scheduler: the server's engine at 32k slots, with the checkpoint's drafter and no suffix drafts
-    spec, _ = build_engine(max_seq_len=32768, k=a.k, drafter_weights="none", suffix_drafts=0,
+    # the speculative scheduler: the server's engine (its slots and its slot length, thus its YaRN rope), with the
+    # checkpoint's drafter and no suffix drafts
+    spec, _ = build_engine(k=a.k, drafter_weights="none", suffix_drafts=0,
                            decode_weights="checkpoint" if a.checkpoint_weights else "int", boundary=IM_START)
-    ref = Scheduler(spec.model, n_slots=1, max_seq_len=8192, n_checkpoints=0)  # plain decode, one request at a time
+    ref = Scheduler(spec.model, n_slots=1, max_seq_len=8192, n_checkpoints=0)  # plain decode on the same model, one request at a time
     print(f"schedulers built in {time.perf_counter() - t0:.1f} s; {torch.cuda.memory_allocated() / 1e9:.1f} GB allocated")
     ok = True
+
+    # 0. the rope of the served model: the kernels read the YaRN frequencies (apply_yarn runs before to_fast), and the
+    # drafter's q norm carries the attention factor (fold_yarn_scale)
+    cfg, da = spec.model.cfg, spec.mtp.layer.self_attn
+    inv = rope_inv_freq(cfg, da.inv_freq.device)
+    # the factor first: inv comes from the same config as the kernels' frequencies, so it alone cannot see a lost apply_yarn
+    rope = cfg.yarn_factor > 1 and cfg.yarn_factor == spec.max_seq_len / cfg.max_position_embeddings
+    rope = rope and torch.equal(da.inv_freq, inv) and all(torch.equal(x.self_attn.inv_freq, inv) for x in spec.model.layers
+                                                          if x.block_type == "full_attention")
+    path, qn = resolve(MODEL), "mtp.layers.0.self_attn.q_norm.weight"
+    raw = read_tensors(os.path.join(path, weight_map(path)[qn]), [qn], da.inv_freq.device)[qn].to(torch.bfloat16)
+    release_buffers()  # the direct reader pins 384 MB of staging buffers for a read; the check does not need them again
+    f, r = yarn_attention_factor(cfg), cfg.rotary_dim
+    fold = torch.equal(da.q_norm.weight[:r], raw[:r] if f == 1 else (f * (1 + raw[:r].float()) - 1).to(raw.dtype))
+    ok &= rope and fold
+    print(f"[rope] YaRN x{cfg.yarn_factor:g} at {spec.max_seq_len} tokens per slot: kernel frequencies "
+          f"{'RIGHT' if rope else 'WRONG'}; drafter q norm x{f:.4f} {'FOLDED' if fold else 'NOT FOLDED'}")
+
+    spec_done = []  # the requests that the MTP scheduler ran since its metrics were last zeroed
+    counts_ok = [True]
+    submit, reset = spec.submit, spec.reset
+
+    def counted_submit(req):
+        spec_done.append(req)
+        return submit(req)
+
+    def check_counts():
+        """The counts of each request sum to the metrics, and each request with decode steps counts them."""
+        m = spec.metrics
+        good = (sum(x.drafted for x in spec_done) == m.drafted.total() and sum(x.accepted for x in spec_done) == m.accepted.total()
+                and all(x.cycles >= 1 and x.accepted <= x.drafted and len(x.output) <= 1 + x.cycles + x.accepted
+                        for x in spec_done if len(x.output) > 1))
+        counts_ok[0] &= good
+
+    def counted_reset():
+        check_counts()
+        spec_done.clear()
+        reset()
+    spec.submit, spec.reset = counted_submit, counted_reset
     names = list(PROMPTS)
     prompts = [chat_ids([{"role": "user", "content": PROMPTS[n]}]) for n in names]
     N = 200
@@ -301,6 +349,9 @@ def main():
           f"{'VALID' if rvalid else 'INVALID'}")
 
     m = spec.metrics
+    check_counts()
+    ok &= counts_ok[0]
+    print(f"[spec] request counts (cycles, drafted, accepted) {'MATCH' if counts_ok[0] else 'DO NOT MATCH'} the metrics")
     print(f"[spec] drafted {m.drafted.total():.0f}, accepted {m.accepted.total():.0f} ({m.accepted.total() / max(m.drafted.total(), 1):.2f}); "
           + ", ".join(f"{src}: {m.accepted.get(source=src) / max(m.drafted.get(source=src), 1):.2f} of {m.drafted.get(source=src):.0f}"
                       for src in ("mtp", "suffix") if m.drafted.get(source=src)))

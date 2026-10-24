@@ -164,15 +164,16 @@ run the night shift in a container.
 `uv run pytest`. Allow the test runner, the linter and the build. Do not allow `rm`, `git push`, package installation,
 or anything that reaches outside the worktree.
 
-> **CAUTION:** Do not allow a task to run anything that loads the model next to the server. `tests/check.sh` without
-> `--quick`, `tests/golden.py`, `tests/perplexity.py` and an HF reference run each take 40 GB or more. With the server's
-> 61 GB, this is within 20 GB of the memory of the machine, and an over-commit powers the machine off. The
-> `kill_below_gb` guard kills the task when the available memory falls under its limit, but a single large allocation
-> can get past it. For this repository, allow `tests/check.sh --quick` and `uv run pytest tests/` only.
+> **CAUTION:** Do not allow a task to run anything that loads the model next to the server. `tests/golden.py`,
+> `tests/perplexity.py` and an HF reference run each take 40 GB or more. `tests/check.sh` without `--quick` takes about
+> 90 GB: `tests/scheduler_check.py` builds the server's engine. The server holds 88 GB of the 121 GB of the machine, so
+> such a load over-commits the memory, and an over-commit powers the machine off. The `kill_below_gb` guard kills the
+> task when the available memory falls under its limit, but a single large allocation can get past it. For this
+> repository, allow `tests/check.sh --quick` and `uv run pytest tests/` only.
 
-**The Stop hook.** This repository has a Stop hook that runs ruff and pytest when a turn of Claude Code ends with
-changed code (`docs/review.md`). The night shift sets `COLINFER_STOP_CHECK=0`, so the hook does not run in a task. To
-let the hook check the work of a task, set `COLINFER_STOP_CHECK = "1"` in the `env` of the task. Each check then takes
+**The Stop hook.** The review harness has a Stop hook that runs ruff and pytest when a turn of Claude Code ends with
+changed code (`docs/review.md`). The night shift sets `REVIEW_STOP_CHECK=0`, so the hook does not run in a task. To
+let the hook check the work of a task, set `REVIEW_STOP_CHECK = "1"` in the `env` of the task. Each check then takes
 about a minute, and a failed check sends the model back to fix it, up to three times.
 
 **Memory.** A task starts only with `min_free_gb` available (`MemAvailable`; the GPU allocations of the server count,

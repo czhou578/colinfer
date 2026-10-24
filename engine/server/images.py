@@ -23,6 +23,13 @@ import torch
 from engine.model.vision import Image
 
 MAX_PIXELS = 2048 * 2048
+# The decode of an image is capped at this multiple of max_pixels. A client may send a photo larger than the resize
+# target, so the cap is not max_pixels itself. At the default max_pixels, 8 x gives 32M pixels: about 130 MB of RGBA.
+# The server runs one decode at a time (engine/server/api.py). PIL's own bomb limit (179M pixels) is too high.
+DECODE_FACTOR = 8
+# The image formats of the OpenAI and Anthropic APIs. No other PIL plugin runs on client bytes: an ICO decodes its
+# embedded PNG inside open(), before any size check, and an EPS runs the client's PostScript in Ghostscript.
+FORMATS = ("PNG", "JPEG", "WEBP", "GIF")
 NOTE = "[image omitted: this server reads text only]"
 
 
@@ -80,21 +87,27 @@ class ImageProcessor:
                                              patch_size=self.patch, temporal_patch_size=c["temporal_patch_size"], merge_size=self.merge,
                                              image_mean=c["image_mean"], image_std=c["image_std"])
 
-    @staticmethod
-    def _open(data: bytes):
-        """The decoded image. ValueError if it is not an image that Pillow reads."""
+    def _open(self, data: bytes):
+        """The decoded image. ValueError if it is not a PNG, JPEG, WEBP or GIF, or if it has more than
+        DECODE_FACTOR x max_pixels pixels. Pillow reads the size from the header, so the check comes before the decode."""
         import PIL.Image
+        limit = DECODE_FACTOR * self.max_pixels
         try:
-            img = PIL.Image.open(io.BytesIO(data))
-            img.load()
+            img = PIL.Image.open(io.BytesIO(data), formats=FORMATS)  # reads the header only
+            w, h = img.size
+            if w * h <= limit:
+                img.load()
         except (PIL.UnidentifiedImageError, PIL.Image.DecompressionBombError, OSError, ValueError) as e:
             raise ValueError(f"cannot read the image: {e}") from None
+        if w * h > limit:
+            raise ValueError(f"image of {w} x {h} pixels: it must have at most {limit:,} pixels")
         return img
 
     def load(self, data: bytes) -> Image:
         """Checks one image (decoded now, not kept) and gives it its grid, from its size, and its key, from its bytes.
         Its patches are made when the vision tower needs them (Image.patches: the resize, normalization and patching
-        take up to ~0.5 s), which a prefix cache hit never does. ValueError if it is not an image that Pillow reads."""
+        take up to ~0.5 s), which a prefix cache hit never does. ValueError if it is not an image that Pillow reads, or if
+        it has too many pixels (see _open)."""
         img = self._open(data)
         w, h = img.size
         if min(w, h) < 1 or max(w, h) / min(w, h) > 200:

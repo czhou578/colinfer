@@ -1,6 +1,9 @@
 """The HTTP layer of the server (engine/server/api.py) against a fake engine thread: request validation and the
 responses of /v1/chat/completions, /v1/completions and /v1/messages. No GPU and no checkpoint: a character-level
 tokenizer and a worker that answers each request with a scripted reply."""
+import asyncio
+import gc
+import json
 import re
 import time
 import types
@@ -12,7 +15,7 @@ from fastapi.testclient import TestClient
 from engine.runtime.metrics import Metrics
 from engine.server import anthropic as anth
 from engine.server import openai as oai
-from engine.server.api import build_app
+from engine.server.api import BadRequest, build_app
 from engine.server.chat import template_kwargs
 from engine.server.worker import ServerConfig
 
@@ -366,6 +369,145 @@ def test_invalid_json_is_400():
         assert c.post(path, content=b"{not json", headers={"content-type": "application/json"}).status_code == 400
 
 
+def test_a_body_past_the_size_limit_is_413_before_the_render():
+    """The render and the tokenize hold host memory in proportion to the body, so a body past max_body_bytes is a 413 in
+    the format of each API, with or without a Content-Length. The body never reaches the template or the engine."""
+    c, w = client("ok<|im_end|>")
+    w.cfg.max_body_bytes = 1 << 16
+    big = {"messages": [{"role": "user", "content": "x" * (1 << 16)}]}
+    r = c.post(CHAT, json=big)
+    assert r.status_code == 413 and r.json()["error"]["code"] == 413
+    r = c.post("/v1/messages", json={"max_tokens": 5, **big})
+    assert r.status_code == 413 and r.json()["error"]["type"] == "request_too_large"
+    assert c.post("/v1/messages/count_tokens", json=big).status_code == 413
+    assert not w.submitted
+    w.cfg.max_body_bytes = 1 << 20
+    assert c.post(CHAT, json=big).status_code == 400  # read in full: the prompt is longer than the slot
+    assert c.post(CHAT, json={"messages": USER}).status_code == 200 and len(w.submitted) == 1
+
+
+def asgi_post(app, path: str, chunks: list[bytes]) -> tuple[int, int]:
+    """POSTs `chunks` to the ASGI app as one body without a Content-Length, one http.request message per chunk. Returns
+    (the response status, the number of receive() calls). TestClient joins an iterator body into one chunk, so it cannot
+    show where the server stops reading."""
+    calls, status = [0], []
+
+    async def receive():
+        i = calls[0]
+        calls[0] += 1
+        if i < len(chunks):
+            return {"type": "http.request", "body": chunks[i], "more_body": i + 1 < len(chunks)}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status.append(message["status"])
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "scheme": "http", "path": path,
+             "raw_path": path.encode(), "query_string": b"", "root_path": "", "headers": [(b"content-type", b"application/json")],
+             "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8000)}
+    asyncio.run(app(scope, receive, send))
+    return status[0], calls[0]
+
+
+def test_the_server_stops_reading_a_body_without_a_length_at_the_size_limit():
+    """A body without a Content-Length gets its 413 when its size passes max_body_bytes: the server does not receive
+    the rest of the body."""
+    c, w = client("ok<|im_end|>")
+    w.cfg.max_body_bytes, size = 1 << 16, 1 << 10
+    raw = json.dumps({"messages": [{"role": "user", "content": "x" * (1 << 18)}]}).encode()
+    status, calls = asgi_post(c.app, CHAT, [raw[i:i + size] for i in range(0, len(raw), size)])
+    assert status == 413 and calls == w.cfg.max_body_bytes // size + 1 and not w.submitted
+
+
+def test_a_refused_body_is_freed_without_the_cyclic_gc():
+    """The 413 of a body past the limit leaves no reference cycle: the chunks that the server read go away when the
+    request ends, not at the next run of the cyclic GC."""
+    c, w = client("ok<|im_end|>")
+    w.cfg.max_body_bytes = 1 << 16
+    raw = json.dumps({"messages": [{"role": "user", "content": "x" * (1 << 17)}]}).encode()
+    gc.collect()
+    gc.disable()
+    try:
+        status, _ = asgi_post(c.app, CHAT, [raw[i:i + 1024] for i in range(0, len(raw), 1024)])
+        alive = [o for o in gc.get_objects() if type(o) is BadRequest]
+    finally:
+        gc.enable()
+    assert status == 413 and not alive
+
+
+def test_a_client_error_in_a_stream_keeps_its_status(monkeypatch):
+    """A BadRequest that ends a stream before its first output gives the error event its own status, not a 400."""
+    c, w = client("ok<|im_end|>")
+
+    def refuse(req):
+        raise BadRequest("too large", 413)
+    monkeypatch.setattr(w, "submit", refuse)
+    r = c.post(CHAT, json={"messages": USER, "stream": True})
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: {")]
+    assert events == [oai.error_body("too large", 413)]
+
+
+class CountingTokenizer(CharTokenizer):
+    """CharTokenizer that counts its encode calls."""
+
+    def __init__(self):
+        self.encodes = 0
+
+    def encode(self, text, add_special_tokens=False):
+        self.encodes += 1
+        return super().encode(text, add_special_tokens)
+
+
+def test_a_prompt_text_past_the_limit_is_refused_before_the_tokenize():
+    """The tokenize holds host memory in proportion to the text, so a chat text or a completion prompt longer than 8
+    bytes of UTF-8 per token of the slot is a 400 before it, in the words of the token check. The limit counts bytes: a
+    rare 4-byte character is up to 4 tokens of a byte-level BPE. A text under the limit is tokenized, and then its tokens
+    are checked."""
+    tok = CountingTokenizer()
+    c, w = client("ok<|im_end|>", tokenizer=tok)
+    for path, body in ((CHAT, {"messages": [{"role": "user", "content": "x" * (8 * MAX_LEN + 1)}]}),
+                       ("/v1/completions", {"prompt": "x" * (8 * MAX_LEN + 1)}),
+                       ("/v1/messages", {"max_tokens": 5, "messages": [{"role": "user", "content": "x" * (8 * MAX_LEN + 1)}]}),
+                       (CHAT, {"messages": [{"role": "user", "content": "\U00020000" * (2 * MAX_LEN + 1)}]})):  # 4 bytes each
+        r = c.post(path, json=body)
+        assert r.status_code == 400 and "bytes" in r.text, r.text
+        assert tok.encodes == 0 and not w.submitted
+    r = c.post(CHAT, json={"messages": [{"role": "user", "content": "x" * (8 * MAX_LEN - 100)}]})
+    assert r.status_code == 400 and "tokens" in r.text and tok.encodes >= 1  # one encode per new message segment
+    assert c.post(CHAT, json={"messages": USER}).status_code == 200 and len(w.submitted) == 1
+
+
+def test_requests_past_the_admission_bound_are_refused_before_their_body_is_read():
+    """At most max_queue + 1 requests are between the body read and the queue at once: their bodies, images and renders
+    hold host memory before the queue check. The next one gets the busy reply of its API at once."""
+    import asyncio
+    import threading
+
+    import httpx
+
+    class SlowTokenizer(CharTokenizer):
+        gate = threading.Event()
+
+        def apply_chat_template(self, conversation, **kw):
+            self.gate.wait(5)
+            return super().apply_chat_template(conversation, **kw)
+    w = FakeWorker("ok<|im_end|>", None)
+    w.cfg.max_queue = 1  # the bound is 2
+    app = build_app(w, SlowTokenizer(), "fake", {}, {"vocab_size": VOCAB}, None, None)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+            slow = [asyncio.create_task(c.post(CHAT, json={"messages": USER})) for _ in range(2)]
+            await asyncio.sleep(0.2)  # both wait in the render, on the gate
+            refused = [await c.post(CHAT, json={"messages": USER}), await c.post("/v1/messages", json={"max_tokens": 5, "messages": USER})]
+            SlowTokenizer.gate.set()
+            return refused, await asyncio.gather(*slow)
+    (r1, r2), done = asyncio.run(run())
+    assert r1.status_code == 503 and r1.json()["error"]["type"] == "server_error"
+    assert r2.status_code == 529 and r2.json()["error"]["type"] == "overloaded_error"
+    assert [r.status_code for r in done] == [200, 200] and len(w.submitted) == 2
+
+
 @pytest.mark.parametrize("body", [
     '{"prompt": [5, %d]}' % VOCAB,  # past the embedding: a device-side assert, which no later CUDA op survives
     '{"prompt": [-1, 5]}',
@@ -502,6 +644,7 @@ def test_main_wires_the_flags(monkeypatch):
     engine thread, the app and the HTTP server are stand-ins; the tokenizer is the checkpoint's."""
     import threading
 
+    import engine.runtime.build as build
     import engine.server.api as api
     from engine.weights.loader import MODEL, resolve
     try:
@@ -527,6 +670,7 @@ def test_main_wires_the_flags(monkeypatch):
     monkeypatch.setattr(api, "Worker", FakeThread)
     monkeypatch.setattr(api, "build_app", fake_app)
     monkeypatch.setattr(api.torch.cuda, "set_per_process_memory_fraction", lambda f: None)
+    monkeypatch.setattr(build, "meminfo_bytes", lambda key: 1 << 50)  # not the memory that is free now
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: got.update(served=True))
     api.main(["--no-prefix-caching", "--spec", "none", "--slots", "1", "--reasoning-effort", "medium", "--committee-size", "0",
               "--session-cache-gb", "3", "--no-vision", "--mem-cap-gb", "70"])
@@ -541,3 +685,56 @@ def test_main_wires_the_flags(monkeypatch):
     assert got["served"] and "temperature" in got["gen"]
     api.main(["--session-cache-gb", "0", "--thinking", "off"])
     assert got["cfg"].checkpoints == D.checkpoints == 32 and got["thinking"] is False and got["committee"] is not None
+    # the default cap: the engine's torch peak (89.5e9 with the vision tower) and a margin, not more of the host's memory
+    assert got["cfg"].mem_cap_bytes == int(min(95e9, api.torch.cuda.get_device_properties(0).total_memory))
+
+
+def test_the_readme_asks_for_the_memory_that_the_engine_takes_at_startup():
+    """The free memory that README.md asks for covers the startup estimate of the memory check at the defaults (3 slots x
+    524288 tokens, MTP) and its reserve for the growth after startup. The README figure is in GB of 10^9 bytes, as
+    `--mem-cap-gb`."""
+    import os
+
+    import engine.runtime.build as build
+    from engine.weights.loader import resolve
+    D = ServerConfig()
+    try:
+        path = resolve(D.model)
+    except Exception:
+        pytest.skip("checkpoint not in the local HF cache")
+    readme = open(os.path.join(os.path.dirname(__file__), "..", "README.md")).read()
+    gb = int(re.search(r"About (\d+) GB of free unified memory", readme).group(1))
+    assert build.startup_bytes(path, D.slots, D.max_seq_len, D.spec) + build.GROWTH_RESERVE_BYTES <= gb * 10**9
+
+
+def test_main_refuses_to_start_without_the_memory_before_the_cuda_context(monkeypatch, capsys):
+    """With less MemAvailable than the startup estimate, main() logs the figures and exits with NO_MEMORY_EXIT before it
+    creates the CUDA context: an over-commit of the unified memory powers the machine off. systemd does not restart the
+    server on that status, so a refused start does not repeat every 5 s."""
+    import os
+
+    import engine.runtime.build as build
+    import engine.server.api as api
+    from engine.weights.loader import MODEL, resolve
+    try:
+        resolve(MODEL)
+    except Exception:
+        pytest.skip("checkpoint not in the local HF cache")
+    cuda = []
+
+    def no_cuda(*a, **k):
+        cuda.append(a)
+        raise AssertionError("main() created the CUDA context")
+
+    def no_worker(cfg, log):
+        raise AssertionError("main() started the engine thread")
+    monkeypatch.setattr(build, "meminfo_bytes", lambda key: 70 * 10**9)  # less than the defaults take
+    monkeypatch.setattr(build, "process_rss_bytes", lambda: 0)  # the check adds what the process holds; the test wants a round figure
+    monkeypatch.setattr(api.torch.cuda, "get_device_properties", no_cuda)
+    monkeypatch.setattr(api, "Worker", no_worker)
+    with pytest.raises(SystemExit) as e:
+        api.main([])
+    assert e.value.code == api.NO_MEMORY_EXIT and not cuda
+    assert "70 GB is available" in capsys.readouterr().out
+    unit = open(os.path.join(os.path.dirname(__file__), "..", "deploy", "colinfer.service")).read()
+    assert f"RestartPreventExitStatus={api.NO_MEMORY_EXIT}\n" in unit

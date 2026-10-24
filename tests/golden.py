@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Golden-output check. The engine in its server configuration must reproduce the recorded tokens and per-token
 logprobs of a fixed request set exactly. The server configuration is: INT6 / INT5 decode copies and the drafter files
-when present, MTP speculation with suffix-match drafts, 3 slots.
+when present, MTP speculation with suffix-match drafts, 3 slots. The slots hold 32768 tokens, so the rope has no
+YaRN: the recorded tokens are the unscaled model's, which the server serves with --max-seq-len 262144. The YaRN model
+of the server's default (524288 tokens) is the model of tests/scheduler_check.py.
 
 The requests, all submitted at once (they queue and run one at a time):
 
@@ -76,7 +78,7 @@ def requests():
 
 def run(spec: bool, suffix_min: int = MIN_MATCH):
     from engine.runtime.build import build_engine
-    sched, _ = build_engine(spec="mtp" if spec else "none", max_seq_len=32768, suffix_drafts=suffix_min)  # the server's engine, 32k slots
+    sched, _ = build_engine(spec="mtp" if spec else "none", max_seq_len=32768, suffix_drafts=suffix_min)  # 32k slots: no YaRN (see above)
     reqs = requests()
     t0 = time.perf_counter()
     sched.run([r for _, r in reqs])

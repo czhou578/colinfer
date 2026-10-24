@@ -47,6 +47,9 @@ class ServerConfig:
     selftest: bool = True
     warmup: bool = True
     max_queue: int = 8
+    max_body_bytes: int = 32 << 20  # the largest request body (the JSON with the messages and the base64 images); past it, a 413. The
+    #                                 request limit of the Anthropic API, which Claude Code obeys. The prompt text has its own
+    #                                 limit (engine/server/api.py max_chars): the tokenize holds host memory in proportion to the text
     max_output_tokens: int = 0
     max_request_seconds: float = 1800.0
     api_key: str | None = None

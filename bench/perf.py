@@ -31,18 +31,11 @@ import uuid
 
 import torch
 
-from engine.runtime.build import build_engine
+from engine.runtime.build import build_engine, meminfo_bytes
 from engine.spec.suffix import MIN_MATCH
 from tests.golden import EOS, load_prompts
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def meminfo_kb(key: str) -> int:
-    for line in open("/proc/meminfo"):
-        if line.startswith(key + ":"):
-            return int(line.split()[1])
-    raise KeyError(key)
 
 
 def status_kb(key: str) -> int:
@@ -58,13 +51,13 @@ class Monitor(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.stop = threading.Event()
-        self.min_avail = meminfo_kb("MemAvailable")
+        self.min_avail = meminfo_bytes("MemAvailable")
         self.gpu = []  # (t, temp C, sm clock MHz, power W)
 
     def run(self):
         n = 0
         while not self.stop.wait(0.5):
-            self.min_avail = min(self.min_avail, meminfo_kb("MemAvailable"))
+            self.min_avail = min(self.min_avail, meminfo_bytes("MemAvailable"))
             n += 1
             if n % 2 == 0:
                 try:
@@ -132,7 +125,7 @@ def main():
     ap.add_argument("--suffix", type=int, default=MIN_MATCH, help="suffix-match drafts of at least N tokens (the server uses 8; 0: off)")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
-    avail0, total = meminfo_kb("MemAvailable"), meminfo_kb("MemTotal")
+    avail0, total = meminfo_bytes("MemAvailable"), meminfo_bytes("MemTotal")
     mon = Monitor()
     mon.start()
     res = dict(when=time.strftime("%Y-%m-%d %H:%M:%S"), git=subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
@@ -156,7 +149,7 @@ def main():
         res["decode_mtp"] = dict(tok_s=stats(r["tok_s"] for r in rounds), ttft_s=stats(r["ttft"] for r in rounds),
                                  per_kind={k: stats(r["per_kind"][k] for r in rounds) for k in rounds[0]["per_kind"]})
         res["memory_gb"] = dict(torch_allocated=torch.cuda.max_memory_allocated() / 1e9, torch_reserved=torch.cuda.max_memory_reserved() / 1e9,
-                                system=((avail0 - mon.min_avail) / 1e6), rss=status_kb("VmHWM") / 1e6, mem_total=total / 1e6)
+                                system=(avail0 - mon.min_avail) / 1e9, rss=status_kb("VmHWM") * 1024 / 1e9, mem_total=total / 1e9)
         del sched
         gc.collect()
         torch.cuda.empty_cache()

@@ -29,7 +29,7 @@ without speculation, bit for bit.
    `Worker._loop` ends the process with `os._exit(1)`, and every request in flight fails. A device-side assert does
    the same, through the poisoned CUDA context. Thus the HTTP layer must check each client value with a 400 before the
    value reaches the engine thread. `Stream.feed` and `Stream.finish` contain their own exceptions: keep it so.
-3. **The machine powers off.** The GPU and the host share 128 GB of unified memory, and the server takes about 61 GB.
+3. **The machine powers off.** The GPU and the host share 128 GB of unified memory, and the server takes about 88 GB.
    An over-commit powers off the machine without an out-of-memory error. An allocation whose size a request sets, or
    that grows with each request, is high or critical.
 4. **Two threads or two streams race.** The map below lists where. A race that corrupts the KV cache, the GDN state or
