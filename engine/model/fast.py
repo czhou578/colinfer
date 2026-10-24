@@ -332,6 +332,7 @@ class KernelGDN(GatedDeltaNet):
     qkvz: StackedFp8Linear  # in_proj_qkv and in_proj_z in one weight pass
     w_ba: torch.Tensor      # in_proj_b and in_proj_a stacked (bf16, for the GEMV)
     _spec: tuple | None     # the inputs of the last verify, for commit()
+    gate_act = 0            # the output gate of gdn_delta: 0 = silu(z) (Qwen3.8-27B), 1 = sigmoid(z) (qwen4_exp)
 
     @classmethod
     def adopt(cls, gdn: GatedDeltaNet) -> "KernelGDN":
@@ -362,19 +363,21 @@ class KernelGDN(GatedDeltaNet):
         ops().gdn_conv(mixed, conv, self.conv1d.weight, qkv)
         o = torch.empty(B, T, z.shape[-1], device=x.device, dtype=torch.bfloat16)
         if state.spec:
-            ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, rec, o, self.num_k_heads, self.norm.eps)
+            ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, rec, o, self.num_k_heads, self.norm.eps, gate_act=self.gate_act)
             self._spec = (mixed, qkv, z, b, a)
         else:
             assert T == 1, "multi-token prompts go through engine/model/prefill.py"
             ops().gdn_conv_commit(mixed, conv, state.active)
-            ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, rec, o, self.num_k_heads, self.norm.eps, state.active)
+            ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, rec, o, self.num_k_heads, self.norm.eps, state.active,
+                            gate_act=self.gate_act)
         return self.out_proj(o.view(B, T, -1), residual)
 
     def commit(self, state: FastState, layer_idx: int, n: torch.Tensor):
         """Advance the conv / recurrent state by the first n[b] tokens of the last verify."""
         mixed, qkv, z, b, a = self._spec
         ops().gdn_conv_commit(mixed, state.conv[layer_idx], n)
-        ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], None, self.num_k_heads, self.norm.eps, n)
+        ops().gdn_delta(qkv, z, b, a, self.A_log, self.dt_bias, self.norm.weight, state.rec[layer_idx], None, self.num_k_heads, self.norm.eps, n,
+                        gate_act=self.gate_act)
 
 
 class FastDecoderLayer(DecoderLayer):
