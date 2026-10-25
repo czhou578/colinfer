@@ -191,7 +191,9 @@ def snapshot(repo: str, paths: tuple[str, ...] = ()) -> str:
     with tempfile.TemporaryDirectory() as d:
         idx = os.path.join(d, "index")
         if os.path.exists(real):
-            shutil.copyfile(real, idx)  # its stat data saves the hashing of the unchanged files
+            # Its stat data saves the hashing of the unchanged files. copy2 keeps the mtime of the index: with a new
+            # mtime, git trusted the stat data of a file edited in the second of the index, and missed the edit.
+            shutil.copy2(real, idx)
         env = dict(os.environ, GIT_INDEX_FILE=idx)
         git(repo, "add", "-A", "--", *(paths or ["."]), env=env)
         tree = git(repo, "write-tree", env=env)

@@ -107,6 +107,19 @@ def test_snapshot_sees_untracked_files_and_leaves_the_index(repo):
     assert rv.snapshot(repo, ("a.py",)) != code
 
 
+def test_snapshot_sees_a_change_of_the_same_size_in_the_second_of_the_index(repo):
+    # The times are pinned, as when a.py, its commit and its edit fall in one second. git then hashes a.py again
+    # (racy git), but only while the copy of the index keeps the mtime of the index.
+    run("git", "-C", repo, "config", "core.trustCtime", "false")  # the kernel sets the ctime, the test cannot pin it
+    t = 1_700_000_000 * 10**9
+    os.utime(os.path.join(repo, "a.py"), ns=(t, t))
+    run("git", "-C", repo, "commit", "-qam", "pinned", "--allow-empty")
+    os.utime(os.path.join(repo, ".git", "index"), ns=(t, t))
+    write(repo, "a.py", "x = 5\n")
+    os.utime(os.path.join(repo, "a.py"), ns=(t, t))  # the same size and mtime as the stat data of the index
+    assert run("git", "-C", repo, "show", rv.snapshot(repo) + ":a.py") == "x = 5"
+
+
 def test_scope_leaves_out_the_skipped_paths(repo):
     run("git", "-C", repo, "checkout", "-qb", "feature")
     write(repo, "a.py", "x = 2\n")
