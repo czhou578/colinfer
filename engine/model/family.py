@@ -41,7 +41,8 @@ NOT_SERVED_YET: dict[str, str] = {}
 # QWEN4EXP_DRAFTER_BYTES is the drafter's part at the defaults: its weights and draft head (1.95e9, engine/spec/mtp4.py)
 # and the pool of the cycle graphs. With --spec none the check thus asks for a little more than the engine takes.
 QWEN4EXP_DRAFTER_BYTES = 3 * 10**9
-QWEN4EXP_FIXED_BYTES = 87 * 10**9 + QWEN4EXP_DRAFTER_BYTES
+QWEN4EXP_COPIES_BYTES = 14 * 10**8  # the requantized decode copies of phase B on the GPU (+1.35 GB measured; the BF16 originals stay for prefill)
+QWEN4EXP_FIXED_BYTES = 87 * 10**9 + QWEN4EXP_DRAFTER_BYTES + QWEN4EXP_COPIES_BYTES
 QWEN4EXP_PREFILL_CHUNK = 4096  # tokens per prefill chunk (bench/prefill_chunk_bench.py: the MoE ceiling is 7.5k tok/s at 4096)
 NGRAM_CACHE_GB = 1.0           # the default of --ngram-cache-gb: 6.25M rows of 160 bytes
 NGRAM_ROW = 160                # bytes of one n-gram row (engine/weights/ple.py ROW_BYTES)
@@ -281,6 +282,10 @@ def _qwen4exp(path: str) -> Family:
 
     def load(path, decode_weights, log, prep, max_seq_len, ngram_cache_gb=NGRAM_CACHE_GB):
         path, model = load_fast(path, decode_weights, log, prep, max_seq_len)
+        if decode_weights == "int" and prep is not None and prep.decode:  # phase B: the requantized copies (tools/requant_qwen4exp.py)
+            log(f"[engine] decode streams the requantized copies of {prep.dir}: {fast.attach_decode_copies4(model, prep.decode)} linears")
+        elif decode_weights == "int":
+            log("[engine] no prepared decode copies (tools/prepare.py): decoding the checkpoint's BF16 weights")
         return path, attach_feeder(model, NGRAM_CACHE_GB if ngram_cache_gb is None else ngram_cache_gb, log)
 
     def prefill(model, input_ids, state, chunk=QWEN4EXP_PREFILL_CHUNK, prev2=None, **kw):
@@ -301,7 +306,7 @@ def _qwen4exp(path: str) -> Family:
                   prefill=prefill, prepare_prefill=getattr(pf, "prepare_prefill", _none),
                   # torch reserves 94.1 GB at the ready line with the drafter, and long prompts add a few GB (the prefill)
                   defaults=Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="mtp", vision=False, mem_cap_gb=101.0),
-                  supports=Supports(mtp=True, vision=False, yarn=False, int_copies=False), spec=QWEN4EXP_SPEC,
+                  supports=Supports(mtp=True, vision=False, yarn=False, int_copies=True), spec=QWEN4EXP_SPEC,
                   before_replay=ngram_before_replay, feed_buffer=lambda model: model.feed_buffer,
                   prefill_chunk=QWEN4EXP_PREFILL_CHUNK, prefill_prev2=True,
                   host_bytes=lambda gb: ngram_cache_rows(NGRAM_CACHE_GB if gb is None else gb) * NGRAM_SLOT_BYTES)

@@ -175,10 +175,10 @@ def test_the_moe_family_has_its_own_defaults(tmp_path):
     fam = family_of(path)
     assert fam.name == "qwen4_exp"
     assert fam.defaults == F.Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="mtp", vision=False, mem_cap_gb=101.0)
-    assert fam.supports == F.Supports(mtp=True, vision=False, yarn=False, int_copies=False)
+    assert fam.supports == F.Supports(mtp=True, vision=False, yarn=False, int_copies=True)
     assert fam.spec is F.QWEN4EXP_SPEC and (fam.spec.k, fam.spec.k_options) == (3, (1, 2, 3))
     assert fam.prefill_chunk == 4096 and fam.prefill_prev2
-    assert fam.fixed_bytes == F.QWEN4EXP_FIXED_BYTES == 87 * 10**9 + F.QWEN4EXP_DRAFTER_BYTES
+    assert fam.fixed_bytes == F.QWEN4EXP_FIXED_BYTES == 87 * 10**9 + F.QWEN4EXP_DRAFTER_BYTES + F.QWEN4EXP_COPIES_BYTES
     state = moe_state_bytes(path, 2, 262144)
     drafter = drafter4_state_bytes(2, 262144)
     assert drafter == 2 * 355_467_264  # 0.355 GB per slot: k + v 268 MB, ik 67 MB, ikb 17 MB, rope_pos 3 MB
