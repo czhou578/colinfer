@@ -41,6 +41,7 @@ The module names match the HF text model without the `model.` prefix of Qwen4Exp
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -201,8 +202,11 @@ class Qwen4ExpConfig(Qwen35Config):
                     raise ValueError(f"PLE layer {i} (one-indexed) must be a linear_attention layer")
             if self.eos_token_id < 0:
                 raise ValueError("eos_token_id must be set when PLE layers are enabled")
-        if self.yarn_factor > 1:
-            raise NotImplementedError("YaRN on qwen4_exp: the indexer's rope would need it too")
+
+    @property
+    def context(self) -> int:
+        """The longest sequence: the native context, times the YaRN factor when apply_yarn4 set one."""
+        return int(self.max_position_embeddings * max(self.yarn_factor, 1.0))
 
     @property
     def ple_layers(self) -> dict[int, int]:
@@ -235,8 +239,9 @@ class Qwen4ExpState(ModelState):
     indexer keys keep the model dtype (fp8 would change the selection)."""
 
     def __init__(self, cfg: Qwen4ExpConfig, batch: int, max_seq_len: int, device, dtype=torch.bfloat16, kv_dtype=None):
-        if max_seq_len > cfg.max_position_embeddings:
-            raise ValueError(f"max_seq_len {max_seq_len} > max_position_embeddings {cfg.max_position_embeddings}: no YaRN for qwen4_exp yet")
+        if max_seq_len > cfg.context:
+            raise ValueError(f"max_seq_len {max_seq_len} > {cfg.context}: the native context {cfg.max_position_embeddings} "
+                             f"x YaRN {cfg.yarn_factor:g} (apply_yarn4)")
         super().__init__(cfg, batch, max_seq_len, device, dtype, kv_dtype)
         self.ik = {i: torch.zeros(batch, 1, max_seq_len, cfg.indexer_head_dim, device=device, dtype=dtype) for i in self.k}
         self.rope_pos = torch.zeros(batch, max_seq_len, 3, device=device, dtype=torch.int64)
@@ -731,10 +736,43 @@ class Qwen4ExpForCausalLM(nn.Module):
         return (logits, h) if return_hyper else logits
 
 
+def fold_yarn_scale4(attn: IndexedAttention, cfg: Qwen4ExpConfig) -> None:
+    """qwen35.fold_yarn_scale for a QSA layer: YaRN's attention factor folded into the rotated dims of the attention's q /
+    k norms and of the indexer's q / k norms. transformers gives the indexer the attention's position embeddings (cos and
+    sin times the factor), so the indexer's rotated dims scale by the same factor. The block keys get it too, since
+    k_layernorm runs before their rotation. All four norms are zero-centered: (1 + w) -> a (1 + w)."""
+    a = qwen35.yarn_attention_factor(cfg)
+    if a == 1.0:
+        return
+    r = cfg.rotary_dim
+    with torch.no_grad():
+        for norm in (attn.q_norm, attn.k_norm, attn.indexer.q_layernorm, attn.indexer.k_layernorm):
+            w = norm.weight
+            w[:r] = (a * (1.0 + w[:r].float()) - 1.0).to(w.dtype)
+
+
+def apply_yarn4(model: Qwen4ExpForCausalLM, factor: float) -> None:
+    """qwen35.apply_yarn for qwen4_exp: YaRN for `factor` times the native context. The new config (rope_inv_freq picks
+    the YaRN frequencies from it) replaces the model's and the indexers' (they rotate the block keys themselves); each
+    attention layer's four norms get the attention factor (fold_yarn_scale4). Call before to_fast4, which reads both."""
+    if factor <= 1:
+        return
+    if model.cfg.yarn_factor > 1:
+        raise ValueError(f"the model already has YaRN x{model.cfg.yarn_factor}")
+    old, new = model.cfg, dataclasses.replace(model.cfg, yarn_factor=float(factor))
+    for m in model.modules():
+        if getattr(m, "cfg", None) is old:
+            m.cfg = new
+    for layer in model.layers:
+        if layer.block_type == "full_attention":
+            fold_yarn_scale4(layer.self_attn, new)
+
+
 def image_ple_ids(ids: torch.Tensor, cfg: Qwen4ExpConfig) -> torch.Tensor:
     """The ids the n-gram hash reads: the engine's image placeholder ids (past the vocabulary) become image_token_id."""
     return torch.where(ids >= cfg.vocab_size, cfg.image_token_id, ids)
 
 
 __all__ = ["Qwen4ExpConfig", "Qwen4ExpState", "Qwen4ExpForCausalLM", "ExpertWeights", "Experts", "nvfp4_experts", "NgramHash",
-           "NgramEmbedding", "PLELayer", "QSAIndexer", "IndexedAttention", "GatedResidual", "GroupRMSNorm", "image_ple_ids"]
+           "NgramEmbedding", "PLELayer", "QSAIndexer", "IndexedAttention", "GatedResidual", "GroupRMSNorm", "image_ple_ids", "apply_yarn4",
+           "fold_yarn_scale4"]

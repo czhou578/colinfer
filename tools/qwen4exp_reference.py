@@ -19,6 +19,7 @@ flock -w 14400 ~/.cache/colinfer/gpu-model.lock <command>):
     uv run python tools/qwen4exp_reference.py                        # three built-in prompts, 24 tokens each
     uv run python tools/qwen4exp_reference.py --tokens 32 --ppl 2048 --windows 8 --fp32-experts --out tests/data/qwen4exp_golden.json
     uv run python tools/qwen4exp_reference.py --tokens 48 --prompt "The capital of France is"
+    uv run python tools/qwen4exp_reference.py --tokens 48 --image --no-text --out tests/data/qwen4exp_golden_image.json
 
 The first run on 2026-10-24 gave, for "The capital of France is": " Paris. The capital of Germany is Berlin. The capital
 of Italy is Rome. The capital of Spain is Madrid." The load took 34 s.
@@ -59,12 +60,26 @@ def margin(logits: torch.Tensor) -> float:
 
 
 @torch.inference_mode()
-def generate(model, ids: list[int], n: int) -> tuple[list[int], list[float], float, float]:
+def generate(model, ids: list[int], n: int, images=None, tower=None) -> tuple[list[int], list[float], float, float]:
     """(the greedy tokens, their margins, the prefill seconds, the seconds per decode token). The prompt runs as one
-    chunk; each token then runs through the recurrent path, as the engine's decode does."""
+    chunk; each token then runs through the recurrent path, as the engine's decode does. images: the Image objects of
+    the prompt's placeholder runs (engine/model/vision.py), with tower the VisionTower: their rows get the tower's
+    output as input embeddings, the multimodal (t, h, w) positions, and the image token in the n-gram hash (image_ple_ids,
+    as transformers' Qwen4ExpModel passes ple_input_ids); each later token rotates by its position + rope_delta."""
+    from engine.model.qwen4exp import image_ple_ids
+    from engine.model.vision import rope_delta, rope_positions
     st = model.new_state(1, len(ids) + n + 8)
+    x = torch.tensor([ids], device="cuda")
+    kw, delta = {}, 0
+    if images:
+        x = image_ple_ids(x, model.cfg)
+        emb = model.embed_tokens(x)
+        for im in images:
+            emb[0, im.start:im.start + im.n] = tower.encode(im)
+        kw = dict(embeds=emb, positions=torch.from_numpy(rope_positions(images, 0, len(ids))).long().cuda(), ple_ids=x)
+        delta = rope_delta(images)
     t0 = time.time()
-    logits = model(torch.tensor([ids], device="cuda"), st, last_only=True)
+    logits = model(x, st, last_only=True, **kw)
     torch.cuda.synchronize()
     t_prefill = time.time() - t0
     out: list[int] = []
@@ -76,7 +91,8 @@ def generate(model, ids: list[int], n: int) -> tuple[list[int], list[float], flo
         margins.append(margin(logits[0, -1]))
         if nxt in STOP:
             break
-        logits = model(torch.tensor([[nxt]], device="cuda"), st, last_only=True)
+        pos = torch.tensor([st.pos + delta], device="cuda") if delta else None
+        logits = model(torch.tensor([[nxt]], device="cuda"), st, last_only=True, positions=pos)
     torch.cuda.synchronize()
     return out, margins, t_prefill, (time.time() - t0) / max(len(out), 1)
 
@@ -119,6 +135,9 @@ def main() -> None:
     ap.add_argument("--chunk", type=int, default=512, help="the chunk of the WikiText forward")
     ap.add_argument("--windows", type=int, default=1, help="score this many consecutive windows of --ppl tokens, each from a fresh state")
     ap.add_argument("--fp32-experts", action="store_true", help="also score the windows with the expert math in fp32 (experts_fp32)")
+    ap.add_argument("--image", action="store_true", help="also the image prompt of tests/golden_qwen4exp.py image_prompt (the report image "
+                    "and its question; the vision tower of the checkpoint)")
+    ap.add_argument("--no-text", action="store_true", help="skip the text prompts (with --image: the image prompt alone)")
     ap.add_argument("--out", help="write the prompts, their token ids, the greedy tokens and margins (and the perplexity) as JSON here")
     args = ap.parse_args()
     from transformers import AutoTokenizer
@@ -129,13 +148,24 @@ def main() -> None:
     print(f"[reference] loaded in {time.time() - t0:.1f}s, {torch.cuda.memory_allocated() / 1e9:.1f} GB on the GPU", flush=True)
     tok = AutoTokenizer.from_pretrained(path)
     results = []
-    for text in args.prompt or PROMPTS:
+    for text in [] if args.no_text else args.prompt or PROMPTS:
         ids = prompt_ids(tok, text)
         out, margins, tp, td = generate(model, ids, args.tokens)
         print(f"[reference] prompt of {len(ids)} tokens: prefill {tp:.2f}s, {td * 1000:.0f} ms per token; smallest margin "
               f"{min(margins):.3f}", flush=True)
         print("    " + repr(tok.decode(out)), flush=True)
         results.append(dict(prompt=text, prompt_ids=ids, tokens=out, margins=[round(m, 4) for m in margins], text=tok.decode(out)))
+    if args.image:
+        from engine.model.vision import VisionTower
+        from tests.golden_qwen4exp import IMAGE_QUESTION, image_prompt
+        ids, ims = image_prompt(path)
+        out, margins, tp, td = generate(model, ids, args.tokens, ims, VisionTower(path))
+        im = ims[0]
+        print(f"[reference] image prompt of {len(ids)} tokens ({im.n} image tokens, grid {im.grid}): prefill {tp:.2f}s, {td * 1000:.0f} ms per "
+              f"token; smallest margin {min(margins):.3f}", flush=True)
+        print("    " + repr(tok.decode(out)), flush=True)
+        results.append(dict(prompt="image:" + IMAGE_QUESTION, prompt_ids=ids, image=dict(grid=list(im.grid), start=im.start, n=im.n), tokens=out,
+                            margins=[round(m, 4) for m in margins], text=tok.decode(out)))
     doc = dict(model=args.model, max_new_tokens=args.tokens, kv="bf16", prompts=results)
     if args.ppl:
         from engine.model import qwen4exp

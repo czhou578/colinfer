@@ -56,6 +56,37 @@ NEAR_TIE = 0.2      # a divergence where the reference's margin is below this is
 PPL_GATE = 0.005    # the perplexity ratio must be within 0.5%
 STOP = (248044, 248046)
 FEEDER_ROWS = 6_250_000  # the row cache of the prefill's n-gram feeder: 1 GB of 160-byte rows
+IMAGE_FILE = os.path.join(ROOT, "tests", "data", "qwen4exp_golden_image.json")  # tools/qwen4exp_reference.py --image
+IMAGE_LINES = ("Quarterly report", "Revenue: 4,210", "Costs: 3,005", "Margin: 28.6%")
+IMAGE_QUESTION = "Transcribe every line of the image."
+
+
+def report_png() -> bytes:
+    """The image of the image checks: IMAGE_LINES in black on a white page of 1024 x 768 pixels (tests/scheduler_check.py
+    draws the same page for the 27B)."""
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+    pic = Image.new("RGB", (1024, 768), "white")
+    for i, line in enumerate(IMAGE_LINES):
+        ImageDraw.Draw(pic).text((60, 60 + 110 * i), line, fill="black", font=ImageFont.load_default(size=40))
+    buf = io.BytesIO()
+    pic.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def image_prompt(path: str, msgs: list | None = None):
+    """(the prompt ids, [the Image]) of a chat that holds the report image, as the server builds it: the chat template
+    with thinking off, then the image's run of placeholder ids (engine/server/images.py ImageProcessor.load, expand).
+    msgs: the messages (default: one user message with the image and IMAGE_QUESTION)."""
+    from engine.server.chat import ChatFormat
+    from engine.server.images import ImageProcessor, expand
+    with open(os.path.join(path, "config.json")) as f:
+        cfg = json.load(f)
+    msgs = msgs or [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_QUESTION}]}]
+    im = ImageProcessor(path).load(report_png())
+    ids = ChatFormat.from_checkpoint(path).render(msgs, enable_thinking=False)
+    return expand(ids, [im], cfg["image_token_id"], cfg["text_config"]["vocab_size"]), [im]
 
 
 class Stepper:

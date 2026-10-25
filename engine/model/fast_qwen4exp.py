@@ -57,16 +57,6 @@ MOE_INTER = (128, 256, 384, 512, 640)  # the intermediate sizes of moe_down (csr
 
 
 # ------------------------------------------------------------------------------------------------------------ linears
-def _dec_rows(dec, x2, r2, out):
-    """dec.rows into out. An INT copy writes bf16 only: for fp32 logits it writes a bf16 buffer first."""
-    if out.dtype == torch.float32 and isinstance(dec, IntLinear):
-        tmp = torch.empty(out.shape, device=out.device, dtype=torch.bfloat16)
-        dec.rows(x2, r2, tmp)
-        out.copy_(tmp)
-    else:
-        dec.rows(x2, r2, out)
-
-
 class Bf16Linear(RowsLinear):
     """BF16 weights w [N, K] on the BF16 skinny GEMM (ops().skinny_bf16: K % 128 == 0, N % 8 == 0). out_fp32: logits.
     The residual rows, if given, are added in the epilogue. dec: an optional decode copy (fast.IntLinear or Nvfp4Linear,
@@ -85,8 +75,8 @@ class Bf16Linear(RowsLinear):
         return self.w
 
     def rows(self, x2, r2, out):
-        if self.dec is not None:
-            _dec_rows(self.dec, x2, r2, out)
+        if self.dec is not None:  # an INT or NVFP4 copy writes bf16 or fp32 (logits) as out is
+            self.dec.rows(x2, r2, out)
         else:
             _rows(lambda x, r, o: ops().skinny_bf16(x, self.w, r, o), x2, r2, out)
 
@@ -143,8 +133,9 @@ class FastState4(FastState):
     def __init__(self, cfg: Qwen4ExpConfig, batch: int, max_seq_len: int, device):
         if max_seq_len % 16:
             raise ValueError(f"max_seq_len {max_seq_len} must be a multiple of 16 (qsa_topk reads the block scores in rows of 4 floats)")
-        if max_seq_len > cfg.max_position_embeddings:
-            raise ValueError(f"max_seq_len {max_seq_len} > max_position_embeddings {cfg.max_position_embeddings}: no YaRN for qwen4_exp yet")
+        if max_seq_len > cfg.context:
+            raise ValueError(f"max_seq_len {max_seq_len} > {cfg.context}: the native context {cfg.max_position_embeddings} "
+                             f"x YaRN {cfg.yarn_factor:g} (qwen4exp.apply_yarn4)")
         super().__init__(cfg, batch, max_seq_len, device)
         D, R = cfg.indexer_head_dim, cfg.indexer_compress_ratio
         bf = dict(device=device, dtype=torch.bfloat16)
@@ -645,20 +636,31 @@ def to_fast4(model: Qwen4ExpForCausalLM) -> FastQwen4Exp:
     return model
 
 
+YARN_MAX_FACTOR = 4  # the model card: "262K natively and extensible up to 1,000,000 tokens"
+
+
 def load_fast_qwen4exp(path_or_repo: str, decode_weights=None, log=print, prep=None, max_seq_len: int | None = None,
                        device="cuda") -> tuple[str, FastQwen4Exp]:
     """The family's load (engine/model/family.py): (the resolved path, the decode model) = load_qwen4exp (the reference
     tree with NVFP4 experts, the n-gram table on disk) + to_fast4. decode_weights and prep (a prepared directory) are
     accepted and not used here: the family's load attaches the requantized decode copies of the prepared directory
-    (attach_decode_copies4) when decode_weights is "int". A max_seq_len beyond the native context is refused (no YaRN for
-    qwen4_exp)."""
+    (attach_decode_copies4) when decode_weights is "int". A max_seq_len beyond the native context turns on YaRN by the
+    ratio (qwen4exp.apply_yarn4, as Qwen documents up to 1M tokens), before to_fast4 reads the frequencies and the norms."""
+    from engine.model.qwen4exp import apply_yarn4
+    from engine.model.qwen35 import yarn_attention_factor
     from engine.weights.loader import resolve
     from engine.weights.qwen4exp_loader import load_qwen4exp
     path = resolve(path_or_repo)
-    cfg = Qwen4ExpConfig.from_checkpoint(path)
-    if max_seq_len is not None and max_seq_len > cfg.max_position_embeddings:
-        raise ValueError(f"max_seq_len {max_seq_len} > the native context {cfg.max_position_embeddings}: qwen4_exp has no YaRN yet")
+    native = Qwen4ExpConfig.from_checkpoint(path).max_position_embeddings
+    if max_seq_len is not None and max_seq_len > YARN_MAX_FACTOR * native:  # refused from the config, before any weight is read
+        raise ValueError(f"max_seq_len {max_seq_len} > {YARN_MAX_FACTOR} x the native context {native}: Qwen documents YaRN for this model up "
+                         "to about 1M tokens")
     t0 = time.time()
-    model = to_fast4(load_qwen4exp(path, device=device, log=log))
+    ref = load_qwen4exp(path, device=device, log=log)
+    if max_seq_len is not None and max_seq_len > native:
+        apply_yarn4(ref, max_seq_len / native)
+        log(f"[fast4] YaRN x{max_seq_len / native:g}: {max_seq_len} tokens per slot over the checkpoint's {native} native positions (rope "
+            f"frequencies scaled, the rotated dims of the attention's and the indexer's q / k x{yarn_attention_factor(ref.cfg):.4f})")
+    model = to_fast4(ref)
     log(f"[fast4] decode model ready in {time.time() - t0:.0f}s, {torch.cuda.memory_allocated() / 1e9:.1f} GB on the GPU")
     return path, model

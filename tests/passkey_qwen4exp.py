@@ -7,8 +7,12 @@ build). One slot of the longest length (plus a margin) holds the prompt. The pre
 n-gram feeder; then the decode graph produces up to 12 greedy tokens. Beyond 2051 tokens the QSA selection is sparse, so
 this checks the indexer, the selection and the sparse attention at depth.
 
+With --max-seq-len past the native 262,144 tokens (or a --lens past it), the model runs with YaRN by the ratio of the slot
+length to the native context (engine/model/qwen4exp.py apply_yarn4), as the server does.
+
 Usage (loads about 80 GB; take the GPU lock):
     flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/passkey_qwen4exp.py [--lens 16384 32768 65536] [--depths 0.1 0.5 0.9]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/passkey_qwen4exp.py --max-seq-len 524288 --lens 16384 300000 480000
 """
 from __future__ import annotations
 
@@ -28,18 +32,21 @@ def main():
     ap.add_argument("--lens", type=int, nargs="+", default=[16384, 32768, 65536])
     ap.add_argument("--depths", type=float, nargs="+", default=[0.1, 0.5, 0.9])
     ap.add_argument("--chunk", type=int, default=4096)
+    ap.add_argument("--max-seq-len", type=int, help="the slot length (default: the longest prompt and a margin); past the native 262,144 "
+                    "tokens the load turns on YaRN by the ratio, as the server does with --max-seq-len")
     a = ap.parse_args()
     from engine.model.fast_qwen4exp import load_fast_qwen4exp
     from engine.server.chat import ChatFormat
     from engine.weights.ple import PleFeeder
     from tests.golden_qwen4exp import FEEDER_ROWS, Stepper
     from tests.passkey import build
-    path, model = load_fast_qwen4exp(a.model)
+    slot = -(-max(a.max_seq_len or 0, max(a.lens) + 256) // 16) * 16
+    path, model = load_fast_qwen4exp(a.model, max_seq_len=slot)
     ple = model.ple_layer()
     model.feeder = PleFeeder(ple.table, cache_rows=FEEDER_ROWS, params=ple.params, image_token_id=model.cfg.image_token_id)
     fmt = ChatFormat.from_checkpoint(path)
     tok = fmt.tok
-    step = Stepper(model, -(-(max(a.lens) + 256) // 16) * 16)
+    step = Stepper(model, slot)
     rng = random.Random(0)
     hits, n = 0, 0
     for L in a.lens:

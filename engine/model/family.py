@@ -9,9 +9,10 @@
   the model's feed buffer, and gives each prefill chunk the two tokens before it (prefill_prev2). Its MTP drafter is
   engine/spec/mtp4.py (Mtp4, Mtp4State, Mtp4Cycle): speculation is on by default, with 1 to 3 drafts per cycle. With
   --decode-weights int, the load attaches the requantized decode copies of the prepared directory
-  (tools/requant_qwen4exp.py, fast_qwen4exp.attach_decode_copies4). The family has no image input and no YaRN
-  (docs/history/qwen4exp_plan.md). A build without these modules refuses the checkpoint with a clear message, instead
-  of a KeyError from the dense config reader.
+  (tools/requant_qwen4exp.py, fast_qwen4exp.attach_decode_copies4). Image input uses the checkpoint's vision tower,
+  the 27B's architecture with a 2560-wide output (engine/model/vision.py). A slot past the native 262,144 tokens turns
+  on YaRN (engine/model/qwen4exp.py apply_yarn4), up to 4 times the native context. A build without these modules
+  refuses the checkpoint with a clear message, instead of a KeyError from the dense config reader.
 
 family_of(path) gives the Family of a checkpoint: the callables and the constants that differ between the families.
 The build (engine/runtime/build.py) and the server (engine/server/api.py) read the defaults, the memory figures and the
@@ -42,11 +43,15 @@ NOT_SERVED_YET: dict[str, str] = {}
 # on the GPU after the load), the checkpoint ring (1.85e9), the graph pool, the prefill workspace, the CUDA context and
 # the pinned host buffers. The plan's estimate (docs/history/qwen4exp_plan.md section 4) was 85.5e9. A build without
 # the warm-up (tests/scheduler_check_qwen4exp.py) measured 84.89e9 at its end, and its first long prompts took the rest.
-# QWEN4EXP_DRAFTER_BYTES is the drafter's part at the defaults: its weights and draft head (1.95e9, engine/spec/mtp4.py)
-# and the pool of the cycle graphs (measured: about 2.8e9 in all). With --spec none the check thus asks for a little more
+# QWEN4EXP_DRAFTER_BYTES is the drafter's part at the defaults: its weights and draft head (1.95e9 with the full BF16
+# head, 1.69e9 with the low-rank head; engine/spec/mtp4.py) and the pool of the cycle graphs (measured: about 2.8e9 in
+# all with the full head). With --spec none the check thus asks for a little more
 # than the engine takes.
 QWEN4EXP_DRAFTER_BYTES = 3 * 10**9
-QWEN4EXP_COPIES_BYTES = 14 * 10**8  # tools/requant_qwen4exp.py's decode copies on the GPU (+1.35 GB measured; the BF16 stays for prefill)
+# The decode copies on the GPU (the BF16 weights stay for prefill): the round-to-nearest classes of
+# tools/requant_qwen4exp.py (+1.35 GB measured) and the GPTQ classes of tools/gptq_qwen4exp.py (GDN in_proj and out_proj,
+# the shared experts' gate | up: 1.81 GB of INT6 codes and scales)
+QWEN4EXP_COPIES_BYTES = 32 * 10**8
 QWEN4EXP_FIXED_BYTES = 87 * 10**9 + QWEN4EXP_DRAFTER_BYTES + QWEN4EXP_COPIES_BYTES
 QWEN4EXP_PREFILL_CHUNK = 4096  # tokens per prefill chunk (bench/prefill_chunk_bench.py: the MoE ceiling is 7.5k tok/s at 4096)
 NGRAM_CACHE_GB = 1.0           # the default of --ngram-cache-gb: 6.25M rows of 160 bytes
@@ -120,14 +125,18 @@ def _lazy(module: str, name: str) -> Callable:
 # at startup.
 QWEN35_SPEC = Speculation(drafter=_lazy("mtp", "Mtp"), state=_lazy("mtp", "MtpState"), cycle=_lazy("mtp", "MtpCycle"), k=7, k_options=(3, 7))
 
-# The cycle of qwen4_exp (tests/golden_qwen4exp_spec.py, 2026-10-24, at 1k context): a least-squares fit over the
-# cycles of the golden and WikiText prompts gives cycle_ms = 41.4 + 0.577 x distinct + 2.92 x k, with about
-# 10 + 5.5 k distinct experts per layer in a verify of k drafts. The plain step takes 46.6 ms. A replay on a garbage
-# state (the startup measurement of the scheduler) routes its rows to other experts than real text, so the family
-# uses the fit. Past the fit's 1k context, the sparse attention reads 2051 keys at any length, and only the block
-# selection grows: qsa_score and qsa_topk take about 110 us per attention layer at 262,144 tokens (65,536 blocks),
-# for the 12 target layers once per cycle and for the drafter's layer once per draft step.
-QWEN4EXP_CYCLE_MS = (41.4, 0.577, 10.0, 5.5, 2.92)  # a, b, distinct = d0 + d1 x k, c: a + b x distinct + c x drafts
+# The cycle of qwen4_exp as the server runs it: the six classes of decode copies and the low-rank draft head of the
+# prepared directory (tests/golden_qwen4exp_spec.py --prepared, 2026-10-24, at 1k context). A least-squares fit over
+# the cycles of the golden and WikiText prompts gives cycle_ms = 24.2 + 0.64 x distinct + 1.06 x k, with about
+# 11.2 + 5.45 k distinct experts per layer in a verify of k drafts: 35.9 / 40.5 / 45.0 ms for k = 1 / 2 / 3 against
+# the measured 35.8 / 40.2 to 40.5 / 44.8 to 45.0. The plain step takes 29.0 ms. (The exact path without the copies
+# and with the full BF16 draft head gave 41.4 + 0.577 x distinct + 2.92 x k.) A replay on a garbage state (the
+# startup measurement of the scheduler) routes its rows to other experts than real text, so the family uses the fit.
+# Past the fit's 1k context, the sparse attention reads 2051 keys at any length, and only the block selection grows:
+# qsa_score and qsa_topk take about 110 us per attention layer at 262,144 tokens (65,536 blocks), for the 12 target
+# layers once per cycle and for the drafter's layer once per draft step. At 262,000 tokens the cycles of k = 1 / 2 / 3
+# took 1.2 / 1.7 / 2.2 ms more than at 1k (the model: 1.4 / 1.5 / 1.65 ms).
+QWEN4EXP_CYCLE_MS = (24.2, 0.64, 11.2, 5.45, 1.06)  # a, b, distinct = d0 + d1 x k, c: a + b x distinct + c x drafts
 QWEN4EXP_SELECT_S = 110e-6 / 262144                 # the block selection of one layer launch, per token of context
 QWEN4EXP_ATTN_LAYERS = 12
 
@@ -302,6 +311,8 @@ def _qwen4exp(path: str) -> Family:
         attention layer: 0.355 GB per slot of 262,144 tokens), on the meta device."""
         from engine.model.qwen4exp import Qwen4ExpConfig
         cfg = Qwen4ExpConfig.from_checkpoint(path)
+        if max_seq_len > cfg.max_position_embeddings:  # the load turns on YaRN by the ratio (fast_qwen4exp.load_fast_qwen4exp)
+            cfg = dataclasses.replace(cfg, yarn_factor=max_seq_len / cfg.max_position_embeddings)
         states = [state_cls(cfg, slots, max_seq_len, "meta")]
         if spec == "mtp":
             states.append(QWEN4EXP_SPEC.state(cfg, max_seq_len, "meta", batch=slots))
@@ -309,9 +320,10 @@ def _qwen4exp(path: str) -> Family:
 
     return Family(name="qwen4_exp", load=load, new_state=_new_state, state_bytes=state_bytes, fixed_bytes=QWEN4EXP_FIXED_BYTES,
                   prefill=prefill, prepare_prefill=getattr(pf, "prepare_prefill", _none),
-                  # torch reserves 94.1 GB at the ready line with the drafter, and long prompts add a few GB (the prefill)
-                  defaults=Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="mtp", vision=False, mem_cap_gb=101.0),
-                  supports=Supports(mtp=True, vision=False, yarn=False, int_copies=True), spec=QWEN4EXP_SPEC,
+                  # torch reserves 97.1 GB at the ready line with the drafter and the six classes of decode copies; the vision
+                  # tower adds 0.9 GB on the first image, and long prompts a few GB (the prefill): 99.6 GB after the scheduler check
+                  defaults=Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="mtp", vision=True, mem_cap_gb=104.0),
+                  supports=Supports(mtp=True, vision=True, yarn=True, int_copies=True), spec=QWEN4EXP_SPEC,
                   before_replay=ngram_before_replay, feed_buffer=lambda model: model.feed_buffer,
                   prefill_chunk=QWEN4EXP_PREFILL_CHUNK, prefill_prev2=True,
                   host_bytes=lambda gb: ngram_cache_rows(NGRAM_CACHE_GB if gb is None else gb) * NGRAM_SLOT_BYTES)

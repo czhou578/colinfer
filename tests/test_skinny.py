@@ -82,6 +82,12 @@ def test_skinny_int(bits, N, K, M):
     o1 = torch.empty(1, N, device="cuda", dtype=torch.bfloat16)
     ops().skinny_int(x[:1].contiguous(), lo, hi, sf, gs, res[:1].contiguous(), o1)
     assert torch.equal(o1[0], out[0])
+    o32 = torch.empty(M, N, device="cuda", dtype=torch.float32)  # fp32 out (logits): the same sums, not rounded
+    ops().skinny_int(x, lo, hi, sf, gs, None, o32)
+    assert torch.equal(out, (o32 + res.float()).bfloat16())
+    o32r = torch.empty(1, N, device="cuda", dtype=torch.float32)
+    ops().skinny_int(x[-1:].contiguous(), lo, hi, sf, gs, None, o32r)
+    assert torch.equal(o32r[0], o32[-1])
 
 
 def test_swiglu():

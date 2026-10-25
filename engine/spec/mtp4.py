@@ -41,8 +41,10 @@ reads it instead of quantizing again.
 
 The draft head scores DRAFT_VOCAB frequent tokens (engine/spec/draft_vocab.npy; the tokenizer is the 27B's, byte for
 byte) plus PROMPT_SLOTS tokens of the current prompt (set_prompt_vocab): a BF16 copy of those lm_head rows
-(69,632 x 2560, 0.36 GB) on the skinny GEMM. This family has no low-rank draft head (the 27B's comes from
-tools/lowrank_draft_head.py).
+(69,632 x 2560, 0.36 GB) on the skinny GEMM. With the low-rank basis of tools/lowrank_draft_head.py (lowrank: U [2560, r]
+from the prepared directory), the head is the 27B's low-rank head instead: the approximate logits (g U)(W U)^T on two
+NVFP4 GEMMs (about 20 MB at r = 512 instead of 0.36 GB), then the top LOWRANK_CANDS candidates rescored exactly against
+the BF16 rows of lm_head itself (ops().rescore_bf16). The BF16 copy of the rows is then not built.
 
 Mtp4Cycle is engine/spec/mtp.py's MtpCycle on this family: verify [y, d1..dk] (FastQwen4Exp.verify, its n-gram rows
 from feed_buffer(B, k + 1), which the host fills before each replay), accept (engine/spec/accept.py: greedy, or the
@@ -68,17 +70,17 @@ import torch.nn as nn
 
 from engine.kernels import ops
 from engine.model import hc_kernels
-from engine.model.fast import MAX_ROWS, capture
+from engine.model.fast import MAX_ROWS, Nvfp4Linear, capture
 from engine.model.fast_qwen4exp import Bf16Linear, FastDecoderLayer4, FastQwen4Exp, FastState4, KernelQSAAttention, hc_rows
 from engine.model.moe_kernels import KernelMoE
-from engine.model.qwen4exp import IndexedAttention, Qwen4ExpConfig
+from engine.model.qwen4exp import IndexedAttention, Qwen4ExpConfig, fold_yarn_scale4
 from engine.model.qwen35 import rope_inv_freq
 from engine.runtime.sampler import apply_mask
 from engine.spec.accept import draw
-from engine.spec.mtp import DRAFT_DIR, DRAFT_STOP, DRAFT_VOCAB, PROMPT_SLOTS
+from engine.spec.mtp import DEQUANT_ROWS, DRAFT_DIR, DRAFT_STOP, DRAFT_VOCAB, LOWRANK_CANDS, PROMPT_SLOTS
 from engine.weights.direct import read_tensors, tensor_names
 from engine.weights.loader import weight_map
-from engine.weights.quantize import E2M1_VALUES, E4M3_MAX, quantize
+from engine.weights.quantize import E2M1_VALUES, E4M3_MAX, nvfp4_global_scale, quantize
 
 FP8_BLOCK = 128      # the block of the checkpoint's FP8 expert scales (weight_scale_inv)
 REQUANT_BATCH = 32   # experts dequantized to fp32 at a time (32 x 1280 x 2560 x 4 B = 0.42 GB)
@@ -185,9 +187,10 @@ class Mtp4(nn.Module):
     """The MTP drafter of a qwen4_exp checkpoint at `path` for the decode model `target`.
 
     weights: optional safetensors with mtp.* tensors (BF16, not the experts) that replace the checkpoint's. lowrank:
-    accepted for the 27B's interface and not used (the full draft head runs). cache: keep the NVFP4 experts in
-    DRAFT_DIR. tensors / experts: build from tensors instead of a checkpoint (tests): tensors {name without "mtp.":
-    bf16 tensor}, experts {w_gu, sf_gu, w_dn, sf_dn, gs} (requant_experts' layout) and optionally in_scale [E, 3].
+    the low-rank basis of the draft head (tools/lowrank_draft_head.py; None or a missing file: the full head). cache:
+    keep the NVFP4 experts in DRAFT_DIR. tensors / experts: build from tensors instead of a checkpoint (tests): tensors
+    {name without "mtp.": bf16 tensor}, experts {w_gu, sf_gu, w_dn, sf_dn, gs} (requant_experts' layout) and optionally
+    in_scale [E, 3].
 
     forward(tokens [B, T], hidden4 [B, T, 10240], st) -> (g [B, T, 2560] the mixer output, x4 [B, T, 10240] the
     pre-mixer stream) at positions st.pos_t + t; it writes the rows' KV, raw indexer keys, block keys and rotary
@@ -200,7 +203,8 @@ class Mtp4(nn.Module):
         self.cfg = target.cfg
         dev = self.dev = target.embed_tokens.weight.device
         self.__dict__["target"] = target  # not a submodule: the drafter does not own the target
-        self.weights, self.lowrank = weights, None
+        self.weights, self.lowrank = weights, lowrank if lowrank and os.path.exists(lowrank) else None
+        self.head = self.lr_A = self.lr_B = self.lr_full = None
         self.cached = False
         self.cache_file = None
         if tensors is None:
@@ -213,7 +217,7 @@ class Mtp4(nn.Module):
         self._build(tensors, experts)
         self._init_head()
         log(f"[mtp4] drafter ready in {time.time() - t0:.1f}s ({'experts from the cache' if self.cached else 'experts requantized'}), "
-            f"{self.nbytes() / 1e9:.2f} GB")
+            f"{self.nbytes() / 1e9:.2f} GB; draft head: " + (f"low-rank, rank {self.lr_A.out_features}" if self.lr_A is not None else "full"))
 
     # -------------------------------------------------------------------------------------------- loading
     @staticmethod
@@ -308,6 +312,7 @@ class Mtp4(nn.Module):
                           (attn.q_norm, "q_norm"), (attn.k_norm, "k_norm"), (attn.indexer.index_qk_proj, "indexer.index_qk_proj"),
                           (attn.indexer.q_layernorm, "indexer.q_layernorm"), (attn.indexer.k_layernorm, "indexer.k_layernorm")):
             mod.weight = _nn_param(t.pop(a + name + ".weight"))
+        fold_yarn_scale4(attn, cfg)  # the target's YaRN (apply_yarn4), if any: the drafter's norms come raw from the files
         KernelQSAAttention.adopt(attn, rope_inv_freq(cfg, dev), cfg.mrope_section[1:])
 
         def gr(prefix, inj=True):
@@ -346,11 +351,37 @@ class Mtp4(nn.Module):
         self.static[ids] = True
         allids = np.concatenate([ids, np.full(slots, ids[0], dtype=np.int64)])
         self.vocab_ids = torch.tensor(allids, device=self.dev)
-        self.head = Bf16Linear(self.lm_head.w[self.vocab_ids].contiguous(), out_fp32=True)
+        if self.lowrank:
+            self._init_lowrank(self.lowrank)
+        else:
+            self.head = Bf16Linear(self.lm_head.w[self.vocab_ids].contiguous(), out_fp32=True)
+
+    def _init_lowrank(self, file: str):
+        """The low-rank draft head (engine/spec/mtp.py Mtp._init_lowrank on a BF16 lm_head): with U [2560, r] the top-r
+        principal directions of the drafter's outputs, lr_A = U^T and W U (W: lm_head's rows) in NVFP4. W U is kept for
+        the whole target vocabulary (lr_full), so a request's prompt rows are a gather into lr_B."""
+        from safetensors import safe_open
+        with safe_open(file, framework="pt", device=str(self.dev)) as sf:
+            U = sf.get_tensor("U").float()                                        # [H, r]
+        W = self.lm_head.w
+        if U.shape[0] != W.shape[1] or U.shape[1] % 512:
+            raise ValueError(f"{file}: U is {tuple(U.shape)}, the head needs [{W.shape[1]}, r] with r a multiple of 512 (the NVFP4 skinny GEMM)")
+        WU = torch.empty(W.shape[0], U.shape[1], device=self.dev)
+        for i in range(0, W.shape[0], DEQUANT_ROWS):
+            WU[i:i + DEQUANT_ROWS] = W[i:i + DEQUANT_ROWS].float() @ U
+        gb = nvfp4_global_scale(WU)
+        wb, sb = quantize(WU, gb)
+        del WU
+        ga = nvfp4_global_scale(U)
+        wa, sa = quantize(U.T.contiguous(), ga)
+        self.lr_A = Nvfp4Linear(wa, sa, ga)                                       # g -> g U [N, r]
+        self.lr_full = (wb, sb)                                                   # [V, r]
+        self.lr_B = Nvfp4Linear(wb[self.vocab_ids].contiguous(), sb[self.vocab_ids].contiguous(), gb, out_fp32=True)
 
     def nbytes(self) -> int:
         """The drafter's own GPU bytes (the embedding and lm_head are the target's)."""
-        mods = [self.pre_e.weight, self.pre_h.weight, self.fc_e.w, self.fc_h.w, self.head.w]
+        mods = [self.pre_e.weight, self.pre_h.weight, self.fc_e.w, self.fc_h.w]
+        mods += [self.head.w] if self.head is not None else [self.lr_A.w, self.lr_A.sf, self.lr_B.w, self.lr_B.sf, *self.lr_full]
         a = self.layer.self_attn
         mods += [a.qkvi.w, a.o_proj.w, a.q_norm.weight, a.k_norm.weight, a.indexer.q_layernorm.weight, a.indexer.k_layernorm.weight]
         for g in (self.layer.attn_hc, self.layer.mlp_hc, self.mixer):
@@ -372,11 +403,24 @@ class Mtp4(nn.Module):
         extra += [int(self.vocab_ids[0])] * (slots - len(extra))
         ids = torch.tensor(extra, dtype=torch.long, device=self.dev)
         self.vocab_ids[self.n_static:] = ids
-        self.head.w[self.n_static:] = self.lm_head.w[ids]
+        if self.head is not None:
+            self.head.w[self.n_static:] = self.lm_head.w[ids]
+        if self.lr_B is not None:
+            self.lr_B.w[self.n_static:] = self.lr_full[0][ids]
+            self.lr_B.sf[self.n_static:] = self.lr_full[1][ids]
 
     def draft(self, g: torch.Tensor):
         """Greedy drafts from mixer outputs g [..., 2560] -> (token ids [...], the drafter's probability of each: the
-        softmax over the draft vocabulary)."""
+        softmax over the draft vocabulary; with the low-rank head, the exact logit over the approximation's logsumexp)."""
+        if self.lr_B is not None:  # low-rank scores, the top candidates rescored exactly against lm_head's BF16 rows
+            g2 = g.reshape(-1, g.shape[-1]).contiguous()
+            ap = self.lr_B(self.lr_A(g2))                                           # [N, V] fp32
+            cand = ap.topk(LOWRANK_CANDS, -1).indices                               # [N, C] into the draft vocabulary
+            ex = ops().rescore_bf16(g2, self.lm_head.w, self.vocab_ids[cand])
+            best = ex.argmax(-1, keepdim=True)
+            ids = self.vocab_ids[cand.gather(-1, best)].view(g.shape[:-1])
+            p = torch.exp(ex.gather(-1, best) - torch.logsumexp(ap, -1, keepdim=True)).clamp_max(1.0)
+            return ids, p.view(g.shape[:-1])
         lg = self.head(g)
         return self.vocab_ids[lg.argmax(-1)], torch.exp(lg.amax(-1) - torch.logsumexp(lg, -1))
 

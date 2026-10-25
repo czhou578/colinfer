@@ -9,6 +9,7 @@ Run: uv run pytest tests/test_qwen4exp_small.py -q
 """
 import dataclasses
 import json
+import math
 import os
 
 import numpy as np
@@ -63,7 +64,7 @@ def ids():
     return x
 
 
-def hf_config(c: Qwen4ExpConfig, **kw):
+def hf_config(c: Qwen4ExpConfig, rope: dict | None = None, **kw):
     from transformers import Qwen4ExpTextConfig
     hc = Qwen4ExpTextConfig(**({
         "hidden_size": c.hidden_size, "num_hidden_layers": c.num_hidden_layers, "layer_types": c.layer_types,
@@ -79,7 +80,7 @@ def hf_config(c: Qwen4ExpConfig, **kw):
         "indexer_budget": c.indexer_budget, "indexer_compress_ratio": c.indexer_compress_ratio, "output_gate_type": c.output_gate_type,
         "tie_word_embeddings": False, "experts_implementation": "eager",  # the default grouped_mm sums in another order
         "rope_parameters": {"rope_type": "default", "rope_theta": c.rope_theta, "partial_rotary_factor": c.partial_rotary_factor,
-                            "mrope_section": c.mrope_section, "mrope_interleaved": True}} | kw))
+                            "mrope_section": c.mrope_section, "mrope_interleaved": True} | (rope or {})} | kw))
     hc._attn_implementation = "sdpa"
     return hc
 
@@ -89,20 +90,21 @@ def _topk_index_ascending(self, k, dim=-1, largest=True, sorted=True):
     return torch.return_types.topk((v.narrow(dim, 0, k), i.narrow(dim, 0, k)))
 
 
-def hf_tiny(model, tie_rule: bool = True):
+def hf_tiny(model, tie_rule: bool = True, sd: dict | None = None, rope: dict | None = None):
     """transformers' Qwen4ExpForCausalLM with the weights of the tiny reference model. The names are the same apart
     from the `model.` prefix; the dense experts already have transformers' 3D layout (gate_up_proj [E, 2 I, H],
     down_proj [E, H, I]).
 
     tie_rule: the indexer's Tensor.topk breaks ties by the engine's rule (score descending, index ascending). The CPU
     topk of torch breaks them in no fixed order, and the tiny indexer (2 heads) has many blocks that score 0, so ties
-    at the boundary of the top 4 are common. test_hf_differs_only_at_ties checks the rows without the rule."""
+    at the boundary of the top 4 are common. test_hf_differs_only_at_ties checks the rows without the rule.
+    sd: other weights for it; rope: further rope_parameters (YaRN)."""
     from transformers import Qwen4ExpForCausalLM as HF
 
     from tests.hf_fallback import force_hf_torch_fallbacks
     force_hf_torch_fallbacks()
-    hf = HF(hf_config(model.cfg)).to(DT).eval()
-    sd = {(k if k == "lm_head.weight" else "model." + k): v for k, v in model.state_dict().items()}
+    hf = HF(hf_config(model.cfg, rope)).to(DT).eval()
+    sd = {(k if k == "lm_head.weight" else "model." + k): v for k, v in (sd or model.state_dict()).items()}
     missing, unexpected = hf.load_state_dict(sd, strict=False)
     assert not unexpected and not [m for m in missing if "rotary" not in m], (missing, unexpected)
     if tie_rule:
@@ -328,6 +330,34 @@ def test_matches_hf_tiny_with_an_image(model, ids):
     ours = model(ids, None, positions=pos, embeds=emb)
     torch.testing.assert_close(ours, ref, rtol=1e-4, atol=1e-4)
     assert not torch.allclose(ours, model(ids, None, embeds=emb), atol=1e-3)  # the positions matter
+
+
+@torch.inference_mode()
+def test_yarn_matches_hf_yarn(ids):
+    """apply_yarn4 (the YaRN frequencies; the attention factor folded into the attention's and the indexer's q / k norms;
+    the indexer's own config) against transformers' yarn rope type, which gives the indexer the attention's scaled cos and
+    sin, with the same raw weights. The native context of 32 positions puts the 70 tokens past it."""
+    from engine.model.qwen4exp import apply_yarn4
+    from engine.model.qwen35 import yarn_attention_factor
+    m = init_tiny(Qwen4ExpForCausalLM(tiny_cfg(max_position_embeddings=32)).to(DT))
+    raw = {k: v.clone() for k, v in m.state_dict().items()}
+    plain = hf_tiny(m, sd=raw)(input_ids=ids, use_cache=False).logits  # no YaRN (the reference refuses 70 tokens over 32 positions)
+    apply_yarn4(m, 4.0)
+    a, r = m.layers[3].self_attn, m.cfg.rotary_dim
+    f = yarn_attention_factor(m.cfg)
+    assert m.cfg.yarn_factor == 4.0 and a.indexer.cfg is m.cfg and m.cfg.context == 128 and f == pytest.approx(0.1 * math.log(4) + 1)
+    for name in ("q_norm", "k_norm", "indexer.q_layernorm", "indexer.k_layernorm"):
+        w, w0 = a.get_submodule(name).weight, raw[f"layers.3.self_attn.{name}.weight"]
+        torch.testing.assert_close(1 + w[:r], f * (1 + w0[:r]))
+        assert torch.equal(w[r:], w0[r:])  # the pass-through dims stay
+    ref = hf_tiny(m, sd=raw, rope={"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32})(input_ids=ids, use_cache=False).logits
+    ours = m(ids, None)
+    torch.testing.assert_close(ours, ref, rtol=1e-4, atol=1e-4)
+    assert not torch.allclose(ours, plain, atol=1e-3)  # the scaling changes the outputs
+    st = m.new_state(1, 128)  # the state takes the YaRN context, and the cached path equals the one-shot one
+    torch.testing.assert_close(torch.cat([m(ids[:, :40], st), m(ids[:, 40:], st)], 1), ours, rtol=1e-4, atol=1e-4)
+    with pytest.raises(ValueError):
+        apply_yarn4(m, 2.0)  # not twice
 
 
 # ------------------------------------------------------------------------------------------------------------ NVFP4 experts

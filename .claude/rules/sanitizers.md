@@ -39,6 +39,8 @@ Most kernel files have one test file of the same name. These files do not:
 - `csrc/qsa_prefill.cu`: `tests/test_qsa_prefill.py`.
 - `csrc/hc_prefill.cu`: `tests/test_prefill_qwen4exp.py` (`test_hc_pre_post`).
 - `csrc/hc.cu`: `tests/test_hc.py`, and also `tests/test_requant_qwen4exp.py` for the INT8 mode of `hc_mix`.
+- `csrc/sampling.cu` (the uniforms of speculative sampling, `rescore_nvfp4` and `rescore_bf16` of the low-rank draft
+  heads): `tests/test_draft_head.py` and `tests/test_mtp4.py`.
 
 The Python files of the list hold these: a side stream in `moe_kernels.py` (the shared expert) and in `mtp4.py` (the
 commit branch of `Mtp4Cycle`), non-blocking copies from pinned buffers in `family.py` (`ngram_before_replay`) and in
@@ -74,8 +76,9 @@ compute-sanitizer --tool racecheck --kernel-name regex='k_topk|k_tc' ...
 
 These scripts load a model: `tests/golden.py`, `tests/scheduler_check.py`, `tests/passkey.py`, `tests/perplexity.py`,
 `tests/golden_qwen4exp*.py`, `tests/scheduler_check_qwen4exp.py`, `tests/passkey_qwen4exp.py`,
-`tools/qwen4exp_reference.py`, `tools/requant_qwen4exp.py` (up to 14 GB on the GPU) and `tests/check.sh` without
-`--quick`. The sanitizer runs of the unit tests above load no model, but they too need the 16 GB of the caution box.
+`tools/qwen4exp_reference.py`, `tools/requant_qwen4exp.py` (up to 14 GB on the GPU), `tools/gptq_qwen4exp.py`,
+`tools/lowrank_draft_head.py`, `tools/prepare.py` when it has files to make, and `tests/check.sh` without `--quick`.
+The sanitizer runs of the unit tests above load no model, but they too need the 16 GB of the caution box.
 
 A test that passes under these tools is not proof that the code has no race. `/reviewing-features` writes a targeted repro
 for each suspected race (`.claude/agents/memrace-verifier.md`).

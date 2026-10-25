@@ -274,7 +274,7 @@ def test_tool_on_synthetic_checkpoint(tmp_path):
 
 @torch.inference_mode()
 def test_lm_head_int6_fp32_logits(models, tokens):
-    """An INT6 lm_head copy (bf16 out on skinny_int) gives the fp32 logits of its bf16 product, and stays row-invariant."""
+    """An INT6 lm_head copy writes fp32 logits on skinny_int (its bf16 output is their rounding), and stays row-invariant."""
     from engine.model.fast import IntLinear
     from engine.model.fast_qwen4exp import _copy_of, attach_decode_copies4
     from tools.requant_qwen4exp import make_copies, write_copies
@@ -288,7 +288,7 @@ def test_lm_head_int6_fp32_logits(models, tokens):
     got = m.lm_head(x)
     want = torch.empty(5, V, device="cuda", dtype=torch.bfloat16)
     m.lm_head.dec.rows(x, None, want)
-    assert got.dtype == torch.float32 and torch.equal(got, want.float())
+    assert got.dtype == torch.float32 and torch.equal(got.bfloat16(), want) and not torch.equal(got, want.float())  # not rounded to bf16
     assert torch.equal(m.lm_head(x[2:3]), got[2:3])
     from engine.weights.direct import read_tensors
     t = read_tensors(f, device="cuda")

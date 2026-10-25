@@ -12,6 +12,11 @@ It fits U on two thirds and saves U. On the rest, it reports how often the argma
 of the approximation.
 
    uv run python tools/lowrank_draft_head.py [--n 40] [--rank 1024] [--weights auto]
+
+For a qwen4_exp checkpoint (--model nvidia/Qwen3.8-Flash-Next-NVFP4; tools/prepare.py runs it for that family), the tool
+collects the mixer outputs g [2560] of the drafter of engine/spec/mtp4.py from real greedy cycles of 3 drafts (the cycle
+driver of tests/golden_qwen4exp_spec.py, early exit off) on the served model, and scores the basis against the BF16 rows
+of the draft vocabulary. Its default rank is 512 (the NVFP4 skinny GEMM takes multiples of 512).
 """
 import argparse
 import os
@@ -20,6 +25,7 @@ import random
 import torch
 
 DEFAULT_OUT = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca.safetensors")
+DEFAULT_OUT4 = os.path.expanduser("~/.cache/colinfer/drafter/draft_head_pca4.safetensors")  # qwen4_exp
 
 
 def collect(n: int, seed: int, weights, k: int = 7, max_new: int = 256) -> torch.Tensor:
@@ -66,14 +72,53 @@ def collect(n: int, seed: int, weights, k: int = 7, max_new: int = 256) -> torch
     return torch.cat(G).float(), W
 
 
+def collect4(path: str, n: int, seed: int, k: int = 3, max_new: int = 256, max_prompt: int = 1500) -> tuple[torch.Tensor, torch.Tensor]:
+    """(the drafter outputs g [samples, 2560] fp32, the BF16 rows of the static draft vocabulary W [n_static, 2560] fp32)
+    of a qwen4_exp checkpoint: greedy cycles of k drafts on the served model (the family's load: the decode copies of the
+    prepared directory, the n-gram rows), every draft step real (early exit off)."""
+    from engine.runtime.build import load_model
+    from engine.server.chat import ChatFormat
+    from engine.spec import mtp4 as M
+    from tests.golden_qwen4exp_spec import Spec
+    from tools.drafter_data import build_prompts
+    gbuf = torch.zeros(k, 2560, device="cuda", dtype=torch.bfloat16)
+    calls = [0]
+    orig = M.Mtp4.draft
+
+    def draft(self, g):  # captured into the cycle graph: draft step j copies its input into gbuf[j]
+        gbuf[calls[0] % k].copy_(g.reshape(-1, g.shape[-1])[0])
+        calls[0] += 1
+        return orig(self, g)
+    M.Mtp4.draft = draft
+    path, model = load_model(path)
+    fmt = ChatFormat.from_checkpoint(path)
+    mtp = M.Mtp4(model, path)  # the full head
+    L = max_prompt + max_new + 64
+    st = model.new_state(1, -(-L // 16) * 16)
+    mst = M.Mtp4State(model.cfg, st.max_seq_len, "cuda", active=st.active, rope_delta=st.rope_delta)
+    sp = Spec(model, mtp, st, mst, k, early_exit=False)
+    G = []
+    for p, kind, think in build_prompts(n, random.Random(seed)):
+        x = fmt.render([{"role": "user", "content": p}], enable_thinking=think)[-max_prompt:]
+        mtp.set_prompt_vocab(x)
+        sp.start(x)
+        while len(sp.out) < max_new and sp.out[-1] not in fmt.eos_ids:
+            sp.cycle()
+            G.append(gbuf.clone())
+        print(f"  {kind}: {len(sp.out)} tokens, {len(G) * k} samples", flush=True)
+    M.Mtp4.draft = orig
+    return torch.cat(G).float(), mtp.head.w[:mtp.n_static].float()
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=None, help="the checkpoint (default: the engine's model, the 27B); a qwen4_exp one runs collect4")
     ap.add_argument("--n", type=int, default=40, help="prompts (tools/drafter_data.py mix)")
     ap.add_argument("--seed", type=int, default=5, help="prompt seed (the evals use 1)")
-    ap.add_argument("--rank", type=int, default=1024)
+    ap.add_argument("--rank", type=int, default=None, help="the rank (default: 1024; qwen4_exp: 512)")
     ap.add_argument("--weights", default="auto",
                     help="MTP head weights: auto = ~/.cache/colinfer/drafter/mtp_ft.safetensors if present, none = the checkpoint's, or a path")
-    ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument("--out", default=None, help=f"the basis file (default: {DEFAULT_OUT}; qwen4_exp: {DEFAULT_OUT4})")
     a = ap.parse_args()
     w = a.weights
     if w == "auto":
@@ -81,7 +126,18 @@ def main():
         w = w if os.path.exists(w) else None
     elif w == "none":
         w = None
-    g, W = collect(a.n, a.seed, w)
+    four = False
+    if a.model is not None:
+        from engine.model.family import model_type
+        from engine.weights.loader import resolve
+        four = model_type(resolve(a.model)) == "qwen4_exp"
+    a.rank = a.rank or (512 if four else 1024)
+    a.out = a.out or (DEFAULT_OUT4 if four else DEFAULT_OUT)
+    if four:
+        g, W = collect4(a.model, a.n, a.seed)
+        w = None
+    else:
+        g, W = collect(a.n, a.seed, w)
     n = g.shape[0]
     tr, te = g[: n * 2 // 3], g[n * 2 // 3:]
     ev, U = torch.linalg.eigh(tr.T @ tr / tr.shape[0])

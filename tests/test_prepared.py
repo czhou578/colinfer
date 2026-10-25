@@ -182,7 +182,8 @@ def test_manifest_family_round_trip(tmp_path):
 
 
 class Requant:
-    """The stand-in for tools/requant_qwen4exp.py: it writes the files of the classes after --classes into --out."""
+    """The stand-in for tools/requant_qwen4exp.py: it writes the files of the classes after --classes into --out. For
+    tools/lowrank_draft_head.py it writes the --out file."""
 
     def __init__(self):
         self.calls = []
@@ -190,6 +191,9 @@ class Requant:
     def __call__(self, argv):
         self.calls.append(argv)
         out = argv[argv.index("--out") + 1]
+        if os.path.basename(argv[1]) == "lowrank_draft_head.py":
+            touch(out)
+            return  # requant_qwen4exp.py and gptq_qwen4exp.py take the same arguments
         formats = dict(x.split("=") for x in argv[argv.index("--formats") + 1].split(","))
         for c in argv[argv.index("--classes") + 1].split(","):
             touch(f"{out}/{pr.decode4_file(c, formats[c])}")
@@ -213,12 +217,16 @@ def test_qwen4exp_dispatch_makes_the_copies(env4):
     touch(f"{out}/{pr.decode4_file(have[0], pr.DECODE4_FORMATS[have[0]])}")  # made before: kept
     tools, logs = Requant(), []
     p = tool.prepare(ckpt, out, run=tools, log=logs.append, legacy_decode=["/nonexistent"], legacy_drafter="/nonexistent")
-    assert len(tools.calls) == 1 and os.path.basename(tools.calls[0][1]) == "requant_qwen4exp.py"
+    assert [os.path.basename(c[1]) for c in tools.calls] == ["requant_qwen4exp.py", "gptq_qwen4exp.py", "lowrank_draft_head.py"]
     argv = tools.calls[0]
     assert argv[argv.index("--model") + 1] == ckpt and argv[argv.index("--out") + 1] == out
-    assert argv[argv.index("--classes") + 1].split(",") == have[1:]
+    requant, gptq = (c[c.index("--classes") + 1].split(",") for c in tools.calls[:2])
+    assert requant == [c for c in have[1:] if pr.DECODE4_FORMATS[c] not in tool.GPTQ_FORMATS]
+    assert gptq == [c for c in have[1:] if pr.DECODE4_FORMATS[c] in tool.GPTQ_FORMATS]
+    lr = tools.calls[2]
+    assert lr[lr.index("--model") + 1] == ckpt and lr[lr.index("--out") + 1] == f"{out}/{pr.LOWRANK_FILE}"
     assert p.family == "qwen4_exp" and p.decode == tuple(f"{out}/{f}" for f in pr.decode4_files())
-    assert p.drafter is None and p.lowrank is None and any("not for this family" in m for m in logs)
+    assert p.drafter is None and p.lowrank == f"{out}/{pr.LOWRANK_FILE}" and any("not for this family" in m for m in logs)
     assert not any("int6_requant" in " ".join(a) for a in tools.calls)
     tools2 = Requant()
     assert tool.prepare(ckpt, out, run=tools2, log=logs.append) == pr.read(ckpt, out) and not tools2.calls  # all kept
@@ -232,16 +240,39 @@ def test_qwen4exp_dispatch_formats_and_skip(env4):
     spec = tools.calls[0][tools.calls[0].index("--formats") + 1]
     assert "lm_head=nvfp4" in spec and "gdn_in=int5" in spec and "hc_up" not in spec
     assert [os.path.basename(f) for f in p.decode] == pr.decode4_files(fm) and any("hc_up: bf16" in m for m in logs)
-    p2 = tool.prepare4(ckpt, str(out) + "_skip", skip_int=True, run=Requant(), log=logs.append)
-    assert p2.decode == () and p2.family == "qwen4_exp"
+    p2 = tool.prepare4(ckpt, str(out) + "_skip", skip_int=True, skip_lowrank=True, run=Requant(), log=logs.append)
+    assert p2.decode == () and p2.family == "qwen4_exp" and p2.lowrank is None
+    legacy = str(out) + "_pca4.safetensors"
+    touch(legacy)
+    p3 = tool.prepare4(ckpt, str(out) + "_legacy", skip_int=True, legacy_lowrank=legacy, run=Requant(), log=logs.append)
+    assert p3.lowrank == f"{out}_legacy/{pr.LOWRANK_FILE}" and os.path.exists(p3.lowrank)  # taken from where the tool writes it
+
+
+def test_qwen4exp_gptq_formats_go_to_the_gptq_tool(env4):
+    """A class in a gptq format comes from tools/gptq_qwen4exp.py (one run for those classes), the others from
+    tools/requant_qwen4exp.py; the requant tool's format choices hold the gptq formats of the GDN and shared classes."""
+    from tools.requant_qwen4exp import parse_formats
+    ckpt, out = env4
+    fm = parse_formats("gdn_in=gptq6,gdn_out=gptq5,shared=gptq6")
+    tools = Requant()
+    p = tool.prepare4(ckpt, out, formats=fm, skip_lowrank=True, run=tools, log=lambda *a: None)
+    by = {os.path.basename(c[1]): c for c in tools.calls}
+    assert sorted(by) == ["gptq_qwen4exp.py", "requant_qwen4exp.py"]
+    g = by["gptq_qwen4exp.py"]
+    assert g[g.index("--classes") + 1].split(",") == ["gdn_in", "gdn_out", "shared"] and "gdn_out=gptq5" in g[g.index("--formats") + 1]
+    assert "gptq" not in by["requant_qwen4exp.py"][by["requant_qwen4exp.py"].index("--formats") + 1]
+    assert {"decode4_gdn_in_gptq6.safetensors", "decode4_gdn_out_gptq5.safetensors"} <= {os.path.basename(f) for f in p.decode}
+    with pytest.raises(ValueError):
+        parse_formats("attn=gptq6")
 
 
 def test_qwen4exp_main_dispatch(env4, monkeypatch):
     """main() on a qwen4_exp checkpoint: --formats reaches the tool, and the 27B's legacy paths are not consulted."""
     ckpt, out = env4
     calls = []
-    def fake(path, o, skip_int, formats):
+    def fake(path, o, skip_int, formats, skip_lowrank=False, legacy_lowrank=None):
         calls.append((path, o, skip_int, formats))
+        assert os.path.basename(legacy_lowrank) == tool.LOWRANK4_LEGACY
         return pr.Prepared(o, "snap4", (), None, None)
     monkeypatch.setattr(tool, "prepare4", fake)
     monkeypatch.setattr("engine.weights.loader.resolve", lambda m: ckpt)

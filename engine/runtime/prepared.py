@@ -33,7 +33,7 @@ DRAFTER_FILE = "mtp_ft.safetensors"      # as tools/train_drafter.py names it
 # qwen4_exp: the classes of tools/requant_qwen4exp.py and the format of each (the decision and its measurements are in that
 # tool's docstring: the classes in bf16 have no copy, because their copies break the perplexity gate)
 DECODE4_CLASSES = ("gdn_in", "gdn_out", "attn", "lm_head", "hc", "hc_up", "shared")
-DECODE4_FORMATS = {"gdn_in": "bf16", "gdn_out": "bf16", "attn": "int6", "lm_head": "int6", "hc": "bf16", "hc_up": "int8", "shared": "bf16"}
+DECODE4_FORMATS = {"gdn_in": "gptq6", "gdn_out": "gptq6", "attn": "int6", "lm_head": "int6", "hc": "bf16", "hc_up": "int8", "shared": "gptq6"}
 LOWRANK_FILE = "draft_head_pca.safetensors"  # as tools/lowrank_draft_head.py names it
 
 

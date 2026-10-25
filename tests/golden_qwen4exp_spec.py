@@ -23,8 +23,15 @@ replay times at 1k context on a garbage state (the median of 20 replays: the ver
 the routing of garbage rows spreads over more experts, so these are upper bounds); the tokens per second of each k
 against plain decode; the drafter's load time and memory.
 
+--draft-stop sets the threshold of the draft early exit (engine/spec/mtp.py DRAFT_STOP) for the cycles of the run.
+With --prepared, the model and the drafter run as the server runs them: the decode copies and the low-rank draft head of
+the prepared directory (tools/prepare.py). --ctx adds the garbage-state timings at longer contexts (the slot grows to
+the longest): the block selection is the only part that grows with the context, so the difference to 1k checks the
+context term of the cost model (QWEN4EXP_SELECT_S).
+
 Usage (loads about 80 GB on the GPU; take the GPU lock):
     flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/golden_qwen4exp_spec.py [--json out.json]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/golden_qwen4exp_spec.py --prepared --ctx 1024 65536 262000
 """
 from __future__ import annotations
 
@@ -133,14 +140,26 @@ def main():
     ap.add_argument("--k", default="1,2,3")
     ap.add_argument("--long", type=int, default=1024, help="the WikiText prompt's tokens (0: none)")
     ap.add_argument("--json", help="write the results here")
+    ap.add_argument("--prepared", action="store_true", help="the decode copies and the low-rank draft head of the prepared directory")
+    ap.add_argument("--ctx", type=int, nargs="+", default=[1024], help="the contexts of the garbage-state timings")
+    ap.add_argument("--draft-stop", type=float, default=None, help="the threshold of the draft early exit (default: DRAFT_STOP)")
     args = ap.parse_args()
     from engine.model.fast import capture
-    from engine.model.fast_qwen4exp import load_fast_qwen4exp
+    from engine.model.fast_qwen4exp import attach_decode_copies4, load_fast_qwen4exp
+    from engine.runtime.prepared import read as read_prepared
+    from engine.spec import mtp4
     from engine.spec.mtp4 import Mtp4, Mtp4State
+    if args.draft_stop is not None:  # read when each cycle graph is captured
+        mtp4.DRAFT_STOP = args.draft_stop
     want = json.load(open(FILE))
     ks = [int(x) for x in args.k.split(",")]
     res: dict = {"k": ks, "tokens": args.tokens}
-    path, model = load_fast_qwen4exp(args.model, max_seq_len=4096)
+    L = -(-max(4096, max(args.ctx) + 64) // 16) * 16
+    path, model = load_fast_qwen4exp(args.model, max_seq_len=L)
+    prep = read_prepared(path) if args.prepared else None
+    if prep is not None and prep.decode:
+        res["decode_copies"] = attach_decode_copies4(model, prep.decode)
+        print(f"[spec4] decode copies of {prep.dir}: {res['decode_copies']} linears")
     for layer in model.layers:  # distinct experts per decode launch (before any graph capture: the graphs keep the pointer)
         layer.mlp.stats = torch.zeros(2, dtype=torch.int32, device="cuda")
 
@@ -150,15 +169,15 @@ def main():
     torch.cuda.synchronize()
     gb0 = torch.cuda.memory_allocated()
     t0 = time.time()
-    mtp = Mtp4(model, path)
+    mtp = Mtp4(model, path, lowrank=prep.lowrank if prep is not None else None)
     torch.cuda.synchronize()
     res.update(drafter_load_s=time.time() - t0, drafter_gb=(torch.cuda.memory_allocated() - gb0) / 1e9, drafter_own_gb=mtp.nbytes() / 1e9,
                drafter_cached=mtp.cached)
     print(f"[spec4] drafter: {res['drafter_load_s']:.1f}s ({'from the cache' if mtp.cached else 'requantized'}), "
           f"{res['drafter_gb']:.2f} GB on the GPU ({res['drafter_own_gb']:.2f} GB of weights and head)")
     step = Stepper(model, 4096)
-    st = model.new_state(1, 4096)
-    mst = Mtp4State(model.cfg, 4096, "cuda", active=st.active, rope_delta=st.rope_delta)
+    st = model.new_state(1, L)
+    mst = Mtp4State(model.cfg, L, "cuda", active=st.active, rope_delta=st.rope_delta)
     specs = {k: Spec(model, mtp, st, mst, k) for k in ks}
     torch.cuda.synchronize()
     res["gb_total"] = torch.cuda.memory_allocated() / 1e9
@@ -237,17 +256,20 @@ def main():
         toks = sp.cyc.tok.clone()
         st.pos_t.fill_(1024)
         vg, _ = capture(lambda: model.verify(toks, st), None)  # noqa: B023 (captured now)
+        for ctx in args.ctx:
+            def ver():
+                st.pos_t.fill_(ctx)  # noqa: B023
+                mst.pos_t.fill_(ctx)  # noqa: B023
+                vg.replay()  # noqa: B023
 
-        def ver():
-            st.pos_t.fill_(1024)
-            vg.replay()  # noqa: B023
-
-        def cyc():
-            st.pos_t.fill_(1024)
-            sp.cyc.graph.replay()  # noqa: B023
-        v_ms, c_ms = timed(ver), timed(cyc)
-        res.setdefault("garbage_1k", {})[k] = dict(verify_ms=v_ms, cycle_ms=c_ms)
-        print(f"[spec4]   k = {k}: verify of {k + 1} rows {v_ms:.1f} ms, cycle {c_ms:.1f} ms (drafting {c_ms - v_ms:.1f} ms)")
+            def cyc():
+                st.pos_t.fill_(ctx)  # noqa: B023
+                mst.pos_t.fill_(ctx)  # noqa: B023
+                sp.cyc.graph.replay()  # noqa: B023
+            v_ms, c_ms = timed(ver), timed(cyc)
+            res.setdefault("garbage", {}).setdefault(str(ctx), {})[k] = dict(verify_ms=v_ms, cycle_ms=c_ms)
+            print(f"[spec4]   k = {k} at {ctx} tokens: verify of {k + 1} rows {v_ms:.1f} ms, cycle {c_ms:.1f} ms (drafting {c_ms - v_ms:.1f} ms)",
+                  flush=True)
     print(f"[spec4] SPEC {'PASSED' if ok else 'FAILED'}: the tokens with speculation {'equal' if ok else 'DIFFER FROM'} plain decode")
     res["ok"] = ok
     if args.json:

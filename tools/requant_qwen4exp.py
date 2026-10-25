@@ -15,16 +15,18 @@ the bytes per decode token of the exact path.
 
 | class   | tensors (count)                                 | kernel               | BF16 GB | format: ratio (weight error)            | decision |
 |---------|-------------------------------------------------|----------------------|---------|-----------------------------------------|----------|
-| gdn_in  | in_proj_qkv + in_proj_z [16384, 2560] (36)      | skinny_int           | 3.02    | INT6 1.0103 (2.4%)                      | BF16     |
-| gdn_out | out_proj [2560, 6144] (36)                      | skinny_int           | 1.13    | INT6 0.9992 (2.4%)                      | BF16 (*) |
+| gdn_in  | in_proj_qkv + in_proj_z [16384, 2560] (36)      | skinny_int           | 3.02    | INT6 1.0103 (2.4%)                      | GPTQ6 (+)|
+| gdn_out | out_proj [2560, 6144] (36)                      | skinny_int           | 1.13    | INT6 0.9992 (2.4%)                      | GPTQ6 (+)|
 |  both   | gdn_in and gdn_out                              |                      | 4.15    | INT5 1.0112 (4.6%); INT6 1.0088         |          |
 | attn    | q + k + v + index_qk [13952, 2560], o_proj (12) | skinny_int           | 1.23    | INT6 1.0033 (2.4%)                      | INT6     |
 | lm_head | [248320, 2560]                                  | skinny_int / _nvfp4  | 1.27    | NVFP4 1.0089 (8.5%); INT6 0.9998 (2.3%) | INT6     |
 | hc      | down + inject [324, 10240] (97; mixer 320 rows) | skinny_int, 328 rows | 0.64    | INT6 1.0032 (2.4%)                      | BF16 (*) |
 | hc_up   | input_mix_weight_up [10240, 320] (97)           | hc_mix INT8 mode     | 0.64    | INT8 per row 1.0012 (1.1%)              | INT8     |
-| shared  | shared_expert gate + up [1280, 2560] (48)       | skinny_int, silu*up  | 0.31    | INT6 1.0111 (2.5%)                      | BF16     |
+| shared  | shared_expert gate + up [1280, 2560] (48)       | skinny_int, silu*up  | 0.31    | INT6 1.0111 (2.5%)                      | GPTQ6 (+)|
 
-(*) alone within the gate, but not with the others. Combinations (golden windows; held out):
+(*) alone within the gate, but not with the others. (+) INT6 by GPTQ (tools/gptq_qwen4exp.py, the format gptq6): this
+tool's round to nearest breaks the gate for these classes, and the calibrated copies pass it, see below. Combinations
+(golden windows; held out):
 - all classes (GDN INT5, lm_head NVFP4): 1.0218. All INT6 / INT8 except shared: 1.0105.
 - lm_head INT6 + hc_up INT8: 1.0008. + attn INT6 (the decision): 1.0014; held out 1.0043. + hc INT6 instead of attn: 1.0029.
 - lm_head + hc_up + attn + hc: 1.0077. lm_head + hc_up + attn + gdn_out: 1.0064; held out 1.0113. All five: 1.0174.
@@ -33,10 +35,16 @@ gate resolves the large terms (GDN in_proj, the shared expert, the NVFP4 lm_head
 that are each within the noise add up past the gate. The routed experts (top 10 of 512) amplify a small change of a
 layer's input into a different expert choice; the lm_head (no routing after it) stays neutral even at INT6.
 
-The decision passes the gate on the decode path: 2.3307 against 2.3274 (1.0014), and the golden prompts pass (two
-diverge at near-ties: the INT6 lm_head writes bf16 logits, so the top two can tie exactly). A decode step streams 8.15
-GB of weights instead of 9.95 GB (the BF16 matrices 6.82 instead of 8.62; the experts 1.33) and takes 39.4 ms instead of
-46.6 ms at 1k context (the verify of 8 rows 56.1 instead of 63.1 ms). The copies add 1.35 GB on the GPU. Kept
+The decision of phase B (attn, lm_head, hc_up) passes the gate on the decode path: 2.3307 against 2.3274 (1.0014). A
+decode step then streams 8.15 GB of weights instead of 9.95 GB (the BF16 matrices 6.82 instead of 8.62; the experts
+1.33) and takes 39.4 ms instead of 46.6 ms at 1k context (the verify of 8 rows 56.1 instead of 63.1 ms). Those copies
+add 1.35 GB on the GPU. The INT6 lm_head writes fp32 logits (skinny_int's fp32 output).
+
+GPTQ (tools/gptq_qwen4exp.py) then made the GDN and shared classes pass, with the phase-B classes (the same windows
+through verify, 2026-10-24): GPTQ in column order for gdn_in, gdn_out and shared gives 1.0058 (held out 1.0003); in act
+order (the columns by descending H diagonal, static group scales) 1.0029 (held out 1.0016; all 16 windows 1.0023, the
+phase-B set 1.0027). The act-order set is the default. Its relative output errors on the calibration inputs are 0.4e-4
+(gdn_in), 1.6e-4 (gdn_out) and 1.5e-4 (shared), against 1.0e-4, 9.7e-4 and 3.2e-4 for round to nearest. Kept
 in BF16 besides the classes above: the shared experts' down_proj [2560, 640] (K = 640: the block-scaled skinny formats
 need K % 512 == 0), the routers, the PLE projections (one layer) and the embedding (one row per token). The INT8 W_up
 mode streams half the bytes: hc_mix takes 19.8 us instead of 33.4 us at M = 1 (97 calls per token).
@@ -80,9 +88,10 @@ from engine.runtime.prepared import decode4_file as file_name
 from engine.weights.quantize import dequant_int, int_global_scale, nvfp4_global_scale, pack5, pack6, quantize, quantize_int
 
 PREFIX = "model.language_model."  # engine.weights.loader.PREFIX
-CHOICES = {"gdn_in": ("int5", "int6", "bf16"), "gdn_out": ("int5", "int6", "bf16"), "attn": ("int6", "int5", "bf16"),
-           "lm_head": ("int6", "nvfp4", "bf16"),
-           "hc": ("int6", "bf16"), "hc_up": ("int8", "bf16"), "shared": ("int6", "bf16")}
+CHOICES = {"gdn_in": ("int5", "int6", "gptq6", "gptq5", "bf16"), "gdn_out": ("int5", "int6", "gptq6", "gptq5", "bf16"),
+           "attn": ("int6", "int5", "bf16"), "lm_head": ("int6", "nvfp4", "bf16"),
+           "hc": ("int6", "bf16"), "hc_up": ("int8", "bf16"), "shared": ("int6", "gptq6", "bf16")}
+GPTQ_FORMATS = ("gptq6", "gptq5")  # INT6 / INT5 made by tools/gptq_qwen4exp.py (calibrated), not by this tool
 
 
 def parse_formats(spec: str | None, base: dict[str, str] | None = None) -> dict[str, str]:
@@ -191,6 +200,9 @@ def make_copies(names, load, formats: dict[str, str], classes=CLASSES, log=print
     out = {}
     for cls in classes:
         fmt = formats[cls]
+        if fmt in GPTQ_FORMATS:
+            log(f"[requant4] {cls}: {fmt} is made by tools/gptq_qwen4exp.py (calibrated), not here")
+            continue
         if fmt == "bf16" or not groups[cls]:
             continue
         t0, tensors, errs = time.time(), {}, []
@@ -206,15 +218,16 @@ def make_copies(names, load, formats: dict[str, str], classes=CLASSES, log=print
     return out
 
 
-def write_copies(out_dir: str, copies: dict, source: str = "") -> list[str]:
-    """Writes one file per class into out_dir (a temporary name, then a rename); returns the file names."""
+def write_copies(out_dir: str, copies: dict, source: str = "", error: str = "weight_error") -> list[str]:
+    """Writes one file per class into out_dir (a temporary name, then a rename); returns the file names. error: the
+    metadata key of the class's error (tools/gptq_qwen4exp.py writes its relative output error)."""
     from safetensors.torch import save_file
     os.makedirs(out_dir, exist_ok=True)
     names = []
     for cls, (fmt, tensors, err) in copies.items():
         name = file_name(cls, fmt)
         path = os.path.join(out_dir, name)
-        save_file(tensors, path + ".tmp", metadata={"source": source, "class": cls, "format": fmt, "weight_error": f"{err:.5f}"})
+        save_file(tensors, path + ".tmp", metadata={"source": source, "class": cls, "format": fmt, error: f"{err:.5f}"})
         os.replace(path + ".tmp", path)
         names.append(name)
     return names

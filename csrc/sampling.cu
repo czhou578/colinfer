@@ -80,3 +80,36 @@ cudaError_t launch_rescore_nvfp4(const void* x, const void* w, const void* sf, f
     k_rescore_nvfp4<<<dim3((NC + 3) / 4, B), 128, 0, st>>>((const __nv_bfloat16*)x, (const uint8_t*)w, (const uint8_t*)sf, gs, cand, out, K, NC);
     return cudaGetLastError();
 }
+
+// Exact logits of candidate rows of a BF16 matrix (the rescoring of the low-rank draft head of qwen4_exp,
+// engine/spec/mtp4.py, whose lm_head is BF16): out[b, j] = sum_k x[b, k] * W[cand[b, j], k]. One warp per candidate.
+// Each lane takes the 8-element chunks lane, lane + 32, ... in order (fp32 fma), then the warp sums the lanes: a row's
+// result does not depend on B or NC.
+__global__ void __launch_bounds__(128) k_rescore_bf16(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                                     const int64_t* __restrict__ cand, float* __restrict__ out, int K, int NC) {
+    const int b = blockIdx.y, j = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (j >= NC) return;
+    const int64_t row = cand[(size_t)b * NC + j];
+    const __nv_bfloat16* wr = w + (size_t)row * K;
+    const __nv_bfloat16* xr = x + (size_t)b * K;
+    float acc = 0.f;
+    for (int c = lane; c < K / 8; c += 32) {
+        const uint4 wv = *reinterpret_cast<const uint4*>(wr + c * 8), xv = *reinterpret_cast<const uint4*>(xr + c * 8);
+        const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&xv);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 wf = __bfloat1622float2(w2[i]), xf = __bfloat1622float2(x2[i]);
+            acc = fmaf(wf.x, xf.x, acc);
+            acc = fmaf(wf.y, xf.y, acc);
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) out[(size_t)b * NC + j] = acc;
+}
+
+cudaError_t launch_rescore_bf16(const void* x, const void* w, const int64_t* cand, float* out, int B, int K, int NC, cudaStream_t st) {
+    if (K % 8) return cudaErrorInvalidValue;
+    k_rescore_bf16<<<dim3((NC + 3) / 4, B), 128, 0, st>>>((const __nv_bfloat16*)x, (const __nv_bfloat16*)w, cand, out, K, NC);
+    return cudaGetLastError();
+}

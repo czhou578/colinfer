@@ -368,3 +368,61 @@ def test_drafter_contract(setup):
     assert st.snap_tensors() == [] and st.kv_ratios() == [1, 1, 1, 4, 1]
     assert mtp.vocab_ids.numel() == V and mtp.head.w.shape == (V, 2560)  # a small vocabulary is scored whole
     assert "target" not in dict(mtp.named_children()) and "lm_head" not in dict(mtp.named_children())
+
+
+def test_drafter_takes_the_targets_yarn(setup):
+    """On a target with YaRN (qwen4exp.apply_yarn4), the drafter's attention rotates by the YaRN frequencies and its four
+    q / k norms (attention and indexer) get the attention factor, as the target's do; its state takes the longer slot."""
+    import copy
+    import dataclasses
+
+    from engine.model.qwen35 import rope_inv_freq, yarn_attention_factor
+    from engine.spec.mtp4 import Mtp4, Mtp4State
+    fast, mtp, _, _ = setup
+    t, ex, _, _ = build_drafter_reference(fast.cfg)
+    raw = {k: v.clone() for k, v in t.items()}
+    cfg = dataclasses.replace(fast.cfg, yarn_factor=2.0)
+    target = copy.copy(fast)  # the same modules, the YaRN config (the drafter reads the target's cfg)
+    target.cfg = cfg
+    m2 = Mtp4(target, None, tensors=dict(t), experts=ex, log=lambda *a: None)
+    a, r, f = m2.layer.self_attn, cfg.rotary_dim, yarn_attention_factor(cfg)
+    assert torch.equal(a.inv_freq, rope_inv_freq(cfg, "cuda")) and not torch.equal(a.inv_freq, mtp.layer.self_attn.inv_freq)
+    for name in ("q_norm", "k_norm", "indexer.q_layernorm", "indexer.k_layernorm"):
+        w, w0 = a.get_submodule(name).weight, raw[f"layers.0.self_attn.{name}.weight"]
+        torch.testing.assert_close(1 + w[:r].float(), f * (1 + w0[:r].float()), rtol=1e-2, atol=1e-2)  # bf16 weights
+        assert torch.equal(w[r:], w0[r:])
+    assert Mtp4State(cfg, 2 * cfg.max_position_embeddings, "meta").k[0].shape[2] == 2 * cfg.max_position_embeddings
+
+
+@torch.inference_mode()
+def test_lowrank_head_drafts_as_the_full_head(setup, tokens, tmp_path):
+    """The low-rank draft head (a basis U [2560, 512] as tools/lowrank_draft_head.py writes it): for drafter outputs in
+    the span of U, the approximation's top LOWRANK_CANDS candidates hold the full head's argmax and the exact rescoring
+    picks it; a row's draft does not depend on the other rows; the BF16 copy of the head rows is not built; and the cycle
+    with it gives the tokens of plain decode."""
+    from safetensors.torch import save_file
+
+    from engine.spec.mtp4 import Mtp4
+    fast, mtp, _, _ = setup
+    t, ex, _, _ = build_drafter_reference(fast.cfg)
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    U = torch.linalg.qr(torch.randn(2560, 512, device="cuda", generator=gen))[0]
+    f = str(tmp_path / "draft_head_pca.safetensors")
+    save_file({"U": U.bfloat16().cpu().contiguous()}, f)
+    lr = Mtp4(fast, None, lowrank=f, tensors=dict(t), experts=ex, log=lambda *a: None)
+    assert lr.head is None and lr.lr_A.out_features == 512 and lr.lr_B.out_features == lr.vocab_ids.numel()
+    g = (torch.randn(16, 512, device="cuda", generator=gen) @ U.T * 3).bfloat16()
+    ids, p = lr.draft(g)
+    want, pw = mtp.draft(g)
+    assert torch.equal(ids, want)
+    # the probability divides by the approximation's logsumexp (NVFP4 noise over the vocabulary): within a factor e of the
+    # full head's; only the draft early exit reads it
+    assert bool(((p > 0) & (p <= 1)).all()) and float((p.log() - pw.log()).abs().max()) < 1.0
+    assert torch.equal(lr.draft(g[5:6])[0], ids[5:6]) and torch.equal(lr.draft(g[:8])[0], ids[:8])
+    prompt, N = tokens[:20], 40
+    ref = plain_decode(fast, prompt, N + 8)
+    sp = Spec(fast, lr, 3)
+    sp.start(prompt)
+    while len(sp.out) < N:
+        sp.cycle()
+    assert sp.out[:N] == ref[:N]

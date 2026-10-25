@@ -809,8 +809,9 @@ def main(argv=None):
                          "0: off). It counts in the memory check. The 27B has no n-gram table")
     ap.add_argument("--mem-cap-gb", type=float, default=None,
                     help="hard cap on this process's GPU memory (torch allocator; GB of 10^9 bytes; default: the model family's, 95 for "
-                         "the 27B, 101 for Qwen3.8-Flash-Next). The 27B reserves 88.6 GB at startup and 89.5 GB with the vision tower, "
-                         "Qwen3.8-Flash-Next 94.1 GB with its drafter; the rest of the unified memory stays for the host (docs/server.md)")
+                         "the 27B, 104 for Qwen3.8-Flash-Next). The 27B reserves 88.6 GB at startup and 89.5 GB with the vision tower, "
+                         "Qwen3.8-Flash-Next 97.1 GB with its drafter and decode copies; the rest of the unified memory stays for the host "
+                         "(docs/server.md)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
     ap.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "xhigh"), default="auto",

@@ -11,7 +11,7 @@
 //   prefill_ops.cu   prefill glue: fp8_quant, add_rmsnorm, causal_conv_silu, gated_rmsnorm, gate_fp8, dequant_nvfp4
 //   gdn_prefill.cu   gdn_prefill (chunked delta rule)
 //   attn_prefill.cu  attn_prefill_fp8
-//   sampling.cu      philox_uniform (sampling), rescore_nvfp4 (low-rank draft head)
+//   sampling.cu      philox_uniform (sampling), rescore_nvfp4 / rescore_bf16 (low-rank draft heads)
 // The kernels of the qwen4_exp family bind in their own files: bind_moe, bind_qsa and bind_hc of moe_bind.cpp, qsa_bind.cpp
 // and hc_bind.cpp, which the module calls.
 #include <c10/cuda/CUDAStream.h>
@@ -53,8 +53,8 @@ cudaError_t launch_skinny_nvfp4(const void*, const void*, const void*, float, co
 cudaError_t launch_skinny_swiglu(const void*, const void*, const void*, float, const void*, const void*, float, void*, int, int, int, float*,
                                  cudaStream_t);
 cudaError_t launch_skinny_fp8(const void*, const void*, float, const float*, const void*, void*, int, int, int, float*, cudaStream_t);
-cudaError_t launch_skinny_int(int, const void*, const void*, const void*, const void*, float, const void*, void*, int, int, int, float*,
-                              cudaStream_t);
+cudaError_t launch_skinny_int(int, const void*, const void*, const void*, const void*, float, const void*, void*, bool, int, int, int,
+                              float*, cudaStream_t);
 cudaError_t launch_skinny_bf16(const void*, const void*, const void*, void*, bool, int, int, int, float*, cudaStream_t);
 cudaError_t launch_skinny_swiglu_bf16(const void*, const void*, const void*, void*, int, int, int, float*, cudaStream_t);
 int skinny_ws_floats(int, bool, int, int, int);
@@ -117,7 +117,7 @@ void skinny_swiglu(torch::Tensor x, torch::Tensor wg, torch::Tensor sg, double g
 }
 
 // INT6 / INT5 weights (engine/weights/quantize.py): wlo uint8 [N, K/2] low nibbles, whi uint8 [N, K/4] (INT6: 2-bit fields)
-// or [N, K/8] (INT5: one bit per code), sf e4m3 [N, K/16]. The width of whi gives the format. out: bf16.
+// or [N, K/8] (INT5: one bit per code), sf e4m3 [N, K/16]. The width of whi gives the format. out: bf16, or fp32 (logits).
 void skinny_int(torch::Tensor x, torch::Tensor wlo, torch::Tensor whi, torch::Tensor sf, double gscale, c10::optional<torch::Tensor> residual,
                 torch::Tensor out) {
     CHECK_CUDA_TENSOR(wlo, torch::kUInt8);
@@ -127,11 +127,10 @@ void skinny_int(torch::Tensor x, torch::Tensor wlo, torch::Tensor whi, torch::Te
     check_sf(sf, N, K);
     const int bits = whi.size(1) == K / 4 ? 6 : whi.size(1) == K / 8 ? 5 : 0;
     TORCH_CHECK(bits && whi.size(0) == N, "high-bit plane: [N, K/4] (INT6) or [N, K/8] (INT5)");
-    TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "out must be bf16");
     torch::Tensor hold;
     float* ws = skinny_ws(2, false, x, N, K, hold);
     CHECK_LAUNCH(launch_skinny_int(bits, x.data_ptr(), wlo.data_ptr(), whi.data_ptr(), sf.data_ptr(), (float)gscale, residual_ptr(residual, out),
-                                   out.data_ptr(), x.size(0), N, K, ws, stream()));
+                                   out.data_ptr(), out.scalar_type() == torch::kFloat32, x.size(0), N, K, ws, stream()));
 }
 
 // FP8 W: e4m3 [N, K] with a per-tensor scale, or per-row scales row_scale fp32 [N] (stacked projections). out: bf16.
@@ -533,6 +532,7 @@ void attn_prefill_fp8(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_ca
 // ===================================================================================================== sampling.cu
 cudaError_t launch_philox_uniform(const int64_t*, const int64_t*, float*, int, int, cudaStream_t);
 cudaError_t launch_rescore_nvfp4(const void*, const void*, const void*, float, const int64_t*, float*, int, int, int, cudaStream_t);
+cudaError_t launch_rescore_bf16(const void*, const void*, const int64_t*, float*, int, int, int, cudaStream_t);
 
 // out fp32 [B, n] = per-slot seeded uniforms in (0, 1] at counters offset[b] + i (seed, offset: int64 [B], device).
 void philox_uniform(torch::Tensor seed, torch::Tensor offset, torch::Tensor out) {
@@ -554,6 +554,20 @@ torch::Tensor rescore_nvfp4(torch::Tensor x, torch::Tensor w, torch::Tensor sf, 
     auto out = torch::empty({B, NC}, x.options().dtype(torch::kFloat32));
     CHECK_LAUNCH(launch_rescore_nvfp4(x.data_ptr(), w.data_ptr(), sf.data_ptr(), (float)gs, cand.data_ptr<int64_t>(), out.data_ptr<float>(), (int)B,
                                       (int)K, (int)NC, stream()));
+    return out;
+}
+
+// exact logits of candidate rows of a BF16 matrix: x bf16 [B, K], w bf16 [V, K], cand int64 [B, NC] -> [B, NC] fp32
+torch::Tensor rescore_bf16(torch::Tensor x, torch::Tensor w, torch::Tensor cand) {
+    CHECK_CUDA_TENSOR(x, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(w, torch::kBFloat16);
+    CHECK_CUDA_TENSOR(cand, torch::kInt64);
+    const int64_t K = x.size(-1), B = x.numel() / K, NC = cand.size(-1);
+    TORCH_CHECK(w.dim() == 2 && w.size(1) == K && K % 8 == 0 && cand.numel() == B * NC, "x [B, K], w [V, K] with K % 8 == 0, cand [B, NC]");
+    TORCH_CHECK((uintptr_t)x.data_ptr() % 16 == 0 && (uintptr_t)w.data_ptr() % 16 == 0, "x and w must be 16-byte aligned");
+    auto out = torch::empty({B, NC}, x.options().dtype(torch::kFloat32));
+    CHECK_LAUNCH(launch_rescore_bf16(x.data_ptr(), w.data_ptr(), cand.data_ptr<int64_t>(), out.data_ptr<float>(), (int)B, (int)K, (int)NC,
+                                     stream()));
     return out;
 }
 
@@ -618,6 +632,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("k_cache"), py::arg("v_cache"), py::arg("out"), py::arg("pos"), py::arg("scale"));
     // sampling and drafting
     m.def("philox_uniform", &philox_uniform, "per-slot seeded uniforms (position-keyed sampling)", py::arg("seed"), py::arg("offset"), py::arg("out"));
+    m.def("rescore_bf16", &rescore_bf16, "exact logits of candidate rows of a BF16 matrix (low-rank draft head of qwen4_exp)", py::arg("x"),
+          py::arg("w"), py::arg("cand"));
     m.def("rescore_nvfp4", &rescore_nvfp4, "exact logits of candidate rows of an NVFP4 matrix (low-rank draft head)", py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gs"), py::arg("cand"));
     // qwen4_exp: MoE, sparse attention and hyper-connection kernels
     bind_moe(m);

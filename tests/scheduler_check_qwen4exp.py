@@ -23,6 +23,10 @@ checkpoints follow the same rules, so both prefill the same chunks. The checks:
   6. the speed: two generations of --tokens tokens (code, prose) with and without speculation: the tokens per second,
      the accepted drafts per cycle and the draft lengths that the scheduler chose; the outputs are equal
   7. the fingerprint of the cached state names the n-gram table file and the drafter "checkpoint"
+  8. an image (tests/golden_qwen4exp.py image_prompt: a page with four lines of text, 768 image tokens): the tokens
+     equal the reference's of tests/data/qwen4exp_golden_image.json (tools/qwen4exp_reference.py --image) under the
+     near-tie rule, and plain decode's; the answer holds every line; turn 2 restores the prefix that holds the image and
+     does not run the vision tower again
 
 Usage (loads about 80 GB of weights; take the GPU lock, MemAvailable >= 100 GB):
     flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/scheduler_check_qwen4exp.py [--sessions-dir DIR] [--json FILE]
@@ -61,7 +65,7 @@ from engine.runtime.sessions import SessionStore  # noqa: E402
 from engine.server.chat import ChatFormat  # noqa: E402
 from engine.weights.loader import resolve  # noqa: E402
 from tests.golden_qwen4exp import FILE as GOLDEN  # noqa: E402
-from tests.golden_qwen4exp import NEAR_TIE, STOP  # noqa: E402
+from tests.golden_qwen4exp import IMAGE_FILE, IMAGE_LINES, IMAGE_QUESTION, NEAR_TIE, STOP, image_prompt  # noqa: E402
 
 
 def golden_verdict(got: list[int], want: dict) -> tuple[bool, str]:
@@ -307,6 +311,44 @@ def main():
     fp_ok = fp.get("drafter") == "checkpoint" and fp.get("ngram", [None])[0] == "model-fp8-mtp-ple.safetensors"
     ok &= fp_ok
     print(f"[fingerprint] {fp} -> {'RIGHT' if fp_ok else 'WRONG'}")
+
+    # ---- 8. an image
+    if sched.vision is None:
+        ok = False
+        print("[image] the build has no vision tower -> WRONG")
+    else:
+        ref.vision, ref.image_pad = sched.vision, sched.image_pad
+        avail_img = mem_available()
+        want_img = json.load(open(IMAGE_FILE))["prompts"][0] if os.path.exists(IMAGE_FILE) else None
+        pi, ims = image_prompt(path)
+        n_img = len(want_img["tokens"]) if want_img else 48
+        sched.reset()
+        ref.reset()
+        ri = sched.run([Request(pi, max_new_tokens=n_img, eos_ids=STOP, images=ims)])[0]
+        pi2, ims2 = image_prompt(path)
+        rpi = ref.run([Request(pi2, max_new_tokens=n_img, eos_ids=STOP, images=ims2)])[0]
+        ans = tok.decode([t for t in ri.output if t not in EOS], skip_special_tokens=True)
+        good, msg = golden_verdict(ri.output, want_img) if want_img else (all(x in ans for x in IMAGE_LINES), "no reference file")
+        calls = [0]
+        encode = sched.vision.encode
+        sched.vision.encode = lambda im: calls.__setitem__(0, calls[0] + 1) or encode(im)
+        m1 = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_QUESTION}]}]
+        p3, ims3 = image_prompt(path, m1 + [{"role": "assistant", "content": ans}, {"role": "user", "content": "What is the margin?"}])
+        r3 = sched.run([R(p3, 24, images=ims3)])[0]
+        sched.vision.encode = encode
+        turn2 = r3.reused == len(pi) + len(ri.output) - 1 and calls[0] == 0
+        img_ok = good and same(ri, rpi) and all(x in ans for x in IMAGE_LINES) and turn2
+        ok &= img_ok
+        torch.cuda.synchronize()
+        res["image"] = dict(tokens=ims[0].n, verdict=msg, answer=ans, spec_equals_plain=same(ri, rpi), ttft=ttft(ri), tok_s=tps(ri),
+                            turn2_reused=r3.reused, turn2_ttft=ttft(r3), turn2_vision_runs=calls[0], turn2_answer=tok.decode(r3.output),
+                            mem_fall_gb=round((avail_img - mem_available()) / 1e9, 2))
+        print(f"[image] {ims[0].n} image tokens of {len(pi)}: {msg}; answer {ans!r}; spec {'EQUALS' if same(ri, rpi) else 'DIFFERS FROM'} plain "
+              f"({agree(ri, rpi)}); TTFT {ttft(ri)} s, {tps(ri)} tok/s; turn 2 reused {r3.reused} of {len(p3)} with {calls[0]} vision tower "
+              f"runs, TTFT {ttft(r3)} s: {tok.decode(r3.output)!r}; MemAvailable {res['image']['mem_fall_gb']:+.2f} GB lower "
+              f"-> {'RIGHT' if img_ok else 'WRONG'}", flush=True)
+        sched.reset()
+        ref.reset()
     st = sched.model.feeder.stats()
     torch.cuda.synchronize()
     avail2 = mem_available()

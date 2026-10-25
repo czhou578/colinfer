@@ -168,14 +168,14 @@ def drafter4_state_bytes(slots, max_seq_len):
 
 def test_the_moe_family_has_its_own_defaults(tmp_path):
     """The qwen4_exp family serves: 2 slots of 262144 tokens, 16 checkpoints, speculation with its drafter (up to 3 drafts,
-    a cycle of 1, 2 or 3), no images, prefill chunks of 4096 tokens with prev2; the memory check counts its fixed bytes
+    a cycle of 1, 2 or 3), images, prefill chunks of 4096 tokens with prev2; the memory check counts its fixed bytes
     (the drafter's weights included), the state of the slots and of the drafter (0.355 GB per slot of 262144 tokens) and
-    the n-gram row cache; the build refuses a slot length past the native context before the memory check."""
+    the n-gram row cache; a slot past the native context counts with YaRN, and the load refuses one past 4 times it."""
     path = moe_config(tmp_path)
     fam = family_of(path)
     assert fam.name == "qwen4_exp"
-    assert fam.defaults == F.Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="mtp", vision=False, mem_cap_gb=101.0)
-    assert fam.supports == F.Supports(mtp=True, vision=False, yarn=False, int_copies=True)
+    assert fam.defaults == F.Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="mtp", vision=True, mem_cap_gb=104.0)
+    assert fam.supports == F.Supports(mtp=True, vision=True, yarn=True, int_copies=True)
     assert fam.spec is F.QWEN4EXP_SPEC and (fam.spec.k, fam.spec.k_options) == (3, (1, 2, 3))
     assert fam.prefill_chunk == 4096 and fam.prefill_prev2
     assert fam.fixed_bytes == F.QWEN4EXP_FIXED_BYTES == 87 * 10**9 + F.QWEN4EXP_DRAFTER_BYTES + F.QWEN4EXP_COPIES_BYTES
@@ -187,10 +187,9 @@ def test_the_moe_family_has_its_own_defaults(tmp_path):
     assert fam.host_bytes(1.0) == 6_250_000 * 176 and fam.host_bytes(0) == 0
     assert build.startup_bytes(path) == F.QWEN4EXP_FIXED_BYTES + state + drafter + 6_250_000 * 176
     assert build.startup_bytes(path, spec="none", ngram_cache_gb=0) == F.QWEN4EXP_FIXED_BYTES + state
-    with pytest.raises(ValueError, match="native context 262144.*no YaRN"):
-        build.build_engine(path, max_seq_len=524288, selftest=False)
-    with pytest.raises(ValueError, match="no YaRN"):
-        build.load_model(path, max_seq_len=524288)
+    assert fam.state_bytes(path, 1, 524288, "none") == moe_state_bytes(path, 1, 524288)  # YaRN x2: one slot holds twice the tokens
+    with pytest.raises(ValueError, match="4 x the native context 262144"):
+        build.load_model(path, max_seq_len=4 * 262144 + 16)  # past YaRN x4, from the config alone
 
 
 def test_the_dense_family_has_no_host_cache(tmp_path):
@@ -274,11 +273,12 @@ def test_the_speculation_of_each_family_names_its_drafter():
 
 
 def test_the_qwen4exp_cycle_cost_picks_k_by_acceptance():
-    """The cost model of qwen4_exp's cycle is M3's fit at 1k context (53.3 / 59.4 / 65.5 ms for k = 1 / 2 / 3) plus the
-    block selection that grows with the context. With the expected tokens of a cycle (1 - a^(k+1)) / (1 - a), the best
-    k is 1 at a low acceptance, 2 at the prior of 0.55 and 3 from about 0.6."""
+    """The cost model of qwen4_exp's cycle is the fit at 1k context of the served configuration (35.9 / 40.5 / 45.0 ms
+    for k = 1 / 2 / 3: the decode copies and the low-rank draft head) plus the block selection that grows with the
+    context. With the expected tokens of a cycle (1 - a^(k+1)) / (1 - a), the best k is 1 at a low acceptance, 2 at the
+    prior of 0.55 and 3 from about 0.6."""
     cost = F.qwen4exp_cycle_cost
-    assert [round(cost(k, k, 1024) * 1e3, 1) for k in (1, 2, 3)] == [53.3, 59.4, 65.5]
+    assert [round(cost(k, k, 1024) * 1e3, 1) for k in (1, 2, 3)] == [35.9, 40.5, 45.0]
     assert 1.4e-3 < cost(2, 2, 262144) - cost(2, 2, 0) < 1.6e-3  # the selection of 12 + 2 layer launches at 262k tokens
     assert cost(15, 3, 0) < cost(15, 15, 0)  # a suffix-match cycle verifies 15 drafts and makes 3
 

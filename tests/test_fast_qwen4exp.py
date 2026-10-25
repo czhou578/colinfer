@@ -125,9 +125,8 @@ def step(fast, st, feed, tok):
 
 
 # ------------------------------------------------------------------------------------------------------------ reference
-@torch.inference_mode()
-def test_decode_matches_reference(models, tokens):
-    ref, fast = models
+def _decode_vs_reference(ref, fast, tokens) -> tuple[float, int, int]:
+    """(the worst max |logit difference| / std, the argmax flips, the steps checked) of 40 decode steps."""
     rs = ref.new_state(1, L, kv_dtype=torch.float8_e4m3fn)  # the engine's fp8 KV, so that the KV rounds the same
     fs, feed = fast.new_state(1, L), Feeder(fast)
     worst, flips, checked = 0.0, 0, 0
@@ -140,9 +139,34 @@ def test_decode_matches_reference(models, tokens):
         if (top2[0] - top2[1]).item() > 0.1 * want.std().item():  # not a near-tie: the argmax must agree
             checked += 1
             flips += int(got.argmax() != want.argmax())
+    return worst, flips, checked
+
+
+@torch.inference_mode()
+def test_decode_matches_reference(models, tokens):
+    worst, flips, checked = _decode_vs_reference(*models, tokens)
     print(f"\n[fast4] worst max|diff| / std over 40 steps: {worst:.4f}; argmax checked at {checked} steps, {flips} differ")
     assert worst < TOL, worst
     assert flips == 0 and checked >= 25
+
+
+@torch.inference_mode()
+def test_yarn_decode_matches_reference(tokens):
+    """With YaRN (qwen4exp.apply_yarn4 before to_fast4), the kernels rotate by the YaRN frequencies and read the folded
+    norms: the decode path follows the YaRN reference as closely as the plain one, and the state takes the longer slot."""
+    from engine.model.fast_qwen4exp import to_fast4
+    from engine.model.qwen4exp import apply_yarn4
+    from engine.model.qwen35 import rope_inv_freq
+    ref = build_reference()
+    apply_yarn4(ref, 2.0)
+    fast = to_fast4(copy.deepcopy(ref))
+    assert torch.equal(fast.layers[3].self_attn.inv_freq, rope_inv_freq(ref.cfg, "cuda"))
+    assert not torch.equal(fast.layers[3].self_attn.inv_freq, rope_inv_freq(small_cfg(), "cuda"))
+    worst, flips, checked = _decode_vs_reference(ref, fast, tokens)
+    assert worst < TOL and flips == 0 and checked >= 25, (worst, flips, checked)
+    assert fast.new_state(1, 2 * 8192).k[3].shape[2] == 2 * 8192  # past the native 8192 positions
+    del ref, fast
+    torch.cuda.empty_cache()
 
 
 @torch.inference_mode()
@@ -362,4 +386,4 @@ def test_load_refuses_long_context():
     if not os.path.exists(os.path.join(path, "config.json")):
         pytest.skip("no qwen4_exp checkpoint")
     with pytest.raises(ValueError, match="native context"):
-        load_fast_qwen4exp(path, None, print, None, 1 << 20)  # refused from the config, before any weight is read
+        load_fast_qwen4exp(path, None, print, None, 1 << 21)  # past YaRN x4: refused from the config, before any weight is read
