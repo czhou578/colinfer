@@ -1,7 +1,9 @@
-// qsa_bind.cpp -- torch bindings of qsa.cu, qsa_prefill.cu and hc_prefill.cu, and of the PLE row reader of ple_io.cpp (ple_gather). bindings.cpp calls
-// bind_qsa(m) from the module; each kernel file of qwen4_exp has its own binding file. Each wrapper checks the shapes /
-// dtypes / strides and launches on the current stream, so a CUDA graph can capture each op (ple_gather is a host function and runs no kernel). Python wrappers:
-// engine/model/qsa_kernels.py.
+// qsa_bind.cpp -- torch bindings of qsa.cu, qsa_prefill.cu and hc_prefill.cu, and of the host row reader and row cache of
+// ple_io.cpp (ple_gather, ple_cache_*). bindings.cpp calls bind_qsa(m) from the module; the kernels of qwen4_exp have
+// three binding files beside bindings.cpp (moe_bind.cpp, hc_bind.cpp, this one). Each wrapper checks the shapes /
+// dtypes / strides and launches on the current stream, so a CUDA graph can capture each op (the ple_* functions run on
+// the host and launch no kernel). Python wrappers: engine/model/qsa_kernels.py, engine/model/prefill_qwen4exp.py
+// (hc_mix_rows), engine/weights/ple.py.
 #include <c10/cuda/CUDAStream.h>
 #include <string.h>
 #include <torch/extension.h>

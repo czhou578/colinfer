@@ -16,7 +16,7 @@ in bf16, an n-gram feeder with a row cache. --ctx takes several values (one mode
 NLL of each 2048-token segment, to compare with the 2048-token windows of tests/data/qwen4exp_golden.json (each from a
 fresh state). It loads about 80 GB: run it under the GPU lock.
 
-  flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/perplexity.py --engine qwen4exp --ckpt nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/perplexity.py --engine qwen4exp --ckpt nvidia/Qwen3.8-Flash-Next-NVFP4 \
       --ctx 16384 2048 --max-tokens 16384
 """
 from __future__ import annotations

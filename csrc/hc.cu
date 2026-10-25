@@ -1,6 +1,7 @@
 // hc.cu -- hyper-connection (gated residual) kernels for qwen4_exp (docs/history/qwen4exp_plan.md section 5.4): the low-rank
 // mix and the injection. The grouped norm (hc_norm) is the grouped form of csrc/norm.cu. The bindings are in hc_bind.cpp, the
-// Python module (KernelGatedResidual) in engine/model/hc_kernels.py. Tests: tests/test_hc.py.
+// Python module (KernelGatedResidual) in engine/model/hc_kernels.py. Tests: tests/test_hc.py, and
+// tests/test_requant_qwen4exp.py for the INT8 mode below.
 //
 // The residual stream of a row is x4 [4 x 2560]. A GatedResidual computes, with bf16 weights, fp32 math and one rounding
 // per op (the rounding points of transformers' Qwen4ExpTextGatedResidual):

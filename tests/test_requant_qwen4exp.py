@@ -9,7 +9,7 @@ the files into a temporary prepared directory, and the attach reads them. The te
 - the prefill keeps the BF16 weights: its 4-stream hidden is the same bits with and without the copies
 - each class alone (the files are independent), and a stacked group with a part missing is refused
 - the tool on the synthetic nvidia-layout checkpoint of tests/qwen4exp_ckpt.py (names from the shards)
-Run: ./py -m pytest tests/test_requant_qwen4exp.py -q"""
+Run: uv run pytest tests/test_requant_qwen4exp.py -q"""
 import copy
 import os
 

@@ -10,7 +10,7 @@ block-scaled experts. The tests check:
   drafts and with partly correct host drafts (so that every accepted length occurs)
 - the sampled cycle (position-keyed uniforms) equals plain sampling
 - a graph replay of the cycle equals the eager cycle, bit for bit
-Run: ./py -m pytest tests/test_mtp4.py -q"""
+Run: uv run pytest tests/test_mtp4.py -q"""
 import itertools
 
 import pytest

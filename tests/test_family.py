@@ -1,6 +1,6 @@
 """The model families (engine/model/family.py): both families pass; the MoE family is refused with a message that names
 the plan when its modules are missing, or while it is in NOT_SERVED_YET; the defaults, the memory figures and the n-gram
-hooks of each family. Run: ./py -m pytest tests/test_family.py -q"""
+hooks of each family. Run: uv run pytest tests/test_family.py -q"""
 import json
 import os
 import shutil

@@ -5,7 +5,7 @@
 - prefill_prologue / prefill_block_keys: the K / V, raw keys, rope record and block keys of a chunk
 - prefill_attend on every path against SDPA with the reference indexer's mask (qsa_select_reference), from rows with
   no complete block through the 2051 boundary to long context, with and without a cached prefix
-Run: ./py -m pytest tests/test_qsa_prefill.py -q"""
+Run: uv run pytest tests/test_qsa_prefill.py -q"""
 import pytest
 import torch
 import torch.nn.functional as F

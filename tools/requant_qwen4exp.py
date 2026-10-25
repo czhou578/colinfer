@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Requantized decode copies of the BF16 matrices of Qwen3.8-Flash-Next (qwen4_exp), docs/history/qwen4exp_plan.md phase B.
+"""Requantized decode copies of the BF16 matrices of Qwen3.8-Flash-Next (qwen4_exp), docs/history/qwen4exp_plan.md.
 
 The exact path streams about 10.2 GB per decode token: 8.6 GB of it are the BF16 matrices outside the routed experts.
 This tool writes smaller copies of them for the decode path (engine/model/fast_qwen4exp.py attach_decode_copies4). The
@@ -59,7 +59,7 @@ time (about 30 s for all classes; up to 14 GB of GPU memory for the INT6 lm_head
 
 CAUTION: an over-commit of the unified memory powers the machine off. Run it under the GPU lock, with no model loaded:
 
-   flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tools/requant_qwen4exp.py [--model PATH] [--out DIR]
+   flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tools/requant_qwen4exp.py [--model PATH] [--out DIR]
          [--formats gdn_in=int6,lm_head=nvfp4] [--classes attn,lm_head]
 
 tools/prepare.py runs it for a qwen4_exp checkpoint and writes the manifest.

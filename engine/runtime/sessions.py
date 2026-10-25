@@ -1,7 +1,7 @@
 """Conversation cache on disk: the KV rows and GDN snapshots of past conversations, on the NVMe. A conversation that
 left the slots (other conversations took them, or the server restarted) then restores in about a second instead of a
-full prefill. A 128k-token conversation is ~4.4 GB: ~0.4 s at the ~12 GB/s of direct reads on this machine, against
-~66 s of prefill.
+full prefill. A 128k-token conversation of the 27B is ~4.4 GB: ~0.4 s at the ~12 GB/s of direct reads on this
+machine, against ~66 s of prefill.
 
 What the store keeps (one directory per engine configuration, see `fingerprint`):
 

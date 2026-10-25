@@ -20,9 +20,9 @@ random weights at the real dims, with no checkpoint (every allocation stays well
                  --probe prefixes, the union size of the sparse attention (keys per 4-row group) and the time of the union
                  and the mask paths on each attention layer's real data
 
-   ./py bench/prefill_chunk_bench.py --part layers attn
-   flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py bench/prefill_chunk_bench.py --part real
-   ./py bench/prefill_chunk_bench.py --part ple --ple-file <snapshot>/model-fp8-mtp-ple.safetensors
+   uv run python bench/prefill_chunk_bench.py --part layers attn
+   flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python bench/prefill_chunk_bench.py --part real
+   uv run python bench/prefill_chunk_bench.py --part ple --ple-file <snapshot>/model-fp8-mtp-ple.safetensors
 """
 import argparse
 import math

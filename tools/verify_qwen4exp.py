@@ -12,7 +12,7 @@ The checks:
 - the experts' scales are finite and positive; the tool reports whether gate and up share their global scale and
   whether each layer has one input scale per projection (the MoE kernels assume both)
 
-Usage: ./py tools/verify_qwen4exp.py [<repo id or dir>]   (default: nvidia/Qwen3.8-Flash-Next-NVFP4)
+Usage: uv run python tools/verify_qwen4exp.py [<repo id or dir>]   (default: nvidia/Qwen3.8-Flash-Next-NVFP4)
 The exit status is non-zero if a check fails.
 """
 from __future__ import annotations

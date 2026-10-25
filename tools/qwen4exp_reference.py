@@ -3,7 +3,7 @@ checkpoint.
 
 The reference (engine/model/qwen4exp.py, loaded by engine/weights/qwen4exp_loader.py) is slow: about one second per
 token, because it dequantizes each routed expert on the fly. It is the ground truth of the kernel path. The golden test
-of the decode milestone (tests/golden_qwen4exp.py) compares the tokens of the engine with the tokens that this tool
+of the decode path (tests/golden_qwen4exp.py) compares the tokens of the engine with the tokens that this tool
 writes. For each greedy token, the tool also records the reference's margin: the top-1 logit minus the top-2 logit. A
 divergence at a small margin is a near-tie, not a bug.
 
@@ -14,10 +14,11 @@ the same windows with the expert loop in fp32. The reference's own bf16 rounding
 2.4% (the first 2048 tokens: 1.876 against 1.831), and that of 8 windows (16,376 tokens) by 0.03% (2.3335 against 2.3329,
 2026-10-24). One window cannot resolve a 0.5% gate; 8 windows can.
 
-Usage (loads about 78 GB on the GPU; take the GPU lock, stop the server first):
-    ./py tools/qwen4exp_reference.py                                 # three built-in prompts, 24 tokens each
-    ./py tools/qwen4exp_reference.py --tokens 32 --ppl 2048 --windows 8 --fp32-experts --out tests/data/qwen4exp_golden.json
-    ./py tools/qwen4exp_reference.py --tokens 48 --prompt "The capital of France is"
+Usage (loads about 78 GB on the GPU; stop the server first, and put each command under the GPU lock:
+flock -w 14400 ~/.cache/colinfer/gpu-model.lock <command>):
+    uv run python tools/qwen4exp_reference.py                        # three built-in prompts, 24 tokens each
+    uv run python tools/qwen4exp_reference.py --tokens 32 --ppl 2048 --windows 8 --fp32-experts --out tests/data/qwen4exp_golden.json
+    uv run python tools/qwen4exp_reference.py --tokens 48 --prompt "The capital of France is"
 
 The first run on 2026-10-24 gave, for "The capital of France is": " Paris. The capital of Germany is Berlin. The capital
 of Italy is Rome. The capital of Spain is Madrid." The load took 34 s.

@@ -21,23 +21,26 @@ this repository. Keep it short. This file is complete in itself: no section send
 
 ## What colinfer is
 
-colinfer is an inference engine for one model (Qwen3.8-27B) on one machine (a DGX Spark, GB10) for one person. The
-server runs one request at a time. Its main promise is exact output: the tokens with speculation are the tokens
+colinfer is an inference engine for the Qwen3.8 family on one machine (a DGX Spark, GB10) for one person. It serves
+Qwen3.8-27B by default, and one server process serves one model. The server runs one request at a time. Its main promise is exact output: the tokens with speculation are the tokens
 without speculation, bit for bit.
 
-The branch `moe` adds a second model family, the MoE model Qwen3.8-Flash-Next (`qwen4_exp`). Its support is in
-progress, and the server does not serve it yet. Its files are `engine/model/family.py`, `qwen4exp.py`,
-`moe_kernels.py`, `qsa_kernels.py` and `hc_kernels.py`, `engine/weights/qwen4exp_loader.py` and `ple.py`,
-`csrc/moe.cu`, `moe_prefill.cu`, `qsa.cu`, `hc.cu`, `ple_io.cpp` and their `*_bind.cpp`. The same promise holds for
-it, with these invariants:
+colinfer also serves a second model family, the MoE model Qwen3.8-Flash-Next (`qwen4_exp`, started with
+`--model nvidia/Qwen3.8-Flash-Next-NVFP4`). It has exact speculation with its own MTP drafter (`engine/spec/mtp4.py`)
+and requantized decode copies under the perplexity gate (`tools/requant_qwen4exp.py`, `attach_decode_copies4`). Its
+files are `engine/model/family.py`, `qwen4exp.py`, `fast_qwen4exp.py`, `prefill_qwen4exp.py`, `moe_kernels.py`,
+`qsa_kernels.py` and `hc_kernels.py`, `engine/weights/qwen4exp_loader.py` and `ple.py`, `engine/spec/mtp4.py`,
+`csrc/moe.cu`, `moe_prefill.cu`, `qsa.cu`, `qsa_prefill.cu`, `hc.cu`, `hc_prefill.cu`, `ple_io.cpp` and their
+`*_bind.cpp`. The same promise holds for it, with these invariants:
 
-- Every output row of a MoE, QSA or hyper-connection decode kernel is bit-identical for any set of rows in the launch.
-  A reduction whose order depends on the rows of the launch (a split by row count, an atomic, a bf16 matmul of torch)
-  breaks this.
-- The n-gram table (51.2 GB) is never resident. The host reads its rows from the disk on demand. A change that loads
-  the table or maps it whole is failure 3.
-- A family that the engine cannot serve is refused (`check_served`, `engine/model/family.py`) before the memory check
-  and before the CUDA context.
+- Every output row of a MoE, QSA or hyper-connection decode kernel, and of the drafter, is bit-identical for any set
+  of rows in the launch. A reduction whose order depends on the rows of the launch (a split by row count, an atomic,
+  a bf16 matmul of torch) breaks this.
+- The n-gram table (51.2 GB) is never resident. The host reads its rows from the disk on demand, through the bounded
+  row cache of `PleFeeder` (`--ngram-cache-gb`). A change that loads the table or maps it whole is failure 3.
+- A family that the engine cannot serve (in `NOT_SERVED_YET`, or in `IN_PROGRESS` without its modules) is refused
+  (`check_served`, `engine/model/family.py`) before the memory check and before the CUDA context. A `model_type`
+  that `family_of` does not know falls to the `qwen3_5` family.
 
 ## What failure looks like here
 
@@ -47,9 +50,9 @@ it, with these invariants:
    `Worker._loop` ends the process with `os._exit(1)`, and every request in flight fails. A device-side assert does
    the same, through the poisoned CUDA context. Thus the HTTP layer must check each client value with a 400 before the
    value reaches the engine thread. `Stream.feed` and `Stream.finish` contain their own exceptions: keep it so.
-3. **The machine powers off.** The GPU and the host share 128 GB of unified memory, and the server takes about 88 GB.
-   An over-commit powers off the machine without an out-of-memory error. An allocation whose size a request sets, or
-   that grows with each request, is high or critical.
+3. **The machine powers off.** The GPU and the host share 128 GB of unified memory, and the server takes about 88 GB
+   (the 27B) or about 100 GB (Qwen3.8-Flash-Next). An over-commit powers off the machine without an out-of-memory
+   error. An allocation whose size a request sets, or that grows with each request, is high or critical.
 4. **Two threads or two streams race.** The map below lists where. A race that corrupts the KV cache, the GDN state or
    a cached conversation is critical.
 5. **The login token leaks.** The gateway (`engine/server/gateway.py`) forwards the claude.ai login token of Claude
@@ -142,7 +145,8 @@ These choices are intentional. Do not report them.
 
 - The server has no authentication by default and listens on 127.0.0.1 (README, "Quick start"). With `--api-key`, the
   `/v1/` endpoints require the key.
-- The server runs one request at a time. The three slots are a cache of conversations, not parallel requests.
+- The server runs one request at a time. The slots (three for the 27B, two for Qwen3.8-Flash-Next) are a cache of
+  conversations, not parallel requests.
 - The engine loop ends the process on any exception, and systemd restarts it. Report the input that reaches the loop,
   not the exit.
 - `engine/model/qwen35.py` repeats the math of the fast path in plain PyTorch. It is the reference of the kernel tests.

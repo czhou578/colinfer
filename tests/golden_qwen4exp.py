@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The golden check of the qwen4_exp decode path (milestone M1) on the real checkpoint, against the plain-PyTorch reference.
+"""The golden check of the qwen4_exp decode path on the real checkpoint, against the plain-PyTorch reference.
 
 tools/qwen4exp_reference.py wrote tests/data/qwen4exp_golden.json: the reference's greedy tokens for three prompts, the
 margin (top-1 minus top-2 logit) of each, and the mean NLL of the first 2048 WikiText tokens. This script loads the decode
@@ -16,7 +16,7 @@ model (engine/model/fast_qwen4exp.py), captures one decode step (T = 1, one slot
 3. times the decode step (T = 1) and a verify of 8 rows at 1k context (the median of 20 graph replays), and, with
    --profile, breaks the decode step down by kernel class.
 
-With --prefill (milestone M2), the script checks the prefill path (engine/model/prefill_qwen4exp.py) instead of 1-3:
+With --prefill, the script checks the prefill path (engine/model/prefill_qwen4exp.py) instead of 1-3:
 
 4. attaches an n-gram feeder with a row cache to the model (model.feeder), prefills each golden prompt as one chunk, then
    decodes 32 greedy tokens through the decode graph. It compares the tokens with the reference under the near-tie rule,
@@ -27,15 +27,15 @@ With --prefill (milestone M2), the script checks the prefill path (engine/model/
 
 The reference runs with a bf16 KV cache; the engine's KV cache is fp8. That is one source of small logit differences.
 
-With --decode-copies (phase B), the decode model streams the requantized copies of tools/requant_qwen4exp.py
+With --decode-copies, the decode model streams the requantized copies of tools/requant_qwen4exp.py
 (attach_decode_copies4): those of the prepared directory's manifest, or the files of a given directory or list. Then the
 perplexity gate of 2 compares with the exact decode path (wikitext_decode_exact of the golden file: 2.3274), within 0.5%.
 1 and 3 run as before (the same near-tie rule against the reference).
 
 Usage (loads about 78 GB on the GPU; take the GPU lock):
-    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py [--profile] [--no-ppl]
-    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py --prefill [--long-tokens 3000]
-    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py --decode-copies [DIR | FILE,FILE...]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/golden_qwen4exp.py [--profile] [--no-ppl]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/golden_qwen4exp.py --prefill [--long-tokens 3000]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/golden_qwen4exp.py --decode-copies [DIR | FILE,FILE...]
 """
 from __future__ import annotations
 

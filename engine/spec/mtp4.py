@@ -41,13 +41,18 @@ reads it instead of quantizing again.
 
 The draft head scores DRAFT_VOCAB frequent tokens (engine/spec/draft_vocab.npy; the tokenizer is the 27B's, byte for
 byte) plus PROMPT_SLOTS tokens of the current prompt (set_prompt_vocab): a BF16 copy of those lm_head rows
-(69,632 x 2560, 0.36 GB) on the skinny GEMM. The low-rank head of the 27B is not ported yet.
+(69,632 x 2560, 0.36 GB) on the skinny GEMM. This family has no low-rank draft head (the 27B's comes from
+tools/lowrank_draft_head.py).
 
 Mtp4Cycle is engine/spec/mtp.py's MtpCycle on this family: verify [y, d1..dk] (FastQwen4Exp.verify, its n-gram rows
 from feed_buffer(B, k + 1), which the host fills before each replay), accept (engine/spec/accept.py: greedy, or the
 position-keyed sample), commit (FastQwen4Exp.commit, on a parallel graph branch), then the drafter: one catch-up row
 per verified position with the target's hidden4, and k - 1 chained steps on the drafter's own stream. The draft
 early exit (DRAFT_STOP, ops().skinny_skip) is ported: a skipped step skips the skinny GEMMs and the expert kernels.
+
+The scheduler runs these classes through engine/model/family.py (QWEN4EXP_SPEC): a cycle of 1, 2 or 3 drafts by the
+acceptance of the request. The scheduler's slot copy (_copy_kv) and the session files (engine/runtime/sessions.py)
+move the drafter's rows through the kv_tensors() hook of Mtp4State (a FastState4).
 """
 from __future__ import annotations
 
@@ -180,7 +185,7 @@ class Mtp4(nn.Module):
     """The MTP drafter of a qwen4_exp checkpoint at `path` for the decode model `target`.
 
     weights: optional safetensors with mtp.* tensors (BF16, not the experts) that replace the checkpoint's. lowrank:
-    accepted for the 27B's interface and not used yet (the full draft head runs). cache: keep the NVFP4 experts in
+    accepted for the 27B's interface and not used (the full draft head runs). cache: keep the NVFP4 experts in
     DRAFT_DIR. tensors / experts: build from tensors instead of a checkpoint (tests): tensors {name without "mtp.":
     bf16 tensor}, experts {w_gu, sf_gu, w_dn, sf_dn, gs} (requant_experts' layout) and optionally in_scale [E, 3].
 

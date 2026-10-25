@@ -1,5 +1,5 @@
 """Prefill of Qwen3.8-Flash-Next (qwen4_exp): a prompt of one slot in chunks of up to CHUNK tokens, each layer over the
-whole chunk (docs/history/qwen4exp_plan.md, milestone M2). The decode model (engine/model/fast_qwen4exp.py,
+whole chunk (docs/history/qwen4exp_plan.md). The decode model (engine/model/fast_qwen4exp.py,
 FastQwen4Exp) and its state (FastState4) are the same objects; after prefill the state is exactly what decode expects:
 K / V, raw indexer keys, block keys and rope record written, GDN conv / recurrent state and PLE conv state advanced,
 pos and pos_t moved.
@@ -26,15 +26,17 @@ them (prev2); its worker gathers the next chunk's rows while the GPU runs the cu
 
 The scheduler's recipe (engine/runtime/scheduler.py through engine/model/family.py):
 
-1. Once after the load: prepare_prefill(model). It attaches model.feeder, a PleFeeder with a 1 GB row cache
-   (FEEDER_ROWS). The decode hooks use the same feeder: before a replay, model.feeder.rows_for(tokens, prev2) gives the
-   pinned rows u8 [T, 16, 160] of the replay's tokens; copy them into the graph's feed_buffer(B, T)[b].
+1. Once after the load: prepare_prefill(model). The family's load attaches model.feeder first (family.attach_feeder,
+   a PleFeeder with a row cache of --ngram-cache-gb); prepare_prefill attaches one with FEEDER_ROWS (1 GB) only when
+   the model has none. The decode hooks use the same feeder: before a replay, model.feeder.rows_for(tokens, prev2)
+   gives the pinned rows u8 [T, 16, 160] of the replay's tokens; copy them into the graph's feed_buffer(B, T)[b].
 2. One call per chunk of a slot b: view = state.view(b, b + 1); view.pos = start (the tokens the slot holds; view.pos_t
    holds the same on the device); then
        logits = prefill(model, ids, view, logits=last, chunk=CHUNK, prev2=prev2, next_ids=nxt)
    ids: int64 [1, n] on the device. prev2: the slot's two tokens before ids (slot.tokens[-2:]); None only at start 0,
    which reads as (eos, eos). nxt (optional): the tokens of the slot's next prefill call; the feeder then reads their
-   rows from the drive while the GPU runs this call (the rows of a cold 4096-token chunk take about 150 ms).
+   rows from the drive while the GPU runs this call (the rows of a cold 4096-token chunk take about 150 ms). The
+   scheduler passes no nxt: its calls read their first chunk's rows when they start.
    A call of n > CHUNK tokens runs ceil(n / CHUNK) chunks; logits=False skips the lm_head (not the last chunk).
 3. return_hidden=True returns (logits, hidden4 [n, 10240]): the pre-mixer stream that the MTP drafter reads.
 4. The call writes K / V, ik, ikb and rope_pos for the n positions, advances the GDN conv / rec and ple_conv of the slot,

@@ -1,6 +1,6 @@
 // hc_bind.cpp -- torch bindings of hc.cu (and the grouped norm of norm.cu). bindings.cpp calls bind_hc(m) from the module;
-// each kernel file of qwen4_exp has its own binding file. Each wrapper checks the shapes / dtypes / strides and launches
-// on the current stream (CUDA-graph safe). Python module: engine/model/hc_kernels.py.
+// the kernels of qwen4_exp have three binding files beside bindings.cpp (moe_bind.cpp, qsa_bind.cpp, this one). Each
+// wrapper checks the shapes / dtypes / strides and launches on the current stream (CUDA-graph safe). Python module: engine/model/hc_kernels.py.
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 

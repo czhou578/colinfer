@@ -1,7 +1,7 @@
 [project]
 name = "colin-inference-engine"
 version = "0.0.1"
-description = "Single-user inference engine for Qwen3.8-27B on one DGX Spark (GB10, sm_121)"
+description = "Single-user inference engine for Qwen3.8-27B and Qwen3.8-Flash-Next on one DGX Spark (GB10, sm_121)"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

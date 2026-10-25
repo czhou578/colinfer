@@ -1,17 +1,17 @@
 """Builds the engine as the server runs it: the CUDA kernels, the quantized model and the artifacts of its prepared
-directory (engine/runtime/prepared.py: the INT6 / INT5 decode copies, the fine-tuned drafter, the low-rank draft head),
+directory (engine/runtime/prepared.py: the decode copies; for the 27B also the fine-tuned drafter and the low-rank head),
 the MTP drafter, the startup self-test and the scheduler. Before it builds anything, it compares the startup memory of
 the engine with MemAvailable (check_memory). An over-commit of the unified memory powers the machine off, so the build
 stops with NotEnoughMemory when the engine does not fit.
 
 The server (engine/server/worker.py) builds it here, and so do the end-to-end checks and the benchmarks (tests/golden.py,
-tests/scheduler_check.py, tests/passkey.py, bench/). The defaults are the server's. tests/scheduler_check.py keeps them,
-so it runs the server's configuration, YaRN included. tests/golden.py runs 32768-token slots: the server's unscaled model
-(--max-seq-len 262144).
+tests/scheduler_check.py, tests/passkey.py, tests/scheduler_check_qwen4exp.py, bench/). The defaults are the server's.
+tests/scheduler_check.py keeps them, so it runs the server's configuration, YaRN included. tests/golden.py runs
+32768-token slots: the server's unscaled model (--max-seq-len 262144).
 
 The model family of the checkpoint (engine/model/family.py, by the model_type of its config.json) gives the defaults
 of the slots, the slot length, the checkpoints and the speculation, the memory figures of check_memory, the loader and
-the prefill callables. The 27B (qwen3_5) loads here (load_dense_model).
+the prefill callables. The 27B (qwen3_5) loads here (load_dense_model); qwen4_exp loads in engine/model/family.py.
 """
 from __future__ import annotations
 
@@ -51,9 +51,10 @@ def check_seq_len(path: str, fam: Family, max_seq_len: int | None) -> None:
 def load_model(path_or_repo: str = MODEL, decode_weights: str = "int", log=print, prep: Prepared | None | str = "auto",
                max_seq_len: int | None = None, ngram_cache_gb: float = NGRAM_CACHE_GB):
     """(checkpoint directory, the model on the kernel decode path), through the loader of the checkpoint's family
-    (engine/model/family.py). decode_weights: "int" streams the INT6 / INT5 decode copies of the attention / GDN
-    projections from the prepared directory (tools/prepare.py) when it has them; "checkpoint" streams the checkpoint's
-    weights. prep: the manifest of the prepared directory ("auto": read it). max_seq_len: the slot length the model will
+    (engine/model/family.py). decode_weights: "int" streams the decode copies of the prepared directory
+    (tools/prepare.py) when it has them (the 27B: INT6 / INT5 attention / GDN projections; qwen4_exp: the copies of
+    tools/requant_qwen4exp.py); "checkpoint" streams the checkpoint's weights (the 27B: FP8; qwen4_exp: BF16, the exact
+    path). prep: the manifest of the prepared directory ("auto": read it). max_seq_len: the slot length the model will
     run at; past the checkpoint's native context, YaRN scales its rope by the ratio (engine/model/qwen35.py apply_yarn),
     as Qwen documents for its models. A family without YaRN raises ValueError there. ngram_cache_gb: the n-gram row
     cache of qwen4_exp (engine/model/family.py attach_feeder)."""
@@ -90,7 +91,7 @@ def load_drafter(model, path: str, weights: str = "auto", log=print, prep: Prepa
     """The MTP drafter of the checkpoint's family (fam.spec.drafter: engine/spec/mtp.py Mtp for the 27B,
     engine/spec/mtp4.py Mtp4 for qwen4_exp; None: the family of path). weights: "auto" = the fine-tuned head of the
     prepared directory when it has one, "none" = the checkpoint's, or a path. The low-rank draft head is the prepared
-    directory's, when it has one (Mtp4 has none yet)."""
+    directory's, when it has one (Mtp4 has none)."""
     fam = fam or family_of(path)
     if weights == "auto":
         weights = prep.drafter if prep is not None else None

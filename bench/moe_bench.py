@@ -5,7 +5,7 @@ nothing runs from L2 (the best measured LPDDR5x rate, ~238 GB/s). Then it times 
 combine) with the routing of random router weights, and the prefill path (KernelMoE.prefill: the grouped NVFP4 GEMMs of
 csrc/moe_prefill.cu) per chunk of T tokens, with the time of each step at T = 2048.
 
-   ./py bench/moe_bench.py
+   uv run python bench/moe_bench.py
 """
 import itertools
 

@@ -11,10 +11,12 @@ The down | inject product (K = 10240) runs on bf16_gemv: it rounds once and give
 
 Decode copies (tools/requant_qwen4exp.py, attached by fast_qwen4exp.attach_decode_copies4 through set_decode_copies):
 - dec: an INT6 copy of the down | inject stack (fast.IntLinear, padded with zero rows to 328 rows, N % 8 == 0) on the INT
-  skinny GEMM (ops().skinny_int). It replaces bf16_gemv, and it also gives each row the same bits for any M.
+  skinny GEMM (ops().skinny_int). It replaces bf16_gemv, and it also gives each row the same bits for any M. The
+  default formats of the prepared directory have no such copy (engine/runtime/prepared.py DECODE4_FORMATS).
 - w_up_q / w_up_s: an INT8 copy of W_up (int8 [10240, 320], one fp32 scale per row) for the INT8 mode of hc_mix.
 The prefill (engine/model/prefill_qwen4exp.py) reads w_di and w_up, which stay BF16.
-Tests: tests/test_hc.py. hc_selftest() is an entry of the startup self-test (engine/selftest.py)."""
+Tests: tests/test_hc.py, and tests/test_requant_qwen4exp.py for the copies. hc_selftest() is an entry of the startup
+self-test (engine/selftest.py)."""
 from __future__ import annotations
 
 import torch

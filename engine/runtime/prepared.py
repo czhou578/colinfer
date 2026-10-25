@@ -1,17 +1,17 @@
 """The prepared directory: the offline artifacts that make decode faster, in one place with a manifest.
 
-tools/prepare.py makes it at ~/.cache/colinfer/prepared/<snapshot>/ (PREPARED_DIR): the INT6 / INT5 decode copies of
-the attention / GDN projections, the fine-tuned MTP drafter when one exists, and the low-rank draft head. manifest.json
-names the files.
+tools/prepare.py makes it at ~/.cache/colinfer/prepared/<snapshot>/ (PREPARED_DIR): the decode copies, and for the 27B
+also the fine-tuned MTP drafter when one exists and the low-rank draft head. manifest.json names the files.
 
 The manifest's "decode" list names the decode copies of the checkpoint's family (the directory belongs to one checkpoint):
 for the 27B (qwen3_5) the INT6 / INT5 copies of its FP8 projections (DECODE_FILES, engine/model/fast.py
 attach_decode_copies); for Qwen3.8-Flash-Next (qwen4_exp) the copies of its BF16 matrices, one file per class
 (decode4_file, tools/requant_qwen4exp.py, engine/model/fast_qwen4exp.py attach_decode_copies4). The optional "family" key
 holds the checkpoint's model_type (tools/prepare.py writes it; a manifest without it is the 27B's). The version stays 1:
-the 27B's manifests read as before. The engine reads the manifest at startup (engine/runtime/build.py). Without one, the engine runs from
-the checkpoint alone: FP8 projections at decode, the checkpoint's MTP head and the full draft head. Thus the engine has
-two configurations, prepared or plain, instead of one per optional file. A manifest that names a missing file is an
+the 27B's manifests read as before. The engine reads the manifest at startup (engine/runtime/build.py). Without one,
+the engine runs from the checkpoint alone: the checkpoint's weights at decode (the 27B: FP8 projections; qwen4_exp:
+BF16), the checkpoint's MTP head and the full draft head. Thus the engine has two configurations, prepared or plain,
+instead of one per optional file. A manifest that names a missing file is an
 error, not a fallback: run tools/prepare.py again.
 
 The files keep the names that their tools give them, so a hard link into the prepared directory keeps the size and the

@@ -13,8 +13,8 @@ reports per corpus:
 
 Documents are separated by eos, so each one starts with the context (eos, eos), as a new conversation does.
 
-   ./py tools/ple_hotset.py                       # 10M tokens of each corpus
-   ./py tools/ple_hotset.py --tokens 2000000 --rate 64
+   uv run python tools/ple_hotset.py                       # 10M tokens of each corpus
+   uv run python tools/ple_hotset.py --tokens 2000000 --rate 64
 """
 from __future__ import annotations
 

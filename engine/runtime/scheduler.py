@@ -2,7 +2,8 @@
 in a FIFO queue. The `n_slots` slots keep the histories (KV cache, GDN state) of the last conversations, so a side
 request (a title, a subagent) does not overwrite the cache of the main conversation.
 
-* State. One FastState holds all slots (KV cache, GDN conv / recurrent state, positions). With speculation, the
+* State. One state of the model's family holds all slots (KV cache, GDN conv / recurrent state, positions): FastState
+  for the 27B, FastState4 for qwen4_exp (also the indexer keys and the PLE conv state). With speculation, the
   drafter's state (MtpState; qwen4_exp: Mtp4State, with the indexer keys of its layer) also holds the own KV cache of
   the drafter. Each slot has its own CUDA graphs, on a single-slot view of the state.
   The graphs share one memory pool: their temporaries overlap instead of each graph keeping its own (1.4 GB for 18
@@ -10,17 +11,20 @@ request (a title, a subagent) does not overwrite the cache of the main conversat
 * Decode with MTP (the default). One CUDA graph per (slot, greedy | sampled, draft length k) runs a full speculative
   cycle: verify, acceptance, commit and drafts (engine/spec/mtp.py; qwen4_exp: engine/spec/mtp4.py). Without MTP, each
   slot has one plain decode graph. The family's Speculation (engine/model/family.py) gives the drafter's state, the
-  cycle, the draft lengths and the cost model of a cycle.
+  cycle, the draft lengths and the cost model of a cycle. For qwen4_exp, the family's before_replay hook writes the
+  n-gram rows of the replay's tokens into the graph's feed buffer right before each replay.
   - Each cycle picks k for the most expected tokens per second. It uses the running acceptance rate of the request and
     the cost of a cycle. The 27B chooses between 3 and 7 by the cycle times measured at startup: code and structured
     output draft 7, and prose drafts 3. qwen4_exp chooses between 1, 2 and 3 by its fitted cost model
     (family.qwen4exp_cycle_cost), since its verify cost grows with the distinct experts of the rows.
   - With suffix_min > 0, the history can end in a repeat of at least suffix_min tokens. Then the cycle drafts what
     followed the earlier occurrence instead (engine/spec/suffix.py), up to SUFFIX_K = 15 drafts.
-* Prefill. An engine step runs one prefill chunk (engine/model/prefill.py) or one decode step. With MTP, the scheduler
-  writes the KV rows of the drafter for the chunk right after the chunk.
-* Prefix checkpoints. A ring, preallocated at startup, holds GDN state snapshots (conv + recurrent, 154 MB): the
-  tensors of the state's snap_tensors() hook. The KV rows of the state are the tensors of its kv_tensors() hook.
+* Prefill. An engine step runs one prefill chunk or one decode step. The family gives the prefill and its chunk
+  (engine/model/prefill.py; qwen4_exp: engine/model/prefill_qwen4exp.py in chunks of 4096 tokens, with the slot's two
+  tokens before the chunk). With MTP, the scheduler writes the KV rows of the drafter for the chunk right after the
+  chunk.
+* Prefix checkpoints. A ring, preallocated at startup, holds GDN state snapshots (conv + recurrent, 154 MB for the
+  27B): the tensors of the state's snap_tensors() hook. The KV rows of the state are the tensors of its kv_tensors() hook.
   - The scheduler takes a snapshot at the prompt end, at the generation end and every `ckpt_interval` prompt tokens.
   - It also takes snapshots at two chat message boundaries (`boundary_token`, <|im_start|>). These are the end of the
     first message (a shared system prompt), and the start of the last message before the generation prompt (the

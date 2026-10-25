@@ -1,8 +1,9 @@
 # Architecture
 
-This page describes how colin-inference-engine runs `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark. It describes the
-engine as it is now. The dated logs in `docs/history/` (`PLAN.md`, `phase*`, `baseline.md`, `results.md`) record how the engine got
-here. They give the measurements behind each decision and the alternatives that the project tried and removed.
+This page describes how colin-inference-engine runs `nvidia/Qwen3.8-27B-NVFP4` on one DGX Spark, and in section 10,
+`nvidia/Qwen3.8-Flash-Next-NVFP4`. It describes the engine as it is now. The dated logs in `docs/history/`
+(`PLAN.md`, `phase*`, `baseline.md`, `results.md`, `qwen4exp_plan.md`) record how the engine got here. They give the
+measurements behind each decision and the alternatives that the project tried and removed.
 
 ## 1. The machine and the model
 
@@ -35,8 +36,8 @@ The layers:
 `engine/model/qwen35.py` implements all of this in plain PyTorch, op for op like `modeling_qwen3_5.py` in transformers.
 The server does not use it. It is the reference for the tests of each kernel.
 
-Sections 1 to 9 describe the 27B, which the server serves. Section 10 describes the MoE family Qwen3.8-Flash-Next,
-whose support is in progress.
+Sections 1 to 9 describe the 27B, the default model of the server. Section 10 describes the MoE family
+Qwen3.8-Flash-Next, which the server also serves (`--model nvidia/Qwen3.8-Flash-Next-NVFP4`).
 
 ## 2. Weights
 
@@ -317,13 +318,16 @@ Most of the remaining gains are in the drafter: its own weights, a better stop r
 tile-contiguous weight copy that bulk copies can stream could give a few percent more (docs/history/phase6_progress.md,
 sections 18-19).
 
-## 10. The qwen4_exp family (in progress)
+## 10. The qwen4_exp family
 
-The branch `moe` adds the MoE model `Qwen/Qwen3.8-Flash-Next` (`model_type` `qwen4_exp`), from the checkpoint
-`nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB). **The server does not serve it yet.** `check_served`
-(`engine/model/family.py`) refuses the checkpoint at the start of the build, before the memory check. This section
-gives the state of the work. `docs/history/qwen4exp_plan.md` is the reference for the design, the decisions, the
-milestones and the dated status log.
+The engine also serves the MoE model `Qwen/Qwen3.8-Flash-Next` (`model_type` `qwen4_exp`), from the checkpoint
+`nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB): `python -m engine.server --model nvidia/Qwen3.8-Flash-Next-NVFP4`.
+`engine/model/family.py` picks the family from the `model_type` of `config.json`. A `Family` gives the load, the state,
+the prefill, the defaults, the speculation (`Speculation`) and the memory of its model, and the build, the scheduler
+and the server take them from there. The 27B path stays byte-identical: before and after the work, the session files of
+`tests/scheduler_check.py` have the same hashes. This section describes the served engine. The numbers are from
+2026-10-24, on the real checkpoint. `docs/history/qwen4exp_plan.md` is the reference for the design, the decisions,
+the milestones and the dated status log (section 9).
 
 ### 10.1 The model
 
@@ -350,14 +354,14 @@ file of 53.7 GB (`model-fp8-mtp-ple.safetensors`) holds the n-gram table (128 FP
 the MTP experts in FP8. In every expert, gate and up share their global scale, and each layer and projection has one
 input scale. The MoE kernels use both facts.
 
-### 10.2 What the engine has today
+### 10.2 The reference, the weights and the n-gram table
 
 **The reference model** (`engine/model/qwen4exp.py`) mirrors `modeling_qwen4_exp.py` of transformers op for op.
 `Qwen4ExpConfig` subclasses `Qwen35Config`, and the GDN layers, the rotary embedding and the norms come from
 `qwen35.py`, which stays unchanged. `tests/test_qwen4exp_small.py` runs a tiny model on the CPU: in fp32 the reference
 is bit-identical to transformers one-shot, split, stepwise, with a cache, with eos and with an image. On the real
 checkpoint, `tools/qwen4exp_reference.py` loads 77.8 GB in 34 s and gives coherent greedy text at about 1 s per token.
-Its tokens are the ground truth of the golden test of the next milestone.
+Its tokens are the ground truth of the golden test (`tests/data/qwen4exp_golden.json`).
 
 **The loader** (`load_qwen4exp`, `engine/weights/qwen4exp_loader.py`) allocates the stacked experts of each layer:
 `w_gu` u8 [512, 1280, 1280] (the gate rows, then the up rows), `w_dn` u8 [512, 2560, 320], their e4m3 block scales,
@@ -365,32 +369,38 @@ and `gs` and `in_scale` f32 [512, 3]. The direct reader writes the bytes of each
 (`read_tensors(..., into=)`), so no expert is copied a second time. The loader skips the vision tower, the MTP block
 and the n-gram shards. It checks the hash buffers of the checkpoint against the values of `engine/weights/ple.py`.
 `tools/verify_qwen4exp.py` checks the index, the dtypes and shapes, the hash buffers, the table rows and the expert
-scales without the GPU.
+scales without the GPU. The server loads the weights in about 34 s.
 
 **The n-gram table** stays on disk. The host computes the 16 row ids of a token from the token and the two tokens before
 it (`ngram_rows`); an eos starts a new context. `NgramTable` reads each 160-byte row with an O_DIRECT read of the 4 KB
 page or pages that hold it, so the page cache does not keep 4 KB for each row. The C++ reader `ops().ple_gather`
 (`csrc/ple_io.cpp`, a host thread pool of preads) reads about 170k cold rows per second at 128 rows per call, and 370k
 to 410k at 4096. `tools/ple_hotset.py` measured the hot set: an LRU row cache of 0.5 to 5 GB hits 51% to 68% of the rows
-on WikiText and 83% to 90% on TinyStories. Thus cold rows stay a real cost of a cycle.
+on WikiText and 83% to 90% on TinyStories.
+
+**The feeder** (`PleFeeder`, `engine/weights/ple.py`) serves the rows to the engine. It holds a set-associative row
+cache of 8 ways in C++ (`csrc/ple_io.cpp`), of `--ngram-cache-gb` (default 1.0 GB, 6.25M rows, 1.1 GB of host memory).
+Before each replay of a decode step or a cycle, the host fills the graph's row buffer (`feed_buffer`) with the rows of
+its tokens (the family's `before_replay` hook). A cold 2048-token prefill chunk takes about 78 ms of row reads, and a
+warm decode step about 0.03 ms. The hit rate was 50% on the golden prompts and 94% on the passkey runs.
+
+### 10.3 Decode
+
+`engine/model/fast_qwen4exp.py` (`FastQwen4Exp`, `FastState4`) is the decode path: the reference with each op on the
+kernels of the engine. A decode step, or a verify of T rows, is one CUDA graph. The routed experts stay NVFP4, and the
+other matrices stream through a BF16 format of the skinny GEMM (`Bf16Linear`, `StackedBf16Linear`): the exact path of
+the checkpoint. The GDN layers run the 27B's kernels with the sigmoid gate. The PLE layer runs as torch ops inside the
+graph, with sums in a fixed order.
 
 **The MoE decode kernels** (`csrc/moe.cu`, `KernelMoE` in `engine/model/moe_kernels.py`). `moe_route` takes the top
 10 experts of each row (an fp32 softmax, then score descending and index ascending). `moe_gate_up` and `moe_down` run
 the expert GEMMs, and `moe_combine` sums the expert outputs and the shared expert. The grid covers the 10 M pair slots
 (row, k). The warp of the first pair of an expert owns that expert: it streams the expert's weights once, with the
 weight-streaming pattern of the skinny GEMM, for all the rows that chose it. Each pair keeps an fp32 partial, and the
-combine sums the partials in slot order. The router and the shared expert run on a BF16 format of the skinny GEMM
+combine sums the partials in slot order. The router and the shared expert run on the BF16 format of the skinny GEMM
 (`skinny_core.cuh` holds the helpers that `skinny.cu` and `moe.cu` share). The kernels stream 208 GB/s at 10 distinct
 experts and 238 GB/s at 75. A full MoE layer takes 196 µs at 1 row, 935 µs at 8 rows and 1635 µs at 16 rows: 9.4 / 45
 / 78 ms over 48 layers.
-
-**The MoE prefill** (`csrc/moe_prefill.cu`, `KernelMoE.prefill`) sorts the (token, slot) pairs by expert. Two grouped
-NVFP4 GEMMs then run, gate | up and down, with the CUTLASS 4.8 SM120 block-scaled ptr-array kernel: one group per
-expert, compiled and run on sm_121a. A gather kernel quantizes the rows of each group, a SwiGLU kernel quantizes the
-input of the down GEMM, and a combine sums in slot order. The device writes the group arguments, so nothing waits for
-the host. A layer takes 8.8 ms per 2048-token chunk (11.3 ms at 4096, 16.6 ms at 8192): a MoE ceiling of 4.8k / 7.5k /
-10.3k tok/s. The raster swizzle of the scheduler matters: without it, the grouped GEMM runs 2.3 to 3 times slower.
-Decode and prefill differ by about 2%, because prefill quantizes the activations to NVFP4.
 
 **The QSA kernels** (`csrc/qsa.cu`, `engine/model/qsa_kernels.py`). `qsa_prologue` norms and ropes the indexer
 queries and writes the raw key of each new row. `qsa_block_keys` makes the key of each completed block: the fp32 mean
@@ -405,65 +415,197 @@ token over 12 layers at 262k), and it is the first kernel to make faster.
 the grouped form of `norm.cu`. `hc_mix` streams W_up (about 200 GB/s, 33 µs at M = 1) and computes the sigmoid mix and
 the mean of the 4 streams. `hc_post` adds the injected output of the sublayer to each stream. The kernels follow the
 rounding points of transformers: `hc_post` and the grouped norm are bit-exact against it. A full gated residual takes
-14 / 40 / 74 µs at M = 1 / 8 / 16. The down | inject product runs on `bf16_gemv` until the BF16 skinny GEMM replaces
-it, because the bf16 matmul of torch is not row-invariant.
+14 / 40 / 74 µs at M = 1 / 8 / 16. The down | inject product runs on `bf16_gemv`, because the bf16 matmul of torch is
+not row-invariant. A move to the skinny GEMM gave nothing: `bf16_gemv` matches it at M ≤ 8.
 
-**The self-test** (`engine/selftest.py`) covers 22 paths, the new kernels included. memcheck, racecheck (filtered to
-the engine's kernels) and synccheck are clean on the new tests; synccheck needs `--num-cuda-barriers 4096` on the
-grouped GEMM. A known limit: the split-K counters of the skinny GEMM are global, so two split-K launches must not
-overlap on different streams.
+**The measured step.** At 1k context, a decode step takes 46.0 to 46.6 ms (21.4 to 21.8 tok/s) on the exact path, and a
+verify of 8 rows takes 63 to 64 ms. The profile of the step: the BF16 skinny GEMMs 61% (36.5 ms), the experts 18%, the
+hyper-connections 11% and their GEMV 7%, GDN 2%, attention and the indexer under 1%. Through the server, plain decode
+runs at 19 to 20 tok/s: the host's row read before each step (with about 23% cache misses) costs the difference. With
+the decode copies (section 10.7), the step takes 39.4 ms and the verify of 8 rows 56.1 ms. The kernels fix hidden
+2560, 4 streams, the low-rank width 320 and 512 blocks, and the slot length must be a multiple of 16.
 
-### 10.3 Design decisions
+### 10.4 Prefill
 
-- **Row-invariant MoE kernels.** The pair-slot grid has no split-K and no atomics, and the combine sums in a fixed
-  slot order. Thus every output row is bit-identical for any set of rows in the launch, and decode equals verify
-  (section 7). The reference keeps the summation order of transformers. The kernel tests compare against it with a
-  tolerance: exactness is required between the paths of the engine, not against the rounding of transformers.
-- **One swizzled copy of the expert scales.** The decode kernels read the CUTLASS swizzled layout that the prefill GEMM
-  needs. A second, row-major copy would cost 7.5 GB, and a swizzle at prefill time would add 22% to prefill.
-- **Always-sparse decode attention.** Decode and verify always run `qsa_attn`. A short row gets the dense list (all its
-  positions). A per-launch choice of kernel would make the bits of a row depend on its neighbours.
-- **The tie rule.** The top-k orders by score descending, then index ascending, with -0.0 read as +0.0. Every path
-  uses this rule. Ties are common: a block whose 4 dot products are all 0 or less scores exactly 0.
-- **The n-gram table stays on disk.** 51 GB does not fit beside the experts. A bounded row cache comes later, sized by
-  the hot-set tool.
-- **The 4-stream hidden state.** The hidden state of a row between layers is x4 [4 × 2560], not one 2560 vector. The
-  plan infers from the shapes (`pre_fc_norm_hidden` [10240]) that the MTP block reads the 4-stream state too.
+`engine/model/prefill_qwen4exp.py` runs a prompt in chunks of 4096 tokens, each layer over the whole chunk, on the
+state of the decode model. The BF16 matrices run on cuBLAS. The MoE runs on the grouped GEMM, the GDN layers on the
+27B's prefill kernels, and the hyper-connections on `csrc/hc_prefill.cu` (167 ms per chunk instead of 763 ms in torch
+ops). The last token's mixer and lm_head run on the decode modules.
 
-### 10.4 Memory
+**The MoE prefill** (`csrc/moe_prefill.cu`, `KernelMoE.prefill`) sorts the (token, slot) pairs by expert. Two grouped
+NVFP4 GEMMs then run, gate | up and down, with the CUTLASS 4.8 SM120 block-scaled ptr-array kernel: one group per
+expert, compiled and run on sm_121a. A gather kernel quantizes the rows of each group, a SwiGLU kernel quantizes the
+input of the down GEMM, and a combine sums in slot order. The device writes the group arguments, so nothing waits for
+the host. A layer takes 8.8 ms per 2048-token chunk (11.3 ms at 4096, 16.6 ms at 8192): a MoE ceiling of 4.8k / 7.5k /
+10.3k tok/s. The raster swizzle of the scheduler matters: without it, the grouped GEMM runs 2.3 to 3 times slower.
 
-Bytes in GB (1e9), from the plan. The default is 2 slots of 262,144 tokens. The decode milestone (no drafter, no
-copies) needs about 94 GB plus the 6 GB growth reserve. The final configuration (copies, drafter, a 2 GB row cache)
-needs about 109 GB of the 122 GB available.
+**The sparse attention of prefill** (`csrc/qsa_prefill.cu`). The indexer scores all rows of a chunk in one launch, with
+the bits of the decode scores (0.13 / 0.75 / 4.6 ms for 2048 rows at prefixes 0 / 16k / 128k). The union kernel
+attends each group of 4 rows over the union of their selected blocks. On real text, that union is 3100 to 3700 keys,
+and a layer takes 12.8 / 15.0 ms at prefixes 8k / 64k. Attention with the selection as a mask takes 21 / 108 ms, so
+the union is the default path.
+
+**The feeder** reads the rows of a chunk from the tokens and the slot's two tokens before it (`prev2`). Its worker can
+read the next chunk's rows while the GPU runs the current one, but the scheduler does not use that yet.
+
+**The chunk** is 4096 tokens. On the real checkpoint it is 6 to 13% faster than 2048: 2760 to 2810 tok/s at prefixes of
+0 to 8k, and about 2500 tok/s at 16k to 60k with cold rows. On random weights (`bench/prefill_chunk_bench.py`), 8192
+adds 8% more, but it holds the lane for 3 s. A call per chunk gives the same bits as one call.
+
+The MoE prefill quantizes its activations to NVFP4, and the decode MoE does not. A small input change can flip one of
+the top 10 of 512 experts. Thus the last-token logits of prefill and decode differ by 10 to 15% in relative L2. Both
+paths give the same tokens on the golden prompts and on a 3000-token prompt, and both pass the perplexity gate
+(section 10.9).
+
+### 10.5 Speculation
+
+`engine/spec/mtp4.py` (`Mtp4`, `Mtp4State`, `Mtp4Cycle`) is the drafter of the family, with the entry points of the
+27B's `engine/spec/mtp.py`. The wiring comes from the source of vLLM:
+
+- The input of a draft row is the 4-stream hidden [4 × 2560] before the final mixer: the target's on the first step,
+  the drafter's own on the chained steps.
+- The projected embedding enters every stream as a plain add. One norm runs over the whole 10240-wide hidden, then the
+  shared `fc_hidden` runs on each stream.
+- The decoder layer is a QSA + MoE layer with its own KV and indexer, and a per-stream norm in the final mixer. The
+  target's lm_head is the draft head, over the 64k draft vocabulary (a BF16 copy of those rows).
+- The drafter selects its sparse blocks on every row with the target's kernels. vLLM reuses the selection of step 0;
+  both are exact under the accept rule.
+
+The FP8 block experts of the MTP block become NVFP4 copies on `KernelMoE` (1.41 GB). The first load requantizes them in
+7.5 s. Later loads read them in 0.3 to 0.9 s from `~/.cache/colinfer/drafter/quant4-*.safetensors`.
+
+A cycle verifies [y, d1..dk] in one graph, accepts with `engine/spec/accept.py`, commits, and then drafts: one catch-up
+row per verified position, and k - 1 chained steps. The host fills the n-gram rows of the k + 1 rows before each
+replay. The scheduler picks k from 1, 2 or 3 per cycle by the acceptance of the request, and a request starts at
+k = 2. Its cost model (`qwen4exp_cycle_cost` in `engine/model/family.py`) is a least-squares fit at 1k context:
+cycle_ms = 41.4 + 0.577 × distinct experts + 2.92 × k, with about 10 + 5.5 k distinct experts per layer in a verify. It
+adds about 110 µs per attention layer at 262,144 tokens for the block selection. k = 4 adds nothing. Suffix-match
+drafts verify up to 15 copied tokens, as for the 27B.
+
+Measured in the served engine (`tests/scheduler_check_qwen4exp.py`), against plain decode in the same process:
+
+| Text | Plain decode | Speculation | Speed-up | Tokens per cycle |
+|---|---|---|---|---|
+| Code | 21.3 tok/s | 39.1 tok/s | 1.84x | 3.23 |
+| Prose | 20.3 tok/s | 27.2 tok/s | 1.34x | 1.89 (acceptance 0.40) |
+
+The chat completions of the server run at 28 to 39 tok/s. On the GPU alone (`tests/golden_qwen4exp_spec.py`), k = 2
+gives 1.80x on the golden prompts and 1.63x on WikiText against the 46.6 ms plain step. These numbers come from the
+exact path, before the decode copies. The host's row read before each cycle keeps the wall rate below the GPU rate.
+
+### 10.6 The serving state
+
+The hidden state of a row between layers is the 4-stream x4 [4 × 2560], not one 2560 vector. `FastState4` holds the
+27B's state (fp8 K / V per attention layer, the GDN conv and recurrent state) and, per slot:
+
+- the raw indexer keys `ik` bf16 [L, 128] and the block keys `ikb` bf16 [L / 4, 128] of each attention layer
+- `rope_pos` int32 [L, 3], the rotary position of each cached row
+- `ple_conv` bf16 [10240, 9], the last 9 inputs of the dilated conv of the PLE layer
+
+The scheduler, the checkpoint ring, `_copy_kv`, the slot reset and the conversation cache see the state only through
+two hooks. `kv_tensors()` gives the per-position tensors (time on dim 2; `ikb` has one row per 4 positions), and
+`snap_tensors()` gives the recurrent state of a slot. The scheduler also takes the family's `prefill_fn`, `prepare_fn`,
+`feed_buffer` and `before_replay(slot, tokens)`, which fills the n-gram rows right before each replay. The ring takes
+16 snapshots (1.85 GB), and it needs no new tensor: the drafter's input, the 10240-wide hidden of the last position,
+fits its buffers.
+
+`Mtp4State` is the drafter's state, with the same hooks. The conversation cache (`engine/runtime/sessions.py`) saves
+the drafter's `kv_tensors()` with the target's. The drafter's rows lag the target's by one, so the files save only the
+complete block-key groups. The session fingerprint names the n-gram table file, the drafter and the decode copies.
+
+Measured: a 4676-token second turn reuses 4655 tokens of its prefix (0.13 s to the first token, against 1.75 s from
+scratch). A second slot keeps the first conversation cached. A 7398-token conversation that left both slots restores
+from disk in 0.15 s with the drafter's rows, with the output of a restore from memory.
+
+### 10.7 The decode copies
+
+The exact path streams 9.95 GB per decode token, and 8.6 GB of it are BF16 matrices outside the routed experts.
+`tools/requant_qwen4exp.py` (run by `tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4`, about 30 s on the GPU)
+writes smaller copies of them into the prepared directory. `attach_decode_copies4` points the decode path at them when
+the directory has them (`--decode-weights int`, the default); the prefill keeps the BF16 weights. The perplexity gate
+decided each format: 0.5% against the exact decode path's 2.3274, on the 8 golden WikiText windows.
+
+| Class | Format: ratio | Decision |
+|---|---|---|
+| attention: q / k / v / index and o_proj | INT6 1.0033 | INT6 |
+| lm_head | INT6 0.9998; NVFP4 1.0089 | INT6 |
+| hyper-connection W_up | INT8 per row 1.0012 (a new mode of `hc_mix`: 19.8 µs instead of 33.4 µs) | INT8 |
+| hyper-connection down / inject | INT6 1.0032, but not with the others | BF16 |
+| GDN out_proj | INT6 0.9992, but not with the others | BF16 |
+| GDN in_proj | INT6 1.0103; INT5 for both GDN classes 1.0112 | BF16 |
+| shared experts | INT6 1.0111 | BF16 |
+
+All classes together give 1.0218 and fail. The three that pass together give 1.0014 (1.0043 on 8 held-out windows).
+The cause of the failures: a small change before the top-10-of-512 routing changes which experts run, and the gate's
+own noise is about 0.25%. With the copies, the decode step falls from 46.6 to 39.4 ms (21.4 to 25.4 tok/s, +18%), and
+the bytes per token from 9.95 to 8.15 GB. The copies take 1.35 GB on the GPU. The plan's 4.7 GB per token needs
+copies of the GDN projections and the shared experts (2.5 GB per token), which need a calibrated quantizer.
+
+A known limit: the INT6 lm_head writes bf16 logits (`skinny_int` has no fp32 output). Thus two golden prompts diverge
+at exact ties of those logits.
+
+### 10.8 Memory
+
+Bytes in GB (1e9), at the defaults: 2 slots of 262,144 tokens, 16 checkpoints, the drafter, the decode copies and a
+1 GB row cache.
 
 | Item | GB |
 |---|---|
-| Routed experts, NVFP4 with scales | 67.95 |
-| BF16 rest: GDN, attention, hyper-connections, shared experts and routers, embedding, lm_head, PLE | 9.88 |
-| Per slot of 262,144 tokens: fp8 KV, raw indexer keys, block keys | 4.2 per slot |
-| GDN and PLE state | 0.12 per slot |
+| Weights: routed experts NVFP4 with scales, and the BF16 rest | 77.8 (78.5 on the GPU after the load) |
+| Decode copies | 1.35 |
+| Drafter: weights and draft head | 1.95 (about 2.8 with its state and its cycle graphs) |
+| Slot state, 2 slots: fp8 KV, indexer and block keys, GDN and PLE state | 8.7 (and 0.71 for the drafter's rows) |
 | Checkpoint ring, 16 snapshots | 1.85 |
-| CUDA context, allocator, pinned buffers, graph pool | about 5.8 |
-| Decode copies (phase B) | +3.10 |
-| Drafter (later) | 2.3 to 3.8 |
+| n-gram row cache (host memory) | 1.1 |
+| `QWEN4EXP_FIXED_BYTES`: everything except the slot state and the row cache | 91.4 |
 
-Plain decode at 32k context streams about 1.33 GB of experts per token, plus 8.6 GB of non-expert weights in BF16 (3.1
-GB with the decode copies). At 230 GB/s, the plan expects about 22 tok/s on the exact path and about 49 tok/s with the
-copies. These are estimates, not measurements. The public vLLM build of this checkpoint decodes 16.9 tok/s on the same
-machine. A verify of M rows reads the union of their experts: about 39 distinct experts at M = 4 and 75 at M = 8. Thus
-the best draft length is shorter than the 27B's.
+The fixed bytes are the measured 87e9 (the fall of `MemAvailable` of a server without the drafter, less its state and
+row cache), the drafter's 3e9 and the copies' 1.4e9. With the drafter, before the copies, the server was ready with
+91.3 GB allocated, and `MemAvailable` fell by about 100 GB. The memory check (`engine/runtime/build.py`) thus asks for
+about 108 GB with the 6 GB growth reserve. The first long prompts add about 5.6 GB, inside the reserve. The torch
+allocator cap is per family: 101 GB here, 95 GB for the 27B, because the drafter left only 0.9 GB under the old cap.
+In the plan's budget, three slots do not fit with the drafter.
 
-### 10.5 What remains
+### 10.9 Exactness
 
-The milestones A (reference and weights), K1 (MoE kernels) and K2 (QSA, HC and GDN kernels) are merged. These remain:
+The evidence, in order:
 
-1. **M1, golden decode:** the decode model on the kernels (`engine/model/fast_qwen4exp.py`, to come) gives the greedy
-   tokens of the reference on three prompts of 2051 tokens or fewer, with one slot and no speculation. This is the
-   next step.
-2. **M2, prefill and long context:** chunked prefill, QSA prefill, three slots, passkey and perplexity at long context.
-3. **M3, speculation:** the MTP drafter, with golden tokens equal with speculation on and off.
-4. **M4, checkpoints and sessions:** the checkpoint ring and the disk cache hold the new state.
-5. **M5, server, copies, docs:** the family dispatch in the server, its flags and defaults, and the decode copies under
-   the perplexity gate.
+1. The reference is bit-identical to transformers in fp32 on a tiny model (`tests/test_qwen4exp_small.py`).
+2. Every decode kernel is row-invariant: the pair-slot MoE grid has no split-K and no atomics, and its combine sums in
+   slot order. A verify of 8 rows equals 8 single steps, bit for bit (`tests/test_fast_qwen4exp.py`,
+   `tests/test_mtp4.py`). Thus decode equals verify (section 7).
+3. The decode path and the prefill give the reference's 32 greedy tokens on the three golden prompts
+   (`tests/golden_qwen4exp.py`). The one divergence of the decode path is a near-tie: the reference's bf16 margin is
+   0.125, and its own fp32 logits pick the engine's token. The rule is now a margin below 0.2.
+4. Speculation gives the tokens of plain decode for k = 1 to 4, greedy and sampled (`tests/golden_qwen4exp_spec.py`),
+   and in the served engine (256 of 256 tokens on code and prose, `tests/scheduler_check_qwen4exp.py`).
+5. The perplexity gate (`tests/perplexity.py --engine qwen4exp`, 8 windows of 2048 WikiText tokens): the reference
+   gives 2.3335, the decode path 2.3274 (ratio 0.9974), the prefill 2.3438 (ratio 1.0044). One 16k window gives 2.2186.
+   The decode copies give 1.0014 against the exact decode path.
+6. Passkey retrieval (`tests/passkey_qwen4exp.py`): 9 of 9 at 16k, 32k and 64k.
 
-Images for this family are a later milestone.
+The kernel tests compare against the reference with a tolerance: exactness is required between the paths of the
+engine, not against the rounding of transformers. The top-k orders by score descending, then index ascending, with
+-0.0 read as +0.0, in every path. Ties are common: a block whose 4 dot products are all 0 or less scores exactly 0.
+
+### 10.10 Design decisions
+
+- **One swizzled copy of the expert scales.** The decode kernels read the CUTLASS swizzled layout that the prefill GEMM
+  needs. A second, row-major copy would cost 7.5 GB, and a swizzle at prefill time would add 22% to prefill.
+- **Always-sparse decode attention.** Decode and verify always run `qsa_attn`. A short row gets the dense list (all its
+  positions). A per-launch choice of kernel would make the bits of a row depend on its neighbours. There is no dense
+  fallback.
+- **The n-gram table stays on disk.** 51 GB does not fit beside the experts. The bounded row cache of the feeder holds
+  the hot rows.
+- **No images and no YaRN.** The loader skips the vision tower, and an image in a request becomes a text note. The
+  state refuses a slot past the 262,144 native positions.
+
+### 10.11 What remains
+
+- the low-rank draft head of the 27B, and the tuning of the draft early exit
+- a prefetch of the n-gram rows between the scheduler's prefill chunks, and before each cycle (the wall rate stays
+  below the GPU rate)
+- decode copies of the GDN projections and the shared experts, with a calibrated (GPTQ- or AWQ-style) quantizer
+- an fp32 output of `skinny_int`, for the INT6 lm_head
+- `qsa_topk` at long context, the cost model past 1k context, and the acceptance on prose
+- images, through the new vision class, and YaRN past 262,144 tokens

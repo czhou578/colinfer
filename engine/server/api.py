@@ -2,8 +2,10 @@
 
     uv run python -m engine.server [--port 8000] [--slots 3] [--max-seq-len 524288] [--spec mtp|none]
 
-The values above are the defaults for the 27B. The defaults of --slots, --max-seq-len and --spec come from the family
-of the model (engine/model/family.py).
+    uv run python -m engine.server --model nvidia/Qwen3.8-Flash-Next-NVFP4    # qwen4_exp: 2 slots of 262144 tokens
+
+The values above are the defaults for the 27B. The defaults of --slots, --max-seq-len, --spec and --mem-cap-gb, and
+the size of the checkpoint ring, come from the family of the model (engine/model/family.py, docs/server.md).
 
 Endpoints: /v1/chat/completions and /v1/completions (SSE streaming, usage + timings, logprobs, stop strings, seeds,
 tools, thinking; engine/server/openai.py formats them), /v1/messages and /v1/messages/count_tokens (the Anthropic
@@ -792,8 +794,10 @@ def main(argv=None):
                     help="MTP head weights: auto = the fine-tuned head of the prepared directory (tools/prepare.py) when it has one, "
                          "none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
     ap.add_argument("--decode-weights", choices=("int", "checkpoint"), default=D.decode_weights,
-                    help="int: decode the attention / GDN projections from the INT6 / INT5 copies of the prepared directory "
-                         "(tools/prepare.py; ~9.5%% faster, perplexity within 0.25%%) when it has them; checkpoint: from the FP8 weights")
+                    help="int: decode from the requantized copies of the prepared directory (tools/prepare.py) when it has them: the 27B's "
+                         "INT6 / INT5 attention and GDN projections (~9.5%% faster, perplexity within 0.25%%), Flash-Next's INT6 attention, "
+                         "INT6 lm_head and INT8 hyper-connection W_up (46.6 -> 39.4 ms per step, perplexity within 0.14%%); checkpoint: "
+                         "the checkpoint's own weights (FP8 for the 27B, BF16 for Flash-Next)")
     ap.add_argument("--no-prefix-caching", action="store_true",
                     help="never reuse a prompt prefix (benchmarking raw prefill): no checkpoint ring, no conversation cache on disk")
     ap.add_argument("--session-cache-gb", type=float, default=D.session_cache_gb,

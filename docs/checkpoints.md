@@ -11,7 +11,7 @@ repo id with no extra configuration. Our loader finds the same path with
 |---|---|---|---|---|---|
 | `Qwen/Qwen3.8-27B` | BF16 | `1d4bf0f2ff60` | 55.6 GB | 18 | downloaded, verified |
 | `nvidia/Qwen3.8-27B-NVFP4` | NVFP4 (mixed: MLP + lm_head NVFP4, attention/GDN FP8, MTP BF16) | `482ca0f38322` | 21.9 GB | 3 | downloaded, verified |
-| `nvidia/Qwen3.8-Flash-Next-NVFP4` | NVFP4 routed experts, the rest BF16; the n-gram table and the MTP experts FP8 in one 53.7 GB file | `fc694b54fb01` | 132.7 GB | 10 + 1 | downloaded and verified 2026-10-24 (`docs/history/qwen4exp_plan.md`) |
+| `nvidia/Qwen3.8-Flash-Next-NVFP4` | NVFP4 routed experts, the rest BF16; the n-gram table and the MTP experts FP8 in one 53.7 GB file | `fc694b54fb01` | 132.7 GB | 10 + 1 | downloaded and verified 2026-10-24; the engine serves it (`docs/history/qwen4exp_plan.md`) |
 
 ## Local paths (snapshot directories, one per Hub commit)
 
@@ -20,7 +20,7 @@ repo id with no extra configuration. Our loader finds the same path with
   `~/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`
 - `nvidia/Qwen3.8-27B-NVFP4` (the serving checkpoint)
   `~/.cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/482ca0f3832238542f8f5295dde86b5f22711d80`
-- `nvidia/Qwen3.8-Flash-Next-NVFP4` (the MoE target of branch `moe`; the engine does not serve it yet)
+- `nvidia/Qwen3.8-Flash-Next-NVFP4` (the serving checkpoint of Qwen3.8-Flash-Next, the second model of the server)
   `~/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47`
 
 ## Verification
@@ -57,3 +57,4 @@ For the total, use `du -sh ~/.cache/huggingface/hub` (102 GB with the three Qwen
   `nvidia/Qwen3.8-Flash-Next-NVFP4` skips its vision tower: images for that model are a later milestone.
 - The n-gram table of `nvidia/Qwen3.8-Flash-Next-NVFP4` (51.2 GB, in `model-fp8-mtp-ple.safetensors`) stays on disk.
   The loader does not load the table: it attaches a row reader to the file (`NgramTable`, `engine/weights/ple.py`).
+  The engine reads the rows through a host row cache of `--ngram-cache-gb` (`PleFeeder`, default 1 GB).

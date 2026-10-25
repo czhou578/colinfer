@@ -3,7 +3,7 @@
 - each kernel against a torch reference, and the full layer against the per-expert fp32 loop of transformers
 - that each output row is bit-identical for any set of rows in the launch, with all, no and some experts shared
 - the skip flag, a CUDA graph replayed with new routing, the shape checks, and one layer at the real shape
-Run: ./py -m pytest tests/test_moe.py -q"""
+Run: uv run pytest tests/test_moe.py -q"""
 import os
 
 import pytest

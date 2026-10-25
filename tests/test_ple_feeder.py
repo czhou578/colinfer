@@ -2,7 +2,7 @@
 parameters: the rows equal NgramTable.rows of the ids, with and without the cache, through evictions; the cache hits
 after a warm-up; the prefetch path; the eos rule and the image ids. The feeder has a worker thread: run this file
 three times under -X dev after a change (.claude/rules/sanitizers.md).
-Run: ./py -m pytest tests/test_ple_feeder.py -q"""
+Run: uv run pytest tests/test_ple_feeder.py -q"""
 import os
 from types import SimpleNamespace
 

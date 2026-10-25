@@ -8,7 +8,7 @@ n-gram table over primes near 1009). The tests check:
 - a captured CUDA graph of forward equals eager, bit for bit
 - the state hooks (kv_tensors, snap_tensors), view(lo, hi) sharing and reset
 - the refusal of a config that does not fit the kernels
-Run: ./py -m pytest tests/test_fast_qwen4exp.py -q"""
+Run: uv run pytest tests/test_fast_qwen4exp.py -q"""
 import copy
 import dataclasses
 

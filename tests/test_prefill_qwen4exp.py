@@ -7,7 +7,7 @@ from the first to the second):
 - moe_layer against moe_reference
 - ple_layer against PLELayer (the n-gram rows as FP8 bytes), the conv state included
 The tolerances are relative L2 errors (rel) and are stated at each assert.
-Run: ./py -m pytest tests/test_prefill_qwen4exp.py -q"""
+Run: uv run pytest tests/test_prefill_qwen4exp.py -q"""
 import math
 from types import SimpleNamespace
 

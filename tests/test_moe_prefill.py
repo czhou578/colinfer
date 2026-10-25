@@ -4,7 +4,7 @@ NVFP4 GEMMs. The tests check, with group sizes 0, 1, 127, 128, 129, 300 and rand
 - each grouped GEMM against an emulation in torch (quant_emul's activation quantization, the loader's dequantization)
 - the SwiGLU quantization against the emulation, and the combine op for op
 - the full prefill layer against the emulation, and that two runs are equal
-Run: ./py -m pytest tests/test_moe_prefill.py -q"""
+Run: uv run pytest tests/test_moe_prefill.py -q"""
 import pytest
 import torch
 

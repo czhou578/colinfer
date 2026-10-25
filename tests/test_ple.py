@@ -1,7 +1,7 @@
 """engine/weights/ple.py: NgramTable over a synthetic n-gram file (shards out of index order, rows across page
 boundaries, the last row, repeated ids, the buffered fallback) and the hash parameters of a second PLE layer against
 transformers' own functions. The model test (tests/test_qwen4exp_small.py) checks the ids against transformers.
-Run: ./py -m pytest tests/test_ple.py -q
+Run: uv run pytest tests/test_ple.py -q
 """
 import os
 

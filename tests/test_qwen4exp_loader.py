@@ -1,7 +1,7 @@
 """engine/weights/qwen4exp_loader.py on a synthetic tiny checkpoint in the nvidia layout (tests/qwen4exp_ckpt.py):
 the stacked expert tensors equal the per-expert ones of the files, the loaded model's logits equal those of the tiny
 reference with the same (dequantized) weights, the decoys are never read, and a corrupted hash buffer is refused.
-Run: ./py -m pytest tests/test_qwen4exp_loader.py -q
+Run: uv run pytest tests/test_qwen4exp_loader.py -q
 """
 import os
 import shutil

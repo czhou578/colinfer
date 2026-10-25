@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The long-context retrieval check of tests/passkey.py for the qwen4_exp family (Qwen3.8-Flash-Next), through its prefill
-(engine/model/prefill_qwen4exp.py) and its decode graph, without the scheduler (milestone M2).
+(engine/model/prefill_qwen4exp.py) and its decode graph, without the scheduler.
 
 The check hides a random 6-digit pass key at a given depth inside filler text of the requested length (tests/passkey.py
 build). One slot of the longest length (plus a margin) holds the prompt. The prefill runs in 4096-token chunks with an
@@ -8,7 +8,7 @@ n-gram feeder; then the decode graph produces up to 12 greedy tokens. Beyond 205
 this checks the indexer, the selection and the sparse attention at depth.
 
 Usage (loads about 80 GB; take the GPU lock):
-    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/passkey_qwen4exp.py [--lens 16384 32768 65536] [--depths 0.1 0.5 0.9]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/passkey_qwen4exp.py [--lens 16384 32768 65536] [--depths 0.1 0.5 0.9]
 """
 from __future__ import annotations
 

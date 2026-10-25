@@ -1,8 +1,9 @@
-"""One plain decode step as a CUDA graph: embed -> 64 layers -> lm_head -> sampler, T = 1 per slot.
+"""One plain decode step as a CUDA graph: the model's forward (embed -> layers -> lm_head) -> sampler, T = 1 per slot.
 
-The scheduler without speculation (--spec none) runs one per slot (engine/runtime/scheduler.py). With speculation,
-engine/spec/mtp.py MtpCycle captures the whole speculative cycle instead. Both capture with engine/model/fast.py
-capture().
+The scheduler without speculation (--spec none) runs one per slot (engine/runtime/scheduler.py), for either family:
+FastQwen35 (the 27B) or FastQwen4Exp (engine/model/fast_qwen4exp.py), which also reads the n-gram rows of the step
+from a fixed feed buffer. With speculation, the family's cycle (engine/spec/mtp.py MtpCycle, engine/spec/mtp4.py
+Mtp4Cycle) captures the whole speculative cycle instead. All capture with engine/model/fast.py capture().
 """
 from __future__ import annotations
 

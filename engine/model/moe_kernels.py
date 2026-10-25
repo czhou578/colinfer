@@ -7,7 +7,8 @@ residual. The chain of kernels is:
 2. moe_route: the top-10 experts of each row, the renormalized weights and the sigmoid of the shared gate.
 3. On a side stream: the shared expert (skinny_swiglu_bf16, then skinny_bf16). With the INT6 decode copy of its gate | up
    (set_shared_copies, tools/requant_qwen4exp.py): skinny_int into [M, 2 Is], silu(gate) * up in fp32 with one rounding
-   (elementwise), then the BF16 down (K = Is = 640 fits no block-scaled format of the skinny GEMM: K % 512).
+   (elementwise), then the BF16 down (K = Is = 640 fits no block-scaled format of the skinny GEMM: K % 512). The
+   default formats of the prepared directory keep the shared expert in BF16 (engine/runtime/prepared.py).
 4. moe_gate_up, then moe_down: the expert GEMMs over the (row, slot) pairs.
 5. moe_combine: the weighted sum in slot order plus the gated shared expert.
 

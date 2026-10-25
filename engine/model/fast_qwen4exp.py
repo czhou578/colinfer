@@ -5,8 +5,8 @@ This module follows engine/model/fast.py (the 27B's decode model). The design:
 
 - Weights: the routed experts stay NVFP4 (moe_kernels.KernelMoE, which swizzles its own scales). Everything else is
   BF16 and streams through the BF16 skinny GEMM (Bf16Linear, StackedBf16Linear): the exact path of the checkpoint.
-  attach_decode_copies4 adds the requantized decode copies of tools/requant_qwen4exp.py (docs/history/qwen4exp_plan.md,
-  phase B): a `.dec` of a linear (INT6 / INT5 / NVFP4), the INT6 down | inject and the INT8 W_up of the hyper-connections,
+  attach_decode_copies4 adds the requantized decode copies of tools/requant_qwen4exp.py (docs/history/qwen4exp_plan.md):
+  a `.dec` of a linear (INT6 / INT5 / NVFP4), the INT6 down | inject and the INT8 W_up of the hyper-connections,
   and the INT6 gate | up of the shared experts; the prepared directory holds the classes that pass the perplexity gate
   (INT6 attention and lm_head, INT8 W_up: the decision is in the tool's docstring). Decode then streams the copies; the
   prefill keeps reading the BF16 weights (cuBLAS), except for the last token's mixer and lm_head (the decode modules).

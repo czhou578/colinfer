@@ -100,6 +100,10 @@ destination, status and time. It shows no header and no body.
 > **NOTE:** To run the server in a terminal instead, use `uv run python -m engine.server`. The server flags are in
 > `docs/server.md`. The gateway runs in a terminal with `uv run python -m engine.server.gateway`.
 
+> **NOTE:** The server can also run Qwen3.8-Flash-Next (`--model nvidia/Qwen3.8-Flash-Next-NVFP4`, `docs/server.md`).
+> The gateway sends each model name that contains `qwen` to the server, whatever model the server runs. Thus Claude
+> Code uses Flash-Next the same way. That model reads text only: a screenshot becomes a short text note.
+
 ## 3. Connect Claude Code (one time only)
 
 Claude Code reads its settings from `~/.claude/settings.json`. The same file applies to the VS Code extension and to

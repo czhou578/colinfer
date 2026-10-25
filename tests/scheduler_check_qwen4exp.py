@@ -25,7 +25,7 @@ checkpoints follow the same rules, so both prefill the same chunks. The checks:
   7. the fingerprint of the cached state names the n-gram table file and the drafter "checkpoint"
 
 Usage (loads about 80 GB of weights; take the GPU lock, MemAvailable >= 100 GB):
-    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/scheduler_check_qwen4exp.py [--sessions-dir DIR] [--json FILE]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/scheduler_check_qwen4exp.py [--sessions-dir DIR] [--json FILE]
     [--tokens N]
 """
 from __future__ import annotations

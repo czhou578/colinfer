@@ -1,5 +1,5 @@
-// qsa_prefill.cu -- Qwen Sparse Attention over a prefill chunk of one slot (docs/history/qwen4exp_plan.md section 5.3,
-// milestone M2): T rows at the positions pos0 .. pos0 + T - 1, T up to 8192. The bindings are in qsa_bind.cpp, the
+// qsa_prefill.cu -- Qwen Sparse Attention over a prefill chunk of one slot (docs/history/qwen4exp_plan.md section
+// 5.3): T rows at the positions pos0 .. pos0 + T - 1, T up to 8192. The bindings are in qsa_bind.cpp, the
 // Python wrappers in engine/model/qsa_kernels.py (prefill_select, prefill_attend). Tests: tests/test_qsa_prefill.py.
 //
 //   k_score_rows  the block scores of all T rows in one launch: the computation of qsa.cu k_score<4> (16 rows per

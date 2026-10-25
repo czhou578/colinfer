@@ -5,7 +5,7 @@ transformers' Qwen4ExpForCausalLM (eager experts, SDPA):
   start of sparse selection)
 - transformers without a cache, with a cache, and with an image's positions and embeddings
 - sparse selection happens; the NVFP4 experts equal their dequantized dense copy
-Run: ./py -m pytest tests/test_qwen4exp_small.py -q
+Run: uv run pytest tests/test_qwen4exp_small.py -q
 """
 import dataclasses
 import json

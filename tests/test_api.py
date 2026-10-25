@@ -708,7 +708,7 @@ def test_the_readme_asks_for_the_memory_that_the_engine_takes_at_startup():
     except Exception:
         pytest.skip("checkpoint not in the local HF cache")
     readme = open(os.path.join(os.path.dirname(__file__), "..", "README.md")).read()
-    gb = int(re.search(r"About (\d+) GB of free unified memory", readme).group(1))
+    gb = int(re.search(r"(?i)about (\d+) GB of free unified memory", readme).group(1))  # the 27B's figure comes first
     assert build.startup_bytes(path, D.slots, D.max_seq_len, D.spec) + build.GROWTH_RESERVE_BYTES <= gb * 10**9
 
 

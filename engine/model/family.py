@@ -7,9 +7,11 @@
   prefill (engine/model/prefill_qwen4exp.py) and the n-gram rows of its PLE layer (engine/weights/ple.py PleFeeder, with
   a host row cache of --ngram-cache-gb). The scheduler feeds the rows of each decode step through before_replay into
   the model's feed buffer, and gives each prefill chunk the two tokens before it (prefill_prev2). Its MTP drafter is
-  engine/spec/mtp4.py (Mtp4, Mtp4State, Mtp4Cycle): speculation is on by default, with 1 to 3 drafts per cycle. No
-  images, no YaRN yet (docs/history/qwen4exp_plan.md). A build without these modules refuses the checkpoint with a
-  clear message, instead of a KeyError from the dense config reader.
+  engine/spec/mtp4.py (Mtp4, Mtp4State, Mtp4Cycle): speculation is on by default, with 1 to 3 drafts per cycle. With
+  --decode-weights int, the load attaches the requantized decode copies of the prepared directory
+  (tools/requant_qwen4exp.py, fast_qwen4exp.attach_decode_copies4). The family has no image input and no YaRN
+  (docs/history/qwen4exp_plan.md). A build without these modules refuses the checkpoint with a clear message, instead
+  of a KeyError from the dense config reader.
 
 family_of(path) gives the Family of a checkpoint: the callables and the constants that differ between the families.
 The build (engine/runtime/build.py) and the server (engine/server/api.py) read the defaults, the memory figures and the
@@ -26,22 +28,25 @@ import os
 from typing import Callable
 
 PLAN = "docs/history/qwen4exp_plan.md"
+# The families whose modules a build can lack (model_type -> the model's name): check_served refuses such a checkpoint
+# when the modules are missing.
 IN_PROGRESS = {"qwen4_exp": "Qwen3.8-Flash-Next"}
-# The families whose serving integration is not finished: check_served refuses them even when their modules exist (name ->
-# the reason). qwen4_exp left it when the end-to-end check (tests/scheduler_check_qwen4exp.py) and the server checks passed.
+# The families that check_served refuses even when their modules exist (model_type -> the reason). It is empty: the
+# engine serves both families.
 NOT_SERVED_YET: dict[str, str] = {}
 
 # The startup memory of a qwen4_exp engine beyond the slot state (the drafter's included) and the n-gram row cache, at
-# the defaults of the family (16 checkpoints, the MTP drafter, no decode copies). Measured on 2026-10-24 without the
-# drafter: from the start of the server process to its ready line (the warm-up included), MemAvailable fell by 96.73e9
-# bytes; the slot state is 8.69e9 of them and the row cache of 1 GB 1.10e9. The rest, 86.94e9, is the weights (78.5e9
+# the defaults of the family (16 checkpoints, the MTP drafter, the decode copies). Measured on 2026-10-24 without the
+# drafter and the copies: from the start of the server process to its ready line (the warm-up included), MemAvailable
+# fell by 96.73e9 bytes; the slot state is 8.69e9 of them and the row cache of 1 GB 1.10e9. The rest, 86.94e9, is the weights (78.5e9
 # on the GPU after the load), the checkpoint ring (1.85e9), the graph pool, the prefill workspace, the CUDA context and
 # the pinned host buffers. The plan's estimate (docs/history/qwen4exp_plan.md section 4) was 85.5e9. A build without
 # the warm-up (tests/scheduler_check_qwen4exp.py) measured 84.89e9 at its end, and its first long prompts took the rest.
 # QWEN4EXP_DRAFTER_BYTES is the drafter's part at the defaults: its weights and draft head (1.95e9, engine/spec/mtp4.py)
-# and the pool of the cycle graphs. With --spec none the check thus asks for a little more than the engine takes.
+# and the pool of the cycle graphs (measured: about 2.8e9 in all). With --spec none the check thus asks for a little more
+# than the engine takes.
 QWEN4EXP_DRAFTER_BYTES = 3 * 10**9
-QWEN4EXP_COPIES_BYTES = 14 * 10**8  # the requantized decode copies of phase B on the GPU (+1.35 GB measured; the BF16 originals stay for prefill)
+QWEN4EXP_COPIES_BYTES = 14 * 10**8  # tools/requant_qwen4exp.py's decode copies on the GPU (+1.35 GB measured; the BF16 stays for prefill)
 QWEN4EXP_FIXED_BYTES = 87 * 10**9 + QWEN4EXP_DRAFTER_BYTES + QWEN4EXP_COPIES_BYTES
 QWEN4EXP_PREFILL_CHUNK = 4096  # tokens per prefill chunk (bench/prefill_chunk_bench.py: the MoE ceiling is 7.5k tok/s at 4096)
 NGRAM_CACHE_GB = 1.0           # the default of --ngram-cache-gb: 6.25M rows of 160 bytes
@@ -137,7 +142,7 @@ def qwen4exp_cycle_cost(k: int, drafts: int, ctx: int) -> float:
 
 # The speculation of qwen4_exp: up to 3 MTP drafts, a cycle of 1, 2 or 3 by the acceptance of the request. The prior
 # acceptance of 0.55 (that of the WikiText prompt at k = 2) makes a request start at k = 2; the model moves to 3 from
-# an acceptance of about 0.6 and to 1 below about 0.4. k = 4 adds nothing (M3).
+# an acceptance of about 0.6 and to 1 below about 0.4. k = 4 adds nothing (tests/golden_qwen4exp_spec.py).
 QWEN4EXP_SPEC = Speculation(drafter=_lazy("mtp4", "Mtp4"), state=_lazy("mtp4", "Mtp4State"), cycle=_lazy("mtp4", "Mtp4Cycle"), k=3,
                             k_options=(1, 2, 3), prior=(1.375, 2.5), cycle_cost=qwen4exp_cycle_cost)
 
@@ -227,7 +232,7 @@ def _qwen35() -> Family:
 
 # ------------------------------------------------------------------------------------------------ qwen4_exp (Flash-Next)
 def _module(name: str):
-    """The module engine.model.<name>, or None when it does not exist yet. An import error inside the module raises."""
+    """The module engine.model.<name>, or None when it does not exist. An import error inside the module raises."""
     full = f"engine.model.{name}"
     try:
         return importlib.import_module(full)
@@ -277,12 +282,12 @@ def _qwen4exp(path: str) -> Family:
     fast, pf = _module("fast_qwen4exp"), _module("prefill_qwen4exp")
     try:
         load_fast, state_cls, pf_prefill = fast.load_fast_qwen4exp, fast.FastState4, pf.prefill
-    except AttributeError:  # a module that does not exist yet (None), or a name that it does not have yet
+    except AttributeError:  # a module that does not exist (None), or a name that it does not have
         raise _refusal(path, "qwen4_exp") from None
 
     def load(path, decode_weights, log, prep, max_seq_len, ngram_cache_gb=NGRAM_CACHE_GB):
         path, model = load_fast(path, decode_weights, log, prep, max_seq_len)
-        if decode_weights == "int" and prep is not None and prep.decode:  # phase B: the requantized copies (tools/requant_qwen4exp.py)
+        if decode_weights == "int" and prep is not None and prep.decode:  # the requantized copies (tools/requant_qwen4exp.py)
             log(f"[engine] decode streams the requantized copies of {prep.dir}: {fast.attach_decode_copies4(model, prep.decode)} linears")
         elif decode_weights == "int":
             log("[engine] no prepared decode copies (tools/prepare.py): decoding the checkpoint's BF16 weights")
@@ -314,7 +319,7 @@ def _qwen4exp(path: str) -> Family:
 
 def family_of(path: str) -> Family:
     """The Family of the checkpoint directory `path`, by its model_type. Raises the NotImplementedError of check_served
-    for a family whose modules do not exist yet."""
+    for a family whose modules do not exist."""
     if model_type(path) == "qwen4_exp":
         return _qwen4exp(path)
     return _qwen35()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""The exactness check of speculation for qwen4_exp (milestone M3) on the real checkpoint: greedy tokens with the MTP
+"""The exactness check of speculation for qwen4_exp on the real checkpoint: greedy tokens with the MTP
 drafter (engine/spec/mtp4.py, Mtp4Cycle with k = 1, 2, 3) against plain decode, and the numbers of the scheduler's
-cost model.
+cost model (engine/model/family.py QWEN4EXP_CYCLE_MS comes from this fit).
 
 The script loads the decode model and the drafter once (one slot of 4096 tokens), then for each prompt of
 tests/data/qwen4exp_golden.json:
@@ -24,7 +24,7 @@ the routing of garbage rows spreads over more experts, so these are upper bounds
 against plain decode; the drafter's load time and memory.
 
 Usage (loads about 80 GB on the GPU; take the GPU lock):
-    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp_spec.py [--json out.json]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock uv run python tests/golden_qwen4exp_spec.py [--json out.json]
 """
 from __future__ import annotations
 
