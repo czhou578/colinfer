@@ -307,5 +307,43 @@
    0.4946293535032212,
    1.098983667743573
   ]
+ },
+ "wikitext_decode_exact": {
+  "ppl": 2.327429214759224,
+  "windows": 8,
+  "tokens": 2048,
+  "window_ppl": [
+   1.8487,
+   1.5222,
+   1.7439,
+   4.5608,
+   3.8361,
+   2.0406,
+   1.6464,
+   2.9848
+  ],
+  "made_by": "tests/golden_qwen4exp.py on the exact BF16 decode path (M1, 2026-10-24): token by token through the graph, fp32 logits"
+ },
+ "wikitext_decode_copies": {
+  "ppl": 2.3306606177479603,
+  "ratio_exact": 1.0013884001147035,
+  "windows": 8,
+  "tokens": 2048,
+  "copies": [
+   "decode4_attn_int6.safetensors",
+   "decode4_lm_head_int6.safetensors",
+   "decode4_hc_up_int8.safetensors"
+  ],
+  "window_ppl": [
+   1.840451,
+   1.526633,
+   1.751239,
+   4.566496,
+   3.900366,
+   2.04236,
+   1.634237,
+   2.976405
+  ],
+  "made_by": "tests/golden_qwen4exp.py --decode-copies (M5a, 2026-10-24): tools/requant_qwen4exp.py's default formats"
  }
 }

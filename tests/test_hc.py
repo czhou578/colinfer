@@ -165,3 +165,94 @@ def test_selftest():
     from engine.kernels import ops
     res = hk.hc_selftest(ops(), torch.Generator(device="cuda").manual_seed(1))
     assert all(v < 5e-3 for v in res.values()), res
+
+
+# ------------------------------------------------------------------------------------------------------------ decode copies
+def int8_rows(w):
+    """The INT8 W_up copy of tools/requant_qwen4exp.py: (q int8, s fp32 [N]), W_up ~ q * s per row."""
+    from tools.requant_qwen4exp import quantize_group
+    t, _ = quantize_group({"m": w.float()}, "int8")
+    return t["m.qweight"].cuda(), t["m.weight_scale"].cuda()
+
+
+def copies(W, inj=True):
+    """The KernelGatedResidual of W with its decode copies attached as attach_decode_copies4 attaches them: INT6 down |
+    inject (+ 4 zero rows: 328 rows) and the INT8 W_up."""
+    from engine.model.fast_qwen4exp import _copy_of
+    from tools.requant_qwen4exp import quantize_group
+    gr = hk.KernelGatedResidual(W["norm_w"], W["w_down"], W["w_inj"], W["w_up"], EPS)
+    ws = {"down": W["w_down"].float()} | ({"inj": W["w_inj"].float()} if inj else {})
+    t, _ = quantize_group(ws, "int6")
+    dec = _copy_of({k: v.cuda() for k, v in t.items()}, list(ws), pad_to=-(-gr.w_di.shape[0] // 8) * 8)
+    q, s = int8_rows(W["w_up"])
+    gr.set_decode_copies(dec=dec, w_up_q=q, w_up_s=s)
+    return gr
+
+
+@pytest.mark.parametrize("M", [1, 3, 8, 16])
+def test_hc_mix_int8_matches_dequantized_reference(M):
+    """The INT8 mode of hc_mix from the same n, d and e against the reference on the dequantized W_up (q * s, exactly
+    rounded products): inj bit for bit; y as in assert_y_close (u = bf16(s * sum a q): one rounding, fp32 sum)."""
+    from engine.kernels import ops
+    W = weights(40 + M)
+    q, s = int8_rows(W["w_up"])
+    w_deq = q.double() * s.double()[:, None]
+    x4 = x4_rows(M, M)
+    n = norm_reference(x4, W["norm_w"])
+    de = (n.double() @ torch.cat([W["w_down"], W["w_inj"]]).double().T).bfloat16()
+    a = hk._bf(torch.nn.functional.silu(hk._bf(de[:, :R].float() / 4).float()))
+    u = hk._bf(a.double() @ w_deq.T)
+    p = hk._bf(hk._bf(torch.sigmoid(u.float())).float() * n.float()).float().view(M, 4, H)
+    y_ref = hk._bf((((p[:, 0] + p[:, 1]) + p[:, 2]) + p[:, 3]) / 4)
+    inj_ref = hk._bf(2 * hk._bf(torch.sigmoid(hk._bf(de[:, R:].float() / 4).float())).float())
+    y = torch.empty(M, H, device="cuda", dtype=torch.bfloat16)
+    inj = torch.empty(M, 4, device="cuda", dtype=torch.bfloat16)
+    ops().hc_mix(de[:, :R], q, n, y, de[:, R:], inj, s)
+    assert torch.equal(inj, inj_ref)
+    assert_y_close(y, y_ref, p, 2e-3)
+
+
+def test_copies_against_bf16_path():
+    """The gated residual with its copies (INT6 down | inject, INT8 W_up) against the BF16 path: y within 1% and inj
+    within 0.5% relative (measured 0.32% and 0.34%; the INT6 weight error is about 2.2%, and the sigmoids damp it), and
+    the final mixer's form (no inject) the same."""
+    rel = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm()).item()  # noqa: E731
+    for inj in (True, False):
+        W = weights(50, inj)
+        x4 = x4_rows(16, 50)
+        want = hk.KernelGatedResidual(W["norm_w"], W["w_down"], W["w_inj"], W["w_up"], EPS)(x4)
+        got = copies(W, inj)(x4)
+        if inj:
+            (y, i), (y_ref, i_ref) = got, want
+            assert rel(i, i_ref) < 5e-3, rel(i, i_ref)
+        else:
+            y, y_ref = got, want
+        assert rel(y, y_ref) < 1e-2, rel(y, y_ref)
+        print(f"\n[hc copies] inject {inj}: y rel {rel(y, y_ref):.2e}" + (f", inj rel {rel(i, i_ref):.2e}" if inj else ""))
+
+
+@pytest.mark.parametrize("inj", [True, False])
+def test_copies_rows_bit_identical_across_M(inj):
+    """With the copies: row i of a 16-row call == the same row in a call of M rows, M = 1 .. 16 (decode = verify)."""
+    W = weights(61, inj)
+    gr = copies(W, inj)
+    assert gr.dec.out_features == (328 if inj else 320)
+    x4 = x4_rows(16, 61)
+    full = gr(x4)
+    for M in range(1, 17):
+        for lo in sorted({0, 16 - M}):
+            got = gr(x4[lo:lo + M].contiguous())
+            if inj:
+                assert torch.equal(got[0], full[0][lo:lo + M]) and torch.equal(got[1], full[1][lo:lo + M]), (M, lo)
+            else:
+                assert torch.equal(got, full[lo:lo + M]), (M, lo)
+
+
+def test_set_decode_copies_refuses_wrong_shapes():
+    W = weights(70)
+    gr = hk.KernelGatedResidual(W["norm_w"], W["w_down"], W["w_inj"], W["w_up"], EPS)
+    q, s = int8_rows(W["w_up"])
+    with pytest.raises(ValueError, match="INT8 W_up"):
+        gr.set_decode_copies(w_up_q=q[:, :160].contiguous(), w_up_s=s)
+    with pytest.raises(ValueError, match="INT8 W_up"):
+        gr.set_decode_copies(w_up_q=q.float(), w_up_s=s)

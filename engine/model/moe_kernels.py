@@ -5,7 +5,9 @@ residual. The chain of kernels is:
 
 1. skinny_bf16: the router and the shared-expert gate in one weight pass (logits [M, E + 8], bf16).
 2. moe_route: the top-10 experts of each row, the renormalized weights and the sigmoid of the shared gate.
-3. On a side stream: the shared expert (skinny_swiglu_bf16, then skinny_bf16).
+3. On a side stream: the shared expert (skinny_swiglu_bf16, then skinny_bf16). With the INT6 decode copy of its gate | up
+   (set_shared_copies, tools/requant_qwen4exp.py): skinny_int into [M, 2 Is], silu(gate) * up in fp32 with one rounding
+   (elementwise), then the BF16 down (K = Is = 640 fits no block-scaled format of the skinny GEMM: K % 512).
 4. moe_gate_up, then moe_down: the expert GEMMs over the (row, slot) pairs.
 5. moe_combine: the weighted sum in slot order plus the gated shared expert.
 
@@ -106,6 +108,16 @@ class KernelMoE:
         self.max_rows = max_rows
         self.stats = torch.zeros(2, dtype=torch.int32, device=w_gu.device) if stats else None
         self.buf = _buffers(w_gu.device, E, K, I, self.Is, max_rows)
+        self.sh_gu_dec = None  # the INT6 decode copy of the shared expert's gate | up (set_shared_copies)
+
+    def set_shared_copies(self, gate_up) -> None:
+        """Decode streams gate_up (an IntLinear [2 Is, K]: the gate rows, then the up rows) instead of the BF16 sh_gate and
+        sh_up; None restores them. The prefill keeps the BF16 weights."""
+        if gate_up is not None and (gate_up.out_features, gate_up.in_features) != (2 * self.Is, self.K):
+            raise ValueError(f"the shared gate | up copy is [{gate_up.out_features}, {gate_up.in_features}], not [{2 * self.Is}, {self.K}]")
+        self.sh_gu_dec = gate_up
+        if gate_up is not None and not hasattr(self.buf, "gu"):
+            self.buf.gu = torch.empty(self.buf.hs.shape[0], 2 * self.Is, dtype=torch.bfloat16, device=self.buf.hs.device)
 
     def __call__(self, x):
         return self.forward(x)
@@ -133,7 +145,13 @@ class KernelMoE:
         with torch.cuda.stream(side):  # the shared expert beside the routed experts (a parallel branch in a graph)
             for i in range(0, M, SKINNY_ROWS):
                 r = slice(i, i + SKINNY_ROWS)
-                o.skinny_swiglu_bf16(x[r], self.sh_gate, self.sh_up, hs[r])
+                d = self.sh_gu_dec
+                if d is None:
+                    o.skinny_swiglu_bf16(x[r], self.sh_gate, self.sh_up, hs[r])
+                else:
+                    gu = b.gu[r][:hs[r].shape[0]]
+                    o.skinny_int(x[r], d.wlo, d.whi, d.sf, d.gscale, None, gu)
+                    hs[r].copy_(torch.nn.functional.silu(gu[:, :self.Is].float()) * gu[:, self.Is:].float())
                 o.skinny_bf16(hs[r], self.sh_down, None, shared[r])
         o.moe_gate_up(x, ids, self.w_gu, self.sf_gu, self.gs, h)
         o.moe_down(h, ids, self.w_dn, self.sf_dn, self.gs, yp)
