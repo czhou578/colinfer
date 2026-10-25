@@ -34,8 +34,8 @@ The harness follows the method that the Claude Code team describes in "Solving c
 | `REVIEW.md` | The contract of this repository: what failure looks like here, the conventions, the security checklist, the repro limits, severity, feasibility, triage, evidence, the paths to skip, and the check commands. |
 | `tools/review.py` | The bookkeeping: the scope, the checks, the snapshots of the working tree, the ledger, the eval score, the export. Also the Stop hook. |
 | `.claude/hooks/quick-check.sh` | The quick check (the `lint` and `test` commands of REVIEW.md): the Stop hook, and the gate of a review. It runs `tools/review.py`. |
-| `.review/ledger.jsonl` | Each finding and its decision. Commit it. |
-| `.review/evals/cases.jsonl` | The eval set: known bugs at old commits. |
+| `.review/ledger.jsonl` | Each finding and its decision. In this repository, git ignores all of `.review/`: the ledger stays on this machine. |
+| `.review/evals/cases.jsonl` | The eval set: known bugs at old commits. git ignores it too. |
 | `.claude/rules/sanitizers.md` | Tells the session that builds a feature which sanitizer to run after a change of a kernel, a stream or a thread. Colinfer only; not part of the export. |
 
 ## How the parts connect

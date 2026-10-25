@@ -24,6 +24,5 @@ cufile.log
 # parity harness outputs (large .pt files)
 tests/parity_out/
 
-# review harness (docs/review.md): the scratch of each run, with its repros and eval worktrees, and the state of the Stop hook
-.review/runs/
-.review/cache/
+# review harness (docs/review.md): the runs, the state of the Stop hook, the ledger and the eval set stay on this machine
+.review/
