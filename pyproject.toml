@@ -22,7 +22,7 @@ dependencies = [
     "tokenizers>=0.23.0",
     "numpy>=2.3",
     # Image input: decoding and the Qwen2-VL resize of transformers' PIL image processor.
-    "pillow>=11.3",
+    "pillow>=13.0",
     # Constrained decoding (JSON schemas, forced tool calls): token masks from a grammar.
     "llguidance>=1.9.1",
     # Build helper for torch.utils.cpp_extension / CMake.
