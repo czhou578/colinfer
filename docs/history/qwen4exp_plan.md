@@ -329,5 +329,12 @@ kernel build. The 27B's tests must keep passing in every worktree.
   directory has them (`--decode-weights int`, the default) and the session fingerprint names their files. Open: the INT6
   lm_head writes bf16 logits (skinny_int has no fp32 output), so two golden prompts now diverge at exact ties of those
   logits; a GPTQ / AWQ-style quantizer for the GDN; a KL-based or longer gate measurement.
+- **2026-10-24, the end-to-end check with the copies attached through the family** (`tests/scheduler_check_qwen4exp.py`,
+  spec on): 158 linears attached at load; startup 44 s; the golden prompts pass (one near-tie at token 1 of the first
+  prompt, the reference margin 0.125); speculation equals plain decode on every check (256 of 256 on code and prose); code
+  37.2 tok/s against 19.6 plain (1.9x), prose 25.3 against 19.6 (1.29x); the golden fibonacci prompt reaches 45 tok/s;
+  a 7398-token disk restore in 0.148 s with identical output and the same accepted drafts. Memory: MemAvailable falls
+  104.3 GB at the end of the build (the check's reference scheduler included; the fixed bytes 91.4e9, the state 9.4, the
+  row cache 1.1) and 109.3 GB after all checks: the machine has about 14 GB of margin at the memory check's 108 GB.
 - **Next:** the documentation pass; then the open items above (the low-rank draft head, the row prefetch between chunks,
   the GDN copies with calibration, the fp32 output of skinny_int).
