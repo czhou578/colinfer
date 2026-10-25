@@ -27,9 +27,15 @@ With --prefill (milestone M2), the script checks the prefill path (engine/model/
 
 The reference runs with a bf16 KV cache; the engine's KV cache is fp8. That is one source of small logit differences.
 
+With --decode-copies (phase B), the decode model streams the requantized copies of tools/requant_qwen4exp.py
+(attach_decode_copies4): those of the prepared directory's manifest, or the files of a given directory or list. Then the
+perplexity gate of 2 compares with the exact decode path (wikitext_decode_exact of the golden file: 2.3274), within 0.5%.
+1 and 3 run as before (the same near-tie rule against the reference).
+
 Usage (loads about 78 GB on the GPU; take the GPU lock):
     flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py [--profile] [--no-ppl]
     flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py --prefill [--long-tokens 3000]
+    flock -w 14400 ~/.cache/colinfer/gpu-model.lock ./py tests/golden_qwen4exp.py --decode-copies [DIR | FILE,FILE...]
 """
 from __future__ import annotations
 
@@ -312,6 +318,30 @@ def prefill_mode(step: Stepper, want: dict, args, res: dict) -> bool:
     return ok
 
 
+def decode_copies(model, path: str, spec: str) -> dict:
+    """Attaches the requantized decode copies (attach_decode_copies4) named by spec: "prepared" (the manifest of the
+    checkpoint's prepared directory), a directory (its decode4_*.safetensors) or a comma list of files."""
+    from engine.model.fast_qwen4exp import attach_decode_copies4
+    from engine.runtime.prepared import read as read_prepared
+    if spec == "prepared":
+        prep = read_prepared(path)
+        if prep is None or not prep.decode:
+            raise SystemExit(f"--decode-copies: no decode copies in the prepared directory of {path} (tools/prepare.py)")
+        files = list(prep.decode)
+    elif os.path.isdir(spec):
+        files = sorted(os.path.join(spec, f) for f in os.listdir(spec) if f.startswith("decode4_") and f.endswith(".safetensors"))
+    else:
+        files = spec.split(",")
+    before = torch.cuda.memory_allocated()
+    t0 = time.time()
+    n = attach_decode_copies4(model, files)
+    torch.cuda.synchronize()
+    gb = (torch.cuda.memory_allocated() - before) / 1e9
+    print(f"[golden4] decode copies: {n} linears from {len(files)} files ({', '.join(os.path.basename(f) for f in files)}) in "
+          f"{time.time() - t0:.1f}s, +{gb:.2f} GB on the GPU")
+    return dict(copies=[os.path.basename(f) for f in files], copies_linears=n, copies_gb=gb)
+
+
 @torch.inference_mode()
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -323,15 +353,20 @@ def main():
     ap.add_argument("--no-timing", action="store_true")
     ap.add_argument("--prefill", action="store_true", help="check the prefill path (4 and 5 of the docstring) instead of the decode path")
     ap.add_argument("--long-tokens", type=int, default=3000, help="--prefill: the WikiText tokens of the long prompt (0: skip it)")
+    ap.add_argument("--decode-copies", nargs="?", const="prepared", default=None,
+                    help="attach the requantized decode copies: those of the prepared directory's manifest (no value), a directory's "
+                         "decode4_*.safetensors, or a comma list of files")
     args = ap.parse_args()
     from engine.model.fast import capture
     from engine.model.fast_qwen4exp import load_fast_qwen4exp
     from engine.weights.loader import resolve
     want = json.load(open(FILE))
     res: dict = {}
-    _, model = load_fast_qwen4exp(args.model, max_seq_len=4096)
+    path, model = load_fast_qwen4exp(args.model, max_seq_len=4096)
     torch.cuda.synchronize()
     res["gb_after_load"] = torch.cuda.memory_allocated() / 1e9
+    if args.decode_copies:
+        res.update(decode_copies(model, path, args.decode_copies))
     step = Stepper(model, 4096)
     torch.cuda.synchronize()
     res["gb_after_state_and_graph"] = torch.cuda.memory_allocated() / 1e9
@@ -373,6 +408,14 @@ def main():
             res.update(ppl_ref_fp32_experts=w32["ppl"], ppl_ratio_fp32_experts=math.exp(nll) / w32["ppl"])
             print(f"[golden4] the reference with fp32 expert math: ppl {w32['ppl']:.4f}; the decode path / it {res['ppl_ratio_fp32_experts']:.5f}; "
                   f"the bf16 reference / it {w['ppl'] / w32['ppl']:.5f}")
+        if args.decode_copies:  # the gate of the copies: the exact decode path
+            ex = want["wikitext_decode_exact"]
+            r_ex = math.exp(nll) / ex["ppl"]
+            res.update(ppl_exact=ex["ppl"], ppl_ratio_exact=r_ex, ppl_ok=abs(r_ex - 1) <= PPL_GATE,
+                       window_ppl=[math.exp(float(a.mean())) for a in per])
+            print(f"[golden4] decode copies: ppl {math.exp(nll):.4f} against the exact decode path's {ex['ppl']:.4f}: ratio {r_ex:.5f} -> "
+                  f"{'PASSED' if res['ppl_ok'] else 'FAILED'} (gate {PPL_GATE:.1%}); per window "
+                  + ", ".join(f"{a:.4f}/{b:.4f}" for a, b in zip(res["window_ppl"], ex["window_ppl"])))
     if args.no_timing:
         sys.exit(0 if ok and res.get("ppl_ok", True) else 1)
     # timing at 1k context: the KV rows below 1024 hold the last run's tokens

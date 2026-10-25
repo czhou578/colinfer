@@ -15,6 +15,10 @@
 //
 // Row invariance: every output row depends on its own input row only, with the same arithmetic for any M (<= 16), so
 // decode and verify give the same bits for a token.
+//
+// The INT8 mode of hc_mix (the decode copy of W_up, tools/requant_qwen4exp.py): W_up = q * s_row, with q int8 [10240, 320]
+// and one fp32 scale per row. The kernel converts q to bf16 (exact: |q| <= 127), runs the same mma, and multiplies the fp32
+// sum by s_row before the one rounding: u = bf16(s_row * sum_j a_j q_j). It streams half the bytes of the bf16 W_up.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -38,15 +42,43 @@ __device__ __forceinline__ float sigmoid(float x) { return 1.f / (1.f + expf(-x)
 // global memory: the first 4 are its B fragment of k-step 2 jj, the next 4 of k-step 2 jj + 1, and the A fragments read a
 // in the same dim order. Then mix and p go to shared memory, and the block writes y for its 16 columns. Block 0 also
 // writes inj. d / e: row strides ldd / lde (column slices of the stacked down | inject output).
+//
+// Q8 (the INT8 mode): w_up is int8 [10240, 320] and w_scale fp32 [10240]. Lane (g, c) loads the 16 bytes 64 i + 16 c
+// (i = 0 .. 4) of W row g of each tile, so the four lanes of a row read 64 contiguous bytes per load, as in the bf16
+// mode. (8-byte loads in the bf16 dim order, or 80 contiguous bytes per lane, stream at 110 to 125 GB/s instead of 165.)
+// Its k-steps 2 jj and 2 jj + 1 take the dims 64 (jj / 2) + 16 c + 8 (jj % 2) .. + 7, and the A fragments read a in the
+// same order. The mma loop converts the codes to bf16, and the scale of column r multiplies its fp32 sum. Both modes
+// issue the weight loads first, before a (each block's a [M, 320] is recomputed from d).
 constexpr int AS = R + 32;  // the a row stride in shared memory (elements): rows 64 bytes apart in the bank space
 
-__global__ void __launch_bounds__(THREADS) k_mix(const __nv_bfloat16* __restrict__ d, int ldd, const __nv_bfloat16* __restrict__ w_up,
-                                                  const __nv_bfloat16* __restrict__ n, __nv_bfloat16* __restrict__ y, const __nv_bfloat16* __restrict__ e,
-                                                  int lde, __nv_bfloat16* __restrict__ inj, int M) {
+// two int8 (bytes b and b + 1 of w) -> a bf16x2 B fragment register (exact)
+__device__ __forceinline__ uint32_t i8x2_bf16(uint32_t w, int b) {
+    const __nv_bfloat162 p = __floats2bfloat162_rn((float)(int8_t)(w >> (8 * b)), (float)(int8_t)(w >> (8 * b + 8)));
+    return *reinterpret_cast<const uint32_t*>(&p);
+}
+
+template <bool Q8>
+__global__ void __launch_bounds__(THREADS) k_mix(const __nv_bfloat16* __restrict__ d, int ldd, const void* __restrict__ w_up_,
+                                                  const float* __restrict__ w_scale, const __nv_bfloat16* __restrict__ n, __nv_bfloat16* __restrict__ y,
+                                                  const __nv_bfloat16* __restrict__ e, int lde, __nv_bfloat16* __restrict__ inj, int M) {
     PDL_TRIGGER();
     __shared__ __align__(16) __nv_bfloat16 as[MAXM * AS];
     __shared__ float ps[S * MAXM * COLS];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, c0 = blockIdx.x * COLS;
+    const int s = warp, g = lane >> 2, c = lane & 3;
+    uint4 wb[2][R / 32];  // the B fragments of the warp's two n tiles, loaded before the barrier (bf16)
+    uint4 wq[2][R / 64];  // Q8: the 80 int8 of each tile row that this lane takes
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+        const size_t row = (size_t)s * H + c0 + nt * 8 + g;
+#pragma unroll
+        for (int jj = 0; jj < R / 32; ++jj) {
+            if constexpr (Q8) {
+                if (jj < R / 64) wq[nt][jj] = __ldg(reinterpret_cast<const uint4*>(reinterpret_cast<const int8_t*>(w_up_) + row * R + 16 * c + 64 * jj));
+            } else
+                wb[nt][jj] = __ldg(reinterpret_cast<const uint4*>(reinterpret_cast<const __nv_bfloat16*>(w_up_) + row * R + 8 * c + 32 * jj));
+        }
+    }
     for (int i = tid; i < MAXM * R; i += THREADS) {
         const int m = i / R, j = i % R;
         float av = 0.f;
@@ -57,28 +89,28 @@ __global__ void __launch_bounds__(THREADS) k_mix(const __nv_bfloat16* __restrict
         as[m * AS + j] = __float2bfloat16(av);
     }
     if (blockIdx.x == 0 && e != nullptr && tid < M * S) {
-        const int m = tid / S, s = tid % S;
-        inj[m * S + s] = __float2bfloat16(2.f * bf(sigmoid(bf(__bfloat162float(e[(size_t)m * lde + s]) / 4.f))));
-    }
-    const int s = warp, g = lane >> 2, c = lane & 3;
-    uint4 wb[2][R / 32];  // the B fragments of the warp's two n tiles, loaded before the barrier
-#pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
-        const __nv_bfloat16* wr = w_up + ((size_t)s * H + c0 + nt * 8 + g) * R + 8 * c;
-#pragma unroll
-        for (int jj = 0; jj < R / 32; ++jj) wb[nt][jj] = __ldg(reinterpret_cast<const uint4*>(wr + 32 * jj));
+        const int m = tid / S, t = tid % S;
+        inj[m * S + t] = __float2bfloat16(2.f * bf(sigmoid(bf(__bfloat162float(e[(size_t)m * lde + t]) / 4.f))));
     }
     __syncthreads();
     float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
 #pragma unroll
     for (int jj = 0; jj < R / 32; ++jj) {
-        const uint4 x0 = *reinterpret_cast<const uint4*>(as + g * AS + 32 * jj + 8 * c);
-        const uint4 x1 = *reinterpret_cast<const uint4*>(as + (g + 8) * AS + 32 * jj + 8 * c);
+        const int ka = Q8 ? 64 * (jj >> 1) + 16 * c + 8 * (jj & 1) : 32 * jj + 8 * c;  // the dims of this lane's k-steps 2 jj and 2 jj + 1
+        const uint4 x0 = *reinterpret_cast<const uint4*>(as + g * AS + ka);
+        const uint4 x1 = *reinterpret_cast<const uint4*>(as + (g + 8) * AS + ka);
         const uint32_t a0[4] = {x0.x, x1.x, x0.y, x1.y}, a1[4] = {x0.z, x1.z, x0.w, x1.w};
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
-            mma_bf16(acc[nt], a0, wb[nt][jj].x, wb[nt][jj].y);
-            mma_bf16(acc[nt], a1, wb[nt][jj].z, wb[nt][jj].w);
+            uint4 b;
+            if constexpr (Q8) {
+                const uint32_t lo = jj & 1 ? wq[nt][jj >> 1].z : wq[nt][jj >> 1].x, hi = jj & 1 ? wq[nt][jj >> 1].w : wq[nt][jj >> 1].y;
+                b = make_uint4(i8x2_bf16(lo, 0), i8x2_bf16(lo, 2), i8x2_bf16(hi, 0), i8x2_bf16(hi, 2));
+            } else {
+                b = wb[nt][jj];
+            }
+            mma_bf16(acc[nt], a0, b.x, b.y);
+            mma_bf16(acc[nt], a1, b.z, b.w);
         }
     }
     // acc[nt][q]: token row g (q < 2) or g + 8, column r = nt * 8 + 2 c + q % 2 of stream s
@@ -88,7 +120,8 @@ __global__ void __launch_bounds__(THREADS) k_mix(const __nv_bfloat16* __restrict
         for (int q = 0; q < 4; ++q) {
             const int m = g + (q >= 2 ? 8 : 0), r = nt * 8 + 2 * c + (q & 1);
             if (m < M) {
-                const float mix = bf(sigmoid(bf(acc[nt][q])));
+                const float u = Q8 ? acc[nt][q] * __ldg(w_scale + (size_t)s * H + c0 + r) : acc[nt][q];
+                const float mix = bf(sigmoid(bf(u)));
                 ps[(s * MAXM + m) * COLS + r] = bf(mix * __bfloat162float(n[(size_t)m * N + s * H + c0 + r]));
             }
         }
@@ -122,10 +155,13 @@ __global__ void k_post(const __nv_bfloat16* __restrict__ o, const __nv_bfloat16*
 
 }  // namespace hc
 
-cudaError_t launch_hc_mix(const void* d, int ldd, const void* w_up, const void* n, void* y, const void* e, int lde, void* inj, int M, cudaStream_t st) {
+// w_scale == nullptr: w_up is bf16 [10240, 320]; else w_up is int8 [10240, 320] with the row scales w_scale fp32 [10240]
+cudaError_t launch_hc_mix(const void* d, int ldd, const void* w_up, const float* w_scale, const void* n, void* y, const void* e, int lde, void* inj, int M,
+                          cudaStream_t st) {
     if (M < 1 || M > hc::MAXM) return cudaErrorInvalidValue;
-    hc::k_mix<<<hc::H / hc::COLS, hc::THREADS, 0, st>>>((const __nv_bfloat16*)d, ldd, (const __nv_bfloat16*)w_up, (const __nv_bfloat16*)n,
-                                                        (__nv_bfloat16*)y, (const __nv_bfloat16*)e, lde, (__nv_bfloat16*)inj, M);
+    auto k = w_scale ? hc::k_mix<true> : hc::k_mix<false>;
+    k<<<hc::H / hc::COLS, hc::THREADS, 0, st>>>((const __nv_bfloat16*)d, ldd, w_up, w_scale, (const __nv_bfloat16*)n, (__nv_bfloat16*)y,
+                                                (const __nv_bfloat16*)e, lde, (__nv_bfloat16*)inj, M);
     return cudaGetLastError();
 }
 

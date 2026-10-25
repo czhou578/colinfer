@@ -4,8 +4,13 @@ kernels of the engine, and the positions on the device. A decode step, or a veri
 This module follows engine/model/fast.py (the 27B's decode model). The design:
 
 - Weights: the routed experts stay NVFP4 (moe_kernels.KernelMoE, which swizzles its own scales). Everything else is
-  BF16 and streams through the BF16 skinny GEMM (Bf16Linear, StackedBf16Linear): the exact path of the checkpoint, no
-  requantized copies yet (docs/history/qwen4exp_plan.md, phase B).
+  BF16 and streams through the BF16 skinny GEMM (Bf16Linear, StackedBf16Linear): the exact path of the checkpoint.
+  attach_decode_copies4 adds the requantized decode copies of tools/requant_qwen4exp.py (docs/history/qwen4exp_plan.md,
+  phase B): a `.dec` of a linear (INT6 / INT5 / NVFP4), the INT6 down | inject and the INT8 W_up of the hyper-connections,
+  and the INT6 gate | up of the shared experts; the prepared directory holds the classes that pass the perplexity gate
+  (INT6 attention and lm_head, INT8 W_up: the decision is in the tool's docstring). Decode then streams the copies; the
+  prefill keeps reading the BF16 weights (cuBLAS), except for the last token's mixer and lm_head (the decode modules).
+  Without the copies, decode is the exact path.
 - The residual stream is x4 [B * T, 4 x 2560]. Each sublayer reads it through a gated residual (hc_kernels
   KernelGatedResidual: the input y and the 4 injection weights), and hc_post adds the sublayer's output back in place.
 - Attention layers run Qwen Sparse Attention (KernelQSAAttention): one stacked q | k | v | index pass, the fused prologues,
@@ -41,7 +46,7 @@ import torch.nn.functional as F
 
 from engine.kernels import ops
 from engine.model import hc_kernels, qsa_kernels
-from engine.model.fast import MAX_ROWS, FastState, KernelGDN, RowsLinear, _rows
+from engine.model.fast import MAX_ROWS, FastState, IntLinear, KernelGDN, Nvfp4Linear, RowsLinear, _rows
 from engine.model.moe_kernels import KernelMoE
 from engine.model.qwen4exp import DecoderLayer4, IndexedAttention, PLELayer, Qwen4ExpConfig, Qwen4ExpForCausalLM
 from engine.model.qwen35 import rope_inv_freq
@@ -52,9 +57,20 @@ MOE_INTER = (128, 256, 384, 512, 640)  # the intermediate sizes of moe_down (csr
 
 
 # ------------------------------------------------------------------------------------------------------------ linears
+def _dec_rows(dec, x2, r2, out):
+    """dec.rows into out. An INT copy writes bf16 only: for fp32 logits it writes a bf16 buffer first."""
+    if out.dtype == torch.float32 and isinstance(dec, IntLinear):
+        tmp = torch.empty(out.shape, device=out.device, dtype=torch.bfloat16)
+        dec.rows(x2, r2, tmp)
+        out.copy_(tmp)
+    else:
+        dec.rows(x2, r2, out)
+
+
 class Bf16Linear(RowsLinear):
     """BF16 weights w [N, K] on the BF16 skinny GEMM (ops().skinny_bf16: K % 128 == 0, N % 8 == 0). out_fp32: logits.
-    The residual rows, if given, are added in the epilogue."""
+    The residual rows, if given, are added in the epilogue. dec: an optional decode copy (fast.IntLinear or Nvfp4Linear,
+    attach_decode_copies4) that rows() streams instead; the prefill reads w."""
 
     def __init__(self, w: torch.Tensor, out_fp32: bool = False):
         super().__init__()
@@ -62,25 +78,30 @@ class Bf16Linear(RowsLinear):
         self.out_fp32 = out_fp32
         self.out_dtype = torch.float32 if out_fp32 else torch.bfloat16
         self.out_features, self.in_features = self.w.shape
+        self.dec = None
 
     @property
     def weight(self) -> torch.Tensor:
         return self.w
 
     def rows(self, x2, r2, out):
-        _rows(lambda x, r, o: ops().skinny_bf16(x, self.w, r, o), x2, r2, out)
+        if self.dec is not None:
+            _dec_rows(self.dec, x2, r2, out)
+        else:
+            _rows(lambda x, r, o: ops().skinny_bf16(x, self.w, r, o), x2, r2, out)
 
 
 class StackedBf16Linear(nn.Module):
     """BF16 linears that read the same input, stacked into one weight pass (one w [sum N, K]). forward(x) returns one
     output per part: column views of one [rows, sum N] tensor. The parts stay usable (prefill): each part's weight
-    becomes a view of the stacked w."""
+    becomes a view of the stacked w. dec: an optional decode copy of the whole stack (one global scale, so one launch)."""
 
     def __init__(self, parts: list):
         super().__init__()
         self.register_buffer("w", torch.cat([p.weight.detach() for p in parts]).contiguous(), persistent=False)
         self.sizes = [p.weight.shape[0] for p in parts]
         self.in_features = self.w.shape[1]
+        self.dec = None
         off = 0
         for p, n in zip(parts, self.sizes):
             view = self.w[off:off + n]
@@ -98,7 +119,10 @@ class StackedBf16Linear(nn.Module):
         shp = x.shape
         x2 = x.reshape(-1, self.in_features).contiguous()
         out = torch.empty(x2.shape[0], sum(self.sizes), device=x.device, dtype=torch.bfloat16)
-        _rows(lambda x_, r, o: ops().skinny_bf16(x_, self.w, r, o), x2, None, out)
+        if self.dec is not None:
+            self.dec.rows(x2, None, out)
+        else:
+            _rows(lambda x_, r, o: ops().skinny_bf16(x_, self.w, r, o), x2, None, out)
         return [t.reshape(*shp[:-1], -1) for t in out.split(self.sizes, dim=-1)]
 
 
@@ -456,6 +480,102 @@ class FastQwen4Exp(Qwen4ExpForCausalLM):
         state.pos_t += n
 
 
+# ------------------------------------------------------------------------------------------------------------ decode copies
+def _copy_of(t: dict, mods, pad_to: int | None = None, out_fp32: bool = False):
+    """The decode copy of the stacked modules `mods` (checkpoint names without .weight) from the tensors t of
+    tools/requant_qwen4exp.py files: an IntLinear (INT6 / INT5: .qweight_lo / .qweight_hi / .weight_scale /
+    .weight_scale_2) or an Nvfp4Linear (.weight / .weight_scale / .weight_scale_2), or None when t has none of them. The
+    parts must share one global scale (one launch). pad_to: zero rows up to that many rows (code 2^(b-1): q = 0)."""
+    if all(m + ".qweight_lo" in t for m in mods):
+        kind, keys = "int", (".qweight_lo", ".qweight_hi", ".weight_scale")
+    elif all(m + ".weight" in t and m + ".weight_scale" in t for m in mods):
+        kind, keys = "nvfp4", (".weight", ".weight_scale")
+    elif any(m + ".qweight_lo" in t or m + ".weight" in t for m in mods):
+        raise RuntimeError(f"the decode copies hold only some of the stacked modules {list(mods)}: run tools/requant_qwen4exp.py again")
+    else:
+        return None
+    gs = {float(t[m + ".weight_scale_2"]) for m in mods}
+    if len(gs) != 1:
+        raise RuntimeError(f"{list(mods)} must share one global scale to stay one launch (tools/requant_qwen4exp.py)")
+    parts = [[t[m + k] for k in keys] for m in mods]
+    rows = sum(p[0].shape[0] for p in parts)
+    if pad_to is not None and pad_to > rows:
+        if kind != "int":
+            raise RuntimeError("only an INT copy takes zero rows")
+        n = pad_to - rows
+        lo, hi, sf = parts[0]
+        bits = 6 if hi.shape[1] * 4 == lo.shape[1] * 2 else 5
+        hi_zero = 0xAA if bits == 6 else 0xFF  # the high bits of code 32 (INT6: 2 per code) / 16 (INT5: 1 per code)
+        parts.append([torch.zeros(n, lo.shape[1], dtype=lo.dtype, device=lo.device), torch.full((n, hi.shape[1]), hi_zero, dtype=hi.dtype,
+                      device=hi.device), torch.ones(n, sf.shape[1], device=sf.device).to(sf.dtype)])
+    cat = [torch.cat([p[j] for p in parts]).contiguous() for j in range(len(keys))]
+    if kind == "int":
+        return IntLinear(*cat, gs.pop())
+    return Nvfp4Linear(*cat, gs.pop(), out_fp32=out_fp32)
+
+
+def _check(dec, n: int, k: int, what: str):
+    if (dec.out_features, dec.in_features) != (n, k):
+        raise ValueError(f"the decode copy of {what} is [{dec.out_features}, {dec.in_features}], the model's is [{n}, {k}]")
+
+
+def attach_decode_copies4(model: FastQwen4Exp, files) -> int:
+    """Point the decode path of the BF16 matrices at the requantized copies in `files` (tools/requant_qwen4exp.py; each
+    file holds one class, and any subset may be given): the GDN qkvz / out_proj and the attention qkvi / o_proj (.dec of
+    the StackedBf16Linear / Bf16Linear), the lm_head (.dec, fp32 logits), the down | inject and W_up of each gated residual
+    (KernelGatedResidual.set_decode_copies) and the shared expert's gate | up (KernelMoE.set_shared_copies). The prefill
+    keeps the BF16 weights. Call after to_fast4 and before capturing graphs. Returns the number of linears attached
+    (a stacked copy counts each of its parts)."""
+    from engine.weights.direct import read_tensors
+    from engine.weights.loader import PREFIX
+    dev = model.embed_tokens.weight.device
+    t: dict[str, torch.Tensor] = {}
+    for f in files:
+        t.update(read_tensors(f, device=dev))
+    n = 0
+
+    def linear(mod, mods, what, out_fp32=False):
+        nonlocal n
+        d = _copy_of(t, mods, out_fp32=out_fp32)
+        if d is not None:
+            _check(d, mod.w.shape[0], mod.w.shape[1], what)
+            mod.dec = d
+            n += len(mods)
+
+    def residual(gr: hc_kernels.KernelGatedResidual, base: str):
+        nonlocal n
+        mods = [base + "input_mix_weight_down"] + ([base + "block_inject_weight"] if gr.has_inj else [])
+        d = _copy_of(t, mods, pad_to=-(-gr.w_di.shape[0] // 8) * 8)
+        if d is not None:
+            gr.set_decode_copies(dec=d)
+            n += len(mods)
+        up = base + "input_mix_weight_up"
+        if up + ".qweight" in t:
+            gr.set_decode_copies(w_up_q=t[up + ".qweight"], w_up_s=t[up + ".weight_scale"])
+            n += 1
+    for i, layer in enumerate(model.layers):
+        p = f"{PREFIX}layers.{i}."
+        if layer.block_type == "linear_attention":
+            g = layer.linear_attn
+            linear(g.qkvz, [p + "linear_attn.in_proj_qkv", p + "linear_attn.in_proj_z"], f"layer {i} qkvz")
+            linear(g.out_proj, [p + "linear_attn.out_proj"], f"layer {i} out_proj")
+        else:
+            a = layer.self_attn
+            linear(a.qkvi, [p + f"self_attn.{m}" for m in ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")], f"layer {i} qkvi")
+            linear(a.o_proj, [p + "self_attn.o_proj"], f"layer {i} o_proj")
+        residual(layer.attn_hc, p + "attn_hyper_connection.")
+        residual(layer.mlp_hc, p + "mlp_hyper_connection.")
+        d = _copy_of(t, [p + "mlp.shared_expert.gate_proj", p + "mlp.shared_expert.up_proj"])
+        if d is not None:
+            if not isinstance(d, IntLinear):
+                raise RuntimeError("the shared expert's gate | up copy must be INT6 / INT5 (KernelMoE.set_shared_copies)")
+            layer.mlp.set_shared_copies(d)
+            n += 2
+    residual(model.mixer, PREFIX + "hyper_connection_mixer.")
+    linear(model.lm_head, ["lm_head"], "lm_head", out_fp32=True)
+    return n
+
+
 # ------------------------------------------------------------------------------------------------------------ build
 def check_dims(cfg: Qwen4ExpConfig):
     """Raises ValueError if the config's dimensions differ from the ones the kernels are compiled for."""
@@ -529,8 +649,9 @@ def load_fast_qwen4exp(path_or_repo: str, decode_weights=None, log=print, prep=N
                        device="cuda") -> tuple[str, FastQwen4Exp]:
     """The family's load (engine/model/family.py): (the resolved path, the decode model) = load_qwen4exp (the reference
     tree with NVFP4 experts, the n-gram table on disk) + to_fast4. decode_weights and prep (a prepared directory) are
-    accepted and not used yet: this family has no requantized decode copies (docs/history/qwen4exp_plan.md, phase B).
-    A max_seq_len beyond the native context is refused (no YaRN for qwen4_exp)."""
+    accepted and not used here: the family's load attaches the requantized decode copies of the prepared directory
+    (attach_decode_copies4) when decode_weights is "int". A max_seq_len beyond the native context is refused (no YaRN for
+    qwen4_exp)."""
     from engine.weights.loader import resolve
     from engine.weights.qwen4exp_loader import load_qwen4exp
     path = resolve(path_or_repo)

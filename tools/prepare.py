@@ -17,18 +17,26 @@ tool writes it (a hard link; a copy on another file system). Else it makes the f
 Then it writes manifest.json. A new drafter replaces the old one, and the tool makes the low-rank head again, because
 the basis depends on the drafter's outputs.
 
+A qwen4_exp checkpoint (Qwen3.8-Flash-Next; config.json model_type) has other artifacts: the decode copies of its BF16
+matrices, one file per class (tools/requant_qwen4exp.py, which reads the checkpoint itself: about 30 s on the GPU).
+The tool keeps the files that exist, makes the missing ones, and writes the manifest with "family": "qwen4_exp". The
+27B's steps (the INT6 / INT5 copies from Qwen/Qwen3.8-27B, the drafter, the low-rank head) do not apply to it.
+
+   uv run python tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4 [--formats gdn_out=int6] [--skip-int]
+
 CAUTION: an over-commit of the unified memory powers the machine off. Stop the server before you run the tool without
 --skip-int and --skip-lowrank: the steps that make files load the model.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 
-from engine.runtime.prepared import DECODE_FILES, DRAFTER_FILE, LOWRANK_FILE, Prepared, prepared_dir
+from engine.runtime.prepared import DECODE4_FORMATS, DECODE_FILES, DRAFTER_FILE, LOWRANK_FILE, Prepared, decode4_file, prepared_dir
 from engine.runtime.prepared import read as read_manifest
 from engine.runtime.prepared import write as write_manifest
 
@@ -60,11 +68,50 @@ def take(src: str, dst: str) -> str:
         return "copied"
 
 
+def model_type(path: str) -> str | None:
+    """The model_type of the checkpoint directory's config.json (None without one)."""
+    try:
+        with open(os.path.join(path, "config.json")) as f:
+            return json.load(f).get("model_type")
+    except (OSError, ValueError):
+        return None
+
+
+def prepare4(path: str, out: str, *, skip_int: bool = False, formats: dict[str, str] | None = None, run=None, log=print) -> Prepared:
+    """The prepared directory of a qwen4_exp checkpoint: the decode copies of tools/requant_qwen4exp.py (one file per
+    class with a format other than bf16; formats: DECODE4_FORMATS by default). It keeps the files that exist and makes the
+    missing ones in one run of the tool, unless skip_int. Then it writes the manifest (family qwen4_exp)."""
+    run = run or (lambda argv: subprocess.run(argv, check=True))
+    formats = dict(formats or DECODE4_FORMATS)
+    os.makedirs(out, exist_ok=True)
+    cp = os.path.basename(os.path.normpath(path))
+    want = {c: decode4_file(c, f) for c, f in formats.items() if f != "bf16"}
+    missing = [c for c, name in want.items() if not os.path.exists(os.path.join(out, name))]
+    for c, name in want.items():
+        log(f"  {name}: " + ("kept" if c not in missing else "skipped (--skip-int): decode streams the BF16 weights of this class" if skip_int
+                             else "made by tools/requant_qwen4exp.py (reads the checkpoint's BF16 tensors: about 30 s on the GPU)"))
+    for c, f in formats.items():
+        if f == "bf16":
+            log(f"  {c}: bf16 (no copy): decode streams the checkpoint's weights of this class")
+    if missing and not skip_int:
+        spec = ",".join(f"{c}={formats[c]}" for c in missing)
+        run([sys.executable, os.path.join(TOOLS, "requant_qwen4exp.py"), "--model", path, "--out", out, "--formats", spec,
+             "--classes", ",".join(missing)])
+    decode = [name for name in want.values() if os.path.exists(os.path.join(out, name))]
+    log(f"  {DRAFTER_FILE}, {LOWRANK_FILE}: not for this family (the drafter is the checkpoint's MTP block, engine/spec/mtp4.py)")
+    mp = write_manifest(out, cp, decode, None, None, family="qwen4_exp")
+    log(f"manifest: {mp}")
+    return read_manifest(path, out)
+
+
 def prepare(path: str, out: str, *, bf16: str = "Qwen/Qwen3.8-27B", skip_int: bool = False, skip_lowrank: bool = False,
             drafter: str | None = None, legacy_decode=(), legacy_drafter: str | None = None, legacy_lowrank: str | None = None,
-            run=None, log=print) -> Prepared:
+            run=None, log=print, formats: dict[str, str] | None = None) -> Prepared:
     """Fills the prepared directory `out` of the checkpoint directory `path` and writes its manifest. legacy_*: where the
-    tools write the artifacts today (taken from there when present). run: runs a tool's argv (subprocess by default)."""
+    tools write the artifacts today (taken from there when present). run: runs a tool's argv (subprocess by default).
+    A qwen4_exp checkpoint goes to prepare4 (with skip_int and formats); the other arguments are the 27B's."""
+    if model_type(path) == "qwen4_exp":
+        return prepare4(path, out, skip_int=skip_int, formats=formats, run=run, log=log)
     run = run or (lambda argv: subprocess.run(argv, check=True))
     os.makedirs(out, exist_ok=True)
     cp = os.path.basename(os.path.normpath(path))
@@ -133,12 +180,22 @@ def main(argv=None) -> int:
                     help="a fine-tuned MTP head to take (default: ~/.cache/colinfer/drafter/mtp_ft.safetensors when it exists)")
     ap.add_argument("--skip-int", action="store_true", help="no INT6 / INT5 decode copies when they have to be made")
     ap.add_argument("--skip-lowrank", action="store_true", help="no low-rank draft head when it has to be made")
+    ap.add_argument("--formats", default=None, help="qwen4_exp: class=format overrides of the decode copies (tools/requant_qwen4exp.py)")
     a = ap.parse_args(argv)
     from engine.model.fast import decode_copies_paths
     from engine.weights.loader import MODEL, resolve
     path = resolve(a.model or MODEL)
     out = os.path.expanduser(a.out) if a.out else prepared_dir(path)
     print(f"prepared directory {out} for {os.path.basename(path)}:")
+    if model_type(path) == "qwen4_exp":
+        from tools.requant_qwen4exp import parse_formats
+        try:
+            prep = prepare4(path, out, skip_int=a.skip_int, formats=parse_formats(a.formats))
+        except subprocess.CalledProcessError as e:
+            print(f"tools/requant_qwen4exp.py failed (exit {e.returncode}); the manifest is not written", file=sys.stderr)
+            return 1
+        print(f"decode: {len(prep.decode)} files of copies" if prep.decode else "decode: the BF16 weights (no copies)")
+        return 0
     try:
         prep = prepare(path, out, bf16=a.bf16, skip_int=a.skip_int, skip_lowrank=a.skip_lowrank,
                        drafter=os.path.expanduser(a.drafter) if a.drafter else None, legacy_decode=decode_copies_paths(path),

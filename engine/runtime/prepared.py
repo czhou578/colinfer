@@ -2,7 +2,14 @@
 
 tools/prepare.py makes it at ~/.cache/colinfer/prepared/<snapshot>/ (PREPARED_DIR): the INT6 / INT5 decode copies of
 the attention / GDN projections, the fine-tuned MTP drafter when one exists, and the low-rank draft head. manifest.json
-names the files. The engine reads the manifest at startup (engine/runtime/build.py). Without one, the engine runs from
+names the files.
+
+The manifest's "decode" list names the decode copies of the checkpoint's family (the directory belongs to one checkpoint):
+for the 27B (qwen3_5) the INT6 / INT5 copies of its FP8 projections (DECODE_FILES, engine/model/fast.py
+attach_decode_copies); for Qwen3.8-Flash-Next (qwen4_exp) the copies of its BF16 matrices, one file per class
+(decode4_file, tools/requant_qwen4exp.py, engine/model/fast_qwen4exp.py attach_decode_copies4). The optional "family" key
+holds the checkpoint's model_type (tools/prepare.py writes it; a manifest without it is the 27B's). The version stays 1:
+the 27B's manifests read as before. The engine reads the manifest at startup (engine/runtime/build.py). Without one, the engine runs from
 the checkpoint alone: FP8 projections at decode, the checkpoint's MTP head and the full draft head. Thus the engine has
 two configurations, prepared or plain, instead of one per optional file. A manifest that names a missing file is an
 error, not a fallback: run tools/prepare.py again.
@@ -23,6 +30,10 @@ MANIFEST = "manifest.json"
 VERSION = 1
 DECODE_FILES = ("attn_gdn_int6_self_attn.safetensors", "attn_gdn_int5_linear_attn.safetensors")  # as tools/int6_requant.py names them
 DRAFTER_FILE = "mtp_ft.safetensors"      # as tools/train_drafter.py names it
+# qwen4_exp: the classes of tools/requant_qwen4exp.py and the format of each (the decision and its measurements are in that
+# tool's docstring: the classes in bf16 have no copy, because their copies break the perplexity gate)
+DECODE4_CLASSES = ("gdn_in", "gdn_out", "attn", "lm_head", "hc", "hc_up", "shared")
+DECODE4_FORMATS = {"gdn_in": "bf16", "gdn_out": "bf16", "attn": "int6", "lm_head": "int6", "hc": "bf16", "hc_up": "int8", "shared": "bf16"}
 LOWRANK_FILE = "draft_head_pca.safetensors"  # as tools/lowrank_draft_head.py names it
 
 
@@ -34,6 +45,18 @@ class Prepared:
     drafter: str | None          # the fine-tuned MTP head, or None: the checkpoint's
     lowrank: str | None          # the low-rank draft head, or None: the full head
     made: str = ""
+    family: str = ""              # the checkpoint's model_type, when the manifest names it
+
+
+def decode4_file(cls: str, fmt: str) -> str:
+    """The file of one class of the qwen4_exp decode copies (tools/requant_qwen4exp.py)."""
+    return f"decode4_{cls}_{fmt}.safetensors"
+
+
+def decode4_files(formats: dict[str, str] | None = None) -> list[str]:
+    """The files of the classes with a copy (a class in "bf16" has none), in DECODE4_CLASSES order."""
+    f = DECODE4_FORMATS if formats is None else formats
+    return [decode4_file(c, f[c]) for c in DECODE4_CLASSES if f.get(c, "bf16") != "bf16"]
 
 
 def prepared_dir(path: str) -> str:
@@ -68,13 +91,17 @@ def read(path: str, dir: str | None = None) -> Prepared | None:
     decode = m.get("decode") or []
     if not isinstance(decode, list):
         raise ValueError(f"{mp}: decode must be a list of file names")
-    return Prepared(d, cp, tuple(one(n) for n in decode), one(m.get("drafter")), one(m.get("lowrank")), str(m.get("made") or ""))
+    return Prepared(d, cp, tuple(one(n) for n in decode), one(m.get("drafter")), one(m.get("lowrank")), str(m.get("made") or ""),
+                    str(m.get("family") or ""))
 
 
-def write(d: str, checkpoint: str, decode, drafter: str | None, lowrank: str | None) -> str:
-    """Writes the manifest of d (file names relative to d) and returns its path."""
+def write(d: str, checkpoint: str, decode, drafter: str | None, lowrank: str | None, family: str | None = None) -> str:
+    """Writes the manifest of d (file names relative to d) and returns its path. family: the checkpoint's model_type
+    (left out when None, as the 27B's manifests)."""
     m = {"version": VERSION, "checkpoint": checkpoint, "made": time.strftime("%Y-%m-%dT%H:%M:%S"), "decode": list(decode),
          "drafter": drafter, "lowrank": lowrank}
+    if family is not None:
+        m["family"] = family
     mp = os.path.join(d, MANIFEST)
     tmp = mp + ".tmp"
     with open(tmp, "w") as f:
