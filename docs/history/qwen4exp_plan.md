@@ -300,4 +300,19 @@ kernel build. The 27B's tests must keep passing in every worktree.
   prompts, 94% on the passkey runs. The hyper-connection speed-up was tried and reverted: bf16_gemv matches the skinny
   GEMM at M <= 8, and a wider hc_mix changed the decode step by nothing; the profiler's per-kernel times are inflated by
   the PDL overlap.
-- **Next:** the drafter's scheduler wiring (M4c) is in progress; then the documentation pass.
+- **2026-10-24, M4 round 3 merged: speculation in the served engine.** `family.Speculation(drafter, state, cycle, k,
+  k_options, prior, cycle_cost)`: the 27B keeps Mtp / MtpState / MtpCycle with k in {3, 7} and its startup-measured cycle
+  times; qwen4_exp uses Mtp4 / Mtp4State / Mtp4Cycle with k in {1, 2, 3} (a request starts at k = 2) and M3's cost model
+  plus about 110 us per layer at 262k tokens for the block selection. The sessions save the drafter's kv_tensors() (the
+  rows lag the target by one; only complete block-key groups are saved), `_copy_kv` copies them, the ring needs no new
+  tensor, and suffix-match drafts work. Memory: the drafter adds 2.8 GB (the family's fixed bytes are 90e9); the per-process
+  memory cap is per family (101 GB here, the 27B's 95 stays) because the drafter left 0.9 GB under the old cap. On the real
+  checkpoint (`tests/scheduler_check_qwen4exp.py`, spec on, against a plain scheduler): the golden prompts equal the
+  reference and speculation equals plain decode everywhere (256 of 256 tokens on code and prose); code 39.1 tok/s against
+  21.3 plain (1.84x, 3.23 tokens per cycle), prose 27.2 against 20.3 (1.34x, 1.89 tokens per cycle, acceptance 0.40); a
+  7398-token disk restore with the drafter rows in 0.151 s with identical output. The server: ready in 45 s with
+  `spec=mtp k=3`, 91.3 GB allocated, chat completions at 28 to 39 tok/s. The 27B is byte-identical (the session digest
+  d4f42e84... again; 667 tests). Remaining: the low-rank draft head, early-exit tuning, the row prefetch between chunks,
+  the host row read before each cycle (wall tok/s below GPU tok/s), the cost model at long context, the prose acceptance.
+- **Next:** phase B (the requantized decode copies under the perplexity gate, M5a) is in progress; then the documentation
+  pass.
