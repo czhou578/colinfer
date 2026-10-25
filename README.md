@@ -121,8 +121,9 @@ decision. In short:
 The branch `moe` adds a second model family: `Qwen/Qwen3.8-Flash-Next` (`model_type` `qwen4_exp`), from the
 checkpoint `nvidia/Qwen3.8-Flash-Next-NVFP4`. It is a MoE model with 125B parameters, 6B of them active per token. It
 has 48 layers (36 Gated DeltaNet, 12 with Qwen Sparse Attention), 512 experts (top-10 and one shared expert), a
-4-stream residual (hyper-connections) and a 51 GB n-gram embedding table. The server serves it with plain decode:
-`python -m engine.server --model nvidia/Qwen3.8-Flash-Next-NVFP4` (`docs/server.md`, section "Qwen3.8-Flash-Next").
+4-stream residual (hyper-connections) and a 51 GB n-gram embedding table. The server serves it with exact MTP
+speculation: `python -m engine.server --model nvidia/Qwen3.8-Flash-Next-NVFP4` (`docs/server.md`, section
+"Qwen3.8-Flash-Next").
 
 What exists and is tested:
 
@@ -149,23 +150,26 @@ What exists and is tested:
   kernels) and synccheck are clean on the tests of the new kernels.
 
 The serving path (milestone M4) works end to end. `tests/scheduler_check_qwen4exp.py` builds the engine as the server
-does (2 slots x 262,144 tokens, 16 checkpoints, no speculation), and every check passes:
+does (2 slots x 262,144 tokens, 16 checkpoints, MTP speculation of 1 to 3 drafts), and every check passes:
 
-- The greedy tokens of the three golden prompts equal the reference's, with the prompts through the prefill.
+- The greedy tokens of the three golden prompts equal the reference's, with the prompts through the prefill and with
+  speculation. Speculation gives the tokens of plain decode on every check.
 - A next turn restores its checkpoint: 0.13 s to the first token, against 1.75 s for the prefill of 4,676 tokens.
 - A second conversation runs in the other slot, and the first one keeps its cache.
-- A conversation that left both slots restores from the disk cache in 0.16 s, with the output of a restore from memory.
+- A conversation that left both slots restores from the disk cache in 0.15 s (the drafter's rows included), with the
+  output of a restore from memory.
 - A prompt of 6,375 tokens (two prefill chunks) finds a code from its first chunk.
 
 The server answers on `/v1/chat/completions` (streaming, `reasoning_effort`), `/v1/messages` and `/metrics`. It is ready
-42 s after the start, `MemAvailable` falls by 96.7 GB, and plain decode runs at 19 to 20 tok/s at short context.
+45 s after the start, and `MemAvailable` falls by 100 GB. Measured at short context: decode with speculation runs at
+39.1 tok/s on code and 27.2 tok/s on prose, against 21.3 and 20.3 tok/s for plain decode (1.84x and 1.34x); a
+streaming chat completion decodes at 28 to 32 tok/s. The public vLLM build decodes 16.9 tok/s on this machine.
 
-What does not exist yet in the serving path: speculation (the MTP drafter), images, YaRN past 262,144 tokens, and the
-requantized decode copies.
+What does not exist yet in the serving path: images, YaRN past 262,144 tokens, the requantized decode copies, and the
+low-rank draft head of the 27B.
 
-The plan expects plain decode at about 22 tok/s on the exact BF16 path, and about 49 tok/s with requantized decode
-copies (under the perplexity gate). The public vLLM build decodes 16.9 tok/s on this machine. The figure with the copies is
-an estimate from the bytes per token, not a measurement. `docs/history/qwen4exp_plan.md` holds the design, the memory
+The plan expects about 49 tok/s of plain decode with requantized decode copies (under the perplexity gate). That
+figure is an estimate from the bytes per token, not a measurement. `docs/history/qwen4exp_plan.md` holds the design, the memory
 budget, the milestones and the dated status log.
 
 ## Repository

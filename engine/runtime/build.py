@@ -29,7 +29,6 @@ from engine.runtime.prepared import Prepared
 from engine.runtime.prepared import read as read_prepared
 from engine.runtime.scheduler import Scheduler
 from engine.selftest import run_selftest
-from engine.spec.mtp import Mtp
 from engine.spec.suffix import MIN_MATCH
 from engine.weights.direct import release_buffers
 from engine.weights.loader import MODEL, resolve
@@ -87,15 +86,18 @@ def load_dense_model(path: str, decode_weights: str, log, prep: Prepared | None,
     return path, model
 
 
-def load_drafter(model, path: str, weights: str = "auto", log=print, prep: Prepared | None = None):
-    """The MTP drafter. weights: "auto" = the fine-tuned head of the prepared directory when it has one, "none" = the
-    checkpoint's, or a path. The low-rank draft head is the prepared directory's, when it has one."""
+def load_drafter(model, path: str, weights: str = "auto", log=print, prep: Prepared | None = None, fam: Family | None = None):
+    """The MTP drafter of the checkpoint's family (fam.spec.drafter: engine/spec/mtp.py Mtp for the 27B,
+    engine/spec/mtp4.py Mtp4 for qwen4_exp; None: the family of path). weights: "auto" = the fine-tuned head of the
+    prepared directory when it has one, "none" = the checkpoint's, or a path. The low-rank draft head is the prepared
+    directory's, when it has one (Mtp4 has none yet)."""
+    fam = fam or family_of(path)
     if weights == "auto":
         weights = prep.drafter if prep is not None else None
     elif weights == "none":
         weights = None
-    mtp = Mtp(model, path, weights=weights, lowrank=prep.lowrank if prep is not None else None)
-    log(f"[engine] MTP drafter: {weights or 'checkpoint weights'}; low-rank draft head: {'on' if mtp.lr_B is not None else 'off'}; "
+    mtp = fam.spec.drafter(model, path, weights=weights, lowrank=prep.lowrank if prep is not None else None)
+    log(f"[engine] MTP drafter: {weights or 'checkpoint weights'}; low-rank draft head: {'on' if getattr(mtp, 'lr_B', None) is not None else 'off'}; "
         f"quantized {'from the cache' if mtp.cached else 'now (cached for the next start)' if mtp.cache_file else 'now'}")
     return mtp
 
@@ -154,7 +156,7 @@ def startup_bytes(path: str, slots: int | None = None, max_seq_len: int | None =
     and the drafter's with spec mtp), built on the meta device, plus the fixed bytes of the family (the 27B:
     ENGINE_FIXED_BYTES) and its host caches (qwen4_exp: the n-gram row cache of ngram_cache_gb). Other flags than the
     defaults take less. None: the default of the family. The state shapes are the Scheduler's: it builds them with the
-    family's new_state (model.new_state) and MtpState."""
+    family's new_state (model.new_state) and the state of its drafter (fam.spec.state)."""
     fam = family_of(path)
     d = fam.defaults
     slots, max_seq_len, spec = d.slots if slots is None else slots, d.max_seq_len if max_seq_len is None else max_seq_len, spec or d.spec
@@ -179,15 +181,16 @@ def check_memory(path: str, slots: int | None = None, max_seq_len: int | None = 
 
 
 def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: int | None = None, checkpoints: int | None = None,
-                 spec: str | None = None, k: int = 7, drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH, decode_weights: str = "int",
-                 boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, vision: bool | None = None, vision_preload: bool = False,
-                 ngram_cache_gb: float = NGRAM_CACHE_GB, metrics=None, log=print):
+                 spec: str | None = None, k: int | None = None, drafter_weights: str = "auto", suffix_drafts: int = MIN_MATCH,
+                 decode_weights: str = "int", boundary: Literal["auto"] | int | None = "auto", selftest: bool = True, vision: bool | None = None,
+                 vision_preload: bool = False, ngram_cache_gb: float = NGRAM_CACHE_GB, metrics=None, log=print):
     """The scheduler with its model, as `python -m engine.server` builds it from the same flags (the defaults are the
     server's). slots, max_seq_len, checkpoints, spec, vision: None takes the default of the checkpoint's family
     (engine/model/family.py; the 27B: 3 slots of 524288 tokens, 32 checkpoints, spec mtp, vision on). spec: "mtp" or
-    "none". boundary: the message-boundary token id, "auto" (the checkpoint's) or None. vision: image input
-    (engine/model/vision.py) when the family supports it and the checkpoint has a vision tower; its 0.92 GB of weights
-    load on the first image, or at startup with vision_preload. ngram_cache_gb: the n-gram row cache of qwen4_exp (host
+    "none". k: the longest MTP draft; None: the family's (the 27B: 7, qwen4_exp: 3). boundary: the message-boundary
+    token id, "auto" (the checkpoint's) or None. vision: image input (engine/model/vision.py) when the family supports
+    it and the checkpoint has a vision tower; its 0.92 GB of weights load on the first image, or at startup with
+    vision_preload. ngram_cache_gb: the n-gram row cache of qwen4_exp (host
     memory; the 27B has none). Before the CUDA context, check_memory raises NotEnoughMemory when the engine does not
     fit in MemAvailable.
     Returns (scheduler, the startup seconds of each phase). scheduler.fingerprint names what the cached state depends
@@ -203,7 +206,7 @@ def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: i
     checkpoints = d.checkpoints if checkpoints is None else checkpoints
     spec = spec or d.spec
     vision = d.vision if vision is None else vision
-    if spec == "mtp" and not fam.supports.mtp:
+    if spec == "mtp" and (not fam.supports.mtp or fam.spec is None):
         raise ValueError(f"spec mtp: the engine has no MTP drafter for the {fam.name} family yet (spec none)")
     check_seq_len(path, fam, max_seq_len)
     check_memory(path, slots, max_seq_len, spec, ngram_cache_gb)  # before the CUDA context and the weights
@@ -214,7 +217,8 @@ def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: i
     log(f"[engine] prepared directory: {prep.dir} (made {prep.made})" if prep is not None else
         "[engine] no prepared directory (tools/prepare.py): the checkpoint alone")
     path, m = fam.load(path, decode_weights, log, prep, max_seq_len, ngram_cache_gb)
-    mtp = load_drafter(m, path, drafter_weights, log, prep) if spec == "mtp" else None
+    mtp = load_drafter(m, path, drafter_weights, log, prep, fam) if spec == "mtp" else None
+    k = (fam.spec.k if fam.spec is not None else 7) if k is None else k
     release_buffers()  # the direct reader's pinned staging buffers (engine/weights/direct.py)
     if boundary == "auto":
         boundary = boundary_token(path)
@@ -227,7 +231,7 @@ def build_engine(model: str = MODEL, *, slots: int | None = None, max_seq_len: i
     sched = Scheduler(m, n_slots=slots, max_seq_len=max_seq_len, n_checkpoints=checkpoints, mtp=mtp, k=k, metrics=metrics,
                       boundary_token=boundary, suffix_min=suffix_drafts, prefill_fn=fam.prefill, prepare_fn=fam.prepare_prefill,
                       before_replay=fam.before_replay(m), feed_buffer=fam.feed_buffer(m), prefill_chunk=fam.prefill_chunk,
-                      prefill_prev2=fam.prefill_prev2)
+                      prefill_prev2=fam.prefill_prev2, spec=fam.spec)
     sched.family = fam.name
     if tower is not None:
         sched.vision, sched.image_pad = tower, json.load(open(os.path.join(path, "config.json")))["image_token_id"]

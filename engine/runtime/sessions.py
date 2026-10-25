@@ -10,10 +10,16 @@ What the store keeps (one directory per engine configuration, see `fingerprint`)
   of the block depends only on the tokens [0, (j+1)B). The hash chain of those tokens (and the cache salt) names the
   block, so conversations that share a prefix (a system prompt) share its blocks. The rows of the target are those of
   the tensors of its state's kv_tensors() hook, in that order (engine/model/qwen35.py ModelState). A tensor with one
-  row per r positions (the block keys of qwen4_exp) gives the rows [jB / r, (j+1)B / r).
+  row per r positions (the block keys of qwen4_exp) gives the rows [jB / r, (j+1)B / r). The drafter's rows are those
+  of the tensors of its state's kv_tensors() hook (the 27B: k, v; qwen4_exp: k, v, ik, ikb, rope_pos). A drafter tensor
+  with one row per r positions gives the rows [(jB - 1) // r, ((j+1)B - 1) // r): the rows whose r positions are all
+  below (j+1)B - 1. The row of the group that holds the drafter's position (j+1)B - 1 is incomplete (qwen4_exp writes
+  a block key when its last position is written), so it goes with the next block.
 * Checkpoints. The GDN state (conv windows and recurrent states: the tensors of the snap_tensors() hook) and the
-  drafter's input hidden state at a prefix of n tokens, plus the KV rows of its partial block [n - n % B, n). The hash
-  of the tokens [0, n) names the checkpoint.
+  drafter's input hidden state at a prefix of n tokens, plus the KV rows of its partial block [n - n % B, n) (the
+  drafter's [n - n % B - 1, n - 1), its tensors of r positions per row as above). The hash of the tokens [0, n) names
+  the checkpoint. A restore thus leaves the drafter's incomplete group row as it was; the next drafter prefill starts
+  at position n - 1, completes that group and writes its row before any read.
 
 A restore of n tokens reads the n // B blocks and the checkpoint. These are exactly the bytes that the slot held, so a
 reply after a restore from disk is the reply after a restore from memory, bit for bit.
@@ -110,14 +116,16 @@ class _Job:
 
 def _shapes(state, mst) -> dict:
     """The shapes of the state for the fingerprint. The keys of the 27B (its k / v pairs, conv and rec) come first in the
-    hooks; the tensors after them (qwen4_exp: ik, ikb, rope_pos; ple_conv) add the keys kv_extra and snap_extra, so the
-    fingerprint of a state without them stays the one of the files on disk."""
+    hooks; the tensors after them (qwen4_exp: ik, ikb, rope_pos; ple_conv; the drafter's ik, ikb, rope_pos) add the keys
+    kv_extra, snap_extra and drafter_extra, so the fingerprint of a state without them stays the one of the files on
+    disk."""
     kv, snap = state.kv_tensors(), state.snap_tensors()
     nkv, nc, nr = 2 * len(state.k), len(state.conv), len(state.rec)
     shapes = {"kv": [list(t.shape[1:]) for t in kv[:nkv:2]], "kv_dtype": str(kv[0].dtype),
               "conv": [list(t.shape[1:]) for t in snap[:nc]], "rec": [list(t.shape[1:]) for t in snap[nc:nc + nr]],
               "drafter_kv": list(mst.k[0].shape[1:]) if mst is not None else None}
-    for key, extra in (("kv_extra", kv[nkv:]), ("snap_extra", snap[nc + nr:])):
+    dextra = mst.kv_tensors()[2 * len(mst.k):] if mst is not None else []
+    for key, extra in (("kv_extra", kv[nkv:]), ("snap_extra", snap[nc + nr:]), ("drafter_extra", dextra)):
         if extra:
             shapes[key] = [[list(t.shape[1:]), str(t.dtype)] for t in extra]
     return shapes
@@ -125,7 +133,7 @@ def _shapes(state, mst) -> dict:
 
 class SessionStore:
     """The disk cache of one engine. state: the scheduler's state of all slots (with the hooks kv_tensors() and
-    snap_tensors()); mst: the drafter's MtpState or None; fingerprint: what the cached bytes depend on
+    snap_tensors()); mst: the drafter's state (MtpState, Mtp4State: the hook kv_tensors()) or None; fingerprint: what the cached bytes depend on
     (engine/runtime/build.py: the checkpoint, the decode weights, the drafter); budget: bytes on disk, over all
     configurations under root. h_dim: the width of the drafter's input hidden state (the scheduler's h_dim); None:
     hidden_size of the state's config."""
@@ -137,8 +145,10 @@ class SessionStore:
         self.kv_t, self.snap_t = state.kv_tensors(), state.snap_tensors()
         L = max(t.shape[2] for t in self.kv_t)
         self.ratio = [L // t.shape[2] for t in self.kv_t]  # positions per row of each per-position tensor
-        if any(block % r for r in self.ratio):
-            raise ValueError(f"block {block}: not a multiple of the row ratios {sorted(set(self.ratio))}")
+        self.dkv_t = mst.kv_tensors() if mst is not None else []  # the drafter's per-position tensors
+        self.dratio = [max(t.shape[2] for t in self.dkv_t) // t.shape[2] for t in self.dkv_t]
+        if any(block % r for r in self.ratio + self.dratio):
+            raise ValueError(f"block {block}: not a multiple of the row ratios {sorted(set(self.ratio + self.dratio))}")
         fp = dict(fingerprint, version=VERSION, block=block, shapes=_shapes(state, mst))
         self.fp = hashlib.blake2b(json.dumps(fp, sort_keys=True).encode(), digest_size=8).hexdigest()
         self.root, self.dir = root, os.path.join(root, self.fp)
@@ -146,7 +156,7 @@ class SessionStore:
         with open(os.path.join(self.dir, "fingerprint.json"), "w") as f:
             json.dump(fp, f, indent=1, sort_keys=True)
         self.row_bytes = [_nbytes(t[0, :, 0]) for t in self.kv_t]  # the bytes of one row of each per-position tensor
-        self.drafter_row = 2 * _nbytes(mst.k[0][0, :, 0]) if mst is not None else 0
+        self.drafter_rows = [_nbytes(t[0, :, 0]) for t in self.dkv_t]  # the bytes of one row of each drafter tensor
         self.gdn_bytes = sum(_nbytes(t[0]) for t in self.snap_t)
         self.h_dim = (h_dim if h_dim is not None else state.cfg.hidden_size) if mst is not None else 0
         largest = HEADER + max(self._span(block), self.gdn_bytes + 2 * self.h_dim + self._span(block - 1))
@@ -262,19 +272,21 @@ class SessionStore:
     def _span(self, n: int) -> int:
         """The most bytes that the KV rows of n positions take, from a position that is a multiple of every ratio:
         the target's and the drafter's."""
-        return sum(m * -(-n // r) for m, r in zip(self.row_bytes, self.ratio)) + n * self.drafter_row
+        return sum(m * -(-n // r) for m, r in zip(self.row_bytes + self.drafter_rows, self.ratio + self.dratio))
 
     def _kv(self, b: int, r0: int, r1: int) -> list[torch.Tensor]:
         """Device views of the KV rows [r0, r1) of slot b: the target's (a tensor with one row per r positions: its
-        rows [r0 / r, ceil(r1 / r))), then the drafter's rows [r0 - 1, r1 - 1)."""
+        rows [r0 / r, ceil(r1 / r))), then the drafter's rows [d0, d1) = [r0 - 1, r1 - 1) (a drafter tensor with one
+        row per r positions: its rows [d0 // r, d1 // r), whose positions are all below d1)."""
         out = []
         for t, r in zip(self.kv_t, self.ratio):
             a, z = r0 // r, -(-r1 // r)
             out += [t[b, h, a:z] for h in range(t.shape[1])]
         d0, d1 = max(r0 - 1, 0), r1 - 1
-        if self.mst is not None and d1 > d0:
-            for t in (self.mst.k[0], self.mst.v[0]):
-                out += [t[b, h, d0:d1] for h in range(t.shape[1])]
+        for t, r in zip(self.dkv_t, self.dratio):
+            a, z = d0 // r, d1 // r
+            if z > a:
+                out += [t[b, h, a:z] for h in range(t.shape[1])]
         return out
 
     def _gdn(self, b: int, h: torch.Tensor | None) -> list[torch.Tensor]:

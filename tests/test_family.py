@@ -95,6 +95,7 @@ def test_the_dense_family_keeps_the_servers_defaults(tmp_path):
     assert fam.supports == F.Supports(mtp=True, vision=True, yarn=True, int_copies=True)
     from engine.model.prefill import prefill, prepare_prefill
     assert fam.prefill is prefill and fam.prepare_prefill is prepare_prefill and fam.before_replay(None) is None and fam.feed_buffer(None) is None
+    assert fam.spec is F.QWEN35_SPEC and (fam.spec.k, fam.spec.k_options, fam.spec.prior, fam.spec.cycle_cost) == (7, (3, 7), (1.5, 2.5), None)
     assert family_of(write_config(tmp_path, "")).name == "qwen3_5"  # no model_type: the dense family, as before the dispatch
 
 
@@ -159,24 +160,33 @@ def moe_state_bytes(path, slots, max_seq_len):
     return slots * (max_seq_len * per_pos + per_slot)
 
 
+def drafter4_state_bytes(slots, max_seq_len):
+    """The state of the drafter of qwen4_exp (Mtp4State, one attention layer): per position its fp8 k and v [2, 256], its
+    raw indexer key (bf16 128), a quarter of its block key and its rotary position (int32 x 3); no per-slot state."""
+    return slots * max_seq_len * (2 * 2 * 256 + 128 * 2 + 128 * 2 // 4 + 3 * 4)
+
+
 def test_the_moe_family_has_its_own_defaults(tmp_path):
-    """The qwen4_exp family serves: 2 slots of 262144 tokens, 16 checkpoints, no speculation, no images, prefill chunks
-    of 4096 tokens with prev2; the memory check counts its fixed bytes, the state and the n-gram row cache; the build
-    refuses MTP and a slot length past the native context before the memory check."""
+    """The qwen4_exp family serves: 2 slots of 262144 tokens, 16 checkpoints, speculation with its drafter (up to 3 drafts,
+    a cycle of 1, 2 or 3), no images, prefill chunks of 4096 tokens with prev2; the memory check counts its fixed bytes
+    (the drafter's weights included), the state of the slots and of the drafter (0.355 GB per slot of 262144 tokens) and
+    the n-gram row cache; the build refuses a slot length past the native context before the memory check."""
     path = moe_config(tmp_path)
     fam = family_of(path)
     assert fam.name == "qwen4_exp"
-    assert fam.defaults == F.Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="none", vision=False)
-    assert fam.supports == F.Supports(mtp=False, vision=False, yarn=False, int_copies=False)
+    assert fam.defaults == F.Defaults(slots=2, max_seq_len=262144, checkpoints=16, spec="mtp", vision=False, mem_cap_gb=101.0)
+    assert fam.supports == F.Supports(mtp=True, vision=False, yarn=False, int_copies=False)
+    assert fam.spec is F.QWEN4EXP_SPEC and (fam.spec.k, fam.spec.k_options) == (3, (1, 2, 3))
     assert fam.prefill_chunk == 4096 and fam.prefill_prev2
-    assert fam.fixed_bytes == F.QWEN4EXP_FIXED_BYTES
+    assert fam.fixed_bytes == F.QWEN4EXP_FIXED_BYTES == 87 * 10**9 + F.QWEN4EXP_DRAFTER_BYTES
     state = moe_state_bytes(path, 2, 262144)
+    drafter = drafter4_state_bytes(2, 262144)
+    assert drafter == 2 * 355_467_264  # 0.355 GB per slot: k + v 268 MB, ik 67 MB, ikb 17 MB, rope_pos 3 MB
     assert fam.state_bytes(path, 2, 262144, "none") == state
+    assert fam.state_bytes(path, 2, 262144, "mtp") == state + drafter
     assert fam.host_bytes(1.0) == 6_250_000 * 176 and fam.host_bytes(0) == 0
-    assert build.startup_bytes(path) == F.QWEN4EXP_FIXED_BYTES + state + 6_250_000 * 176
-    assert build.startup_bytes(path, ngram_cache_gb=0) == F.QWEN4EXP_FIXED_BYTES + state
-    with pytest.raises(ValueError, match="no MTP drafter"):
-        build.build_engine(path, spec="mtp", selftest=False)
+    assert build.startup_bytes(path) == F.QWEN4EXP_FIXED_BYTES + state + drafter + 6_250_000 * 176
+    assert build.startup_bytes(path, spec="none", ngram_cache_gb=0) == F.QWEN4EXP_FIXED_BYTES + state
     with pytest.raises(ValueError, match="native context 262144.*no YaRN"):
         build.build_engine(path, max_seq_len=524288, selftest=False)
     with pytest.raises(ValueError, match="no YaRN"):
@@ -247,3 +257,33 @@ def test_the_moe_before_replay_fills_the_feed_buffer_of_its_row_count():
     assert set(bufs) == {(1, 1), (1, 4)}
     assert torch.equal(bufs[(1, 1)][0], FakeFeeder().rows_for([5], ()))
     assert torch.equal(bufs[(1, 4)][0], FakeFeeder().rows_for([12, 13, 14, 15], ()))
+
+
+def test_the_speculation_of_each_family_names_its_drafter():
+    """The 27B's Speculation builds engine/spec/mtp.py's MtpState and the qwen4_exp one engine/spec/mtp4.py's Mtp4State
+    (their kv_tensors: the 27B's k, v; qwen4_exp's k, v, ik, ikb, rope_pos)."""
+    from engine.model.qwen4exp import Qwen4ExpConfig
+    from engine.model.qwen35 import Qwen35Config
+    from engine.spec.mtp import MtpState
+    from engine.spec.mtp4 import Mtp4State
+    st = F.QWEN35_SPEC.state(Qwen35Config(**DENSE), 64, "meta", batch=2)
+    assert type(st) is MtpState and [tuple(t.shape) for t in st.kv_tensors()] == [(2, 4, 64, 256)] * 2
+    st4 = F.QWEN4EXP_SPEC.state(Qwen4ExpConfig(), 64, "meta", batch=2)
+    assert type(st4) is Mtp4State
+    assert [tuple(t.shape) for t in st4.kv_tensors()] == [(2, 2, 64, 256)] * 2 + [(2, 1, 64, 128), (2, 1, 16, 128), (2, 1, 64, 3)]
+
+
+def test_the_qwen4exp_cycle_cost_picks_k_by_acceptance():
+    """The cost model of qwen4_exp's cycle is M3's fit at 1k context (53.3 / 59.4 / 65.5 ms for k = 1 / 2 / 3) plus the
+    block selection that grows with the context. With the expected tokens of a cycle (1 - a^(k+1)) / (1 - a), the best
+    k is 1 at a low acceptance, 2 at the prior of 0.55 and 3 from about 0.6."""
+    cost = F.qwen4exp_cycle_cost
+    assert [round(cost(k, k, 1024) * 1e3, 1) for k in (1, 2, 3)] == [53.3, 59.4, 65.5]
+    assert 1.4e-3 < cost(2, 2, 262144) - cost(2, 2, 0) < 1.6e-3  # the selection of 12 + 2 layer launches at 262k tokens
+    assert cost(15, 3, 0) < cost(15, 15, 0)  # a suffix-match cycle verifies 15 drafts and makes 3
+
+    def best(a):
+        return max(F.QWEN4EXP_SPEC.k_options, key=lambda k: (1 - a ** (k + 1)) / (1 - a) / cost(k, k, 4096))
+    prior = F.QWEN4EXP_SPEC.prior[0] / F.QWEN4EXP_SPEC.prior[1]
+    assert prior == 0.55 and best(prior) == 2
+    assert best(0.3) == 1 and best(0.7) == 3
