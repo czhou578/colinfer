@@ -314,5 +314,20 @@ kernel build. The 27B's tests must keep passing in every worktree.
   `spec=mtp k=3`, 91.3 GB allocated, chat completions at 28 to 39 tok/s. The 27B is byte-identical (the session digest
   d4f42e84... again; 667 tests). Remaining: the low-rank draft head, early-exit tuning, the row prefetch between chunks,
   the host row read before each cycle (wall tok/s below GPU tok/s), the cost model at long context, the prose acceptance.
-- **Next:** phase B (the requantized decode copies under the perplexity gate, M5a) is in progress; then the documentation
-  pass.
+- **2026-10-24, phase B merged: the requantized decode copies, under the gate.** `tools/requant_qwen4exp.py` (run by
+  `tools/prepare.py` for this family, 30 s on the GPU) writes copies of the BF16 matrices into the prepared directory;
+  `attach_decode_copies4` points the decode path at them (prefill keeps the BF16 weights). The gate (0.5% against the exact
+  decode path's 2.3274 on the 8 golden windows) decided the formats: the planned set of every class gives a ratio of
+  1.0218 and fails; the GDN projections fail alone (INT6 in_proj 1.0103, INT5 both 1.0112), and the HC down | inject and
+  the GDN out_proj pass alone but not together with the others. A small change before the top-10-of-512 routing changes
+  which experts run, and the gate's own noise is about 0.25%. The default is the three classes that pass together:
+  INT6 attention (q | k | v | index and o_proj), INT6 lm_head (NVFP4 gives 1.0089) and INT8 per-row W_up of the
+  hyper-connections (a new mode of hc_mix: 19.8 us against 33.4 us): ratio 1.0014 (1.0043 on 8 held-out windows). The
+  decode step falls from 46.6 to 39.4 ms (21.4 to 25.4 tok/s, +18%), the verify of 8 rows from 63.1 to 56.1 ms; the
+  bytes per token from 9.95 to 8.15 GB (the plan's 4.7 GB needs the GDN and the shared experts, 2.5 GB per token, with a
+  calibrated quantizer); the copies take 1.35 GB on the GPU. The family's load attaches the copies when the prepared
+  directory has them (`--decode-weights int`, the default) and the session fingerprint names their files. Open: the INT6
+  lm_head writes bf16 logits (skinny_int has no fp32 output), so two golden prompts now diverge at exact ties of those
+  logits; a GPTQ / AWQ-style quantizer for the GDN; a KL-based or longer gate measurement.
+- **Next:** the documentation pass; then the open items above (the low-rank draft head, the row prefetch between chunks,
+  the GDN copies with calibration, the fp32 output of skinny_int).
