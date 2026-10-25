@@ -265,10 +265,17 @@ ROW_BYTES = 160  # one n-gram row: 160 e4m3 values
 IMAGE_TOKEN_ID = 248056  # <|image_pad|>: image rows hash as this token
 
 
-def gather_threads(n: int) -> int:
-    """The thread count of a gather of n cold rows: a wakeup costs about 10 us, so a few rows want one or two threads
-    (warm rows come from the page cache or the row cache); a drive read wants many in flight (docs/history/
-    qwen4exp_plan.md section 9: 1 to 2 threads for small warm batches, 64 for cold ones)."""
+GATHER_THREADS = 128  # the most threads of one gather: the drive gives about 630k random 4 KB reads per second at 128 in flight
+
+
+def gather_threads(n: int, direct: bool = True) -> int:
+    """The thread count of a gather of n rows that the row cache does not hold. With O_DIRECT (direct) each row is a
+    drive read of about 0.2 ms, and its thread waits through it, so one thread per row, up to GATHER_THREADS, gives the
+    lowest latency. Measured on the real table on 2026-10-24: 16 rows take 0.5 ms on 16 threads and 2.1 ms on 2; 4096
+    rows take 6.5 ms on 128 threads, 10.4 ms on 64 and 36 ms on 32. Without O_DIRECT the page cache can serve a read in a
+    few us, and a wakeup (about 10 us) costs more than the read: a few rows then want one or two threads."""
+    if direct:
+        return max(1, min(n, GATHER_THREADS))
     if n <= 8:
         return 1
     if n <= 64:
@@ -285,7 +292,7 @@ class PleFeeder:
 
     table: the NgramTable of the checkpoint (its fd and offsets; its own reader is not used). cache_rows: the capacity
     of the row cache in rows (0: no cache; 2 GB = 12.5M rows). threads: the gather's thread count (None: by the miss
-    count, gather_threads). params: the hash parameters (default: the real config's first PLE layer).
+    count and the table's O_DIRECT flag, gather_threads). params: the hash parameters (default: the real config's first PLE layer).
     buffers: the pinned output buffers that rows_for cycles through.
 
     ids(tokens, prev2) -> int64 [T, 16]: tokens int [T], prev2 the two tokens before the first one ((eos, eos) at a
@@ -346,7 +353,7 @@ class PleFeeder:
             return
         offs = torch.from_numpy(self.table.offsets(ids))
         t = torch.from_numpy(out) if out.flags.c_contiguous else torch.empty(ids.size, ROW_BYTES, dtype=torch.uint8)
-        self._ops.ple_gather(self.table.fd, offs, t, self.table.direct, self.threads or gather_threads(ids.size))
+        self._ops.ple_gather(self.table.fd, offs, t, self.table.direct, self.threads or gather_threads(ids.size, self.table.direct))
         if t.data_ptr() != out.ctypes.data:
             out[:] = t.numpy()
         with self._lock:

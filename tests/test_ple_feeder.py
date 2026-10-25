@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from engine.weights.ple import NgramTable, PleFeeder, gather_threads, ngram_params, ngram_rows
+from engine.weights.ple import GATHER_THREADS, NgramTable, PleFeeder, gather_threads, ngram_params, ngram_rows
 from tests.qwen4exp_ckpt import ngram_shards, tiny_table_fp8, write_safetensors
 
 PREFIX = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
@@ -138,8 +138,10 @@ def test_eos_rule_and_image_ids(params, table_file):
 
 
 def test_gather_threads():
-    assert gather_threads(1) == 1 and gather_threads(64) == 2 and gather_threads(32768) == 64
-    assert all(gather_threads(n) <= gather_threads(n + 1) for n in range(0, 10000, 7))
+    assert gather_threads(1) == 1 and gather_threads(16) == 16 and gather_threads(32768) == GATHER_THREADS  # drive reads: one thread per row
+    assert gather_threads(1, False) == 1 and gather_threads(64, False) == 2 and gather_threads(32768, False) == 64  # the page cache
+    for direct in (True, False):
+        assert all(gather_threads(n, direct) <= gather_threads(n + 1, direct) for n in range(0, 10000, 7))
 
 
 def test_cache_binding_checks():

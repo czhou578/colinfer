@@ -198,7 +198,8 @@ class Scheduler:
         history of the slot (slot.tokens) does not hold y yet. feed_buffer (optional): a callable (B, T) -> the fixed
         device buffer that a plain decode graph passes to the model as its third argument. prefill_prev2: each prefill
         call also gets prev2, the last two tokens of the slot's history before the chunk (fewer at the start of a slot;
-        the n-gram rows of qwen4_exp depend on them). spec: the drafter's state, cycle, draft lengths and cost model
+        the n-gram rows of qwen4_exp depend on them), and next_ids, the tokens of the slot's next prefill call (the
+        feeder reads their rows while the GPU runs this call). spec: the drafter's state, cycle, draft lengths and cost model
         of the model's family (engine/model/family.py Speculation); None: the 27B's (QWEN35_SPEC)."""
         self.prefill_fn, self.prepare_fn, self.before_replay = prefill_fn, prepare_fn, before_replay
         self.prefill_prev2 = prefill_prev2
@@ -547,16 +548,20 @@ class Scheduler:
         for ph in ("prefill", "decode"):
             m.slots_busy.set(sum(s.phase == ph for s in self.slots), phase=ph)
 
+    def _chunk_len(self, s: Slot, start: int, left: int) -> int:
+        """The tokens of the prefill call at prompt position start, with `left` prompt tokens to go."""
+        n = min(self.chunk, left)
+        if left <= self.chunk * 5 // 4:  # finish the prompt in one chunk rather than leave a short tail (a full weight pass)
+            n = left
+        for p in s.splits:
+            if start < p < start + n:
+                return p - start
+        return n
+
     def _prefill_chunk(self, s: Slot):
         t0 = time.perf_counter()
         b, start = s.idx, len(s.tokens)
-        n = min(self.chunk, len(s.todo))
-        if len(s.todo) <= self.chunk * 5 // 4:  # finish the prompt in one chunk rather than leave a short tail (a full weight pass)
-            n = len(s.todo)
-        for p in s.splits:
-            if start < p < start + n:
-                n = p - start
-                break
+        n = self._chunk_len(s, start, len(s.todo))
         chunk, last = s.todo[:n], n == len(s.todo)
         view = self.state.view(b, b + 1)
         view.pos = start
@@ -565,7 +570,9 @@ class Scheduler:
         ids = torch.tensor([self._ids(chunk, images)], device=self.dev)
         pf = self.prefill_fn or prefill
         if self.prefill_prev2:  # the history before the chunk: its last two tokens
-            kw["prev2"] = s.tokens[-2:]
+            kw["prev2"] = self._ids(s.tokens[-2:], images)  # as the ids of the chunk, so the key of a prefetch matches
+            if not last:  # the next call's tokens: the feeder reads their n-gram rows while the GPU runs this chunk
+                kw["next_ids"] = self._ids(s.todo[n:n + self._chunk_len(s, start + n, len(s.todo) - n)], images)
         if self.mtp is not None:  # only the last chunk's logits are read (the first token)
             logits, H = pf(self.model, ids, view, return_hidden=True, logits=last, **kw)
         else:

@@ -482,22 +482,27 @@ def test_random_conversations_on_a_state_with_extra_tensors_stay_exact(make_ext,
 
 def test_each_prefill_chunk_gets_the_two_tokens_before_it(make_ext):
     """With prefill_prev2 (qwen4_exp), the scheduler passes prev2 = the last two tokens of the slot's history before each
-    chunk: none at a slot's start, then the end of the previous chunk, or of the restored checkpoint."""
+    chunk: none at a slot's start, then the end of the previous chunk, or of the restored checkpoint. Each call but the
+    last of a prompt also gets next_ids, the tokens of the next call (the feeder reads their n-gram rows early)."""
     calls = []
 
-    def prefill(model, ids, state, prev2=None, **kw):
-        calls.append((state.pos, list(prev2)))
+    def prefill(model, ids, state, prev2=None, next_ids=None, **kw):
+        calls.append((state.pos, list(prev2), next_ids))
         return ext_prefill(model, ids, state, **kw)
     sched, rng = make_ext(prefill_chunk=64, ckpt_interval=10**6), random.Random(21)
     sched.prefill_fn, sched.prefill_prev2 = prefill, True
     p1 = prompt(rng, 140)  # chunks of 64 and 76 tokens (the scheduler finishes a prompt of 5 / 4 chunks or less in one)
     r1 = sched.run([S.Request(p1, max_new_tokens=5)])[0]
-    assert calls == [(0, []), (64, p1[62:64])] and r1.output == ext_reference(p1, 5)
+    assert calls == [(0, [], p1[64:140]), (64, p1[62:64], None)] and r1.output == ext_reference(p1, 5)
     calls.clear()
     p2 = p1 + r1.output + prompt(rng, 10)
     r2 = sched.run([S.Request(p2, max_new_tokens=5)])[0]
     n = len(p1) + len(r1.output) - 1
-    assert r2.reused == n and calls == [(n, p2[n - 2:n])] and r2.output == ext_reference(p2, 5)
+    assert r2.reused == n and calls == [(n, p2[n - 2:n], None)] and r2.output == ext_reference(p2, 5)
+    calls.clear()
+    p3 = prompt(rng, 200)  # three calls: 64, 64, then 72 (5 / 4 of a chunk or less)
+    sched.run([S.Request(p3, max_new_tokens=2)])
+    assert [c[2] for c in calls] == [p3[64:128], p3[128:200], None]
 
 
 # ------------------------------------------------------------------------------------------------ the qwen4_exp state
