@@ -102,7 +102,7 @@ destination, status and time. It shows no header and no body.
 
 > **NOTE:** The server can also run Qwen3.8-Flash-Next (`--model nvidia/Qwen3.8-Flash-Next-NVFP4`, `docs/server.md`).
 > The gateway sends each model name that contains `qwen` to the server, whatever model the server runs. Thus Claude
-> Code uses Flash-Next the same way. That model reads text only: a screenshot becomes a short text note.
+> Code uses Flash-Next the same way. That model reads images too, so a screenshot reaches it as an image.
 
 ## 3. Connect Claude Code (one time only)
 

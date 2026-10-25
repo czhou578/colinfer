@@ -420,10 +420,16 @@ not row-invariant. A move to the skinny GEMM gave nothing: `bf16_gemv` matches i
 
 **The measured step.** At 1k context, a decode step takes 46.0 to 46.6 ms (21.4 to 21.8 tok/s) on the exact path, and a
 verify of 8 rows takes 63 to 64 ms. The profile of the step: the BF16 skinny GEMMs 61% (36.5 ms), the experts 18%, the
-hyper-connections 11% and their GEMV 7%, GDN 2%, attention and the indexer under 1%. Through the server, plain decode
-runs at 19 to 20 tok/s: the host's row read before each step (with about 23% cache misses) costs the difference. With
-the decode copies (section 10.7), the step takes 39.4 ms and the verify of 8 rows 56.1 ms. The kernels fix hidden
-2560, 4 streams, the low-rank width 320 and 512 blocks, and the slot length must be a multiple of 16.
+hyper-connections 11% and their GEMV 7%, GDN 2%, attention and the indexer under 1%. With the decode copies (section
+10.7), the step takes 39.4 ms and the verify of 8 rows 56.1 ms. The kernels fix hidden 2560, 4 streams, the low-rank
+width 320 and 512 blocks, and the slot length must be a multiple of 16.
+
+**The host's row read.** The host reads the n-gram rows of a step after the step before it ends, so the GPU waits for
+the read. New text brings new n-grams, so most rows of a step miss the row cache. A miss is an O_DIRECT read of about
+0.2 ms from the drive. The gather first ran 15 misses on 2 threads: 5.4 ms per plain step and 10.4 ms per cycle, and
+plain decode ran at 19.6 tok/s against the 25.4 tok/s of the graph. The gather now runs one thread per miss, up to 128
+(`gather_threads` in `engine/weights/ple.py`): 16 cold rows take 0.5 ms, and a cold chunk of 4096 rows takes 6.5 ms
+instead of 36 ms. Plain decode then runs at the speed of the graph: 25.0 to 25.2 tok/s through the scheduler.
 
 ### 10.4 Prefill
 
@@ -445,8 +451,10 @@ attends each group of 4 rows over the union of their selected blocks. On real te
 and a layer takes 12.8 / 15.0 ms at prefixes 8k / 64k. Attention with the selection as a mask takes 21 / 108 ms, so
 the union is the default path.
 
-**The feeder** reads the rows of a chunk from the tokens and the slot's two tokens before it (`prev2`). Its worker can
-read the next chunk's rows while the GPU runs the current one, but the scheduler does not use that yet.
+**The feeder** reads the rows of a chunk from the tokens and the slot's two tokens before it (`prev2`). Its worker reads
+the next chunk's rows while the GPU runs the current one: within a prefill call, and between the scheduler's calls,
+which give each call the tokens of the next one (`next_ids`). A 6,375-token prompt in two chunks prefills at 2,657
+tok/s, against 1,624 tok/s before the prefetch and the gather threads.
 
 **The chunk** is 4096 tokens. On the real checkpoint it is 6 to 13% faster than 2048: 2760 to 2810 tok/s at prefixes of
 0 to 8k, and about 2500 tok/s at 16k to 60k with cold rows. On random weights (`bench/prefill_chunk_bench.py`), 8192
@@ -467,7 +475,8 @@ paths give the same tokens on the golden prompts and on a 3000-token prompt, and
 - The projected embedding enters every stream as a plain add. One norm runs over the whole 10240-wide hidden, then the
   shared `fc_hidden` runs on each stream.
 - The decoder layer is a QSA + MoE layer with its own KV and indexer, and a per-stream norm in the final mixer. The
-  target's lm_head is the draft head, over the 64k draft vocabulary (a BF16 copy of those rows).
+  target's lm_head is the draft head, over the 64k draft vocabulary: a BF16 copy of those rows (0.36 GB per draft
+  step), or the low-rank head of the prepared directory (below).
 - The drafter selects its sparse blocks on every row with the target's kernels. vLLM reuses the selection of step 0;
   both are exact under the accept rule.
 
@@ -477,21 +486,34 @@ The FP8 block experts of the MTP block become NVFP4 copies on `KernelMoE` (1.41 
 A cycle verifies [y, d1..dk] in one graph, accepts with `engine/spec/accept.py`, commits, and then drafts: one catch-up
 row per verified position, and k - 1 chained steps. The host fills the n-gram rows of the k + 1 rows before each
 replay. The scheduler picks k from 1, 2 or 3 per cycle by the acceptance of the request, and a request starts at
-k = 2. Its cost model (`qwen4exp_cycle_cost` in `engine/model/family.py`) is a least-squares fit at 1k context:
-cycle_ms = 41.4 + 0.577 × distinct experts + 2.92 × k, with about 10 + 5.5 k distinct experts per layer in a verify. It
-adds about 110 µs per attention layer at 262,144 tokens for the block selection. k = 4 adds nothing. Suffix-match
-drafts verify up to 15 copied tokens, as for the 27B.
+k = 2. Its cost model (`qwen4exp_cycle_cost` in `engine/model/family.py`) is a least-squares fit at 1k context of the
+served configuration (the decode copies and the low-rank head): cycle_ms = 24.2 + 0.64 × distinct experts + 1.06 × k,
+with about 11.2 + 5.45 k distinct experts per layer in a verify. (The exact path with the full head gave 41.4 + 0.577 ×
+distinct + 2.92 × k.) The model adds about 110 µs per attention layer launch at 262,144 tokens for the block selection;
+at 262,000 tokens the cycles took 1.2 to 2.2 ms more than at 1k, against the model's 1.4 to 1.65 ms. k = 4 adds
+nothing. Suffix-match drafts verify up to 15 copied tokens, as for the 27B.
 
-Measured in the served engine (`tests/scheduler_check_qwen4exp.py`), against plain decode in the same process:
+**The low-rank draft head** is the 27B's design on a BF16 lm_head. `tools/lowrank_draft_head.py --model` collects
+12,369 drafter outputs from real cycles and keeps their top 512 principal directions U. The head then scores (g U)(W
+U)^T on two NVFP4 GEMMs (about 21 MB) and rescores its top 256 candidates exactly against the BF16 rows of lm_head
+(`ops().rescore_bf16`, `csrc/sampling.cu`, one warp per candidate). The full head's draft is among those candidates for
+99.8% of the outputs at rank 512 and for all of them at rank 1024. The drafter then holds no BF16 copy of the head rows.
+
+**The draft early exit** skips the GEMMs of the chained steps when the product of the draft probabilities falls below
+`DRAFT_STOP` (0.1, the 27B's value). With k of 3 at most, it fires in 0 to 7% of the cycles, and a threshold of 0.03
+gives the same tok/s: the threshold stays.
+
+Measured in the served engine (`tests/scheduler_check_qwen4exp.py`, 2026-10-24, with the decode copies and the
+low-rank head), against plain decode in the same process:
 
 | Text | Plain decode | Speculation | Speed-up | Tokens per cycle |
 |---|---|---|---|---|
-| Code | 21.3 tok/s | 39.1 tok/s | 1.84x | 3.23 |
-| Prose | 20.3 tok/s | 27.2 tok/s | 1.34x | 1.89 (acceptance 0.40) |
+| Code | 33.9 tok/s | 68.6 tok/s | 2.02x | 3.19 |
+| Prose | 33.9 tok/s | 47.2 tok/s | 1.39x | 2.07 |
 
-The chat completions of the server run at 28 to 39 tok/s. On the GPU alone (`tests/golden_qwen4exp_spec.py`), k = 2
-gives 1.80x on the golden prompts and 1.63x on WikiText against the 46.6 ms plain step. These numbers come from the
-exact path, before the decode copies. The host's row read before each cycle keeps the wall rate below the GPU rate.
+On the exact path with the full head, before the gather fix (section 10.3), the same checks gave 39.1 against 21.3
+tok/s on code and 27.2 against 20.3 tok/s on prose. On the GPU alone (`tests/golden_qwen4exp_spec.py --prepared`),
+k = 3 gives 60.1 tok/s on the golden prompts (1.74x the 29.0 ms plain step) and 57.7 tok/s on WikiText (1.68x).
 
 ### 10.6 The serving state
 
@@ -531,18 +553,32 @@ decided each format: 0.5% against the exact decode path's 2.3274, on the 8 golde
 | lm_head | INT6 0.9998; NVFP4 1.0089 | INT6 |
 | hyper-connection W_up | INT8 per row 1.0012 (a new mode of `hc_mix`: 19.8 µs instead of 33.4 µs) | INT8 |
 | hyper-connection down / inject | INT6 1.0032, but not with the others | BF16 |
-| GDN out_proj | INT6 0.9992, but not with the others | BF16 |
-| GDN in_proj | INT6 1.0103; INT5 for both GDN classes 1.0112 | BF16 |
-| shared experts | INT6 1.0111 | BF16 |
+| GDN out_proj | INT6 0.9992, but not with the others | INT6 by GPTQ |
+| GDN in_proj | INT6 1.0103; INT5 for both GDN classes 1.0112 | INT6 by GPTQ |
+| shared experts | INT6 1.0111 | INT6 by GPTQ |
 
-All classes together give 1.0218 and fail. The three that pass together give 1.0014 (1.0043 on 8 held-out windows).
-The cause of the failures: a small change before the top-10-of-512 routing changes which experts run, and the gate's
-own noise is about 0.25%. With the copies, the decode step falls from 46.6 to 39.4 ms (21.4 to 25.4 tok/s, +18%), and
-the bytes per token from 9.95 to 8.15 GB. The copies take 1.35 GB on the GPU. The plan's 4.7 GB per token needs
-copies of the GDN projections and the shared experts (2.5 GB per token), which need a calibrated quantizer.
+With round to nearest, all classes together give 1.0218 and fail, and the three that pass together give 1.0014 (1.0043
+on 8 held-out windows). The cause of the failures: a small change before the top-10-of-512 routing changes which experts
+run, and the gate's own noise is about 0.25%. With those three copies, the decode step falls from 46.6 to 39.4 ms
+(21.4 to 25.4 tok/s, +18%), and the bytes per token from 9.95 to 8.15 GB. With all six classes, the step takes
+29.1 ms at 1k context (34.3 tok/s on the GPU) and the verify of 8 rows 51.0 ms; the bytes per token fall to about 5.5
+GB (computed from the formats; the plan's estimate was 4.7 GB).
 
-A known limit: the INT6 lm_head writes bf16 logits (`skinny_int` has no fp32 output). Thus two golden prompts diverge
-at exact ties of those logits.
+`tools/gptq_qwen4exp.py` makes calibrated copies of the GDN projections and the shared experts' gate | up. It prefills
+48 windows of 2048 tokens of text that the gate does not use (WikiText train, Python functions, TinyStories), and
+collects the second moment H = X^T X of each input: a torch function mode sees the prefill's matmuls with those weights.
+GPTQ then quantizes each matrix one column at a time and moves the error of each column onto the columns not yet
+quantized, weighted by the inverse of H. The layout is the engine's INT6, so the decode path reads the files unchanged.
+In act order (the columns by descending H diagonal, with static group scales), the output error on the calibration
+inputs falls 2 to 6 times against round to nearest. All six classes together give 1.0029 on the gate windows, 1.0016
+on the held-out windows and 1.0023 on all 16 (the three round-to-nearest classes alone: 1.0027). In column order the
+same set gave 1.0058 and failed. The gate of `tests/golden_qwen4exp.py --decode-copies`, token by token, gives the
+same 1.0029 (2.3341 against 2.3274), and 1.0003 against the reference. The six classes take 3.2 GB on the GPU, beside
+the BF16 weights that the prefill reads.
+
+The INT6 lm_head writes fp32 logits: `skinny_int` has an fp32 output, as the NVFP4 and BF16 formats have. With bf16
+logits, two golden prompts diverged at exact ties of those logits. With fp32 logits, both give the reference's 32
+tokens again, and only the known near-tie of the first prompt remains (a reference margin of 0.125).
 
 ### 10.8 Memory
 
@@ -552,19 +588,20 @@ Bytes in GB (1e9), at the defaults: 2 slots of 262,144 tokens, 16 checkpoints, t
 | Item | GB |
 |---|---|
 | Weights: routed experts NVFP4 with scales, and the BF16 rest | 77.8 (78.5 on the GPU after the load) |
-| Decode copies | 1.35 |
-| Drafter: weights and draft head | 1.95 (about 2.8 with its state and its cycle graphs) |
+| Decode copies, six classes | 3.2 |
+| Drafter: weights and the low-rank draft head | 1.69 (1.95 with the full head; about 2.8 with its state and its cycle graphs) |
 | Slot state, 2 slots: fp8 KV, indexer and block keys, GDN and PLE state | 8.7 (and 0.71 for the drafter's rows) |
 | Checkpoint ring, 16 snapshots | 1.85 |
 | n-gram row cache (host memory) | 1.1 |
-| `QWEN4EXP_FIXED_BYTES`: everything except the slot state and the row cache | 91.4 |
+| `QWEN4EXP_FIXED_BYTES`: everything except the slot state and the row cache | 93.2 |
 
 The fixed bytes are the measured 87e9 (the fall of `MemAvailable` of a server without the drafter, less its state and
-row cache), the drafter's 3e9 and the copies' 1.4e9. With the drafter, before the copies, the server was ready with
-91.3 GB allocated, and `MemAvailable` fell by about 100 GB. The memory check (`engine/runtime/build.py`) thus asks for
-about 108 GB with the 6 GB growth reserve. The first long prompts add about 5.6 GB, inside the reserve. The torch
-allocator cap is per family: 101 GB here, 95 GB for the 27B, because the drafter left only 0.9 GB under the old cap.
-In the plan's budget, three slots do not fit with the drafter.
+row cache), the drafter's 3e9 and the copies' 3.2e9. With the drafter and the six classes of copies, `MemAvailable`
+falls by 101.9 GB at the end of the build (91.4 GB of it besides the state and the row cache), and the server is ready
+with 94.3 GB allocated and 97.1 GB reserved. The memory check (`engine/runtime/build.py`) thus asks for about 110 GB
+with the 6 GB growth reserve. The first long prompts and an image add about 4.4 GB, inside the reserve. The torch
+allocator cap is per family: 104 GB here, 95 GB for the 27B. In the plan's budget, three slots do not fit with the
+drafter.
 
 ### 10.9 Exactness
 
@@ -581,8 +618,14 @@ The evidence, in order:
    and in the served engine (256 of 256 tokens on code and prose, `tests/scheduler_check_qwen4exp.py`).
 5. The perplexity gate (`tests/perplexity.py --engine qwen4exp`, 8 windows of 2048 WikiText tokens): the reference
    gives 2.3335, the decode path 2.3274 (ratio 0.9974), the prefill 2.3438 (ratio 1.0044). One 16k window gives 2.2186.
-   The decode copies give 1.0014 against the exact decode path.
-6. Passkey retrieval (`tests/passkey_qwen4exp.py`): 9 of 9 at 16k, 32k and 64k.
+   The six classes of decode copies give 1.0029 against the exact decode path (1.0016 on 8 held-out windows).
+6. Passkey retrieval (`tests/passkey_qwen4exp.py`): 9 of 9 at 16k, 32k and 64k. With YaRN x2 (one slot of 524,288
+   tokens): 9 of 9 at 16k, 288k and 461k (prefill 2,400 tok/s at 461k).
+7. Images: the reference with an image is bit-identical to transformers on the tiny model. On the real checkpoint, the
+   served engine gives the reference's 32 greedy tokens for a page of text in an image (768 image tokens,
+   `tools/qwen4exp_reference.py --image`, `tests/data/qwen4exp_golden_image.json`), with speculation as without.
+8. YaRN: the reference with YaRN equals transformers' `yarn` rope type on the tiny model, at 70 tokens over 32 native
+   positions (`tests/test_qwen4exp_small.py`). Without the fold into the indexer's norms, the logits differ by 0.24.
 
 The kernel tests compare against the reference with a tolerance: exactness is required between the paths of the
 engine, not against the rounding of transformers. The top-k orders by score descending, then index ascending, with
@@ -597,15 +640,24 @@ engine, not against the rounding of transformers. The top-k orders by score desc
   fallback.
 - **The n-gram table stays on disk.** 51 GB does not fit beside the experts. The bounded row cache of the feeder holds
   the hot rows.
-- **No images and no YaRN.** The loader skips the vision tower, and an image in a request becomes a text note. The
-  state refuses a slot past the 262,144 native positions.
+- **Images as for the 27B.** The vision tower of the checkpoint has the 27B's architecture with a 2560-wide output, so
+  `engine/model/vision.py` runs it unchanged. The image rows hash as the image pad token in the n-gram rows, as
+  transformers passes `ple_input_ids`. The prefill records the (t, h, w) position of each row before it makes the block
+  keys, and the decode rows rotate by their position plus the slot's `rope_delta`.
+- **YaRN in four norms per layer.** Past the 262,144 native positions, `apply_yarn4` (`engine/model/qwen4exp.py`)
+  scales the rope frequencies by the ratio, as for the 27B. It folds YaRN's attention factor into the rotated dims of
+  four norms per attention layer: the attention's q / k norms and the indexer's. transformers gives the indexer the
+  attention's scaled cos and sin, and the block keys take the factor through `k_layernorm`, before their rotation. The
+  drafter folds its own norms. The load refuses a slot of more than 4 times the native context, the model card's
+  1,000,000 tokens.
 
 ### 10.11 What remains
 
-- the low-rank draft head of the 27B, and the tuning of the draft early exit
-- a prefetch of the n-gram rows between the scheduler's prefill chunks, and before each cycle (the wall rate stays
-  below the GPU rate)
-- decode copies of the GDN projections and the shared experts, with a calibrated (GPTQ- or AWQ-style) quantizer
-- an fp32 output of `skinny_int`, for the INT6 lm_head
-- `qsa_topk` at long context, the cost model past 1k context, and the acceptance on prose
-- images, through the new vision class, and YaRN past 262,144 tokens
+- a decode copy of the hyper-connections' down | inject product (0.64 GB per token). Its round-to-nearest INT6 copy
+  passes the gate alone, but not with the other copies. A GPTQ copy needs the second moments of its 10240-wide inputs:
+  0.42 GB each, for 97 groups.
+- a fine-tuned drafter, for the acceptance on prose (about 0.44 of the drafts, against 0.73 on code).
+  `tools/train_drafter.py` trains the 27B's dense MTP head, not this MoE drafter.
+- a faster `qsa_topk` at long context: one block per row. The block selection adds 1.2 to 2.2 ms to a cycle at
+  262,000 tokens.
+- video input, as for the 27B.

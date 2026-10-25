@@ -52,9 +52,9 @@ For the total, use `du -sh ~/.cache/huggingface/hub` (102 GB with the three Qwen
 - To download again or update, run `uv run hf download <repo>`. To delete, run `uv run hf cache delete` (interactive).
   Removing only the `models--*` directory leaves its large files in `blobs/`. A blob can belong to several models
   (the NVFP4 and BF16 checkpoints share their tokenizer), so delete only the blobs that no other snapshot links to.
-- Each checkpoint contains a vision tower. The engine serves images with the vision tower of
-  `nvidia/Qwen3.8-27B-NVFP4` (0.92 GB BF16, loaded on the first image; `engine/model/vision.py`). The loader of
-  `nvidia/Qwen3.8-Flash-Next-NVFP4` skips its vision tower: images for that model are a later milestone.
+- Each checkpoint contains a vision tower (about 0.9 GB BF16). The engine serves images with the vision tower of the
+  checkpoint that it runs, loaded on the first image (`engine/model/vision.py`). The tower of
+  `nvidia/Qwen3.8-Flash-Next-NVFP4` has the 27B's architecture with a 2560-wide output.
 - The n-gram table of `nvidia/Qwen3.8-Flash-Next-NVFP4` (51.2 GB, in `model-fp8-mtp-ple.safetensors`) stays on disk.
   The loader does not load the table: it attaches a row reader to the file (`NgramTable`, `engine/weights/ple.py`).
   The engine reads the rows through a host row cache of `--ngram-cache-gb` (`PleFeeder`, default 1 GB).

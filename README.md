@@ -42,8 +42,8 @@ perplexity gate of ≤ 0.5% against the checkpoint (WikiText and Python code).
   error. The server does not start with less.
 - Up to 64 GB of disk for the conversation cache (`--session-cache-gb`, under `~/.cache/colinfer/sessions`).
 - Optional, for the second model: the checkpoint `nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB). Its server takes
-  about 100 GB of unified memory at startup with the drafter. The memory check asks for about 108 GB of `MemAvailable`
-  (the 6 GB growth reserve included), and the server does not start with less.
+  about 102 GB of unified memory at startup with the drafter and the decode copies. The memory check asks for about
+  110 GB of `MemAvailable` (the 6 GB growth reserve included), and the server does not start with less.
 
 ## Quick start
 
@@ -78,7 +78,7 @@ offline, with the server stopped. It gathers the files below into `~/.cache/coli
 ```bash
 uv run hf download Qwen/Qwen3.8-27B                      # the BF16 checkpoint (55.6 GB), for the INT copies; or pass --skip-int
 uv run python tools/prepare.py                           # a few minutes on the GPU
-uv run python tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4   # Qwen3.8-Flash-Next: about 30 s on the GPU
+uv run python tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4   # Flash-Next: about 11 min, two model loads
 ```
 
 | File | Made by | Effect |
@@ -86,7 +86,9 @@ uv run python tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4   # Qwen3
 | INT6 / INT5 decode copies of the FP8 attention and GDN projections | `tools/int6_requant.py`, run by `prepare.py` | ~9.5% faster decode, perplexity within 0.25% |
 | a fine-tuned MTP drafter, when one exists | `tools/drafter_data.py`, then `tools/train_drafter.py --extract` / `--train`; `prepare.py` takes the file | more accepted drafts per cycle |
 | a low-rank draft head | `tools/lowrank_draft_head.py`, run by `prepare.py` on that drafter | the same drafts for ~1/5 of the draft head's bytes (k=7 cycle 89.8 → 86.0 ms) |
-| Qwen3.8-Flash-Next: INT6 copies of the attention projections and of lm_head, an INT8 per-row copy of the hyper-connections' W_up | `tools/requant_qwen4exp.py`, run by `prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4` (it reads the checkpoint's BF16 matrices) | decode step 46.6 → 39.4 ms (+18%), perplexity ratio 1.0014 against the exact decode path, +1.35 GB on the GPU |
+| Qwen3.8-Flash-Next: INT6 copies of the attention projections and of lm_head, an INT8 per-row copy of the hyper-connections' W_up | `tools/requant_qwen4exp.py`, run by `prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4` (it reads the checkpoint's BF16 matrices) | with the row below: decode step 46.6 → 29.1 ms (+60%), perplexity ratio 1.0029 against the exact decode path, +3.2 GB on the GPU |
+| Qwen3.8-Flash-Next: INT6 copies of the GDN projections and of the shared experts, calibrated with GPTQ | `tools/gptq_qwen4exp.py`, run by `prepare.py` (it loads the model) | the copies that round to nearest break the gate; these pass it |
+| Qwen3.8-Flash-Next: a low-rank draft head | `tools/lowrank_draft_head.py --model`, run by `prepare.py` (it loads the model and the drafter) | the full head's draft for 99.8% of the drafter outputs for ~1/17 of the head's bytes |
 
 The first start quantizes the drafter and keeps the result in `~/.cache/colinfer/drafter/quant-<key>.safetensors`
 (~3 s off every later start).
@@ -132,7 +134,8 @@ decision. In short, for the 27B (the last bullet gives what differs for Qwen3.8-
   (`csrc/moe_prefill.cu`). Each attention row attends to its 512 selected blocks of 4 tokens and its own tail
   (`csrc/qsa.cu`). A 4-stream residual (hyper-connections, `csrc/hc.cu`) replaces the norms. The 51 GB n-gram table
   stays on the disk, and the host reads its rows through a row cache. Decode runs the exact BF16 path of the
-  checkpoint. When the prepared directory has them, requantized copies replace three classes of BF16 matrices.
+  checkpoint. When the prepared directory has them, requantized copies replace six classes of BF16 matrices (three of
+  them calibrated with GPTQ), and a low-rank head scores the drafts.
 
 ## Qwen3.8-Flash-Next
 
@@ -146,53 +149,48 @@ uv run python -m engine.server --model nvidia/Qwen3.8-Flash-Next-NVFP4
 ```
 
 The family has its own defaults: 2 slots of 262,144 tokens (the native context), 16 checkpoints, 4,096-token prefill
-chunks, a 1 GB host row cache for the n-gram table (`--ngram-cache-gb`) and a `--mem-cap-gb` of 101. Speculation is on:
+chunks, a 1 GB host row cache for the n-gram table (`--ngram-cache-gb`) and a `--mem-cap-gb` of 104. Speculation is on:
 the checkpoint's MTP block drafts 1 to 3 tokens per cycle, by the acceptance of each request, and suffix-match drafts
-work as for the 27B. The model reads text only: an image in a request becomes a short text note. The chat template is
-the 27B's, so `reasoning_effort` and the tool calls work the same way. `docs/server.md`, section
-"Qwen3.8-Flash-Next", gives the flags and the behavior.
+work as for the 27B. Images run through the checkpoint's vision tower, as for the 27B. A `--max-seq-len` past 262,144
+tokens turns on YaRN, up to 4 times the native context. The chat template is the 27B's, so `reasoning_effort` and the
+tool calls work the same way. `docs/server.md`, section "Qwen3.8-Flash-Next", gives the flags and the behavior. Run
+`tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4` once first (see above): the figures below need its files.
 
-Measured on 2026-10-24 on this machine, at the defaults. The public vLLM build of this checkpoint decodes 16.9 tok/s
-on the same machine.
+Measured on 2026-10-24 on this machine, at the defaults, with the prepared directory. The public vLLM build of this
+checkpoint decodes 16.9 tok/s on the same machine.
 
 | | colinfer |
 |---|---|
-| Plain decode, no speculation, through the server | **19 to 20 tok/s** (the graph step alone: 46.6 ms; the rest is the host's read of the n-gram rows) |
-| Plain decode with the decode copies, graph step | **39.4 ms** (25.4 tok/s, +18%) |
-| Decode with speculation, short context | code **39.1 tok/s** (1.84x, 3.23 tokens per cycle), prose **27.2 tok/s** (1.34x); chat completions on the server 28 to 39 tok/s |
-| Prefill, 4,096-token chunks | **2760 to 2810 tok/s** at prefixes of 0 to 8k; about 2500 tok/s at 16k to 60k |
-| Time to first token: short prompt / next turn (prefix reuse) / restore from disk | 0.1 to 0.3 s / **0.13 s** (1.75 s from scratch for 4,676 tokens) / **0.15 s** (7,398 tokens) |
-| Passkey retrieval | 9 of 9 at 16k, 32k and 64k |
-| Startup / memory at the ready line | 45 s / 91.3 GB allocated; `MemAvailable` falls by about 100 GB |
-
-The speculation and server figures come from the exact path, before the decode copies existed. The prefill reads the
-BF16 weights with or without the copies. The speed of the server with the copies is not measured yet.
+| Plain decode, no speculation, through the scheduler | **33.9 to 34.1 tok/s** (the graph step: 29.1 ms; 46.6 ms on the exact BF16 path) |
+| Decode with speculation, short context | code **68.6 tok/s** (2.02x, 3.19 tokens per cycle), prose **47.2 tok/s** (1.39x) |
+| Prefill, 4,096-token chunks | **2,760 to 2,810 tok/s** at prefixes of 0 to 8k; about 2,400 tok/s at 461k with YaRN |
+| Time to first token: short prompt / next turn (prefix reuse) / restore from disk | 0.1 to 0.3 s / **0.11 s** (1.78 s from scratch for 4,676 tokens) / **0.15 s** (7,398 tokens) |
+| Passkey retrieval | 9 of 9 at 16k, 32k and 64k; with YaRN x2, 9 of 9 at 16k, 288k and 461k |
+| An image (a page of four lines of text, 768 image tokens) | the reference's 32 tokens; TTFT 1.06 s |
+| Startup / memory at the ready line | 46 s / 94.3 GB allocated, 97.1 GB reserved; `MemAvailable` falls by about 102 GB |
 
 How the engine proves the output exact:
 
 - The plain-PyTorch reference (`engine/model/qwen4exp.py`) is bit-identical to the `Qwen4ExpForCausalLM` of
   transformers in fp32 on a tiny model (`tests/test_qwen4exp_small.py`): one-shot, split, stepwise, with a cache, with
-  eos, with an image.
+  eos, with an image, and with YaRN.
 - The kernel path gives the reference's 32 greedy tokens on the three golden prompts (`tests/golden_qwen4exp.py`,
-  `tests/data/qwen4exp_golden.json`), also with the prompts through the prefill. A divergence passes only at a near-tie
-  of the reference (a bf16 margin below 0.2). With the decode copies, two golden prompts diverge at exact ties of the
-  bf16 logits of the INT6 lm_head.
+  `tests/data/qwen4exp_golden.json`), also with the prompts through the prefill, and on an image prompt
+  (`tests/data/qwen4exp_golden_image.json`). A divergence passes only at a near-tie of the reference (a bf16 margin
+  below 0.2).
 - Speculation gives the tokens of plain decode on every check, greedy and sampled (`tests/golden_qwen4exp_spec.py`;
   `tests/scheduler_check_qwen4exp.py`: 256 of 256 tokens on code and prose).
 - Every decode kernel is row-invariant: a verify of 8 rows equals 8 single steps, bit for bit.
 - The perplexity gate (0.5%, 8 WikiText windows of 2,048 tokens): the prefill gives 2.3438 against the reference's
-  2.3335 (ratio 1.0044), and the decode path gives 2.3274 (ratio 0.9974). The decode copies give a ratio of 1.0014
-  against the exact decode path. The last-token logits of prefill and decode differ by 10 to 15%, because the MoE
-  prefill quantizes its activations to NVFP4, but both paths give the same tokens.
+  2.3335 (ratio 1.0044), and the decode path gives 2.3274 (ratio 0.9974). The decode copies give a ratio of 1.0029
+  against the exact decode path (1.0016 on 8 held-out windows). The last-token logits of prefill and decode differ by
+  10 to 15%, because the MoE prefill quantizes its activations to NVFP4, but both paths give the same tokens.
 
 What the engine does not have for this family:
 
-- images (the loader skips the vision tower; the 27B serves images as before)
-- YaRN past 262,144 tokens
-- the low-rank draft head of the 27B
-- decode copies of the GDN projections and of the shared experts: their round-to-nearest copies break the perplexity
-  gate, so they stay BF16 until a calibrated quantizer exists
-- a prefetch of the n-gram rows between the prefill chunks
+- video input (as for the 27B)
+- a decode copy of the hyper-connections' down | inject product
+- a fine-tuned drafter: the acceptance on prose is about 0.44 of the drafts
 
 `docs/history/qwen4exp_plan.md` holds the design, the memory budget, the milestones and the dated status log.
 
@@ -233,14 +231,16 @@ The files of Qwen3.8-Flash-Next:
 | `csrc/ple_io.cpp` | the host row reader of the n-gram table (a thread pool of preads, `ops().ple_gather`) and the row cache of `PleFeeder` |
 | `csrc/moe_bind.cpp`, `qsa_bind.cpp`, `hc_bind.cpp` | the Torch bindings of the new kernels; `bindings.cpp` calls `bind_moe`, `bind_qsa` and `bind_hc` |
 | `tools/requant_qwen4exp.py` | the requantized decode copies, run by `prepare.py` (the formats and their perplexity ratios are in its docstring) |
+| `tools/gptq_qwen4exp.py` | the GPTQ copies of the GDN projections and the shared experts: the calibration on the prefill, then GPTQ in the engine's INT6 layout |
+| `tools/lowrank_draft_head.py` | with `--model` of this family: the basis of the low-rank draft head, from real drafter outputs |
 | `tools/qwen4exp_reference.py` | greedy text from the reference on the real checkpoint (77.8 GB on the GPU: stop the server first) |
 | `tools/verify_qwen4exp.py` | checks the checkpoint's headers, n-gram buffers, rows and scales without the GPU |
 | `tools/ple_hotset.py` | the hot set of the n-gram table on real text, and the hit rate of a row cache |
 | `bench/moe_bench.py`, `bench/prefill_chunk_bench.py` | the MoE decode stream rate, the full MoE layer and the MoE prefill per chunk; the prefill chunk by block on random weights |
 | `tests/test_qwen4exp_small.py`, `test_qwen4exp_loader.py`, `test_ple.py`, `test_ple_io.py`, `test_ple_feeder.py`, `test_family.py` | the reference against transformers on a tiny model; the loader, the row readers and the feeder on synthetic checkpoints (`tests/qwen4exp_ckpt.py`); the family dispatch |
 | `tests/test_moe.py`, `test_moe_prefill.py`, `test_qsa.py`, `test_qsa_prefill.py`, `test_hc.py` | the new kernels against their references; the bit identity of each row of the decode kernels for any row count |
-| `tests/test_fast_qwen4exp.py`, `test_prefill_qwen4exp.py`, `test_mtp4.py`, `test_requant_qwen4exp.py` | the decode path, the prefill, the drafter and the decode copies on small random models |
-| `tests/golden_qwen4exp.py`, `golden_qwen4exp_spec.py`, `scheduler_check_qwen4exp.py`, `passkey_qwen4exp.py` | the end-to-end checks on the real checkpoint: the golden tokens (`tests/data/qwen4exp_golden.json`), speculation against plain decode, the scheduler as the server builds it, long-context retrieval |
+| `tests/test_fast_qwen4exp.py`, `test_prefill_qwen4exp.py`, `test_mtp4.py`, `test_requant_qwen4exp.py`, `test_gptq_qwen4exp.py`, `test_draft_head.py` | the decode path, the prefill, the drafter (with YaRN and the low-rank head) and the decode copies on small random models; GPTQ; the rescoring kernels |
+| `tests/golden_qwen4exp.py`, `golden_qwen4exp_spec.py`, `scheduler_check_qwen4exp.py`, `passkey_qwen4exp.py` | the end-to-end checks on the real checkpoint: the golden tokens (`tests/data/qwen4exp_golden.json`, `qwen4exp_golden_image.json`), speculation against plain decode and the cost model, the scheduler as the server builds it (with an image), long-context retrieval (with YaRN) |
 
 ## Testing
 

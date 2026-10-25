@@ -336,5 +336,55 @@ kernel build. The 27B's tests must keep passing in every worktree.
   a 7398-token disk restore in 0.148 s with identical output and the same accepted drafts. Memory: MemAvailable falls
   104.3 GB at the end of the build (the check's reference scheduler included; the fixed bytes 91.4e9, the state 9.4, the
   row cache 1.1) and 109.3 GB after all checks: the machine has about 14 GB of margin at the memory check's 108 GB.
-- **Next:** the documentation pass; then the open items above (the low-rank draft head, the row prefetch between chunks,
-  the GDN copies with calibration, the fp32 output of skinny_int).
+- **2026-10-24, the open items.** The documentation pass is merged (d88491b). Then, item by item, on the real
+  checkpoint:
+  - *The host's row read* (wall tok/s below GPU tok/s). A profile of the scheduler showed the cause: new text brings
+    new n-grams, so most rows of a step miss the row cache, and the gather ran the 15 misses of a step on 2 threads
+    (5.4 ms per plain step, 10.4 ms per cycle). A cold drive read takes about 0.2 ms; one thread per miss, up to 128
+    (`gather_threads`), reads 16 rows in 0.5 ms and 4096 rows in 6.5 ms instead of 36 ms. Plain decode went from 19.6
+    to 25.2 tok/s through the scheduler (the graph's 39.4 ms), code with speculation from 37.2 to 51.2 tok/s.
+  - *The row prefetch between the scheduler's chunks.* The scheduler gives each prefill call the tokens of the next one
+    (`next_ids`, with the image tokens mapped as the chunk's ids). A 6375-token prompt prefills at 2657 tok/s instead
+    of 1624.
+  - *The fp32 output of skinny_int.* The INT6 lm_head writes fp32 logits; the two golden prompts that tied at bf16
+    give the reference's 32 tokens again.
+  - *Images.* The vision tower is the 27B's architecture with a 2560-wide output, so `engine/model/vision.py` runs it
+    unchanged; the prefill and the decode already took the (t, h, w) positions. `tools/qwen4exp_reference.py --image`
+    wrote the reference's tokens for a page of four lines of text (768 image tokens, smallest margin 1.25,
+    `tests/data/qwen4exp_golden_image.json`). The served engine gives the same 32 tokens, with speculation as without,
+    and the next turn reuses the image prefix without the vision tower (`tests/scheduler_check_qwen4exp.py` check 8).
+  - *YaRN.* `apply_yarn4` scales the rope frequencies and folds the attention factor into four norms per attention
+    layer (the attention's q / k and the indexer's: transformers gives the indexer the attention's scaled cos and sin).
+    On the tiny model it equals transformers' yarn rope type (without the indexer fold the logits differ by 0.24). The
+    load refuses more than 4 times the native context. The passkey with YaRN x2 (one slot of 524,288 tokens): 9 of 9 at
+    16k, 288k and 461k (prefill 2400 tok/s at 461k).
+  - *The low-rank draft head.* `tools/lowrank_draft_head.py --model` collected 12,369 drafter outputs from real cycles:
+    at rank 512, the full head's argmax is in the approximation's top 256 for 99.81% of them (rank 1024: 100%). The
+    head reads about 21 MB of NVFP4 instead of 0.36 GB of BF16 rows and rescores 256 candidates on the new
+    `rescore_bf16` kernel.
+  - *Calibrated copies.* `tools/gptq_qwen4exp.py` collects the input second moments on the prefill of 48 windows of
+    2048 tokens (WikiText train, code, stories) and runs GPTQ in the engine's INT6 layout. The output errors fall 2 to 6
+    times against round to nearest. With the three phase-B classes, the GDN projections and the shared experts in
+    column order give 1.0058 on the gate windows (held out 1.0003) and fail; in act order (static group scales)
+    1.0029 (held out 1.0016; all 16 windows 1.0023 against 1.0027 for the phase-B set). The official gate
+    (`tests/golden_qwen4exp.py --decode-copies`): 2.3341 against 2.3274, ratio 1.00288, PASSED. The decode step takes
+    29.1 ms at 1k context (34.3 tok/s on the GPU), the verify of 8 rows 51.0 ms; the copies take 3.2 GB on the GPU.
+    The six classes are the default (`DECODE4_FORMATS`: gdn_in, gdn_out and shared in the format gptq6).
+  - *The cost model.* The fit of the served configuration (`tests/golden_qwen4exp_spec.py --prepared`): cycle_ms =
+    24.2 + 0.64 x distinct + 1.06 x k with 11.2 + 5.45 k distinct experts (35.9 / 40.5 / 45.0 ms for k = 1 / 2 / 3).
+    At 262,000 tokens of context the cycles took 1.2 / 1.7 / 2.2 ms more than at 1k, against the model's 1.4 / 1.5 /
+    1.65 ms, so the context term stays.
+  - *The early exit.* DRAFT_STOP 0.1 against 0.03: the same tok/s within 0.2; it fires in 0 to 7% of the cycles of
+    k = 3. It stays at 0.1.
+  - *The end-to-end check* with everything (`tests/scheduler_check_qwen4exp.py`): startup 40 s; the golden prompts pass
+    (two equal, the known near-tie of the first); plain decode 33.9 to 34.1 tok/s; code 68.6 tok/s (2.02x, 3.19 tokens
+    per cycle), prose 47.2 tok/s (1.39x, acceptance 0.44); a second turn in 0.11 s; a disk restore in 0.15 s; the
+    image prompt equal. MemAvailable falls 101.9 GB at the build and 106.3 GB after all checks; torch reserves 99.7 GB
+    at the end, so the family's cap went from 101 to 104 GB (`QWEN4EXP_FIXED_BYTES` 93.2e9 with the copies). The
+    server (`--port 8011`): ready in 46 s with 94.3 GB allocated and 97.1 GB reserved; a streaming chat, an image
+    chat and `/metrics` answer.
+  - *The 27B* is byte-identical: `tests/scheduler_check.py` passes every check, and its 24 session files equal the
+    reference hash for hash. The suite has 701 tests.
+  - Not done: a copy of the hyper-connections' down | inject product (its GPTQ needs 0.42 GB of second moments per
+    group, for 97 groups), a fine-tuned drafter for the prose acceptance, a faster `qsa_topk` (1.2 to 2.2 ms per cycle
+    at 262k), video input.

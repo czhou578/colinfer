@@ -19,7 +19,8 @@ For the 27B, with a warm page cache, startup takes about 25 s:
 Then the process holds about 88 GB of the 121 GB unified memory until it exits. Before the server creates the CUDA
 context, it compares its estimate of this memory with `MemAvailable`. The estimate adds a reserve of 6 GB for the growth
 after startup: the vision tower, a tokenize or an image decode, and the request bodies before the queue. At the defaults
-of the 27B, the server needs about 101 GB. When the estimate does not fit, the server logs the two figures and exits
+of the 27B, the server needs about 101 GB, and about 110 GB for Qwen3.8-Flash-Next with its prepared directory. When
+the estimate does not fit, the server logs the two figures and exits
 with status 3. The systemd unit (`deploy/colinfer.service`) does not restart on this status. `engine/runtime/build.py`
 (`check_memory`) holds the estimate, and `build_engine` makes the same check for the end-to-end checks and the
 benchmarks.
@@ -34,15 +35,15 @@ the 27B (the `qwen3_5` family) first and the value of Qwen3.8-Flash-Next (the `q
 | `--host`, `--port` | `127.0.0.1`, `8000` | |
 | `--model` | `nvidia/Qwen3.8-27B-NVFP4` | An HF repo id in the local cache, or a checkpoint directory. The engine serves two families (`model_type` in `config.json`): `qwen3_5`, which includes Qwen3.8-27B, and `qwen4_exp`, Qwen3.8-Flash-Next (`nvidia/Qwen3.8-Flash-Next-NVFP4`, see below). A checkpoint of another `model_type` gets the `qwen3_5` family. |
 | `--slots` | 3 (the 27B), 2 (Flash-Next) | Conversations whose KV stays cached. The server runs one request at a time; the others wait in a FIFO queue. |
-| `--max-seq-len` | 524288 (the 27B), 262144 (Flash-Next) | Tokens per slot (prompt plus output). The 27B: the fp8 KV cache costs 32 KB per token per slot. The checkpoint was trained on 262,144 positions. Past them, the server scales the rope with YaRN by the ratio (x2 at the default), as Qwen documents for its models. YaRN is static: it applies to every request, and costs a little quality on short prompts. Set `--max-seq-len 262144` for the unscaled model. Flash-Next: 262,144 is its native context, and the engine has no YaRN for it, so the server refuses a longer slot. |
+| `--max-seq-len` | 524288 (the 27B), 262144 (Flash-Next) | Tokens per slot (prompt plus output). The 27B: the fp8 KV cache costs 32 KB per token per slot. The checkpoint was trained on 262,144 positions. Past them, the server scales the rope with YaRN by the ratio (x2 at the default), as Qwen documents for its models. YaRN is static: it applies to every request, and costs a little quality on short prompts. Set `--max-seq-len 262144` for the unscaled model. Flash-Next: 262,144 is its native context, and the default; a longer slot turns on YaRN the same way, up to 4 times the native context (the model card's 1,000,000 tokens). The memory check asks for about 108 GB of `MemAvailable` for one slot of 524,288 tokens (`--slots 1`, as much as the defaults), and about 117 GB for two such slots or one slot of 1,048,576 tokens, which also need a higher `--mem-cap-gb`. |
 | `--spec` | `mtp` (both) | `none` turns off speculation and runs plain one-token decode. |
 | `--drafter-weights` | `auto` | MTP head weights. `auto` uses the fine-tuned head of the prepared directory (`tools/prepare.py`, `tools/train_drafter.py`) when it has one. `none` uses the weights of the checkpoint. You can also give a path. Drafts change the speed, never the outputs. The first start with a given drafter file quantizes it and keeps the result in `~/.cache/colinfer/drafter/` (`quant-<key>.safetensors` for the 27B, `quant4-<key>.safetensors` for Flash-Next) for the next starts. Flash-Next has no fine-tuned head, so `auto` uses the checkpoint's drafter. |
-| `--decode-weights` | `int` | `int`: decode from the requantized copies of the prepared directory (`tools/prepare.py`) when it has them. The 27B: the INT6 / INT5 copies of the attention / GDN projections (`tools/int6_requant.py`). This gives ~9.5% faster decode, perplexity within 0.25%, and uses +5.2 GB of GPU memory. Flash-Next: the three copies of `tools/requant_qwen4exp.py` (see below). Without the files, or with `checkpoint`, decode reads the weights of the checkpoint: FP8 for the 27B, BF16 for Flash-Next (the exact path). |
+| `--decode-weights` | `int` | `int`: decode from the requantized copies of the prepared directory (`tools/prepare.py`) when it has them. The 27B: the INT6 / INT5 copies of the attention / GDN projections (`tools/int6_requant.py`). This gives ~9.5% faster decode, perplexity within 0.25%, and uses +5.2 GB of GPU memory. Flash-Next: the six classes of copies of `tools/requant_qwen4exp.py` and `tools/gptq_qwen4exp.py`, and the low-rank draft head (see below): a decode step of 29.1 ms instead of 46.6 ms, perplexity within 0.3%, +3.2 GB of GPU memory. Without the files, or with `checkpoint`, decode reads the weights of the checkpoint: FP8 for the 27B, BF16 for Flash-Next (the exact path). |
 | `--no-prefix-caching` | off | Never reuse a prompt prefix: no checkpoint ring, no conversation cache on disk. Use it for raw-prefill benchmarks, like `--no-enable-prefix-caching` in vLLM. |
 | `--session-cache-gb` | 64 | The disk budget of the conversation cache (see below). The least recently used files go first. 0 turns the cache off. |
-| `--no-vision` | off | No image input. Images then become a short text note. Flash-Next has no image input in any case. |
+| `--no-vision` | off | No image input. Images then become a short text note. Both models read images; the vision tower (about 0.9 GB) loads on the first image. |
 | `--ngram-cache-gb` | 1.0 | Flash-Next only: the host cache of the n-gram rows that the PLE layer reads from the disk, in GB of 160-byte rows (1.0: 6.25M rows, 1.1 GB of host memory with the index). The memory check counts it. 0 turns the cache off. The 27B has no n-gram table and ignores the flag. |
-| `--mem-cap-gb` | 95 (the 27B), 101 (Flash-Next) | A hard cap on the torch allocator, in GB of 10^9 bytes. Past the cap, the allocator raises an error, and the process exits and restarts. The 27B: torch reserves 88.6 GB at startup and 89.5 GB after the first image. Flash-Next: 94.1 GB at the ready line with the drafter, and its long prompts add a few GB. The cap does not bound the CUDA context, the pinned host buffers, the Python process or the OS. Thus the cap leaves about 36 GB (the 27B) or 30 GB (Flash-Next) of the 130.7 GB of `MemTotal` for them. |
+| `--mem-cap-gb` | 95 (the 27B), 104 (Flash-Next) | A hard cap on the torch allocator, in GB of 10^9 bytes. Past the cap, the allocator raises an error, and the process exits and restarts. The 27B: torch reserves 88.6 GB at startup and 89.5 GB after the first image. Flash-Next: 97.1 GB at the ready line with the drafter and the decode copies; the vision tower adds 0.9 GB, and the first long prompts a few GB. The cap does not bound the CUDA context, the pinned host buffers, the Python process or the OS. Thus the cap leaves about 36 GB (the 27B) or 27 GB (Flash-Next) of the 130.7 GB of `MemTotal` for them. |
 | `--thinking` | `auto` | The default `enable_thinking`. `auto` uses the template default, which is on. A `/v1/messages` request without a `thinking` field runs without reasoning, as on the Anthropic API, unless the value is `on`. |
 | `--reasoning-effort` | `auto` | The reasoning effort of a request with thinking on that does not set an effort: `low`, `medium` or `xhigh`. `auto` uses the template default, `xhigh`. A request that sets an effort keeps it. |
 | `--committee-size` | 3, or the roles of the file | Members of a committee reply (a request that names the model `<name>-committee`, see "Committee mode" below). 0 turns the alias off. |
@@ -78,58 +79,81 @@ These values have no flag. They are the defaults of `ServerConfig` in `engine/se
 ## Qwen3.8-Flash-Next
 
 ```bash
+uv run python tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4   # once, with the server stopped: about 11 min
 uv run python -m engine.server --model nvidia/Qwen3.8-Flash-Next-NVFP4   # 2 slots x 262,144 tokens, MTP speculation
 ```
 
 The `qwen4_exp` family has its own defaults: 2 slots of 262,144 tokens (its native context), 16 checkpoints of 115.6 MB
-in the ring, `--spec mtp`, no image input and a `--mem-cap-gb` of 101. The prefill runs in chunks of 4,096 tokens.
+in the ring, `--spec mtp`, image input and a `--mem-cap-gb` of 104. The prefill runs in chunks of 4,096 tokens. The
+chat template is the 27B's, so `reasoning_effort`, `enable_thinking` and the tool calls work the same way.
+
 The PLE layer reads 16 rows of the n-gram table (51.2 GB on the disk) per token. `engine/weights/ple.py` (`PleFeeder`)
-reads them through a host row cache of `--ngram-cache-gb`, for the prefill chunks and for each decode step. The chat
-template is the 27B's, so `reasoning_effort`, `enable_thinking` and the tool calls work the same way.
+reads them through a host row cache of `--ngram-cache-gb`, for the prefill chunks and for each decode step. A row that
+the cache does not hold is a drive read of about 0.2 ms. The feeder reads the misses of a step on one thread each, so a
+step waits about 0.5 ms for its rows. The scheduler gives each prefill call the tokens of the next one, and the feeder
+reads their rows while the GPU runs the current chunk.
 
 Speculation is on by default. The MTP drafter of the checkpoint (`engine/spec/mtp4.py`: one QSA + MoE layer, its FP8
 experts requantized to NVFP4 once and then read from `~/.cache/colinfer/drafter/quant4-<key>.safetensors`) drafts 1 to
 3 tokens per cycle. The scheduler picks the draft length of each cycle from the acceptance of the request and a cost
 model of the cycle (`qwen4exp_cycle_cost` in `engine/model/family.py`): a verify costs more with each distinct expert
-that its rows route to. A request starts at 2 drafts. Suffix-match drafts (repeats of 8 or more tokens) verify up to 15
-drafts. The output with speculation is the output of plain decode, token for token, greedy and sampled. `--spec none`
-turns it off.
+that its rows route to. A request starts at 2 drafts, and the scheduler moves to 3 from an acceptance of about 0.6.
+Suffix-match drafts (repeats of 8 or more tokens) verify up to 15 drafts. The output with speculation is the output of
+plain decode, token for token, greedy and sampled. `--spec none` turns it off.
 
-**Decode copies.** Run `uv run python tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4` once, with the server
-stopped. The tool runs `tools/requant_qwen4exp.py` (about 30 s on the GPU). It writes three copies into
-`~/.cache/colinfer/prepared/<snapshot>/`: INT6 attention projections, an INT6 `lm_head` and an INT8 copy (one scale per
-row) of the `W_up` of the hyper-connections. With `--decode-weights int` (the default), the server attaches them at
-load. Measured on 2026-10-24:
+**Images** work as for the 27B, on both APIs. The vision tower of the checkpoint loads on the first image (about 0.9
+GB), and an image costs one prompt token per 32 x 32 pixels. A page of four lines of text (1024 x 768 pixels, 768
+image tokens) gives the reference's 32 greedy tokens, and the next turn reuses the prefix that holds the image without
+the vision tower. On `/v1/messages`, a document becomes the text note `[document omitted: this server reads text only]`.
 
-- The decode step takes 39.4 ms instead of 46.6 ms at 1k context (25.4 instead of 21.4 tok/s on the GPU, +18%). A
-  token reads 8.15 GB of weights instead of 9.95 GB.
-- The perplexity on the 8 golden WikiText windows is 1.0014 times that of the exact path (the gate is 0.5%).
-- The copies take 1.35 GB more on the GPU. Prefill keeps the BF16 weights.
-- Two golden prompts diverge from the reference at exact ties of the bf16 logits of the INT6 `lm_head`. The near-tie
-  rule of `tests/golden_qwen4exp.py` accepts them.
+**Long context.** A `--max-seq-len` past 262,144 tokens turns on YaRN by the ratio, up to 4 times the native context
+(see the flag). One slot of 524,288 tokens (`--slots 1 --max-seq-len 524288`) needs the memory of the defaults. With it,
+the passkey check finds 9 of 9 keys at 16k, 288k and 461k tokens, and the prefill runs at about 2,400 tok/s at 461k.
 
-The GDN projections and the shared experts have no copy: their round-to-nearest copies fail the gate.
-`--decode-weights checkpoint` decodes from the BF16 weights of the checkpoint: the exact path.
+**The prepared directory.** `tools/prepare.py --model nvidia/Qwen3.8-Flash-Next-NVFP4` writes three kinds of files
+into `~/.cache/colinfer/prepared/<snapshot>/`:
 
-Measured on 2026-10-24 at the defaults, before the decode copies:
+- `tools/requant_qwen4exp.py` (about 30 s on the GPU): INT6 copies of the attention projections and of `lm_head`, and
+  an INT8 copy (one scale per row) of the `W_up` of the hyper-connections.
+- `tools/gptq_qwen4exp.py` (about 4 min; it loads the model): INT6 copies of the GDN projections and of the shared
+  experts' gate | up, calibrated with GPTQ on text that the perplexity gate does not use.
+- `tools/lowrank_draft_head.py` (about 6 min; it loads the model and the drafter): the basis of the low-rank draft head.
 
-- The server is ready 45 s after the start: 35 s for the weights (78.5 GB on the GPU), 0.4 s for the drafter, 5 s for
-  the self-test and the graphs, 5 s for the warm-up. Torch has 91.3 GB allocated at the ready line.
-- `MemAvailable` falls by about 100 GB from the start to the ready line: 9.4 GB of slot state (0.71 GB of it for the
-  drafter's rows, 0.355 GB per slot), 1.1 GB of n-gram row cache and 89.5 GB for the rest (the weights, 1.95 GB for
-  the drafter and its draft head, the cycle graphs, the ring). Torch reserves 94.1 GB, under the family's
-  `--mem-cap-gb` of 101. The memory check counts 91.4 GB for the rest with the decode copies (`QWEN4EXP_FIXED_BYTES`
-  in `engine/model/family.py`). With the 6 GB reserve, it thus asks for about 108 GB of `MemAvailable`.
-- Plain decode runs at 19 to 20 tok/s through the server on the exact path. The CUDA graph of a step takes 46 ms
-  (21.7 tok/s); the host's read of the n-gram rows before each step costs the rest. The public vLLM build decodes
-  16.9 tok/s on the same machine.
-- Decode with speculation (`tests/scheduler_check_qwen4exp.py`, against plain decode in the same process): 39.1
-  against 21.3 tok/s on code (1.84x, 3.2 tokens per cycle) and 27.2 against 20.3 tok/s on prose (1.34x, 1.9 tokens
-  per cycle, acceptance 0.40). The chat completions of the server decode at 28 to 39 tok/s.
-- Prefill runs at 2,760 to 2,810 tok/s at prefixes of 0 to 8k tokens, and at about 2,500 tok/s at 16k to 60k tokens
-  with cold n-gram rows. The time to the first token of a short prompt is 0.1 to 0.3 s.
+With `--decode-weights int` (the default), the server attaches the copies at load, and the drafter uses the low-rank
+head. Measured on 2026-10-24:
+
+- The decode step takes 29.1 ms instead of 46.6 ms at 1k context (34.3 instead of 21.4 tok/s on the GPU).
+- The perplexity on the 8 golden WikiText windows is 1.0029 times that of the exact path (the gate is 0.5%), and
+  1.0016 times on 8 held-out windows. Round-to-nearest copies of the GDN projections and the shared experts fail the
+  gate; the GPTQ copies pass it.
+- The copies take 3.2 GB more on the GPU. Prefill keeps the BF16 weights.
+- The low-rank head (rank 512) scores the 69,632-token draft vocabulary in about 21 MB of NVFP4 instead of the 0.36 GB
+  of BF16 rows, and rescores its top 256 candidates exactly. It gives the full head's draft for 99.8% of the drafter
+  outputs. The per-draft term of the fit of the cycle time falls from 2.92 to 1.06 ms.
+- The golden prompts give the reference's tokens, or diverge at a near-tie of the reference. The INT6 `lm_head` writes
+  fp32 logits.
+
+`--decode-weights checkpoint` decodes from the BF16 weights of the checkpoint, with the full draft head: the exact
+path.
+
+Measured on 2026-10-24 at the defaults, with the prepared directory:
+
+- The server is ready 46 s after the start: 36 s for the weights (78.5 GB on the GPU), 0.9 s for the drafter, 5 s for
+  the self-test and the graphs, 5 s for the warm-up. Torch has 94.3 GB allocated and 97.1 GB reserved at the ready
+  line, under the family's `--mem-cap-gb` of 104.
+- `MemAvailable` falls by about 102 GB from the start to the end of the build: 9.4 GB of slot state (0.71 GB of it for
+  the drafter's rows, 0.355 GB per slot), 1.1 GB of n-gram row cache and 91.4 GB for the rest (the weights, the copies,
+  the drafter, the cycle graphs, the ring). The memory check counts 93.2 GB for the rest (`QWEN4EXP_FIXED_BYTES` in
+  `engine/model/family.py`). With the 6 GB reserve, it thus asks for about 110 GB of `MemAvailable`.
+- Plain decode runs at 33.9 to 34.1 tok/s through the scheduler: the speed of the CUDA graph. The public vLLM build
+  decodes 16.9 tok/s on the same machine.
+- Decode with speculation (`tests/scheduler_check_qwen4exp.py`, against plain decode in the same process): 68.6
+  against 33.9 tok/s on code (2.02x, 3.2 tokens per cycle) and 47.2 against 33.9 tok/s on prose (1.39x, 2.1 tokens per
+  cycle). The golden fibonacci prompt decodes at 73.1 tok/s.
+- Prefill runs at 2,760 to 2,810 tok/s at prefixes of 0 to 8k tokens, and a 6,375-token prompt in two chunks at 2,656
+  tok/s. The time to the first token of a short prompt is 0.1 to 0.3 s.
 - A second turn of 4,676 tokens restores 4,655 of them from the checkpoint of the first turn. Its time to the first
-  token is 0.13 s, against 1.75 s from scratch.
+  token is 0.11 s, against 1.78 s from scratch.
 - A turn of a 7,398-token conversation that two other conversations evicted from both slots restores from the
   conversation cache on disk in 0.15 s, with the drafter's rows, and with the output and the accepted drafts of a
   restore from memory.
@@ -140,15 +164,12 @@ Measured on 2026-10-24 at the defaults, before the decode copies:
 `tests/scheduler_check_qwen4exp.py` is the end-to-end check of the family through the scheduler (under the GPU lock,
 `.claude/rules/sanitizers.md`).
 
-An image in a request to this model becomes the text note `[image omitted: this server reads text only]`, on both
-APIs, and the request runs on the text. On `/v1/messages`, a document gets the same note.
-
 The engine does not support these for this family:
 
-- images (the vision tower of the checkpoint does not load)
-- the low-rank draft head of the 27B: the drafter scores its 69,632-token draft vocabulary with a BF16 head
-- YaRN: the server refuses a `--max-seq-len` past the 262,144 native positions
-- decode copies of the GDN projections and the shared experts
+- video input (as for the 27B)
+- a decode copy of the hyper-connections' down | inject product: its INT6 copy passes the gate alone, but not with the
+  other copies
+- a fine-tuned drafter: `tools/train_drafter.py` trains the 27B's dense MTP head, not this MoE drafter
 
 ## API
 
@@ -183,7 +204,7 @@ The engine does not support these for this family:
     what plain constrained decoding would. The masks cost ~0.2 ms a cycle. The first constrained request builds the
     grammar tokenizer (~1.5 s); a schema compiles in a few ms. A schema or a tool name that the grammar cannot take
     gets a 400.
-- **Images** (the 27B; Qwen3.8-Flash-Next turns each image into a text note, see its section): content parts
+- **Images** (both models): content parts
   `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` in user and tool messages (PNG, JPEG,
   WebP, GIF: what Pillow reads). The server accepts only base64 data URLs: it fetches nothing. A system message cannot
   hold images (the chat template rejects them with a 400).
@@ -356,11 +377,12 @@ uv run python tools/committee_ab.py --reveal ~/.cache/colinfer/committee_ab/<run
   of a cycle can fall below 0.1. Then the remaining draft steps of the cycle skip their weight GEMMs (the 27B: ~0.35 ms
   instead of ~1.8 ms a step). Both drafters do this. The verify rejects their junk drafts, so the outputs do not
   change. See `DRAFT_STOP` in `engine/spec/mtp.py` and `docs/history/phase6_progress.md` section 18.
-- **Low-rank draft head (the 27B).** `tools/lowrank_draft_head.py` makes the basis, and `tools/prepare.py` puts it in
-  the prepared directory. With this file, each draft step scores a rank-1024 approximation of the draft lm head and
-  rescores its top 256 candidates exactly. This gives the same drafts as the full head for ~1/5 of its bytes (k=7
-  cycle 89.8 → 86.0 ms).
-  Without the file, the engine uses the full draft head (`docs/history/phase6_progress.md` section 19).
+- **Low-rank draft head.** `tools/lowrank_draft_head.py` makes the basis, and `tools/prepare.py` puts it in the
+  prepared directory. With this file, each draft step scores a low-rank approximation of the draft lm head and rescores
+  its top 256 candidates exactly. The 27B: rank 1024, the same drafts as the full head for ~1/5 of its bytes (k=7 cycle
+  89.8 → 86.0 ms). Qwen3.8-Flash-Next: rank 512 over its BF16 lm_head, the full head's draft for 99.8% of the drafter
+  outputs for ~1/17 of the bytes (see "Qwen3.8-Flash-Next" above). Without the file, the engine uses the full draft
+  head (`docs/history/phase6_progress.md` section 19).
 - **Suffix-match drafts (repeats of 8 or more tokens).** The history of a request is its prompt and the reply
   so far. When the last N or more tokens of the history occurred earlier in it, the cycle drafts the tokens that
   followed that earlier occurrence (`engine/spec/suffix.py`). These drafts replace the MTP drafts.

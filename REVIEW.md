@@ -27,11 +27,11 @@ without speculation, bit for bit.
 
 colinfer also serves a second model family, the MoE model Qwen3.8-Flash-Next (`qwen4_exp`, started with
 `--model nvidia/Qwen3.8-Flash-Next-NVFP4`). It has exact speculation with its own MTP drafter (`engine/spec/mtp4.py`)
-and requantized decode copies under the perplexity gate (`tools/requant_qwen4exp.py`, `attach_decode_copies4`). Its
-files are `engine/model/family.py`, `qwen4exp.py`, `fast_qwen4exp.py`, `prefill_qwen4exp.py`, `moe_kernels.py`,
-`qsa_kernels.py` and `hc_kernels.py`, `engine/weights/qwen4exp_loader.py` and `ple.py`, `engine/spec/mtp4.py`,
-`csrc/moe.cu`, `moe_prefill.cu`, `qsa.cu`, `qsa_prefill.cu`, `hc.cu`, `hc_prefill.cu`, `ple_io.cpp` and their
-`*_bind.cpp`. The same promise holds for it, with these invariants:
+and requantized decode copies under the perplexity gate (`tools/requant_qwen4exp.py`, `tools/gptq_qwen4exp.py`,
+`attach_decode_copies4`). Its files are `engine/model/family.py`, `qwen4exp.py`, `fast_qwen4exp.py`,
+`prefill_qwen4exp.py`, `moe_kernels.py`, `qsa_kernels.py` and `hc_kernels.py`, `engine/weights/qwen4exp_loader.py` and
+`ple.py`, `engine/spec/mtp4.py`, `csrc/moe.cu`, `moe_prefill.cu`, `qsa.cu`, `qsa_prefill.cu`, `hc.cu`, `hc_prefill.cu`,
+`ple_io.cpp` and their `*_bind.cpp`. The same promise holds for it, with these invariants:
 
 - Every output row of a MoE, QSA or hyper-connection decode kernel, and of the drafter, is bit-identical for any set
   of rows in the launch. A reduction whose order depends on the rows of the launch (a split by row count, an atomic,
