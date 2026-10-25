@@ -35,14 +35,14 @@ WARMUP_IDS = (1000, 150000)  # ordinary text tokens for the warm-up prompts: pas
 class ServerConfig:
     """What the engine thread builds and the HTTP layer enforces. The defaults are the server's flags (engine/server/api.py
     main reads its argparse defaults from here), so a test constructs the same object with a few fields changed. None in
-    slots, max_seq_len, checkpoints and spec: the default of the model's family (engine/model/family.py). The engine
+    slots, max_seq_len, checkpoints, spec and k: the default of the model's family (engine/model/family.py). The engine
     thread writes the values it built with into these fields before it sets `ready`."""
     model: str = MODEL
     slots: int | None = None        # the 27B: 3; qwen4_exp: 2
     max_seq_len: int | None = None  # the 27B: 524288, twice the checkpoint's native 262144 (YaRN x2); qwen4_exp: 262144
     checkpoints: int | None = None  # the 27B: 32; qwen4_exp: 16
-    spec: str | None = None         # the 27B: mtp; qwen4_exp: none
-    k: int = 7
+    spec: str | None = None         # the 27B: mtp; qwen4_exp: mtp
+    k: int | None = None            # the longest MTP draft; None: the family's (the 27B: 7, qwen4_exp: 3)
     drafter_weights: str = "auto"
     suffix_drafts: int = MIN_MATCH
     decode_weights: str = "int"
@@ -98,6 +98,7 @@ class Worker(threading.Thread):
         # the values of the family's defaults, for the log below and the HTTP layer (build_app reads max_seq_len)
         c.slots, c.max_seq_len, c.checkpoints = sched.n_slots, sched.max_seq_len, sched.n_checkpoints
         c.spec = "mtp" if sched.mtp is not None else "none"
+        c.k = sched.k
         t3 = time.perf_counter()
         if c.warmup:
             self._warmup(sched, sched.model.cfg.vocab_size)

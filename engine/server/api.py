@@ -787,7 +787,7 @@ def main(argv=None):
                     help="conversations whose KV stays cached; one request runs at a time (default: the model family's, 3 for the 27B)")
     ap.add_argument("--max-seq-len", type=int, default=D.max_seq_len,
                     help="tokens per slot (prompt + output; default: the model family's, 524288 for the 27B)")
-    ap.add_argument("--spec", choices=("mtp", "none"), default=D.spec, help="speculative decoding (default: the model family's, mtp for the 27B)")
+    ap.add_argument("--spec", choices=("mtp", "none"), default=D.spec, help="speculative decoding (default: the model family's, mtp for both)")
     ap.add_argument("--drafter-weights", default=D.drafter_weights,
                     help="MTP head weights: auto = the fine-tuned head of the prepared directory (tools/prepare.py) when it has one, "
                          "none = the checkpoint's, or a path. Drafts only affect speed, never outputs")
@@ -803,10 +803,10 @@ def main(argv=None):
     ap.add_argument("--ngram-cache-gb", type=float, default=D.ngram_cache_gb,
                     help="qwen4_exp: the host row cache of the n-gram table that the PLE layer reads from the disk (GB of 160-byte rows; "
                          "0: off). It counts in the memory check. The 27B has no n-gram table")
-    ap.add_argument("--mem-cap-gb", type=float, default=95.0,
-                    help="hard cap on this process's GPU memory (torch allocator; GB of 10^9 bytes). The 27B reserves 88.6 GB at "
-                         "startup and 89.5 GB with the vision tower, Qwen3.8-Flash-Next 91.2 GB; the rest of the unified memory stays for "
-                         "the host (docs/server.md)")
+    ap.add_argument("--mem-cap-gb", type=float, default=None,
+                    help="hard cap on this process's GPU memory (torch allocator; GB of 10^9 bytes; default: the model family's, 95 for "
+                         "the 27B, 101 for Qwen3.8-Flash-Next). The 27B reserves 88.6 GB at startup and 89.5 GB with the vision tower, "
+                         "Qwen3.8-Flash-Next 94.1 GB with its drafter; the rest of the unified memory stays for the host (docs/server.md)")
     ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
                     help="default enable_thinking (auto: the template's default, on; for /v1/messages without a thinking field: off)")
     ap.add_argument("--reasoning-effort", choices=("auto", "low", "medium", "xhigh"), default="auto",
@@ -842,7 +842,7 @@ def main(argv=None):
         log(f"[server] {e}")
         raise SystemExit(NO_MEMORY_EXIT) from None
     total = torch.cuda.get_device_properties(0).total_memory
-    mem_cap_bytes = int(min(a.mem_cap_gb * 1e9, total))
+    mem_cap_bytes = int(min((fd.mem_cap_gb if a.mem_cap_gb is None else a.mem_cap_gb) * 1e9, total))
     torch.cuda.set_per_process_memory_fraction(mem_cap_bytes / total)
     log(f"[server] GPU memory cap {mem_cap_bytes / 1e9:.0f} GB of {total / 1e9:.0f} GB")
 

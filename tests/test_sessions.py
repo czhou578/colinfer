@@ -220,10 +220,14 @@ def test_the_fingerprint_of_the_27b_state_keeps_its_shapes():
     old = {"kv": [list(st.k[i].shape[1:]) for i in sorted(st.k)], "kv_dtype": str(st.k[min(st.k)].dtype),
            "conv": [list(st.conv[i].shape[1:]) for i in sorted(st.rec)], "rec": [list(st.rec[i].shape[1:]) for i in sorted(st.rec)],
            "drafter_kv": list(mst.k[1].shape[1:])}
-    mst.k = {0: mst.k[1]}
+    mst.k, mst.v = {0: mst.k[1]}, {0: mst.v[1]}  # the one attention layer of the drafter (MtpState)
     assert _shapes(st, mst) == old
     ext = ExtModel().new_state(2, 64)
     assert set(_shapes(ext, None)) - set(old) == {"kv_extra", "snap_extra"}
+    from engine.model.qwen4exp import Qwen4ExpConfig
+    from engine.spec.mtp4 import Mtp4State
+    m4 = Mtp4State(Qwen4ExpConfig(), 64, "meta", batch=2)  # the drafter of qwen4_exp: its ik, ikb and rope_pos add drafter_extra
+    assert _shapes(st, m4)["drafter_extra"] == [[[1, 64, 128], "torch.bfloat16"], [[1, 16, 128], "torch.bfloat16"], [[1, 64, 3], "torch.int32"]]
 
 
 @pytest.fixture
@@ -301,17 +305,19 @@ def small4(tmp_path_factory):
     nt.close()
 
 
-def make4(small4, store_dir=None):
+def make4(small4, store_dir=None, mtp=None, **kw):
     """A scheduler of 2 slots of 512 tokens on the small qwen4_exp model with the family's callables, as build_engine
-    makes it, and a store of 64-token blocks in store_dir (None: no store)."""
+    makes it, and a store of 64-token blocks in store_dir (None: no store). mtp: the drafter (speculation on, with the
+    family's Speculation: k up to 3), else plain decode."""
     fast, fam = small4
-    sched = Checked(fast, n_slots=2, max_seq_len=512, n_checkpoints=4, prefill_chunk=64, ckpt_interval=10**6, prefill_fn=fam.prefill,
-                    prepare_fn=fam.prepare_prefill, before_replay=fam.before_replay(fast), feed_buffer=fam.feed_buffer(fast),
-                    prefill_prev2=fam.prefill_prev2)
+    kw = dict(n_slots=2, max_seq_len=512, n_checkpoints=4, prefill_chunk=64, ckpt_interval=10**6) | kw
+    sched = Checked(fast, prefill_fn=fam.prefill, prepare_fn=fam.prepare_prefill, before_replay=fam.before_replay(fast),
+                    feed_buffer=fam.feed_buffer(fast), prefill_prev2=fam.prefill_prev2, mtp=mtp, k=fam.spec.k, spec=fam.spec, **kw)
     if store_dir is not None:
         with torch.inference_mode():
-            sched.store = SessionStore(sched.state, None, {"model": "small4", "drafter": "none"}, 10**9, str(store_dir), block=BLOCK,
-                                       min_tokens=BLOCK, log=lambda *a: None)
+            sched.store = SessionStore(sched.state, sched.mst if mtp is not None else None,
+                                       {"model": "small4", "drafter": "none" if mtp is None else "small"}, 10**9, str(store_dir), block=BLOCK,
+                                       min_tokens=BLOCK, log=lambda *a: None, h_dim=sched.h_dim)
         sched.store.min_gain = 16
     return sched
 
@@ -358,3 +364,125 @@ def test_a_qwen4exp_state_restores_from_disk_byte_for_byte(small4, tmp_path):
     assert ref.run([S.Request(p1, max_new_tokens=12)])[0].output == r1.output
     rm = ref.run([S.Request(p2, max_new_tokens=12)])[0]
     assert rm.reused == n and rm.output == req.output
+
+
+# ------------------------------------------------------------------------------------------------ qwen4_exp with its drafter
+@pytest.fixture(scope="module")
+def mtp4(small4):
+    """A random drafter of the small qwen4_exp model (tests/test_mtp4.py: FP8 block-scaled experts requantized to NVFP4)."""
+    from engine.spec.mtp4 import Mtp4
+    from tests.test_mtp4 import build_drafter_reference
+    fast, _ = small4
+    t, ex, _, _ = build_drafter_reference(fast.cfg)
+    return Mtp4(fast, None, tensors=dict(t), experts=ex, log=lambda *a: None)
+
+
+def drafter_rows(sched, b, n):
+    """The bytes of the drafter's rows of slot b for a history of n tokens: rows [0, n - 1) of each kv_tensors() tensor
+    (its rows [0, (n - 1) // r) for one row per r positions: the complete ones)."""
+    out = []
+    for t in sched.mst.kv_tensors():
+        r = sched.mst.max_seq_len // t.shape[2]
+        out.append(t[b, :, :(n - 1) // r].clone().view(torch.uint8))
+    return out
+
+
+def test_speculation_on_a_qwen4exp_model_equals_plain_decode(small4, mtp4, monkeypatch):
+    """The scheduler with the drafter of qwen4_exp (Mtp4State, Mtp4Cycle through the family's Speculation, k in 1..3, the
+    suffix-match drafts on) against plain decode, on the small model: greedy and sampled requests, a multi-turn
+    conversation (a restore from memory), a second conversation in the other slot, a side request with a copy of the KV
+    prefix into the other slot, and prompts of several prefill chunks give the same tokens. The cycles' n-gram rows go
+    through before_replay into the feed buffer of k + 1 rows."""
+    monkeypatch.setattr(S, "COPY_MIN_TAIL", 64)
+    rng = random.Random(41)
+    bnd = 3  # the message boundary: the prompts' other ids are 4 and up
+    kw = dict(boundary_token=bnd, n_checkpoints=8)
+    spec, plain = make4(small4, mtp=mtp4, suffix_min=4, **kw), make4(small4, **kw)
+    assert spec.k_opts == [1, 2, 3] and spec.kmax == S.SUFFIX_K and spec.h_dim == 10240
+    assert [c.feed.shape[1] for (b, sampled, kk), c in spec.cycles.items()] == [kk + 1 for (b, sampled, kk) in spec.cycles]
+    sys_a = [rng.randrange(4, 1000) for _ in range(260)]
+
+    def chat4(n_user):
+        return [bnd] + sys_a + [bnd] + [rng.randrange(4, 1000) for _ in range(n_user)] + [bnd, 5, 6]
+    reqs = []
+
+    def both(p, n=24, **kw):
+        a = spec.run([S.Request(p, max_new_tokens=n, **kw)])[0]
+        b = plain.run([S.Request(p, max_new_tokens=n, **kw)])[0]
+        assert a.output == b.output, (len(p), next(i for i, (x, y) in enumerate(zip(a.output, b.output)) if x != y))
+        reqs.append(a)
+        return a
+    r1 = both(chat4(20))
+    p2 = r1.prompt + r1.output + [rng.randrange(4, 1000) for _ in range(9)]
+    r2 = both(p2)
+    assert r2.reused == len(r1.prompt) + len(r1.output) - 1
+    r3 = both([rng.randrange(4, 1000) for _ in range(30)], temperature=0.8, top_p=0.9, seed=3)  # the other slot, sampled
+    assert r3.slot != r2.slot
+    r4 = both(chat4(15))  # the system prompt of the first: the KV prefix and the drafter's rows copied into the other slot
+    assert r4.reused == len(sys_a) + 1 and r4.slot == r3.slot
+    r5 = both(p2 + r2.output + [rng.randrange(4, 1000) for _ in range(5)], 40)  # the first conversation, still cached
+    assert r5.slot == r2.slot and r5.reused == len(p2) + len(r2.output) - 1
+    both([rng.randrange(4, 1000) for _ in range(300)], 30, temperature=0.6, seed=9)  # five prefill chunks
+    assert all(r.cycles > 0 and r.drafted >= r.cycles for r in reqs)
+
+
+def test_copy_kv_moves_the_drafters_rows(small4, mtp4):
+    """_copy_kv copies the drafter's rows with the target's: every kv_tensors() tensor of Mtp4State (k, v, ik, ikb with
+    one row per 4 positions, rope_pos), rows [0, ceil(L / r))."""
+    sched = make4(small4, mtp=mtp4)
+    g = torch.Generator(device="cuda").manual_seed(2)
+    with torch.inference_mode():
+        for t in sched.mst.kv_tensors():
+            t.view(torch.uint8).copy_(torch.randint(0, 120, t.view(torch.uint8).shape, device="cuda", dtype=torch.uint8, generator=g))
+        n = 37
+        want = [t[0, :, :-(-n // r)].clone() for t, r in zip(sched.mst.kv_tensors(), [1, 1, 1, 4, 1])]
+        sched._copy_kv(0, 1, n)
+    assert sched.mst.kv_ratios() == [1, 1, 1, 4, 1]
+    for t, w in zip(sched.mst.kv_tensors(), want):
+        assert torch.equal(t[1, :, :w.shape[1]].view(torch.uint8), w.view(torch.uint8))
+        assert not torch.equal(t[1, :, w.shape[1]:].view(torch.uint8), t[0, :, w.shape[1]:].view(torch.uint8))
+
+
+def test_a_qwen4exp_drafter_restores_from_disk(small4, mtp4, tmp_path):
+    """With speculation on the small qwen4_exp model: a conversation of 151 tokens and its reply go to disk with the
+    drafter's rows (shifted by one, the block keys of the complete groups of 4 only) and its input hidden. After a
+    restart (zeroed states, a new store on the same directory), the next turn restores the reply end from disk: the
+    slot then holds the drafter's rows [0, n - 1), and the next turn's output, accepted drafts and next drafts equal
+    those after a restore from memory. The fingerprint of the store names the drafter's extra tensors."""
+    rng = random.Random(42)
+    sched = make4(small4, tmp_path, mtp=mtp4)
+    assert set(sched.store.fp) and "drafter_extra" in open(os.path.join(sched.store.dir, "fingerprint.json")).read()
+    p1 = [rng.randrange(4, 1000) for _ in range(151)]
+    r1 = sched.run([S.Request(p1, max_new_tokens=12)])[0]
+    sched.store.flush()
+    b, n = r1.slot, len(p1) + len(r1.output) - 1
+    assert (n - 1) % 4 and n > 2 * BLOCK  # the drafter's last group of 4 positions is incomplete
+    rows = drafter_rows(sched, b, n)
+    h = sched.ring_h[next(c.buf for c in sched.ckpts if len(c.tokens) == n and c.slot == b)].clone()
+    assert all(x.any() for x in rows)
+    sched.store = None
+    del sched
+    sched = make4(small4, tmp_path, mtp=mtp4)
+    with torch.inference_mode():
+        sched.state.reset()
+        sched.mst.reset()
+    p2 = p1 + r1.output + [rng.randrange(4, 1000) for _ in range(20)]
+    req = sched.submit(S.Request(p2, max_new_tokens=16))
+    with torch.inference_mode():
+        sched._admit()
+    s = sched.slots[req.slot]
+    assert req.reused == n and sched.store.stats["restores"] == 1
+    assert all(torch.equal(x, y) for x, y in zip(drafter_rows(sched, s.idx, n), rows))
+    assert torch.equal(s.h_last, h)
+    while sched.busy():
+        sched.step()
+    disk_next = sched.tok[s.idx].clone()
+    sched.store.flush()
+    sched.store = None
+    del sched
+    ref = make4(small4, mtp=mtp4)
+    assert ref.run([S.Request(p1, max_new_tokens=12)])[0].output == r1.output
+    rm = ref.run([S.Request(p2, max_new_tokens=16)])[0]
+    assert rm.reused == n and rm.output == req.output
+    assert (rm.cycles, rm.drafted, rm.accepted) == (req.cycles, req.drafted, req.accepted)
+    assert torch.equal(ref.tok[rm.slot], disk_next)

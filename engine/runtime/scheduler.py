@@ -2,14 +2,19 @@
 in a FIFO queue. The `n_slots` slots keep the histories (KV cache, GDN state) of the last conversations, so a side
 request (a title, a subagent) does not overwrite the cache of the main conversation.
 
-* State. One FastState holds all slots (KV cache, GDN conv / recurrent state, positions). With speculation, an MtpState
-  also holds the own KV cache of the drafter. Each slot has its own CUDA graphs, on a single-slot view of the state.
+* State. One FastState holds all slots (KV cache, GDN conv / recurrent state, positions). With speculation, the
+  drafter's state (MtpState; qwen4_exp: Mtp4State, with the indexer keys of its layer) also holds the own KV cache of
+  the drafter. Each slot has its own CUDA graphs, on a single-slot view of the state.
   The graphs share one memory pool: their temporaries overlap instead of each graph keeping its own (1.4 GB for 18
   graphs), since only one replays at a time. A graph's outputs are read right after its replay, before any other.
 * Decode with MTP (the default). One CUDA graph per (slot, greedy | sampled, draft length k) runs a full speculative
-  cycle: verify, acceptance, commit and drafts (engine/spec/mtp.py). Without MTP, each slot has one plain decode graph.
-  - Each cycle picks k (3 or 7) for the most expected tokens per second. It uses the running acceptance rate of the
-    request and the cycle times measured at startup. Code and structured output draft 7, and prose drafts 3.
+  cycle: verify, acceptance, commit and drafts (engine/spec/mtp.py; qwen4_exp: engine/spec/mtp4.py). Without MTP, each
+  slot has one plain decode graph. The family's Speculation (engine/model/family.py) gives the drafter's state, the
+  cycle, the draft lengths and the cost model of a cycle.
+  - Each cycle picks k for the most expected tokens per second. It uses the running acceptance rate of the request and
+    the cost of a cycle. The 27B chooses between 3 and 7 by the cycle times measured at startup: code and structured
+    output draft 7, and prose drafts 3. qwen4_exp chooses between 1, 2 and 3 by its fitted cost model
+    (family.qwen4exp_cycle_cost), since its verify cost grows with the distinct experts of the rows.
   - With suffix_min > 0, the history can end in a repeat of at least suffix_min tokens. Then the cycle drafts what
     followed the earlier occurrence instead (engine/spec/suffix.py), up to SUFFIX_K = 15 drafts.
 * Prefill. An engine step runs one prefill chunk (engine/model/prefill.py) or one decode step. With MTP, the scheduler
@@ -66,6 +71,7 @@ from typing import Protocol
 import numpy as np
 import torch
 
+from engine.model.family import QWEN35_SPEC, Speculation
 from engine.model.fast import MAX_ROWS, FastQwen35
 from engine.model.prefill import CHUNK, prefill, prepare_prefill
 from engine.model.vision import Image, VisionTower, rope_delta, rope_positions
@@ -74,11 +80,10 @@ from engine.runtime.grammar import Constraint, mask_words
 from engine.runtime.metrics import Metrics
 from engine.runtime.sampler import SamplerParams, apply_mask, sample
 from engine.runtime.sessions import Hit, SessionStore
-from engine.spec.mtp import MtpCycle, MtpState
 from engine.spec.suffix import SuffixIndex
 
 MAX_STOP_IDS = 8  # stop token ids per slot visible to the GPU-side cut (more are still honored on the host)
-K_OPTIONS = (3, 7)  # draft lengths a cycle chooses between (capped by k)
+K_OPTIONS = QWEN35_SPEC.k_options  # the 27B's draft lengths a cycle chooses between (capped by k): 3 and 7
 ACC_DECAY = 0.85    # per-cycle decay of a slot's draft-acceptance statistics
 SUFFIX_K = MAX_ROWS - 1  # suffix-match draft length: its verify rows still fit one weight pass
 REPLY_SPLIT_MIN = 512  # last-message length from which a prompt also snapshots at the start of the reply
@@ -182,18 +187,20 @@ class Scheduler:
     def __init__(self, model: FastQwen35, n_slots: int = 3, max_seq_len: int = 32768, n_checkpoints: int = 32, mtp=None, k: int = 3,
                  prefill_chunk: int = CHUNK, ckpt_interval: int = 8192, metrics: Metrics | None = None,
                  boundary_token: int | None = None, suffix_min: int = 0, prefill_fn=None, prepare_fn=None, before_replay=None,
-                 feed_buffer=None, prefill_prev2: bool = False):
+                 feed_buffer=None, prefill_prev2: bool = False, spec: Speculation | None = None):
         """prefill_fn, prepare_fn: the prefill callables of the model's family (engine/model/family.py); None: those of
         engine/model/prefill.py. before_replay (optional): a callable (slot, tokens) that runs right before each decode
         replay, with the token ids of the slot's rows: [y, d1..dk] for a speculative cycle, [y] for a plain step. The
         history of the slot (slot.tokens) does not hold y yet. feed_buffer (optional): a callable (B, T) -> the fixed
         device buffer that a plain decode graph passes to the model as its third argument. prefill_prev2: each prefill
         call also gets prev2, the last two tokens of the slot's history before the chunk (fewer at the start of a slot;
-        the n-gram rows of qwen4_exp depend on them)."""
+        the n-gram rows of qwen4_exp depend on them). spec: the drafter's state, cycle, draft lengths and cost model
+        of the model's family (engine/model/family.py Speculation); None: the 27B's (QWEN35_SPEC)."""
         self.prefill_fn, self.prepare_fn, self.before_replay = prefill_fn, prepare_fn, before_replay
         self.prefill_prev2 = prefill_prev2
         (prepare_fn or prepare_prefill)(model)
         self.model, self.mtp, self.k = model, mtp, k
+        self.spec = spec = spec or QWEN35_SPEC
         self.suffix_min = suffix_min if mtp is not None else 0  # > 0: suffix-match drafts of at least this match length
         self.kmax = max(k, SUFFIX_K) if self.suffix_min else k   # longest draft a cycle verifies
         self.n_slots, self.max_seq_len, self.chunk, self.ckpt_interval = n_slots, max_seq_len, prefill_chunk, ckpt_interval
@@ -211,10 +218,10 @@ class Scheduler:
         self.mask_host = torch.full((self.margin, W), -1, dtype=torch.int32, pin_memory=True)
         # draft lengths of K_OPTIONS (capped by k) whose verify rows fit one weight pass of the skinny GEMM (MAX_ROWS =
         # 16), since a second pass streams every weight again. The pending drafts are a chain: a shorter k uses a prefix.
-        self.k_opts = [kk for kk in sorted({min(kk, k) for kk in K_OPTIONS + (k,)}) if kk + 1 <= MAX_ROWS] or [MAX_ROWS - 1]
+        self.k_opts = [kk for kk in sorted({min(kk, k) for kk in tuple(spec.k_options) + (k,)}) if kk + 1 <= MAX_ROWS] or [MAX_ROWS - 1]
         self.pool = torch.cuda.graph_pool_handle()  # one memory pool for every graph: they never replay concurrently
         if mtp is not None:
-            self.mst = MtpState(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active, rope_delta=self.state.rope_delta)
+            self.mst = spec.state(cfg, max_seq_len, dev, batch=n_slots, active=self.state.active, rope_delta=self.state.rope_delta)
             self.tok = torch.zeros(n_slots, self.kmax + 1, dtype=torch.long, device=dev)
             self.stop_buf = torch.full((n_slots, MAX_STOP_IDS), -1, dtype=torch.long, device=dev)
             self.cycles, self.cycle_s = {}, {}
@@ -222,9 +229,9 @@ class Scheduler:
                 sv, mv = self.state.view(b, b + 1), self.mst.view(b, b + 1)
                 for kw in self.k_opts + ([SUFFIX_K] if self.kmax > k else []):
                     for sampled in (False, True):
-                        self.cycles[(b, sampled, kw)] = MtpCycle(model, mtp, sv, mv, kw, params=self.params.view(b, b + 1) if sampled else None,
-                                                                 tok=self.tok[b:b + 1, :kw + 1], stop_ids=self.stop_buf[b:b + 1],
-                                                                 drafts=min(kw, k), mask=self.masks[b:b + 1, :kw + 1], pool=self.pool)
+                        self.cycles[(b, sampled, kw)] = spec.cycle(model, mtp, sv, mv, kw, params=self.params.view(b, b + 1) if sampled else None,
+                                                                   tok=self.tok[b:b + 1, :kw + 1], stop_ids=self.stop_buf[b:b + 1],
+                                                                   drafts=min(kw, k), mask=self.masks[b:b + 1, :kw + 1], pool=self.pool)
                     if b == 0:  # cycle time per k, for choosing k (the state is garbage here and reset below)
                         g = self.cycles[(b, False, kw)]
                         g.graph.replay()
@@ -235,6 +242,9 @@ class Scheduler:
                         torch.cuda.synchronize()
                         self.cycle_s[kw] = (time.perf_counter() - t0) / 2
             self.mst.pos_t.zero_()
+            # the drafter's per-position tensors (its kv_tensors hook: k, v; qwen4_exp also ik, ikb, rope_pos), for _copy_kv
+            self.mkv_t = self.mst.kv_tensors()
+            self.mseq_len = max(t.shape[2] for t in self.mkv_t)
             # cycle_s is measured at ~0 context; per token of a slot's context a cycle also reads the target's KV once
             # (multi-row attention: whatever k) and the drafter's KV once per draft step (seconds per token, ~240 GB/s)
             kv = lambda d: sum(t.shape[1] * t.shape[-1] * t.element_size() * 2 for t in d.values())  # noqa: E731 (K + V)
@@ -267,9 +277,9 @@ class Scheduler:
 
     def _pick_k(self, s: Slot) -> int:
         """The draft length with the most expected tokens per second: (1 - a^(k+1)) / (1 - a), a = the per-token
-        acceptance estimate, over the cycle time: measured at startup, plus the KV reads that grow with the context (the
-        target's once per ATTN_ROWS query rows, the drafter's once per MTP draft step; at 128k: ~17 ms + ~1.1 ms per
-        draft step)."""
+        acceptance estimate, over the cycle time. The cycle time is the family's cost model (spec.cycle_cost) when it has
+        one, else the time measured at startup plus the KV reads that grow with the context (the target's once per
+        ATTN_ROWS query rows, the drafter's once per MTP draft step; the 27B at 128k: ~17 ms + ~1.1 ms per draft step)."""
         opts = self.k_opts + ([self.kmax] if self.kmax > self.k and s.src == "suffix" else [])
         if len(opts) == 1:
             return opts[0]
@@ -278,8 +288,11 @@ class Scheduler:
 
         def tokens_per_s(kk):
             n = min(kk, s.fresh) if s.src == "suffix" else kk  # a suffix match may have fewer tokens to offer
-            passes = -(-self.q_per_kv * (kk + 1) // ATTN_ROWS)  # target KV reads per cycle
-            cycle = self.cycle_s[kk] + len(s.tokens) * (passes * self.ctx_s + min(kk, self.k) * self.ctx_draft_s)
+            if self.spec.cycle_cost is not None:
+                cycle = self.spec.cycle_cost(kk, min(kk, self.k), len(s.tokens))
+            else:
+                passes = -(-self.q_per_kv * (kk + 1) // ATTN_ROWS)  # target KV reads per cycle
+                cycle = self.cycle_s[kk] + len(s.tokens) * (passes * self.ctx_s + min(kk, self.k) * self.ctx_draft_s)
             return (1 - a ** (n + 1)) / (1 - a) / cycle
         return max(opts, key=tokens_per_s)
 
@@ -333,9 +346,10 @@ class Scheduler:
         for t in self.kv_t:
             n = -(-L * t.shape[2] // self.seq_len)
             t[dst, :, :n].copy_(t[src, :, :n])
-        if self.mtp is not None:
-            for d in (self.mst.k, self.mst.v):
-                d[0][dst, :, :L].copy_(d[0][src, :, :L])
+        if self.mtp is not None:  # the drafter's tensors (kv_tensors of its state), in the same way
+            for t in self.mkv_t:
+                n = -(-L * t.shape[2] // self.mseq_len)
+                t[dst, :, :n].copy_(t[src, :, :n])
 
     def _target(self, holder: Slot, shared: int) -> Slot:
         """The slot for a request that restores a prefix of its prompt held in `holder`, whose history shares `shared`
@@ -479,7 +493,7 @@ class Scheduler:
         req.slot, req.reused, req.t_admit = b, len(s.tokens), time.perf_counter()
         s.salt = req.cache_salt
         s.req, s.phase, s.todo, s.y = req, "prefill", list(P[len(s.tokens):]), None
-        s.acc = {"mtp": [1.5, 2.5], "suffix": [4.0, 5.0]}  # priors 0.6 and 0.8
+        s.acc = {"mtp": list(self.spec.prior), "suffix": [4.0, 5.0]}  # priors 0.6 (qwen4_exp: 0.55) and 0.8
         if self.suffix_min:  # the slot's index stays when its tokens are a prefix of this prompt (the last turn's, plus its reply)
             x = s.sfx
             if x is not None and (len(x.toks) > len(P) or _shared(pa, x.toks) < len(x.toks)):
