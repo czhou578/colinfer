@@ -9,7 +9,7 @@ with the DeepSeek server stopped. No change to the DeepSeek server. The port of 
 
 | Step | Status |
 |---|---|
-| §5 Phase 0: the memory floor of the engine (one window of about 15 min) | ⬜ |
+| §5 Phase 0: the memory floor of the engine (one window of about 15 min) | ✅ 2026-11-14 (§5.1): X = 5.2 GB; the gate is not met |
 | §6 A: the reference model and the weights (no window) | ⬜ |
 | §6 K1, K2: the kernel changes (no window) | ⬜ |
 | §6 M1: golden decode on the real checkpoint | ⬜ |
@@ -166,6 +166,53 @@ DeepSeek context cap and the full model. X at 4.8 GB or less gives only the memo
 reaches 6.0 GB, colinfer saves less than 1 GiB against vLLM. Then only the speed goal remains, and you decide whether the
 plan goes on.
 
+### 5.1 Result (2026-11-14, 13:21 to 13:29, `colinfer_floor.sh` of `dsv4-specialize`)
+
+The window stopped DeepSeek for 7 minutes and booted the 27B four times (1 slot of 131,072 tokens, checkpoint decode
+weights, no vision). Each boot took 8 to 10 seconds (the prepared weights). All values in GB; "fall" is the fall of
+`MemAvailable` from before the boot, at its lowest sample.
+
+| Point | Fall at the peak | Torch allocated / reserved | Outside the allocator | Process resident (anonymous + file) | GPU process |
+|---|---|---|---|---|---|
+| f1: no drafter, no prefix caching | 29.76 | 25.79 / 26.60 | 3.03 to 3.08 | 2.16 + 0.58 | 26.90 |
+| f2: f1 with prefix caching | 34.80 | 30.73 / 31.43 | 3.16 to 3.29 | 2.17 + 0.58 | 31.73 |
+| f3: f2 with the session cache | 35.40 | 30.86 / 31.43 | 3.98 | 2.16 + 1.39 | 31.73 |
+| f4: f2 with the MTP drafter | 36.53 | 31.52 / 32.78 | 3.39 to 3.65 | 2.26 + 0.59 | 33.13 |
+
+The smoke test passed at f1, f2 and f4. The prompt of 99,855 tokens took 64.3 s (f1), 65.0 s (f2) and 53.8 s (f4).
+
+**The fixed memory X of f1:** 29.76 − 20.2 (the weights, "20.2 GB on GPU") − 4.19 (the KV of 131,072 tokens at 32 KB)
+− 0.16 (the GDN state) = **5.2 GB**:
+
+| Part | GB | Can a flag or a small change remove it? |
+|---|---|---|
+| Inside the allocator, beyond the weights, the KV and the state: workspaces, graph buffers, logits | 1.24 | In part: a smaller prefill chunk, a logits buffer for one row in decode |
+| Allocator slack (reserved, not allocated) | 0.81 | Mostly: an `empty_cache` after the warmup, or a pool sized to the graphs |
+| Process memory: Python, torch, the CUDA libraries, the tokenizer, llguidance | 2.74 (2.16 anonymous, 0.58 file) | Little: step 1 measured 2.5 GB with no model |
+| CUDA context and driver | About 0.3 | No |
+
+**The other parts:** the checkpoint ring is 4.94 GB on the 27B (32 snapshots of 154 MB), and the plan's 8 snapshots
+of 63 MB on the 35B hold (0.50 GB). The session cache adds 0.13 GB allocated and 0.8 GB of file pages. The drafter
+adds 0.79 GB allocated and 1.73 GB at the peak (its weights, its KV, its cycle graphs and more slack).
+
+**What it means for the 35B** (GB, then GiB):
+
+| Item | No trims | With the trims above (about 1.0 to 1.2 GB) |
+|---|---|---|
+| Weights 21.05, drafter copy 0.55, KV 1.48, GDN 0.06, ring 0.50 | 23.64 | 23.64 |
+| X | 5.2 | 4.0 to 4.2 |
+| The drafter beyond its weights and KV (graphs, slack) | 0.7 to 1.0 | 0.5 |
+| **Peak** | **29.5 to 29.9 (27.5 to 27.8 GiB)** | **28.2 to 28.4 (26.2 to 26.4 GiB)** |
+| Against vLLM (29.64 GiB) | 1.8 to 2.1 GiB less | 3.2 to 3.4 GiB less |
+| Margin beside DeepSeek (28.8 to 29.5 GiB available) | 1.0 to 2.0 GiB | 2.4 to 3.3 GiB |
+| With the DeepSeek context cap (+0.35 GiB) | 1.4 to 2.4 GiB | 2.8 to 3.7 GiB |
+
+**The gate is not met.** X is 5.2 GB, above the 3.4 to 4.1 GB of a 4 GiB margin and above the 4.8 GB of the goal
+of 26.5 GiB. X is below 6.0 GB, so colinfer saves more than 1 GiB against vLLM. With the trims, the full model in
+colinfer reaches about the memory of K 208 under vLLM (26.5 GiB) with no loss of quality, but not a margin of
+4 GiB. A margin of 4 GiB needs a second saving: K 208 weights in colinfer (about 3.1 GiB less: a margin of about 5.5
+to 6.5 GiB), or a smaller drafter. Your decision: go on with the plan for the quality (about 200 hours), or stop it.
+
 ## 6. Milestones
 
 The hours use the scale of `qwen4exp_plan.md` §6, where Flash-Next was 500 hours.
@@ -265,6 +312,9 @@ and it pays the fixed memory a second time.
 
 ## 11. Status log
 
+- **2026-11-14.** Phase 0 is done (§5.1): X = 5.2 GB, of which about 1.0 to 1.2 GB can be trimmed. The full model in
+  colinfer would use about 26.2 to 27.8 GiB at the peak: 1.8 to 3.4 GiB less than vLLM, a margin of 1.4 to 3.7 GiB
+  beside DeepSeek with the context cap. The gate of a 4 GiB margin is not met.
 - **2026-11-14.** A correction: the DeepSeek context cap frees about 0.35 GiB, not 1.1, so the limit of X for a
   margin of 4 GiB with the cap is about 3.4 to 4.1 GB (§4), and the gate of §5 names it. Step 2 of Phase 0 is the
   window `colinfer_floor.sh` of `dsv4-specialize` (pull request 64, merged).
