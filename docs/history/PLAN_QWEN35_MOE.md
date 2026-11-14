@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B (qwen3_5_moe) on colinfer: the plan
 
-**Status:** 2026-11-14: plan written; nothing built · **Author:** colin-spark · **Date:** 2026-11-14
+**Status:** 2026-11-14: Phase 0, step 1 is done (§5.1): a process with no model takes about 2.5 GB. The window of step 2 is open · **Author:** colin-spark · **Date:** 2026-11-14
 **Related:** `qwen4exp_plan.md` (the MoE family that this plan reuses), `../architecture.md` (the 27B),
 `~/Projects/dsv4-specialize/plans/PLAN_SECOND_MODEL_FIT.md` (§5.5: the model under vLLM) and `PLAN_QWEN_PRUNE.md`
 (§7.4: the overhead of vLLM, and K 208)
@@ -9,7 +9,7 @@ with the DeepSeek server stopped. No change to the DeepSeek server. The port of 
 
 | Step | Status |
 |---|---|
-| §5 Phase 0: the memory floor of the engine (one window of about 15 min) | ⬜ |
+| §5 Phase 0: the memory floor of the engine (one window of about 15 min) | 🔨 2026-11-14: step 1, the process with no model: about 2.5 GB (§5.1). Step 2, the window with the 27B, is open |
 | §6 A: the reference model and the weights (no window) | ⬜ |
 | §6 K1, K2: the kernel changes (no window) | ⬜ |
 | §6 M1: golden decode on the real checkpoint | ⬜ |
@@ -137,7 +137,7 @@ the scheduler needs the cost model with the distinct-expert count.
 The docs give the fixed memory only as a remainder: 5.3 GB (the plan of Flash-Next), 5.8 GB (its budget table) and up
 to 6.6 GB (the measured constant less the weights and the ring). No measurement splits it.
 
-1. Write `tools/mem_floor.py`. It records `MemAvailable`, the resident memory of the process and
+1. Write `tools/mem_floor.py` (done, §5.1). It records `MemAvailable`, the resident memory of the process and
    `torch.cuda.memory_reserved` after each step:
    - the start of Python and the import of torch;
    - the CUDA context;
@@ -151,12 +151,53 @@ to 6.6 GB (the measured constant less the weights and the ring). No measurement 
    defaults of the drafter and the session cache, to get the cost of each.
 3. Report a table of the fixed memory by part, and the parts that a flag or a small change can remove.
 
+The window of step 2 is `colinfer_floor.sh` in `~/Projects/dsv4-specialize` (its pull request #64), on the run
+library of the other test windows. It has four points, all with 1 slot of 131,072 tokens, no INT copies and no vision
+tower: f1 with no drafter and no prefix caching, f2 with the checkpoint ring, f3 with the session cache (boot only, so
+that no test conversation goes into `~/.cache/colinfer/sessions`), and f4 with the MTP drafter. The state of the slot
+is 4.45 GB with no drafter and 4.72 GB with it (`startup_bytes` on the meta device).
+
 CAUTION: Step 2 needs about 35 GB. The DeepSeek server must be stopped, or the machine can power off. You start the
 window.
 
 **Gate.** The table exists, and it names the changes that bring X to 4.8 GB or less. If no set of changes reaches
 6.0 GB, colinfer saves less than 1 GiB against vLLM. Then only the speed goal remains, and you decide whether the
 plan goes on.
+
+### 5.1 Result of step 1 (2026-11-14, 11:00 to 11:10, beside the DeepSeek server)
+
+`tools/mem_floor.py` ran five times, with about 31 GB of `MemAvailable`. A parent with no torch starts a child, and
+measures after each step of the child. The noise of `MemAvailable` before a run was at most 0.03 GB, and its drift
+over a run was −0.06 to +0.24 GB. A first run, 3 minutes after the restore of the DeepSeek server, had a drift of
+0.8 GB and is not in the table.
+
+| Step | Growth of the fall of `MemAvailable` (GB, range of the runs) |
+|---|---|
+| The interpreter and `import torch` | 0.29 to 0.33 |
+| The CUDA context and one tensor | 0.23 to 0.31 |
+| The kernel extension (`engine/kernels`) | 0.00 |
+| The imports of the server (`engine.server.api`, the drafter) | 0.02 to 0.05 |
+| The tokenizer of the 27B | 0.20 to 0.34 |
+| One bf16 matmul (cuBLAS), 2 runs | 0.18 to 0.24 |
+| The self-test of each matmul path (`engine/selftest.py`), after cuBLAS | 1.29 to 1.31 |
+| One small CUDA graph in a graph pool | 0.00 |
+| **Sum at the end, 5 runs** | **2.32 to 2.63 (median 2.48)** |
+
+At the end, the child holds 1.94 GB of anonymous host memory, 0.51 GB of file-backed pages (the libraries) and 0.44 GB
+in its CUDA context. The torch allocator holds 0.15 GB of that. A release of the allocator cache frees nothing more.
+
+What the result says:
+
+- **The process floor is about 2.5 GB.** The docs give 5.3 to 6.6 GB for the fixed memory. So 2.8 to 4.1 GB of it
+  is not the process: it is the graph pool of a real model, the prefill workspace, the buffers of the session cache
+  (0.74 GB by `docs/architecture.md`), the drafter and the slack of the allocator. Step 2 measures these parts.
+- **The goal of §4 is possible.** X at or below 4.8 GB leaves about 2.3 GB for these parts. The stricter limit of
+  3.0 to 3.7 GB leaves 0.5 to 1.2 GB, so it needs a trim of each part.
+- **The self-test is the largest step: 1.3 GB**, 1.12 GB of it anonymous host memory. It is the first use of the
+  other matmul paths: the engine's kernels, cuBLASLt, CUTLASS and FlashInfer. A split of the self-test by path can
+  show whether one library takes most of it. That is a candidate for a trim, with step 2.
+- **Against vLLM:** its two processes hold 4.76 GB of host memory with a model loaded (1.72 GB for the API server,
+  3.04 GB for the engine core; read from `/proc` on 2026-11-14). colinfer has one process.
 
 ## 6. Milestones
 
@@ -257,5 +298,7 @@ and it pays the fixed memory a second time.
 
 ## 11. Status log
 
+- **2026-11-14, Phase 0 step 1.** `tools/mem_floor.py` and its test are written, and the tool ran five times beside
+  the DeepSeek server (§5.1). A process with no model takes about 2.5 GB. Step 2 needs a window.
 - **2026-11-14.** The plan is written. The checkpoint is on disk (5 shards, 22.0 GiB). Its config, tensor list and
   scales are read (§2). Nothing is built.
