@@ -151,6 +151,12 @@ to 6.6 GB (the measured constant less the weights and the ring). No measurement 
    defaults of the drafter and the session cache, to get the cost of each.
 3. Report a table of the fixed memory by part, and the parts that a flag or a small change can remove.
 
+The window of step 2 is `colinfer_floor.sh` in `~/Projects/dsv4-specialize` (its pull request #64), on the run
+library of the other test windows. It has four points, all with 1 slot of 131,072 tokens, no INT copies and no vision
+tower: f1 with no drafter and no prefix caching, f2 with the checkpoint ring, f3 with the session cache (boot only, so
+that no test conversation goes into `~/.cache/colinfer/sessions`), and f4 with the MTP drafter. The state of the slot
+is 4.45 GB with no drafter and 4.72 GB with it (`startup_bytes` on the meta device).
+
 CAUTION: Step 2 needs about 35 GB. The DeepSeek server must be stopped, or the machine can power off. You start the
 window.
 
