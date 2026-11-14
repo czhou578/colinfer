@@ -117,9 +117,15 @@ No new kernel class is necessary. That is the difference from Flash-Next, which 
 | The engine's fixed memory X: CUDA context, Python and torch, graph pool, prefill workspace, pinned buffers | 5.3 to 6.6 today (§5) |
 | **Sum** | **28.9 to 30.2 (26.9 to 28.2 GiB)** |
 
-- The goal of 26.5 GiB (28.5 GB) needs X at or below about 4.8 GB.
-- A margin of 4 GiB beside DeepSeek with no change there needs X at or below about 3.0 to 3.7 GB.
-- With the DeepSeek context cap (D1 of the fit plan, 1.1 GiB) the limit is about 4.2 to 4.9 GB.
+- The goal of 26.5 GiB (28.5 GB) needs X at or below about 4.8 GB. It gives the margin of K 208 beside DeepSeek,
+  2.3 to 3.0 GiB, with no loss of quality, not a margin of 4 GiB.
+- A margin of 4 GiB beside DeepSeek with no change there needs X at or below about 3.0 to 3.7 GB (28.8 to 29.5 GiB
+  available beside DeepSeek, measured on 2026-11-14).
+- With the DeepSeek context cap (D1 of the fit plan) the limit is about 3.4 to 4.1 GB. D1 frees about 0.35 GiB: the
+  1.1 GiB of the fit plan is the saving against the old KV pin of 8 GiB, and the live pin is 7.25 GiB
+  (`dsv4-specialize` pull request 66).
+- A colinfer process with no model already uses about 2.5 GB (Phase 0, step 1). The graph pool, the prefill
+  workspace, the pinned buffers and the peak of a long prefill must fit in the rest.
 - A slot of 262,144 tokens adds 1.48 GB.
 - The vision tower adds 0.89 GB with the first image. The INT decode copies would add about 1 GB; this plan does not
   make them.
@@ -154,8 +160,10 @@ to 6.6 GB (the measured constant less the weights and the ring). No measurement 
 CAUTION: Step 2 needs about 35 GB. The DeepSeek server must be stopped, or the machine can power off. You start the
 window.
 
-**Gate.** The table exists, and it names the changes that bring X to 4.8 GB or less. If no set of changes reaches
-6.0 GB, colinfer saves less than 1 GiB against vLLM. Then only the speed goal remains, and you decide whether the
+**Gate.** The table exists, and it names the changes that bring X to about 3.4 to 4.1 GB: a margin of 4 GiB with the
+DeepSeek context cap and the full model. X at 4.8 GB or less gives only the memory of K 208 (a margin of 2.3 to
+3.0 GiB) with no loss of quality: then the value of the plan is the quality, not the margin. If no set of changes
+reaches 6.0 GB, colinfer saves less than 1 GiB against vLLM. Then only the speed goal remains, and you decide whether the
 plan goes on.
 
 ## 6. Milestones
@@ -257,5 +265,8 @@ and it pays the fixed memory a second time.
 
 ## 11. Status log
 
+- **2026-11-14.** A correction: the DeepSeek context cap frees about 0.35 GiB, not 1.1, so the limit of X for a
+  margin of 4 GiB with the cap is about 3.4 to 4.1 GB (§4), and the gate of §5 names it. Step 2 of Phase 0 is the
+  window `colinfer_floor.sh` of `dsv4-specialize` (pull request 64, merged).
 - **2026-11-14.** The plan is written. The checkpoint is on disk (5 shards, 22.0 GiB). Its config, tensor list and
   scales are read (§2). Nothing is built.
